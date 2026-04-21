@@ -352,7 +352,11 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         detect_by_base_keyword="",
         default_api_base="https://api.minimax.io/v1",
         strip_model_prefix=False,
-        model_overrides=(),
+        # MiniMax M2.5 is trained at temp=1.0, top_p=0.95 per the model card.
+        # Lower temps cause mode collapse on long generations + weaker reasoning chains.
+        model_overrides=(
+            ("minimax-m2.5", {"temperature": 1.0, "top_p": 0.95}),
+        ),
     ),
 
     # === Local deployment (matched by config key, NOT by api_base) =========
