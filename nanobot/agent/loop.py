@@ -150,8 +150,8 @@ class _LoopHook(AgentHook):
             u.get("cached_tokens", 0),
         )
         # Ziggy: Prometheus metrics + audit log for each LLM call
-        response = getattr(context, "response", None)
-        latency_ms = getattr(context, "latency_ms", None)
+        response = context.response
+        latency_ms = context.latency_ms
         if latency_ms is not None:
             try:
                 from nanobot.dashboard.server import _PROM_AVAILABLE
