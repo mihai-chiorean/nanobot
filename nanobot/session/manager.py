@@ -1,15 +1,16 @@
 """Session management for conversation history."""
 
 import json
+import os
 import shutil
+import tempfile
+from pathlib import Path
 from dataclasses import dataclass, field
 from datetime import datetime
-from pathlib import Path
 from typing import Any
 
 from loguru import logger
 
-from nanobot.config.paths import get_legacy_sessions_dir
 from nanobot.utils.helpers import ensure_dir, safe_filename
 
 
@@ -31,6 +32,8 @@ class Session:
     updated_at: datetime = field(default_factory=datetime.now)
     metadata: dict[str, Any] = field(default_factory=dict)
     last_consolidated: int = 0  # Number of messages already consolidated to files
+    _last_saved_count: int = 0  # Number of messages at last save (for append-only)
+    _needs_full_rewrite: bool = False  # Force full rewrite on next save
 
     def add_message(self, role: str, content: str, **kwargs: Any) -> None:
         """Add a message to the session."""
@@ -67,6 +70,8 @@ class Session:
         """Clear all messages and reset session to initial state."""
         self.messages = []
         self.last_consolidated = 0
+        self._last_saved_count = 0
+        self._needs_full_rewrite = True
         self.updated_at = datetime.now()
 
 
@@ -80,8 +85,9 @@ class SessionManager:
     def __init__(self, workspace: Path):
         self.workspace = workspace
         self.sessions_dir = ensure_dir(self.workspace / "sessions")
-        self.legacy_sessions_dir = get_legacy_sessions_dir()
+        self.legacy_sessions_dir = Path.home() / ".nanobot" / "sessions"
         self._cache: dict[str, Session] = {}
+        self._saved_last_consolidated: dict[str, int] = {}
 
     def _get_session_path(self, key: str) -> Path:
         """Get the file path for a session."""
@@ -149,39 +155,84 @@ class SessionManager:
                     else:
                         messages.append(data)
 
-            return Session(
+            session = Session(
                 key=key,
                 messages=messages,
                 created_at=created_at or datetime.now(),
                 metadata=metadata,
-                last_consolidated=last_consolidated
+                last_consolidated=last_consolidated,
             )
+            # Mark that all current messages are already saved on disk
+            session._last_saved_count = len(messages)
+            self._saved_last_consolidated[key] = last_consolidated
+            return session
         except Exception as e:
             logger.warning("Failed to load session {}: {}", key, e)
             return None
 
     def save(self, session: Session) -> None:
-        """Save a session to disk."""
+        """Save a session to disk, using append-only mode when possible."""
         path = self._get_session_path(session.key)
 
-        with open(path, "w", encoding="utf-8") as f:
-            metadata_line = {
-                "_type": "metadata",
-                "key": session.key,
-                "created_at": session.created_at.isoformat(),
-                "updated_at": session.updated_at.isoformat(),
-                "metadata": session.metadata,
-                "last_consolidated": session.last_consolidated
-            }
-            f.write(json.dumps(metadata_line, ensure_ascii=False) + "\n")
-            for msg in session.messages:
-                f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+        # Determine if we need a full rewrite or can just append
+        metadata_changed = (
+            session._needs_full_rewrite
+            or session._last_saved_count == 0
+            or not path.exists()
+            or self._saved_last_consolidated.get(session.key) != session.last_consolidated
+        )
 
+        if metadata_changed:
+            # Full rewrite: metadata changed or first save (atomic via temp+rename)
+            self._full_rewrite(path, session)
+        else:
+            # Append-only: just write new messages with fsync
+            new_messages = session.messages[session._last_saved_count:]
+            if new_messages:
+                with open(path, "a", encoding="utf-8") as f:
+                    for msg in new_messages:
+                        f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+                    f.flush()
+                    os.fsync(f.fileno())
+
+        session._last_saved_count = len(session.messages)
+        session._needs_full_rewrite = False
+        self._saved_last_consolidated[session.key] = session.last_consolidated
         self._cache[session.key] = session
+
+    def _full_rewrite(self, path: Path, session: Session) -> None:
+        """Atomic full rewrite: write to temp file, fsync, then rename."""
+        fd, tmp_path = tempfile.mkstemp(
+            dir=str(path.parent), suffix=".tmp", prefix=".session_"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                metadata_line = {
+                    "_type": "metadata",
+                    "key": session.key,
+                    "created_at": session.created_at.isoformat(),
+                    "updated_at": session.updated_at.isoformat(),
+                    "metadata": session.metadata,
+                    "last_consolidated": session.last_consolidated
+                }
+                f.write(json.dumps(metadata_line, ensure_ascii=False) + "\n")
+                for msg in session.messages:
+                    f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, path)
+        except BaseException:
+            # Clean up temp file on any failure
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
 
     def invalidate(self, key: str) -> None:
         """Remove a session from the in-memory cache."""
         self._cache.pop(key, None)
+        self._saved_last_consolidated.pop(key, None)
 
     def list_sessions(self) -> list[dict[str, Any]]:
         """

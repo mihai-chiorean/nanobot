@@ -5,10 +5,11 @@ import re
 from typing import Any
 
 from loguru import logger
+from slack_sdk.socket_mode.websockets import SocketModeClient
 from slack_sdk.socket_mode.request import SocketModeRequest
 from slack_sdk.socket_mode.response import SocketModeResponse
-from slack_sdk.socket_mode.websockets import SocketModeClient
 from slack_sdk.web.async_client import AsyncWebClient
+
 from slackify_markdown import slackify_markdown
 
 from nanobot.bus.events import OutboundMessage
@@ -82,14 +83,13 @@ class SlackChannel(BaseChannel):
             thread_ts = slack_meta.get("thread_ts")
             channel_type = slack_meta.get("channel_type")
             # Only reply in thread for channel/group messages; DMs don't use threads
+            use_thread = thread_ts and channel_type != "im"
             thread_ts_param = thread_ts if use_thread else None
 
-            # Slack rejects empty text payloads. Keep media-only messages media-only,
-            # but send a single blank message when the bot has no text or files to send.
-            if msg.content or not (msg.media or []):
+            if msg.content:
                 await self._web_client.chat_postMessage(
                     channel=msg.chat_id,
-                    text=self._to_mrkdwn(msg.content) if msg.content else " ",
+                    text=self._to_mrkdwn(msg.content),
                     thread_ts=thread_ts_param,
                 )
 

@@ -1,0 +1,67 @@
+// Example: multi-model routing configuration for ~/.nanobot/config.json
+//
+// This setup uses a local MiniMax-M2.5 (via llama-server on :8001) for casual
+// chat and routes complex coding/analysis questions to Claude via the
+// claude-code-proxy running on localhost:8082.
+//
+// The proxy translates Anthropic API calls into OpenAI-compatible requests,
+// so it appears as a "custom" provider to nanobot.
+//
+// To enable: merge the sections below into your ~/.nanobot/config.json
+
+{
+  "agents": {
+    "defaults": {
+      "model": "MiniMax-M2.5",
+      "provider": "custom"
+    }
+  },
+
+  "providers": {
+    // Local model — fast, free (llama-server)
+    "custom": {
+      "apiKey": "not-needed",
+      "apiBase": "http://localhost:8001/v1"
+    }
+
+    // If you have a real Anthropic key and want to use it directly
+    // instead of the proxy, uncomment and set:
+    //
+    // "anthropic": {
+    //   "apiKey": "sk-ant-..."
+    // }
+  },
+
+  "routing": {
+    "enabled": true,
+
+    // Fallback when classifier is uncertain
+    "defaultModel": "MiniMax-M2.5",
+    "defaultProvider": "custom",
+
+    // Casual chat, greetings, simple questions → local model (free)
+    "simpleModel": "MiniMax-M2.5",
+    "simpleProvider": "custom",
+
+    // Code generation, debugging, analysis → Claude via proxy (smart)
+    // The proxy at :8082 maps "claude-sonnet-4-5" to whatever BIG_MODEL
+    // is configured in its .env (currently the same local model, but you
+    // can point it at a real OpenAI/Anthropic endpoint).
+    "complexModel": "claude-sonnet-4-5",
+    "complexProvider": "custom",
+    // ^ Uses "custom" because the proxy speaks OpenAI-compatible API.
+    //   Override apiBase per the proxy's address:
+    //
+    //   To route complex requests through the proxy, add a second
+    //   custom-like provider entry OR change the proxy's OPENAI_BASE_URL
+    //   to point at a real API.
+    //
+    //   Alternatively, if you have a direct Anthropic key:
+    //     "complexModel": "claude-sonnet-4-5",
+    //     "complexProvider": "anthropic"
+
+    // Writing, brainstorming → optional, falls back to default if empty
+    "creativeModel": "",
+    "creativeProvider": ""
+  }
+}

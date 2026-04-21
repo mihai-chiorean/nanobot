@@ -1,6 +1,6 @@
 """Spawn tool for creating background subagents."""
 
-from typing import TYPE_CHECKING, Any
+from typing import Any, TYPE_CHECKING
 
 from nanobot.agent.tools.base import Tool
 
@@ -32,7 +32,11 @@ class SpawnTool(Tool):
         return (
             "Spawn a subagent to handle a task in the background. "
             "Use this for complex or time-consuming tasks that can run independently. "
-            "The subagent will complete the task and report back when done."
+            "The subagent will complete the task and report back when done. "
+            "Available agent types: 'default' (general-purpose), 'code' (code analysis, "
+            "file I/O, shell execution, testing), 'research' (web search, content synthesis), "
+            "'security' (vulnerability scanning, security audit), 'planner' (task decomposition, "
+            "architecture planning). Custom types can be configured in agents.types."
         )
 
     @property
@@ -48,11 +52,20 @@ class SpawnTool(Tool):
                     "type": "string",
                     "description": "Optional short label for the task (for display)",
                 },
+                "agent_type": {
+                    "type": "string",
+                    "description": (
+                        "The type of specialized agent to spawn. "
+                        "Built-in types: 'default', 'code', 'research', 'security', 'planner'. "
+                        "Each type has a focused tool set and system prompt. "
+                        "Defaults to 'default' (all tools available)."
+                    ),
+                },
             },
             "required": ["task"],
         }
 
-    async def execute(self, task: str, label: str | None = None, **kwargs: Any) -> str:
+    async def execute(self, task: str, label: str | None = None, agent_type: str = "default", **kwargs: Any) -> str:
         """Spawn a subagent to execute the given task."""
         return await self._manager.spawn(
             task=task,
@@ -60,4 +73,5 @@ class SpawnTool(Tool):
             origin_channel=self._origin_channel,
             origin_chat_id=self._origin_chat_id,
             session_key=self._session_key,
+            agent_type=agent_type,
         )

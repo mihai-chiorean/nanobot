@@ -8,7 +8,6 @@ from typing import Any
 from urllib.parse import urlparse
 
 import httpx
-from loguru import logger
 
 from nanobot.agent.tools.base import Tool
 
@@ -32,13 +31,41 @@ def _normalize(text: str) -> str:
 
 
 def _validate_url(url: str) -> tuple[bool, str]:
-    """Validate URL: must be http(s) with valid domain."""
+    """Validate URL: must be http(s) with valid domain, no private/internal IPs."""
+    import ipaddress
+    import socket
+
     try:
         p = urlparse(url)
         if p.scheme not in ('http', 'https'):
             return False, f"Only http/https allowed, got '{p.scheme or 'none'}'"
         if not p.netloc:
             return False, "Missing domain"
+
+        # Resolve hostname and block private/reserved IPs (SSRF protection)
+        hostname = p.hostname or ""
+        if not hostname:
+            return False, "Missing hostname"
+
+        try:
+            addr = ipaddress.ip_address(hostname)
+        except ValueError:
+            # It's a hostname — resolve it
+            try:
+                resolved = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+                addrs = [ipaddress.ip_address(r[4][0]) for r in resolved]
+            except socket.gaierror:
+                return False, f"Could not resolve hostname: {hostname}"
+        else:
+            addrs = [addr]
+
+        for addr in addrs:
+            if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved:
+                return False, f"Access to private/internal addresses is blocked ({addr})"
+            # Block cloud metadata endpoints (169.254.169.254)
+            if str(addr) == "169.254.169.254":
+                return False, "Access to cloud metadata endpoint is blocked"
+
         return True, ""
     except Exception as e:
         return False, str(e)
@@ -46,7 +73,7 @@ def _validate_url(url: str) -> tuple[bool, str]:
 
 class WebSearchTool(Tool):
     """Search the web using Brave Search API."""
-
+    
     name = "web_search"
     description = "Search the web. Returns titles, URLs, and snippets."
     parameters = {
@@ -57,11 +84,10 @@ class WebSearchTool(Tool):
         },
         "required": ["query"]
     }
-
-    def __init__(self, api_key: str | None = None, max_results: int = 5, proxy: str | None = None):
+    
+    def __init__(self, api_key: str | None = None, max_results: int = 5):
         self._init_api_key = api_key
         self.max_results = max_results
-        self.proxy = proxy
 
     @property
     def api_key(self) -> str:
@@ -69,46 +95,82 @@ class WebSearchTool(Tool):
         return self._init_api_key or os.environ.get("BRAVE_API_KEY", "")
 
     async def execute(self, query: str, count: int | None = None, **kwargs: Any) -> str:
-        if not self.api_key:
-            return (
-                "Error: Brave Search API key not configured. Set it in "
-                "~/.nanobot/config.json under tools.web.search.apiKey "
-                "(or export BRAVE_API_KEY), then restart the gateway."
+        n = min(max(count or self.max_results, 1), 10)
+        
+        # Try Brave API first if key is available
+        if self.api_key:
+            try:
+                return await self._brave_search(query, n)
+            except Exception as e:
+                # Fall through to DuckDuckGo on Brave failure
+                pass
+        
+        # Fallback: DuckDuckGo HTML (no API key needed)
+        return await self._ddg_search(query, n)
+    
+    async def _brave_search(self, query: str, n: int) -> str:
+        """Search using Brave Search API."""
+        async with httpx.AsyncClient() as client:
+            r = await client.get(
+                "https://api.search.brave.com/res/v1/web/search",
+                params={"q": query, "count": n},
+                headers={"Accept": "application/json", "X-Subscription-Token": self.api_key},
+                timeout=10.0
             )
-
+            r.raise_for_status()
+        
+        results = r.json().get("web", {}).get("results", [])
+        if not results:
+            return f"No results for: {query}"
+        
+        lines = [f"Results for: {query}\n"]
+        for i, item in enumerate(results[:n], 1):
+            lines.append(f"{i}. {item.get('title', '')}\n   {item.get('url', '')}")
+            if desc := item.get("description"):
+                lines.append(f"   {desc}")
+        return "\n".join(lines)
+    
+    async def _ddg_search(self, query: str, n: int) -> str:
+        """Search using DuckDuckGo HTML (no API key required)."""
+        from urllib.parse import quote
+        
         try:
-            n = min(max(count or self.max_results, 1), 10)
-            logger.debug("WebSearch: {}", "proxy enabled" if self.proxy else "direct connection")
-            async with httpx.AsyncClient(proxy=self.proxy) as client:
+            async with httpx.AsyncClient() as client:
                 r = await client.get(
-                    "https://api.search.brave.com/res/v1/web/search",
-                    params={"q": query, "count": n},
-                    headers={"Accept": "application/json", "X-Subscription-Token": self.api_key},
-                    timeout=10.0
+                    f"https://html.duckduckgo.com/html/?q={quote(query)}",
+                    headers={"User-Agent": USER_AGENT},
+                    timeout=15.0
                 )
                 r.raise_for_status()
-
-            results = r.json().get("web", {}).get("results", [])[:n]
+            
+            # Parse results from HTML
+            results = []
+            # Match result links: <a class="result__a" href="...">
+            links = re.findall(r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>([^<]+)</a>', r.text, re.I)
+            # Match result snippets: <a class="result__snippet" ...>
+            snippets = re.findall(r'<a[^>]+class="result__snippet"[^>]*>([^<]+)</a>', r.text, re.I)
+            
+            for i, (url, title) in enumerate(links[:n]):
+                title = _strip_tags(title)
+                snippet = _strip_tags(snippets[i]) if i < len(snippets) else ""
+                results.append({"title": title, "url": url, "description": snippet})
+            
             if not results:
                 return f"No results for: {query}"
-
-            lines = [f"Results for: {query}\n"]
-            for i, item in enumerate(results, 1):
-                lines.append(f"{i}. {item.get('title', '')}\n   {item.get('url', '')}")
-                if desc := item.get("description"):
-                    lines.append(f"   {desc}")
+            
+            lines = [f"Results for: {query} (DuckDuckGo)\n"]
+            for i, item in enumerate(results[:n], 1):
+                lines.append(f"{i}. {item['title']}\n   {item['url']}")
+                if item['description']:
+                    lines.append(f"   {item['description']}")
             return "\n".join(lines)
-        except httpx.ProxyError as e:
-            logger.error("WebSearch proxy error: {}", e)
-            return f"Proxy error: {e}"
         except Exception as e:
-            logger.error("WebSearch error: {}", e)
             return f"Error: {e}"
 
 
 class WebFetchTool(Tool):
     """Fetch and extract content from a URL using Readability."""
-
+    
     name = "web_fetch"
     description = "Fetch URL and extract readable content (HTML → markdown/text)."
     parameters = {
@@ -120,34 +182,47 @@ class WebFetchTool(Tool):
         },
         "required": ["url"]
     }
-
-    def __init__(self, max_chars: int = 50000, proxy: str | None = None):
+    
+    def __init__(self, max_chars: int = 50000):
         self.max_chars = max_chars
-        self.proxy = proxy
-
+    
     async def execute(self, url: str, extractMode: str = "markdown", maxChars: int | None = None, **kwargs: Any) -> str:
         from readability import Document
 
         max_chars = maxChars or self.max_chars
+
+        # Validate URL before fetching
         is_valid, error_msg = _validate_url(url)
         if not is_valid:
             return json.dumps({"error": f"URL validation failed: {error_msg}", "url": url}, ensure_ascii=False)
 
         try:
-            logger.debug("WebFetch: {}", "proxy enabled" if self.proxy else "direct connection")
+            # Manually follow redirects to validate each target (prevents SSRF via redirect)
             async with httpx.AsyncClient(
-                follow_redirects=True,
-                max_redirects=MAX_REDIRECTS,
+                follow_redirects=False,
                 timeout=30.0,
-                proxy=self.proxy,
             ) as client:
-                r = await client.get(url, headers={"User-Agent": USER_AGENT})
+                current_url = url
+                for _ in range(MAX_REDIRECTS):
+                    r = await client.get(current_url, headers={"User-Agent": USER_AGENT})
+                    if r.is_redirect:
+                        redirect_url = str(r.next_request.url) if r.next_request else r.headers.get("location", "")
+                        if not redirect_url:
+                            break
+                        ok, err = _validate_url(redirect_url)
+                        if not ok:
+                            return json.dumps({"error": f"Redirect blocked (SSRF): {err}", "url": url, "blocked_redirect": redirect_url}, ensure_ascii=False)
+                        current_url = redirect_url
+                        continue
+                    break
                 r.raise_for_status()
-
+            
             ctype = r.headers.get("content-type", "")
-
+            
+            # JSON
             if "application/json" in ctype:
                 text, extractor = json.dumps(r.json(), indent=2, ensure_ascii=False), "json"
+            # HTML
             elif "text/html" in ctype or r.text[:256].lower().startswith(("<!doctype", "<html")):
                 doc = Document(r.text)
                 content = self._to_markdown(doc.summary()) if extractMode == "markdown" else _strip_tags(doc.summary())
@@ -155,19 +230,16 @@ class WebFetchTool(Tool):
                 extractor = "readability"
             else:
                 text, extractor = r.text, "raw"
-
+            
             truncated = len(text) > max_chars
-            if truncated: text = text[:max_chars]
-
+            if truncated:
+                text = text[:max_chars]
+            
             return json.dumps({"url": url, "finalUrl": str(r.url), "status": r.status_code,
                               "extractor": extractor, "truncated": truncated, "length": len(text), "text": text}, ensure_ascii=False)
-        except httpx.ProxyError as e:
-            logger.error("WebFetch proxy error for {}: {}", url, e)
-            return json.dumps({"error": f"Proxy error: {e}", "url": url}, ensure_ascii=False)
         except Exception as e:
-            logger.error("WebFetch error for {}: {}", url, e)
             return json.dumps({"error": str(e), "url": url}, ensure_ascii=False)
-
+    
     def _to_markdown(self, html: str) -> str:
         """Convert HTML to markdown."""
         # Convert links, headings, lists before stripping tags

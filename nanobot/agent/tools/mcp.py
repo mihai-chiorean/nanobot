@@ -1,6 +1,7 @@
 """MCP client: connects to MCP servers and wraps their tools as native nanobot tools."""
 
 import asyncio
+import re
 from contextlib import AsyncExitStack
 from typing import Any
 
@@ -11,6 +12,32 @@ from nanobot.agent.tools.base import Tool
 from nanobot.agent.tools.registry import ToolRegistry
 
 
+def _sanitize_mcp_text(text: str, max_length: int = 500) -> str:
+    """Sanitize MCP tool description/name to prevent prompt injection."""
+    # Remove control characters (C0, C1, and Unicode bidi/ZWS)
+    text = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', text)
+    text = re.sub(r'[\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]', '', text)
+    # Remove common injection delimiters
+    text = re.sub(r'(\[{2,}|\]{2,}|\{{2,}|\}{2,}|<{3,}|>{3,})', '', text)
+    # Remove system prompt manipulation attempts
+    text = re.sub(r'(?i)(ignore|disregard|forget)\s+(previous|all|your)\s+\w+', '[filtered]', text)
+    # Truncate
+    if len(text) > max_length:
+        text = text[:max_length] + "..."
+    return text.strip()
+
+
+def _sanitize_schema(obj: Any) -> Any:
+    """Recursively sanitize all string values in an MCP inputSchema."""
+    if isinstance(obj, str):
+        return _sanitize_mcp_text(obj, max_length=1000)
+    if isinstance(obj, dict):
+        return {k: _sanitize_schema(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize_schema(item) for item in obj]
+    return obj
+
+
 class MCPToolWrapper(Tool):
     """Wraps a single MCP server tool as a nanobot Tool."""
 
@@ -18,8 +45,8 @@ class MCPToolWrapper(Tool):
         self._session = session
         self._original_name = tool_def.name
         self._name = f"mcp_{server_name}_{tool_def.name}"
-        self._description = tool_def.description or tool_def.name
-        self._parameters = tool_def.inputSchema or {"type": "object", "properties": {}}
+        self._description = _sanitize_mcp_text(tool_def.description or tool_def.name)
+        self._parameters = _sanitize_schema(tool_def.inputSchema or {"type": "object", "properties": {}})
         self._tool_timeout = tool_timeout
 
     @property
@@ -36,7 +63,6 @@ class MCPToolWrapper(Tool):
 
     async def execute(self, **kwargs: Any) -> str:
         from mcp import types
-
         try:
             result = await asyncio.wait_for(
                 self._session.call_tool(self._original_name, arguments=kwargs),
@@ -45,23 +71,6 @@ class MCPToolWrapper(Tool):
         except asyncio.TimeoutError:
             logger.warning("MCP tool '{}' timed out after {}s", self._name, self._tool_timeout)
             return f"(MCP tool call timed out after {self._tool_timeout}s)"
-        except asyncio.CancelledError:
-            # MCP SDK's anyio cancel scopes can leak CancelledError on timeout/failure.
-            # Re-raise only if our task was externally cancelled (e.g. /stop).
-            task = asyncio.current_task()
-            if task is not None and task.cancelling() > 0:
-                raise
-            logger.warning("MCP tool '{}' was cancelled by server/SDK", self._name)
-            return "(MCP tool call was cancelled)"
-        except Exception as exc:
-            logger.exception(
-                "MCP tool '{}' failed: {}: {}",
-                self._name,
-                type(exc).__name__,
-                exc,
-            )
-            return f"(MCP tool call failed: {type(exc).__name__})"
-
         parts = []
         for block in result.content:
             if isinstance(block, types.TextContent):
@@ -76,48 +85,17 @@ async def connect_mcp_servers(
 ) -> None:
     """Connect to configured MCP servers and register their tools."""
     from mcp import ClientSession, StdioServerParameters
-    from mcp.client.sse import sse_client
     from mcp.client.stdio import stdio_client
-    from mcp.client.streamable_http import streamable_http_client
 
     for name, cfg in mcp_servers.items():
         try:
-            transport_type = cfg.type
-            if not transport_type:
-                if cfg.command:
-                    transport_type = "stdio"
-                elif cfg.url:
-                    # Convention: URLs ending with /sse use SSE transport; others use streamableHttp
-                    transport_type = (
-                        "sse" if cfg.url.rstrip("/").endswith("/sse") else "streamableHttp"
-                    )
-                else:
-                    logger.warning("MCP server '{}': no command or url configured, skipping", name)
-                    continue
-
-            if transport_type == "stdio":
+            if cfg.command:
                 params = StdioServerParameters(
                     command=cfg.command, args=cfg.args, env=cfg.env or None
                 )
                 read, write = await stack.enter_async_context(stdio_client(params))
-            elif transport_type == "sse":
-                def httpx_client_factory(
-                    headers: dict[str, str] | None = None,
-                    timeout: httpx.Timeout | None = None,
-                    auth: httpx.Auth | None = None,
-                ) -> httpx.AsyncClient:
-                    merged_headers = {**(cfg.headers or {}), **(headers or {})}
-                    return httpx.AsyncClient(
-                        headers=merged_headers or None,
-                        follow_redirects=True,
-                        timeout=timeout,
-                        auth=auth,
-                    )
-
-                read, write = await stack.enter_async_context(
-                    sse_client(cfg.url, httpx_client_factory=httpx_client_factory)
-                )
-            elif transport_type == "streamableHttp":
+            elif cfg.url:
+                from mcp.client.streamable_http import streamable_http_client
                 # Always provide an explicit httpx client so MCP HTTP transport does not
                 # inherit httpx's default 5s timeout and preempt the higher-level tool timeout.
                 http_client = await stack.enter_async_context(
@@ -131,7 +109,7 @@ async def connect_mcp_servers(
                     streamable_http_client(cfg.url, http_client=http_client)
                 )
             else:
-                logger.warning("MCP server '{}': unknown transport type '{}'", name, transport_type)
+                logger.warning("MCP server '{}': no command or url configured, skipping", name)
                 continue
 
             session = await stack.enter_async_context(ClientSession(read, write))
