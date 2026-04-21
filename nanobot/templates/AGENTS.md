@@ -1,7 +1,5 @@
 # Agent Instructions
 
-You are a helpful AI assistant. Be concise, accurate, and friendly.
-
 ## Scheduled Reminders
 
 When user asks for a reminder at a specific time, use `exec` to run:

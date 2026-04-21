@@ -52,11 +52,40 @@ class ToolRegistry:
         """Check if a tool is registered."""
         return name in self._tools
 
+    @staticmethod
+    def _schema_name(schema: dict[str, Any]) -> str:
+        """Extract a normalized tool name from either OpenAI or flat schemas."""
+        fn = schema.get("function")
+        if isinstance(fn, dict):
+            name = fn.get("name")
+            if isinstance(name, str):
+                return name
+        name = schema.get("name")
+        return name if isinstance(name, str) else ""
+
     def get_definitions(self) -> list[dict[str, Any]]:
-        """Get all tool definitions in OpenAI format."""
+        """Get tool definitions with stable ordering for cache-friendly prompts.
+
+        Built-in tools are sorted first as a stable prefix, then MCP tools are
+        sorted and appended.  The result is cached until the next
+        register/unregister call.
+        """
         if self._definitions_cache is not None:
             return self._definitions_cache
-        self._definitions_cache = [tool.to_schema() for tool in self._tools.values()]
+
+        definitions = [tool.to_schema() for tool in self._tools.values()]
+        builtins: list[dict[str, Any]] = []
+        mcp_tools: list[dict[str, Any]] = []
+        for schema in definitions:
+            name = self._schema_name(schema)
+            if name.startswith("mcp_"):
+                mcp_tools.append(schema)
+            else:
+                builtins.append(schema)
+
+        builtins.sort(key=self._schema_name)
+        mcp_tools.sort(key=self._schema_name)
+        self._definitions_cache = builtins + mcp_tools
         return self._definitions_cache
 
     async def execute(
@@ -73,6 +102,13 @@ class ToolRegistry:
         avoiding shared mutable state across concurrent workers.
         """
         _HINT = "\n\n[Analyze the error above and try a different approach.]"
+
+        # Guard against invalid parameter types (e.g., list instead of dict)
+        if not isinstance(params, dict) and name in ('write_file', 'read_file'):
+            return (
+                f"Error: Tool '{name}' parameters must be a JSON object, got {type(params).__name__}. "
+                "Use named parameters: tool_name(param1=\"value1\", param2=\"value2\")" + _HINT
+            )
 
         tool = self._tools.get(name)
         if not tool:

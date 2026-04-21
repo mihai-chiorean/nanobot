@@ -60,6 +60,13 @@ class ProviderSpec:
     # Provider supports cache_control on content blocks (e.g. Anthropic prompt caching)
     supports_prompt_caching: bool = False
 
+    # Backend implementation selector (for future migration from LiteLLM):
+    # "openai_compat" | "anthropic" | "azure_openai" | "openai_codex" | "github_copilot"
+    backend: str = "openai_compat"
+
+    # Max completion tokens parameter style (some providers use max_completion_tokens)
+    supports_max_completion_tokens: bool = False
+
     @property
     def label(self) -> str:
         return self.display_name or self.name.title()
@@ -79,6 +86,17 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         display_name="Custom",
         litellm_prefix="",
         is_direct=True,
+    ),
+
+    # Azure OpenAI: direct API calls with API version 2024-10-21
+    ProviderSpec(
+        name="azure_openai",
+        keywords=("azure", "azure-openai"),
+        env_key="",
+        display_name="Azure OpenAI",
+        litellm_prefix="",
+        is_direct=True,
+        backend="azure_openai",
     ),
 
     # === Gateways (detected by api_key / api_base, not model name) =========
@@ -156,6 +174,60 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         detect_by_base_keyword="volces",
         default_api_base="https://ark.cn-beijing.volces.com/api/v3",
         strip_model_prefix=False,
+        model_overrides=(),
+    ),
+
+    # VolcEngine Coding Plan: dedicated code-gen endpoint
+    ProviderSpec(
+        name="volcengine_coding_plan",
+        keywords=("volcengine-plan",),
+        env_key="OPENAI_API_KEY",
+        display_name="VolcEngine Coding Plan",
+        litellm_prefix="volcengine",
+        skip_prefixes=(),
+        env_extras=(),
+        is_gateway=True,
+        is_local=False,
+        detect_by_key_prefix="",
+        detect_by_base_keyword="",
+        default_api_base="https://ark.cn-beijing.volces.com/api/coding/v3",
+        strip_model_prefix=True,
+        model_overrides=(),
+    ),
+
+    # BytePlus: VolcEngine international, pay-per-use models
+    ProviderSpec(
+        name="byteplus",
+        keywords=("byteplus",),
+        env_key="OPENAI_API_KEY",
+        display_name="BytePlus",
+        litellm_prefix="",
+        skip_prefixes=(),
+        env_extras=(),
+        is_gateway=True,
+        is_local=False,
+        detect_by_key_prefix="",
+        detect_by_base_keyword="bytepluses",
+        default_api_base="https://ark.ap-southeast.bytepluses.com/api/v3",
+        strip_model_prefix=True,
+        model_overrides=(),
+    ),
+
+    # BytePlus Coding Plan: code-gen endpoint on BytePlus
+    ProviderSpec(
+        name="byteplus_coding_plan",
+        keywords=("byteplus-plan",),
+        env_key="OPENAI_API_KEY",
+        display_name="BytePlus Coding Plan",
+        litellm_prefix="",
+        skip_prefixes=(),
+        env_extras=(),
+        is_gateway=True,
+        is_local=False,
+        detect_by_key_prefix="",
+        detect_by_base_keyword="",
+        default_api_base="https://ark.ap-southeast.bytepluses.com/api/coding/v3",
+        strip_model_prefix=True,
         model_overrides=(),
     ),
 
@@ -333,6 +405,7 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         strip_model_prefix=False,
         model_overrides=(
             ("kimi-k2.5", {"temperature": 1.0}),
+            ("kimi-k2.6", {"temperature": 1.0}),
         ),
     ),
 
@@ -357,6 +430,79 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         model_overrides=(
             ("minimax-m2.5", {"temperature": 1.0, "top_p": 0.95}),
         ),
+    ),
+
+    # MiniMax Anthropic-compatible endpoint: supports thinking mode
+    ProviderSpec(
+        name="minimax_anthropic",
+        keywords=("minimax_anthropic",),
+        env_key="MINIMAX_API_KEY",
+        display_name="MiniMax (Anthropic)",
+        litellm_prefix="",
+        skip_prefixes=(),
+        env_extras=(),
+        is_gateway=False,
+        is_local=False,
+        detect_by_key_prefix="",
+        detect_by_base_keyword="",
+        default_api_base="https://api.minimax.io/anthropic",
+        strip_model_prefix=False,
+        model_overrides=(),
+        backend="anthropic",
+    ),
+
+    # Mistral AI: OpenAI-compatible API
+    ProviderSpec(
+        name="mistral",
+        keywords=("mistral",),
+        env_key="MISTRAL_API_KEY",
+        display_name="Mistral",
+        litellm_prefix="mistral",
+        skip_prefixes=("mistral/",),
+        env_extras=(),
+        is_gateway=False,
+        is_local=False,
+        detect_by_key_prefix="",
+        detect_by_base_keyword="",
+        default_api_base="https://api.mistral.ai/v1",
+        strip_model_prefix=False,
+        model_overrides=(),
+    ),
+
+    # Step Fun (阶跃星辰): OpenAI-compatible API
+    ProviderSpec(
+        name="stepfun",
+        keywords=("stepfun", "step"),
+        env_key="STEPFUN_API_KEY",
+        display_name="Step Fun",
+        litellm_prefix="",
+        skip_prefixes=(),
+        env_extras=(),
+        is_gateway=False,
+        is_local=False,
+        detect_by_key_prefix="",
+        detect_by_base_keyword="",
+        default_api_base="https://api.stepfun.com/v1",
+        strip_model_prefix=False,
+        model_overrides=(),
+    ),
+
+    # Xiaomi MIMO: OpenAI-compatible API
+    ProviderSpec(
+        name="xiaomi_mimo",
+        keywords=("xiaomi_mimo", "mimo"),
+        env_key="XIAOMIMIMO_API_KEY",
+        display_name="Xiaomi MIMO",
+        litellm_prefix="",
+        skip_prefixes=(),
+        env_extras=(),
+        is_gateway=False,
+        is_local=False,
+        detect_by_key_prefix="",
+        detect_by_base_keyword="",
+        default_api_base="https://api.xiaomimimo.com/v1",
+        strip_model_prefix=False,
+        model_overrides=(),
     ),
 
     # === Local deployment (matched by config key, NOT by api_base) =========
