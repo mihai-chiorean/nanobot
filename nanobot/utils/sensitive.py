@@ -280,9 +280,19 @@ def _is_script_carrying_option(token: str) -> bool:
     This predicate is load-bearing for the MIT-164 fix — anything it
     excludes must genuinely NOT carry a script, or we reopen the bypass.
     """
-    if not token.startswith("-"):
+    # Accept both `-` and `+` option prefixes.  POSIX / bash / zsh all
+    # treat `+<letters>` as "turn off option(s)" in the same cluster
+    # grammar as `-<letters>` ("turn on").  `+c` isn't a documented
+    # shell option but `+n`/`+i`/`+x` are (bash/zsh), and any of them
+    # can legitimately appear before `-c` in a wrapper invocation —
+    # codex-round-13 P1.  Recognising `+X...` as option-shaped here
+    # ensures the scanner skips those tokens instead of treating them
+    # as positional script-file-mode triggers.
+    if not (token.startswith("-") or token.startswith("+")):
         return False
-    if token == "-" or token == "--" or token.startswith("--"):
+    if token in ("-", "+", "--", "++"):
+        return False
+    if token.startswith("--") or token.startswith("++"):
         return False
     letters = token[1:]
     # Short-option clusters are alphabetic in POSIX + bash + zsh.  If the
@@ -716,7 +726,12 @@ def _extract_shell_wrapper_inner(command: str) -> str | None:
 
         # (d) Any other option-shaped token (short flag without ``c``,
         # long flag without a value, or ``--opt=val`` form) — skip it.
-        if tok.startswith("-") and tok != "-":
+        # Both ``-``- and ``+``-prefixed tokens count as option-shaped:
+        # bash and zsh accept ``+n``, ``+i``, ``+x``, etc. as "turn
+        # option off" pre-`-c` (codex-round-13 P1).  Filter out bare
+        # ``-`` and ``+`` which are positional conventions in some
+        # tools.
+        if (tok.startswith("-") or tok.startswith("+")) and tok not in ("-", "+"):
             # Short option: if the cluster contains ``c`` we already
             # returned at (b); so this is a flag-only cluster.
             # Long option: either no value or ``--opt=val`` (self-
@@ -724,10 +739,10 @@ def _extract_shell_wrapper_inner(command: str) -> str | None:
             idx += 1
             continue
 
-        # (e) Positional (not starting with ``-``, or bare ``-``) —
-        # shell is in script-file mode.  Not a wrapper.  See
-        # codex-round-3: ``bash script.sh -c printenv`` must not
-        # unwrap to ``printenv``.
+        # (e) Positional (not starting with ``-``/``+``, or bare
+        # ``-``/``+``) — shell is in script-file mode.  Not a
+        # wrapper.  See codex-round-3: ``bash script.sh -c printenv``
+        # must not unwrap to ``printenv``.
         return None
 
     return None

@@ -1518,3 +1518,74 @@ def test_mit164r13_pre_dashdash_dash_prefixed_not_treated_as_assignment() -> Non
     # allow because the command is invalid on real env).
     result = check_shell_command("/usr/bin/env '-X=1' bash -c 'printenv'")
     assert result is None or "blocked by security policy" in result
+
+
+
+# ---------------------------------------------------------------------------
+# MIT-164 round 14 — codex review iteration 13
+#
+# Codex round 13 flagged (P1) that bash and zsh accept `+`-prefixed
+# option tokens (`+n`, `+x`, `+i`, `+nx`, etc.) as the "turn option
+# off" form in the same cluster grammar as `-`-prefixed options.
+# Those CAN appear before `-c`:
+#
+#     bash +n -c 'printenv'   ⇒  runs `printenv`
+#     zsh  +i -c 'cat ...'    ⇒  runs `cat ...`
+#
+# The round-13 scanner only treated `-`-prefixed tokens as option-
+# shaped, so `+n` fell through to branch (e) (positional → halt).
+#
+# Fix: `_is_script_carrying_option` and branch (d) in the main
+# option-prefix walker both accept `-` OR `+` as the option prefix.
+# Bare `+` and `++` are filtered out (treated as positionals, same
+# as bare `-` and `--`).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Single-letter + flags before -c
+        "bash +n -c 'printenv'",
+        "bash +x -c 'cat /etc/shadow'",
+        "bash +e -c 'printenv'",
+        # zsh +i (interactive off)
+        "zsh +i -c 'cat /etc/shadow'",
+        "zsh +x -c 'printenv'",
+        # Clustered + flags
+        "bash +nx -c 'printenv'",
+        "bash +xvn -c 'printenv'",
+        # Mixed - and + flags
+        "bash -l +n -c 'printenv'",
+        "bash +n -x -c 'printenv'",
+        "bash +n -lc 'printenv'",
+        # + flag with value-taker -O pair
+        "bash +n -O extglob -c 'printenv'",
+        # Path-prefixed shell + + flag
+        "/usr/bin/bash +n -c 'printenv'",
+    ],
+)
+def test_mit164r14_plus_prefix_option_wrapper_blocks(command: str) -> None:
+    """MIT-164 round 14: `+`-prefixed option clusters before `-c` must not terminate the scan."""
+    result = check_shell_command(command)
+    assert result is not None, f"Expected block: {command!r}"
+    assert "blocked by security policy" in result
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Benign + flag usage
+        "bash +n -c 'echo hi'",
+        "bash +nx -c 'git status'",
+        "zsh +i -c 'echo hello'",
+        # + flag in script-file mode — MUST NOT unwrap
+        "bash +n script.sh -c printenv",
+        # Bare + and ++ — positional, not options
+        "bash + script.sh",
+        "bash ++ script.sh",
+    ],
+)
+def test_mit164r14_plus_prefix_benign_allowed(command: str) -> None:
+    """MIT-164 round 14: benign + flags and bare +/++ must not false-positive."""
+    assert check_shell_command(command) is None, f"False positive: {command!r}"
