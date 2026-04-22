@@ -292,8 +292,9 @@ def _is_script_carrying_option(token: str) -> bool:
 # shells AND (b) do not themselves contain ``c`` belong here.
 _SHORT_OPTS_TAKING_VALUE: frozenset[str] = frozenset({
     "-O",   # bash --shopt setting
+    "+O",   # bash --shopt-off setting (mirror of -O)
     "-o",   # sh/bash/zsh setopt name (`set -o <name>` family)
-    "+o",   # zsh setopt-off
+    "+o",   # zsh / bash setopt-off
 })
 
 # Long options (exact match) that consume the NEXT argv slot as their
@@ -310,6 +311,25 @@ _LONG_OPTS_TAKING_VALUE: frozenset[str] = frozenset({
 })
 
 
+# Regex for a POSIX shell-style assignment token: `NAME=value`, where
+# `NAME` follows identifier rules (letter or underscore, then letters /
+# digits / underscores).  `value` can be empty or anything (shlex has
+# already handled quoting).  Used to skip over assignment prefixes
+# before the shell binary: `FOO=1 BAR=2 bash -c '...'`.
+_ASSIGNMENT_TOKEN_RE: re.Pattern = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def _is_assignment_token(token: str) -> bool:
+    """Return True iff *token* looks like a POSIX `NAME=value` assignment.
+
+    Used to strip env-var-assignment prefixes from a command before the
+    wrapper extractor looks up the shell binary.  Matches both empty-value
+    (`FOO=`) and non-empty (`FOO=bar`, `PATH=/usr/bin`, `MSG=hello world`
+    — shlex already split the token on spaces in surrounding context).
+    """
+    return bool(_ASSIGNMENT_TOKEN_RE.match(token))
+
+
 def _extract_shell_wrapper_inner(command: str) -> str | None:
     """If *command* runs a shell with an inline script argument, return the script.
 
@@ -321,9 +341,13 @@ def _extract_shell_wrapper_inner(command: str) -> str | None:
     * ``bash -cl 'printenv'``                       — ``c`` first in bundle
     * ``bash --noprofile -c 'printenv'``            — long option BEFORE -c
     * ``bash -O extglob -c 'printenv'``             — short option with value
+    * ``bash +O extglob -c 'printenv'``             — bash shopt-off variant
     * ``zsh -o no_aliases -c 'env'``                — zsh setopt pair
     * ``bash --rcfile /dev/null -lc 'printenv'``    — several pre-options + bundle
     * ``/usr/bin/bash -lc "cat /etc/shadow"``       — path-prefixed shell
+    * ``FOO=1 bash -c 'printenv'``                  — POSIX assignment prefix
+    * ``env bash -c 'printenv'``                    — env-runner prefix
+    * ``/usr/bin/env FOO=1 bash -c 'printenv'``     — env-runner + assignments
 
     Explicitly NOT recognised (correctly treated as non-wrapper shape):
 
@@ -378,8 +402,47 @@ def _extract_shell_wrapper_inner(command: str) -> str | None:
     if len(tokens) < 3:
         return None
 
-    # First token: the shell binary, possibly path-prefixed.
-    shell_basename = os.path.basename(tokens[0])
+    # MIT-164 review 4 / codex P1: command-prefix stripping.  Tokens
+    # before the shell can legitimately include:
+    #
+    #   * POSIX-style VAR=value assignments: `FOO=1 BAR=2 bash -c '...'`
+    #   * an `env` (or `/usr/bin/env`) runner, optionally followed by
+    #     more VAR=value assignments: `/usr/bin/env FOO=1 bash -c '...'`
+    #   * both combined.
+    #
+    # All three are standard Unix idioms for invoking a shell with a
+    # modified environment, and all three bypass the prescreen if we
+    # require the shell to be `tokens[0]`.  Advance a cursor past any
+    # such prefix and treat the next token as the shell binary.
+    #
+    # Assignments are identified by an identifier-name followed by `=`
+    # (POSIX: `name` must start with letter/underscore and contain only
+    # letters/digits/underscore).  `env` is identified by its basename
+    # so `/usr/bin/env`, `/bin/env`, `env` are all recognised.
+    shell_idx = 0
+    # Optional `env` runner.  Can appear either BEFORE any assignments
+    # (`env FOO=1 bash -c ...`) or after (`FOO=1 env bash -c ...`), so
+    # we do one pass that accepts each token type in either order until
+    # we hit the shell.
+    while shell_idx < len(tokens) - 2:
+        tok = tokens[shell_idx]
+        if _is_assignment_token(tok):
+            shell_idx += 1
+            continue
+        if os.path.basename(tok) == "env":
+            # Don't re-skip the `env` token itself as a shell — advance
+            # past it and continue looking for assignments and finally
+            # the real shell.
+            shell_idx += 1
+            continue
+        break
+
+    # After stripping prefixes, require at least `<shell> -c <script>`
+    # remaining (3 tokens).
+    if len(tokens) - shell_idx < 3:
+        return None
+
+    shell_basename = os.path.basename(tokens[shell_idx])
     if shell_basename not in _SHELL_WRAPPER_BASENAMES:
         return None
 
@@ -388,7 +451,7 @@ def _extract_shell_wrapper_inner(command: str) -> str | None:
     # with-value.  End-of-options (either ``--`` or a bare positional)
     # exits with ``None`` — shell is in script-file mode, not wrapper
     # mode.  See codex-review-round-3 rationale in the docstring.
-    idx = 1
+    idx = shell_idx + 1
     while idx < len(tokens) - 1:
         tok = tokens[idx]
 

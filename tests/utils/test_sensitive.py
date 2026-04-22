@@ -760,3 +760,97 @@ def test_mit164r4_dashdash_ends_options_before_c() -> None:
     assert check_shell_command("bash -- -c printenv") is None
     # Same invariant with dash: -- stops option parsing.
     assert check_shell_command("dash -- -c printenv") is None
+
+
+
+# ---------------------------------------------------------------------------
+# MIT-164 round 5 — codex review iteration 4
+#
+# Codex round 4 flagged two residual bypasses in the wrapper detector:
+#
+#   P1. Command-prefix bypass:
+#       * ``FOO=1 bash -c 'printenv'``     (POSIX env-var assignment)
+#       * ``/usr/bin/env bash -c 'printenv'`` (env runner)
+#       * combinations thereof
+#     The round-4 extractor hard-coded ``tokens[0]`` as the shell, so
+#     any legitimate prefix broke detection.  Fix: strip leading
+#     ``NAME=value`` assignments and leading ``env`` / ``/usr/bin/env``
+#     tokens before looking up the shell binary.
+#
+#   P2. Missing bash ``+O`` form.  ``-O`` (set shopt) was in the
+#       value-taking-option allowlist but ``+O`` (unset shopt) was not.
+#       Fix: add ``+O`` alongside ``+o``.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # P1: POSIX env-var assignment prefixes
+        "FOO=1 bash -c 'printenv'",
+        "FOO=1 BAR=2 bash -c 'printenv'",
+        "PATH=/usr/bin bash -c 'cat ~/.ssh/id_rsa'",
+        "HOME=/tmp bash -c 'ssh-add -l'",
+        # P1: env-runner prefixes
+        "/usr/bin/env bash -c 'printenv'",
+        "/bin/env sh -c 'printenv'",
+        "/usr/bin/env zsh -c 'base64 ~/.ssh/id_rsa'",
+        # P1: env-runner + assignments (either order)
+        "/usr/bin/env FOO=1 bash -c 'printenv'",
+        "env FOO=1 BAR=2 bash -c 'printenv'",
+        "FOO=1 env bash -c 'printenv'",
+        "FOO=1 /usr/bin/env bash -c 'printenv'",
+        # P2: bash +O form
+        "bash +O extglob -c 'printenv'",
+        "bash +O no_history -c 'printenv'",
+        # P2: +O + existing -O / -o combinations
+        "bash -O extglob +O no_history -c 'printenv'",
+    ],
+)
+def test_mit164r5_env_prefix_and_plus_O_wrapper_is_blocked(command: str) -> None:
+    """MIT-164 round 5: env-var and /usr/bin/env prefixes + bash ``+O`` must all unwrap."""
+    result = check_shell_command(command)
+    assert result is not None, f"Expected block for: {command!r}"
+    assert "blocked by security policy" in result
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Benign env-prefix usage
+        "FOO=1 bash -c 'echo hi'",
+        "/usr/bin/env bash -c 'npm install'",
+        "FOO=1 BAR=baz /usr/bin/env bash -c 'git status'",
+        "PATH=/usr/bin bash -c 'git status'",
+        # env-prefix + script-file mode (not a wrapper)
+        "FOO=1 bash script.sh",
+        "/usr/bin/env bash script.sh arg1",
+        # env-runner + non-shell target (python, fish, etc.) — not in
+        # our wrapper basename set, so we don't unwrap.
+        "/usr/bin/env python3 -c 'print(hi)'",
+        "/usr/bin/env fish -c 'echo hi'",
+        # +O with benign inner
+        "bash +O extglob -c 'echo hi'",
+        # Just the env-runner calling a shell with no -c (interactive)
+        "/usr/bin/env bash -l",
+        # Just env-prefix with no shell at all (different command)
+        "FOO=1 echo hi",
+    ],
+)
+def test_mit164r5_benign_env_prefix_allowed(command: str) -> None:
+    """MIT-164 round 5: benign env-prefix usage must not false-positive."""
+    assert check_shell_command(command) is None, f"False positive: {command!r}"
+
+
+def test_mit164r5_env_token_alone_still_blocks() -> None:
+    """Pre-existing: bare `env` at start of command is an env-dumper — still blocked.
+
+    Regression guard: the MIT-164 round-5 wrapper-prefix logic treats
+    ``env`` as a runner-prefix only when it's followed by a shell or
+    more assignments.  Bare ``env`` alone (``env`` on its own as the
+    whole command) is still caught by the outer regex denylist as an
+    env-dumper.  This has been true since MIT-123 and must not regress.
+    """
+    result = check_shell_command("env")
+    assert result is not None
+    assert "blocked by security policy" in result
