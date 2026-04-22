@@ -643,28 +643,62 @@ def _extract_shell_wrapper_inner(command: str) -> str | None:
                 in_env_flags = False
                 past_env_dashdash = True
                 continue
-            # `-S <payload>` (GNU env split-string): the payload is
-            # re-split by env and CONCATENATED with any trailing
-            # argv tokens.  `/usr/bin/env -S 'bash -c' 'printenv'`
-            # actually executes `bash -c printenv`, so we must glue
-            # the payload and trailing argv together before recursing.
-            # Shlex-quote the trailing args so `check_shell_command`
-            # re-parses the joined string identically.
-            if tok in ("-S", "--split-string") and shell_idx + 1 < len(tokens):
+            # `--split-string <payload>` long-form (the new cluster
+            # handler below covers `-S <payload>` as a no-payload-in-
+            # token cluster, so only --split-string needs an explicit
+            # branch here).
+            if tok == "--split-string" and shell_idx + 1 < len(tokens):
                 return _join_env_split_payload(
                     tokens[shell_idx + 1],
                     tokens[shell_idx + 2 :],
                 )
-            # `-S<PAYLOAD>` attached-argument form (codex-round-10 P1).
-            # GNU env accepts `-Sbash -c printenv` as a single token
-            # that is equivalent to `-S bash -c printenv`.  Strip the
-            # `-S` prefix, treat the rest as the payload, and glue
-            # trailing argv.
-            if tok.startswith("-S") and len(tok) > 2 and not tok.startswith("-S-"):
-                return _join_env_split_payload(
-                    tok[2:],
-                    tokens[shell_idx + 1 :],
-                )
+            # `-[flags]S[payload]` clustered short-option form
+            # (codex-round-10 P1 attached-arg AND codex-round-14 P1
+            # clustered flags like `-iSbash`).  GNU env's short-option
+            # parser is the standard cluster grammar: `-iS<payload>`
+            # means `-i` + `-S<payload>`.  Anything after the `S` letter
+            # in the cluster is the payload; if `S` is the last letter,
+            # the payload is empty-in-token and comes from the next argv.
+            #
+            # We accept the cluster iff:
+            #   * the token is a short-option cluster (`-<letters>`, not
+            #     `--<anything>`, and the letters are alphabetic — a
+            #     non-letter like `-123` isn't a cluster),
+            #   * `S` appears among the letters.
+            # Letters BEFORE the `S` must all be valueless env flags —
+            # if any of them take a value, the cluster grammar wouldn't
+            # compile (env would reject it).  We don't enforce that
+            # here; env does the check at runtime, and over-treating a
+            # malformed cluster as a wrapper is safe (over-block).
+            if (
+                tok.startswith("-")
+                and len(tok) >= 2
+                and not tok.startswith("--")
+                and tok[1:2].isalpha()
+                and "S" in tok[1:]
+            ):
+                # Find the position of the first `S` in the letters.
+                letters = tok[1:]
+                # The letters prefix up to `S` can be alphabetic; if
+                # there's a non-alpha character before `S`, this isn't
+                # a cluster we recognise — fall through.
+                s_pos = letters.index("S")
+                # Empty prefix (`-S...`) is fine; otherwise require all
+                # preceding letters be alphabetic (a real cluster).
+                if s_pos == 0 or letters[:s_pos].isalpha():
+                    payload_in_token = letters[s_pos + 1 :]
+                    if payload_in_token:
+                        # Embedded payload: `-iSbash`, `-Sbash`, etc.
+                        return _join_env_split_payload(
+                            payload_in_token,
+                            tokens[shell_idx + 1 :],
+                        )
+                    # `-iS` (or `-S`) — payload is in next argv slot.
+                    if shell_idx + 1 < len(tokens):
+                        return _join_env_split_payload(
+                            tokens[shell_idx + 1],
+                            tokens[shell_idx + 2 :],
+                        )
             # `--split-string=PAYLOAD` — self-contained, then trailing argv.
             if tok.startswith("--split-string="):
                 return _join_env_split_payload(

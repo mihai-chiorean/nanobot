@@ -1589,3 +1589,58 @@ def test_mit164r14_plus_prefix_option_wrapper_blocks(command: str) -> None:
 def test_mit164r14_plus_prefix_benign_allowed(command: str) -> None:
     """MIT-164 round 14: benign + flags and bare +/++ must not false-positive."""
     assert check_shell_command(command) is None, f"False positive: {command!r}"
+
+
+
+# ---------------------------------------------------------------------------
+# MIT-164 round 15 — codex review iteration 14
+#
+# Codex round 14 flagged (P1) that GNU env accepts clustered short
+# options that mix valueless flags with `-S`, e.g. `/usr/bin/env
+# -iSbash -c 'printenv'` where `-iSbash` means `-i` + `-S bash`.
+# The round-14 attached-arg handler only recognised `-S<payload>`
+# shapes with `S` at the start of the cluster.
+#
+# Fix: replace the attached-arg branch with a generic cluster
+# handler that scans for the first `S` letter in the cluster and
+# treats everything AFTER it as the payload (or takes the next
+# argv token if `S` is the last letter in the cluster).  The
+# `-Sbash` and `-iSbash` shapes are both handled by the same code
+# path now.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Codex round-14 core case
+        "/usr/bin/env -iSbash -c 'printenv'",
+        "/usr/bin/env -iS 'bash -c printenv'",
+        "/usr/bin/env -vSbash -c 'printenv'",
+        # Multiple valueless flags before S
+        "/usr/bin/env -ivSbash -c 'printenv'",
+
+        # S at end: value comes from next argv
+        "/usr/bin/env -iS bash -c printenv",
+        # Combined with -- and non-POSIX assignment
+        "/usr/bin/env -iSbash -c 'cat /etc/shadow'",
+    ],
+)
+def test_mit164r15_env_clustered_S_flag_blocks(command: str) -> None:
+    """MIT-164 round 15: GNU env clustered `-...S[payload]` must unwrap."""
+    result = check_shell_command(command)
+    assert result is not None, f"Expected block: {command!r}"
+    assert "blocked by security policy" in result
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "/usr/bin/env -iSbash -c 'echo hi'",
+        "/usr/bin/env -ivSbash -c 'git status'",
+        "/usr/bin/env -iS 'bash -c echo'",
+    ],
+)
+def test_mit164r15_env_clustered_S_benign_allowed(command: str) -> None:
+    """MIT-164 round 15: benign clustered -S invocations must not false-positive."""
+    assert check_shell_command(command) is None, f"False positive: {command!r}"
