@@ -231,25 +231,37 @@ _SHELL_WRAPPER_BASENAMES: frozenset[str] = frozenset(
 )
 
 # Recursion depth cap for nested wrappers (`sh -c "bash -c '...'"`).  Three
-# is well beyond anything seen in practice; the guard exists purely to bound
-# runtime on pathological input.
+# is well beyond anything seen in practice.  Reaching the cap causes
+# `check_shell_command` to FAIL CLOSED (block) — see the comment in that
+# function for the security rationale.  Widening the cap is fine for
+# ergonomics, but the fail-closed semantic at the cap is load-bearing:
+# without it, an attacker can trivially bypass the whole recursion by
+# stacking one more wrapper than the cap.
 _MAX_SHELL_WRAPPER_DEPTH = 3
 
 
 def _extract_shell_wrapper_inner(command: str) -> str | None:
-    """If *command* has the shape `<shell> -c <script>`, return the script.
+    """If *command* runs a shell with an inline script argument, return the script.
+
+    Handles the canonical ``<shell> -c <script>`` form *and* common flag
+    bundles that combine ``-c`` with other short options — ``bash -lc``
+    (login), ``bash -ic`` (interactive), ``bash -ec`` (errexit),
+    ``bash -xc`` (xtrace), or any short-option cluster containing ``c``.
+    All of those still execute the following argument as a shell script,
+    so all of them reopen the quote-wrapper bypass this function exists
+    to close.
 
     Uses :func:`shlex.split` so all three quoting forms are handled uniformly:
 
     * ``sh -c 'printenv'``        — single-quoted
-    * ``sh -c "printenv"``        — double-quoted
+    * ``bash -lc "printenv"``     — flag bundle + double-quoted
     * ``sh -c printenv``          — unquoted (bash permits this for a single arg)
 
     The shell binary may appear with or without a path prefix
     (``sh``, ``/bin/sh``, ``/usr/bin/bash``, …). Any trailing tokens after
-    the ``-c`` script (POSIX ``sh -c <script> [argv0 [args...]]``) are
-    ignored — the script is always the third token and is the only thing
-    that gets executed as shell syntax.
+    the script (POSIX ``sh -c <script> [argv0 [args...]]``) are ignored —
+    the script is always the token immediately after the first ``-*c*``
+    option and is the only thing that gets executed as shell syntax.
 
     Returns ``None`` when the command does not look like a recognized
     wrapper, or when :mod:`shlex` cannot parse it (malformed quoting).
@@ -271,13 +283,31 @@ def _extract_shell_wrapper_inner(command: str) -> str | None:
     if shell_basename not in _SHELL_WRAPPER_BASENAMES:
         return None
 
-    # Second token must be `-c` (POSIX contract for "run the next arg as
-    # a shell script").  Other `-` flags (`-l`, `-i`, `-s`) don't take a
-    # script argument the same way, so we only recurse on `-c`.
-    if tokens[1] != "-c":
-        return None
-
-    return tokens[2]
+    # Find the first ``-*c*`` short-option token and treat the NEXT token
+    # as the script.  Accepts ``-c``, ``-lc``, ``-cl``, ``-ec``, ``-xc``,
+    # ``-ic``, ``-eic``, etc.  A token is a "script-carrying" option iff:
+    #   * it starts with a single ``-`` followed by at least one letter
+    #     (excludes positional args, long options, and ``--``),
+    #   * the letters include ``c``,
+    #   * it is not ``--`` (argument separator).
+    # We only scan across *contiguous* short-option tokens starting at
+    # index 1 — as soon as we see a non-option token, that is a positional
+    # and we are not in wrapper shape.  Once the ``c``-bearing option is
+    # found, its immediate successor is the script.
+    for idx in range(1, len(tokens) - 1):
+        tok = tokens[idx]
+        if not tok.startswith("-") or tok == "--" or tok.startswith("--"):
+            # Positional, `--`, or long option — break the option-scan.
+            return None
+        # Strip leading dash(es) and check for ``c`` among the letters.
+        if not tok[1:].isalpha():
+            # Short options are letters only; anything else (e.g. `-123`)
+            # isn't a flag bundle we recognise.  Fail closed on unknown
+            # shapes by aborting the wrapper-extraction path.
+            return None
+        if "c" in tok[1:]:
+            return tokens[idx + 1]
+    return None
 
 
 def check_shell_command(command: str, _depth: int = 0) -> str | None:
@@ -312,11 +342,31 @@ def check_shell_command(command: str, _depth: int = 0) -> str | None:
                 "accessing sensitive data (keys, credentials, secrets) is not permitted."
             )
 
-    # 2. MIT-164: shell-wrapper unwrap + recurse.  `_depth` is an anti-loop
-    # guard for pathological nesting (`sh -c "bash -c 'sh -c ...'"`) — in
-    # practice depth > 1 is extremely rare, but a hard cap is cheap.
+    # 2. MIT-164: shell-wrapper unwrap + recurse.  `_depth` is a runtime
+    # bound on pathological nesting like `sh -c "bash -c 'sh -c ...'"`.
+    # In practice depth > 1 is extremely rare; legitimate depth > 3 has
+    # never been observed.  At the cap we FAIL CLOSED: if the caller is
+    # trying to stack more than _MAX_SHELL_WRAPPER_DEPTH wrappers, that
+    # is itself strong evidence of an evasion attempt, and letting it
+    # through would reopen the bypass (the innermost script might be
+    # denylisted — we just stopped looking).  Return the same block
+    # string the regex layer would use.
     if _depth >= _MAX_SHELL_WRAPPER_DEPTH:
-        return None
+        # Only reachable via the `check_shell_command(inner, _depth + 1)`
+        # tail call below — so `command` here is an already-unwrapped
+        # inner script.  A depth-cap block doubles as a canary: if this
+        # ever fires on legitimate traffic the cap should be revisited,
+        # not the fail-closed semantic.
+        logger.warning(
+            "Blocked shell command at max wrapper depth "
+            "({} levels of sh/bash/zsh/dash/ash/ksh -c nesting): {}",
+            _MAX_SHELL_WRAPPER_DEPTH,
+            command,
+        )
+        return (
+            "Error: Command blocked by security policy — "
+            "accessing sensitive data (keys, credentials, secrets) is not permitted."
+        )
 
     inner = _extract_shell_wrapper_inner(command)
     if inner is not None:

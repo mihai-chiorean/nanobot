@@ -441,32 +441,108 @@ def test_mit164_malformed_quoting_does_not_crash() -> None:
     assert result is None or "blocked by security policy" in result
 
 
-def test_mit164_recursion_depth_is_bounded() -> None:
-    """Deeply nested wrappers must not loop — the depth guard is load-bearing.
+def test_mit164_deep_nesting_fails_closed() -> None:
+    """Wrappers nested past `_MAX_SHELL_WRAPPER_DEPTH` must BLOCK, not fall through.
 
-    Crafted input:
-        sh -c "sh -c 'sh -c \"sh -c printenv\"'"
+    Codex review of MIT-164 (round 1) correctly flagged that returning
+    `None` at the depth cap trivially reopens the bypass — stack one
+    more `sh -c` than the cap allows and the innermost denylisted
+    command sails through.  The fix: at the cap, return the standard
+    block string.  This is fail-closed, which matches the rest of the
+    security layer's default (better to over-block than leak a key).
 
-    Each unwrap peels one layer; at depth == 3 the guard stops recursion
-    and returns None (for the innermost `printenv`, if reached; else the
-    match fires earlier).  The test asserts only that the call terminates
-    and produces a bool-ish result — it does not mandate block/allow at
-    the cap, because the cap is a runtime guard, not a security boundary.
+    Four nested `sh -c` wrappers is well above anything seen in
+    legitimate traffic — depth 0 → 1 → 2 → 3 recursive calls, at which
+    point the cap fires before unwrapping the fourth layer.
     """
-    deep = "sh -c \"sh -c 'sh -c \\\"sh -c \\\\\\\"printenv\\\\\\\"\\\"'\""
-    # Should not raise, should not hang.  Value itself is implementation-
-    # defined at the depth cap; "did we return in finite time" is the
-    # property under test.
+    deep = "sh -c \"sh -c 'sh -c \\\"sh -c printenv\\\"'\""
     result = check_shell_command(deep)
-    assert result is None or isinstance(result, str)
+    assert result is not None, "Depth-cap must fail closed"
+    assert "blocked by security policy" in result
 
 
 def test_mit164_nested_wrapper_blocks_inner_denylist() -> None:
-    """Two-level nesting within the depth cap must still block.
+    """Two-level nesting within the depth cap must still block via inner regex.
 
     `sh -c "bash -c 'printenv'"` → unwrap to `bash -c 'printenv'` (depth 1)
-    → unwrap to `printenv` (depth 2) → regex hits.
+    → unwrap to `printenv` (depth 2) → regex hits.  No cap involvement.
     """
     result = check_shell_command("sh -c \"bash -c 'printenv'\"")
     assert result is not None
     assert "blocked by security policy" in result
+
+
+# ---------------------------------------------------------------------------
+# MIT-164 round 2 — codex review findings
+#
+# Round 1 of MIT-164 only recognised `<shell> -c <script>` as a wrapper
+# shape.  Codex review flagged two residual bypasses:
+#
+#   P1. `bash -lc`, `bash -ec`, `zsh -ic`, etc. — short-option bundles
+#       that combine `-c` with other flags.  All of those shells still
+#       execute the following arg as a script, so they reopen the same
+#       hole.  Fix: scan for any short-option cluster containing `c`.
+#
+#   P2. Depth-cap fall-through — returning None at _MAX_SHELL_WRAPPER_DEPTH
+#       meant `sh -c "sh -c 'sh -c \"sh -c printenv\"'"` (one level
+#       beyond the cap) was allowed.  Fix: fail closed at the cap.
+#
+# These tests cover the round-2 fixes specifically.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Login shell (`-lc`) — common in CI
+        "bash -lc 'printenv'",
+        'bash -lc "cat /etc/shadow"',
+        "bash -lc 'base64 ~/.ssh/id_rsa'",
+        # Errexit + -c
+        "bash -ec 'printenv'",
+        'bash -ec "cat /etc/shadow"',
+        # xtrace + -c
+        "bash -xc 'printenv'",
+        # Interactive + -c
+        "zsh -ic 'ssh-add -l'",
+        "bash -ic 'printenv'",
+        # `c` not last in the bundle — bash still treats next arg as script
+        "bash -cl 'printenv'",
+        # Multiple stacked flags
+        "sh -eic 'printenv'",
+        "bash -lxc 'cat ~/.ssh/id_rsa'",
+        # Path-prefixed + bundle
+        "/bin/bash -lc 'printenv'",
+        "/usr/bin/bash -lc \"cat /etc/shadow\"",
+    ],
+)
+def test_mit164r2_flag_bundle_wrapper_is_blocked(command: str) -> None:
+    """MIT-164 round 2: `-lc`/`-ec`/`-ic`/`-xc` and friends must recurse into the script."""
+    result = check_shell_command(command)
+    assert result is not None, f"Expected block for flag-bundle wrapper: {command!r}"
+    assert "blocked by security policy" in result
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Bundle wrapper with benign inner — must still pass
+        "bash -lc 'echo hello'",
+        "bash -lc 'git status'",
+        "bash -ec 'npm install'",
+        "bash -xc 'ls /tmp'",
+        # Shell invoked with short options that do NOT include `c` — not a wrapper
+        "bash -l",           # login shell, no script
+        "bash -x script.sh", # xtrace on a script, no -c
+        "sh -s",             # read-from-stdin, no -c
+        # Long options — not short-option bundles
+        "bash --login",
+        "bash --version",
+        "bash --help",
+        # `--` separator — stops option parsing
+        "sh -- foo",
+    ],
+)
+def test_mit164r2_benign_flag_bundle_usage_still_allowed(command: str) -> None:
+    """MIT-164 round 2: flag-bundle detection must not false-positive on benign shells."""
+    assert check_shell_command(command) is None, f"False positive for: {command!r}"
