@@ -226,6 +226,19 @@ _BLOCKED_SHELL_COMMANDS: list[re.Pattern] = [
 # denylisted command was wrapped inside a quoted argument the regexes never
 # saw. Detecting the wrapper shape and recursing into the extracted script
 # closes that bypass without reworking the regex layer.
+#
+# Match strategy: basename.  `/bin/sh`, `/usr/bin/bash`, `./bash`, and plain
+# `bash` are all treated as the same shell because we cannot distinguish
+# a real shell from a user-supplied executable with the same basename at
+# prescreen time.  Codex review (round 7) noted this can over-block a
+# repo-local helper named `./bash` or `./sh` — documented and accepted:
+# the prescreen's stance throughout `_BLOCKED_SHELL_COMMANDS` is already
+# basename-keyed (e.g. `\bcat\s+...` matches `cat`, `./cat`, `/usr/bin/cat`
+# alike), and a security prescreen is allowed to over-block edge cases
+# in exchange for closing the bypass.  Callers with legitimate workspace-
+# local shells-named-`bash` binaries should invoke them with an explicit
+# non-wrapper form (positional script) which the stripper correctly
+# classifies as script-file mode and leaves alone.
 _SHELL_WRAPPER_BASENAMES: frozenset[str] = frozenset(
     {"sh", "bash", "zsh", "dash", "ash", "ksh"}
 )
@@ -458,6 +471,13 @@ def _extract_shell_wrapper_inner(command: str) -> str | None:
             shell_idx += 1
             continue
         # (2) `env` runner — basename match catches path-prefixed forms.
+        # Tradeoff (codex round 7 P3): a repo-local helper named `./env`
+        # that is NOT the system env runner will be misclassified here
+        # and its following arguments will be inspected as if env had
+        # run them.  Same stance as the `_SHELL_WRAPPER_BASENAMES`
+        # comment above — basename-keyed matching is the security
+        # prescreen's established model, and over-blocking on a
+        # collision is preferable to leaking env-wrapped secrets.
         if os.path.basename(tok) == "env":
             shell_idx += 1
             seen_env = True
