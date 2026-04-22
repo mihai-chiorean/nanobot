@@ -1091,3 +1091,88 @@ def test_mit164r7_env_dashdash_then_assignments_still_unwraps(command: str) -> N
 def test_mit164r7_env_flags_benign_payloads_allowed(command: str) -> None:
     """MIT-164 round 7: -S and -- with benign inner payloads must not false-positive."""
     assert check_shell_command(command) is None, f"False positive: {command!r}"
+
+
+
+# ---------------------------------------------------------------------------
+# MIT-164 round 8 — codex review iteration 7 (GNU env value-takers)
+#
+# Codex round 7 flagged (P1) that GNU env's `--default-signal SIG`,
+# `--block-signal SIG`, `--ignore-signal SIG`, and `-a ARGV0` options
+# take values and could stop the prefix stripper.  On empirical
+# verification:
+#
+#   * `-a ARGV0` / `--argv0=ARGV0` — YES, these genuinely take values
+#     and a space-separated form is accepted.  Added to
+#     `_ENV_FLAGS_TAKING_VALUE`.
+#
+#   * `--block-signal`, `--default-signal`, `--ignore-signal` — the
+#     codex concern was a FALSE POSITIVE.  On actual GNU env, these
+#     flags accept their signal argument ONLY in equals form
+#     (`--default-signal=PIPE`).  The space-separated form
+#     (`--default-signal PIPE bash -c '...'`) is not a valid env
+#     invocation — env treats `PIPE` as the command to exec and
+#     errors with "PIPE: No such file".  No special handling needed;
+#     the equals form is a self-contained token and the generic
+#     skip-1 fallback handles it.
+#
+# The tests below cover both axes.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Codex round 7 P1: env -a ARGV0 (space-separated, value-taking)
+        "/usr/bin/env -a myarg0 bash -c 'printenv'",
+        "/usr/bin/env -a agent-shell bash -c 'cat ~/.ssh/id_rsa'",
+        # --argv0=value equals form
+        "/usr/bin/env --argv0=myarg0 bash -c 'printenv'",
+        # Signal flags in equals form — ARE valid bypass shapes
+        "/usr/bin/env --default-signal=PIPE bash -c 'printenv'",
+        "/usr/bin/env --block-signal=INT bash -c 'printenv'",
+        "/usr/bin/env --ignore-signal=HUP bash -c 'printenv'",
+        # -a + equals-form signal combined
+        "/usr/bin/env -a myarg0 --default-signal=PIPE bash -c 'printenv'",
+    ],
+)
+def test_mit164r8_gnu_env_value_takers_unwrap(command: str) -> None:
+    """MIT-164 round 8: GNU env's -a (ARGV0) and equals-form signal flags must not block the strip."""
+    result = check_shell_command(command)
+    assert result is not None, f"Expected block: {command!r}"
+    assert "blocked by security policy" in result
+
+
+def test_mit164r8_space_separated_signal_flags_documented() -> None:
+    """Documentation test: `/usr/bin/env --default-signal PIPE bash -c '...'` is NOT a bypass.
+
+    Contrary to the codex-round-7 concern, GNU env's signal flags only
+    accept the equals form.  `env --default-signal PIPE bash -c X` is
+    not a valid invocation — env treats `PIPE` as the command to exec
+    and errors with "PIPE: No such file".  Therefore the prescreen's
+    current behaviour (treat `--default-signal` as a plain long-option
+    skip-1, hit `PIPE` as a positional, halt the strip, return None)
+    is SAFE: env errors at runtime before the inner `bash -c '...'`
+    runs, so there's nothing to block.
+
+    This test is a canary: if GNU env ever changes to accept the
+    space-separated form (or if BSD env does), the prescreen will need
+    to be revisited.  For now, the expected behaviour is that the
+    space-separated form falls through as `None`.
+    """
+    assert check_shell_command(
+        "/usr/bin/env --default-signal PIPE bash -c 'printenv'"
+    ) is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "/usr/bin/env -a myarg0 bash -c 'echo hi'",
+        "/usr/bin/env --argv0=myarg0 bash -c 'git status'",
+        "/usr/bin/env --default-signal=PIPE bash -c 'npm install'",
+    ],
+)
+def test_mit164r8_gnu_env_value_takers_benign_allowed(command: str) -> None:
+    """MIT-164 round 8: -a / --argv0 / equals-signal with benign payloads must pass."""
+    assert check_shell_command(command) is None, f"False positive: {command!r}"

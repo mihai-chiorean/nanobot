@@ -315,17 +315,31 @@ _SHORT_OPTS_TAKING_VALUE: frozenset[str] = frozenset({
 # sh -c '...'``.  The equivalent ``--option=value`` forms are self-
 # contained single tokens and handled by the generic ``-*``/``--*``
 # skip rule — only the space-separated forms need special handling.
-# Covers both GNU env and BSD env's flag surface:
-#   * ``-u NAME`` / ``--unset=NAME``     — remove NAME from env
-#   * ``-C DIR``  / ``--chdir=DIR``      — chdir before exec
-#   * ``-S CMD``  / ``--split-string=CMD`` — GNU env's multi-arg split
-# `-i` / `-0` / `-v` / `--help` / `--version` do NOT take a value and
-# are handled by the generic skip-1 rule.
+# Covers GNU env's full flag surface (BSD env is a strict subset):
+#   * ``-u NAME``  / ``--unset=NAME``           — remove NAME from env
+#   * ``-C DIR``   / ``--chdir=DIR``            — chdir before exec
+#   * ``-S CMD``   / ``--split-string=CMD``     — GNU env's multi-arg split
+#   * ``-a ARGV0`` / ``--argv0=ARGV0``          — override argv[0]
+# GNU env signal flags (``--block-signal``, ``--default-signal``,
+# ``--ignore-signal``) only accept equals form; the space-separated
+# form is a no-op (env exec's the following token as the command and
+# errors on non-signal-name values).  Equals forms are self-contained
+# and handled by the generic skip-1 rule.
+# `-i` / `-0` / `-v` / `--help` / `--version` / `--null` do NOT take a
+# value and are handled by the generic skip-1 rule.
 _ENV_FLAGS_TAKING_VALUE: frozenset[str] = frozenset({
     "-u", "--unset",
     "-C", "--chdir",
     "-S", "--split-string",
+    "-a", "--argv0",
 })
+# Signal flags (``--block-signal``, ``--default-signal``,
+# ``--ignore-signal``) are NOT listed here.  Counter-intuitively, GNU env
+# only accepts them in equals form (``--default-signal=PIPE``): the
+# space-separated form ``--default-signal PIPE bash ...`` is not an env
+# option — env treats `PIPE` as the command to exec and errors out.
+# Equals forms are single tokens and are correctly skipped by the
+# generic ``-*``-fallback branch.
 
 # Long options (exact match) that consume the NEXT argv slot as their
 # value.  Same skip-next-token semantic as ``_SHORT_OPTS_TAKING_VALUE``.
@@ -530,6 +544,17 @@ def _extract_shell_wrapper_inner(command: str) -> str | None:
                 shell_idx += 2
                 continue
             # All other `-*` tokens (flag-only or `--option=value`).
+            # The GNU env signal flags (``--block-signal``,
+            # ``--default-signal``, ``--ignore-signal``) are handled
+            # here via the equals form (``--default-signal=PIPE`` is a
+            # self-contained single token and is correctly skipped).
+            # The bare / space-separated forms are NOT bypass paths —
+            # verified empirically: `/usr/bin/env --default-signal
+            # PIPE bash -c '...'` errors with "PIPE: No such file"
+            # because env treats `PIPE` as the command to exec.  So
+            # the codex-round-7 concern about space-separated signal
+            # flags is a false positive on actual GNU env semantics;
+            # no special handling is needed.
             shell_idx += 1
             continue
         # (4) Not an assignment, not `env`, not an env-flag.  This is
