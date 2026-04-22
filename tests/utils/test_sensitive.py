@@ -1392,3 +1392,57 @@ def test_mit164r11_env_S_attached_form_blocks(command: str) -> None:
 def test_mit164r11_env_S_attached_form_benign_allowed(command: str) -> None:
     """MIT-164 round 11: benign attached-form -S invocations must not false-positive."""
     assert check_shell_command(command) is None, f"False positive: {command!r}"
+
+
+
+# ---------------------------------------------------------------------------
+# MIT-164 round 12 — codex review iteration 11
+#
+# Codex round 11 flagged (P1) that the `env --` branch cleared
+# `seen_env` entirely, reverting to the POSIX-strict assignment
+# regex for the remaining prefix tokens.  Result: `/usr/bin/env --
+# 'X-Y=1' bash -c 'printenv'` bypassed detection because `X-Y=1`
+# wasn't a POSIX identifier, halting the strip before the shell.
+#
+# Fix: decouple the two meanings of `seen_env` into `seen_env`
+# (sticky; governs assignment-regex loosening) and `in_env_flags`
+# (transient; governs env's OWN flag parsing).  `env --` clears
+# only `in_env_flags`; `seen_env` stays True so env-style non-POSIX
+# names keep being consumed as assignments.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Codex-round-11 core case
+        "/usr/bin/env -- 'X-Y=1' bash -c 'printenv'",
+        # Combined with env's own flags before --
+        "/usr/bin/env -i -- 'X-Y=1' bash -c 'printenv'",
+        "/usr/bin/env -u HOME -- 'X-Y=1' bash -c 'printenv'",
+        # Multiple non-POSIX assignments post --
+        "/usr/bin/env -- 'X-Y=1' 'A.B=2' bash -c 'printenv'",
+        # Mix POSIX + non-POSIX post --
+        "/usr/bin/env -- FOO=1 'X-Y=2' bash -c 'printenv'",
+        "/usr/bin/env -- 'X-Y=1' FOO=2 bash -c 'printenv'",
+    ],
+)
+def test_mit164r12_env_dashdash_preserves_env_style_assignments(command: str) -> None:
+    """MIT-164 round 12: `env --` must NOT lose the loose assignment regex."""
+    result = check_shell_command(command)
+    assert result is not None, f"Expected block: {command!r}"
+    assert "blocked by security policy" in result
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Benign inner — must still pass
+        "/usr/bin/env -- 'X-Y=1' bash -c 'echo hi'",
+        "/usr/bin/env -i -- 'X-Y=1' bash -c 'git status'",
+        "/usr/bin/env -- 'A.B=2' FOO=3 bash -c 'npm install'",
+    ],
+)
+def test_mit164r12_env_dashdash_non_posix_benign_allowed(command: str) -> None:
+    """MIT-164 round 12: benign `env -- 'X-Y=1' bash -c '...'` must not false-positive."""
+    assert check_shell_command(command) is None, f"False positive: {command!r}"

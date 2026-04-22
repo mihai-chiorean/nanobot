@@ -521,7 +521,19 @@ def _extract_shell_wrapper_inner(command: str) -> str | None:
     # sets (flags-only and value-taking) — both GNU and BSD env implement
     # the same core set.
     shell_idx = 0
+    # `seen_env` is a STICKY flag that stays True for the entire prefix
+    # strip after we encounter an `env` token.  It governs the
+    # assignment-name loosening (env accepts `X-Y=1`, shell doesn't) —
+    # see `_is_assignment_token(..., allow_env_style=...)`.  Must NOT
+    # be cleared on `env --` because env-style assignments can appear
+    # after the `--` terminator (`/usr/bin/env -- 'X-Y=1' bash -c
+    # '...'` — codex-round-11 P1).
     seen_env = False
+    # `in_env_flags` is a TRANSIENT flag that is True while we're in
+    # env's OWN option-parsing state (after an `env` token, until
+    # env's `--` or until we hit a non-flag token).  Only it governs
+    # the env-flag-specific branches below (-i, -u, -S, etc.).
+    in_env_flags = False
     # Loop guard: keep going as long as there's at least ONE token to
     # inspect.  The "at least `<shell> -c <script>` remaining" check
     # happens AFTER the loop — this loop is only the prefix-stripping
@@ -531,9 +543,10 @@ def _extract_shell_wrapper_inner(command: str) -> str | None:
         tok = tokens[shell_idx]
         # (1) Assignment token — always allowed in the prefix.  Before
         # we've seen `env`, only POSIX-valid identifiers count (shell
-        # syntax).  AFTER `env`, we loosen the identifier rule because
-        # env accepts arbitrary NAME=value pairs (e.g. ``X-Y=1``) —
-        # closes the codex-round-9 P1 bypass.
+        # syntax).  AFTER `env` (including post-`--`), we loosen the
+        # identifier rule because env accepts arbitrary NAME=value
+        # pairs (e.g. ``X-Y=1``) — closes the codex-round-9 and
+        # round-11 P1 bypasses.
         if _is_assignment_token(tok, allow_env_style=seen_env):
             shell_idx += 1
             continue
@@ -548,6 +561,7 @@ def _extract_shell_wrapper_inner(command: str) -> str | None:
         if os.path.basename(tok) == "env":
             shell_idx += 1
             seen_env = True
+            in_env_flags = True
             continue
         # (3) After we've seen `env`, skip env's own flags until we hit
         # an assignment or the shell.  This closes the codex-round-5 P1:
@@ -573,15 +587,17 @@ def _extract_shell_wrapper_inner(command: str) -> str | None:
         # direction (same rationale as elsewhere: over-stripping a
         # non-env-flag token is at worst a false-negative on an already-
         # unusual command shape, not a bypass).
-        if seen_env and tok.startswith("-"):
+        if in_env_flags and tok.startswith("-"):
             # `--` ends env's OWN options but NOT the prefix strip.
             # After `env -- FOO=1 bash -c '...'`, the `FOO=1` must
             # still be consumed as an assignment before we hit the
-            # shell.  Clear env-flag state and continue the loop so
-            # assignments (branch 1) can fire on the next iteration.
+            # shell.  Clear ONLY `in_env_flags` — keep `seen_env`
+            # True so the loose assignment regex stays active for
+            # env-style non-POSIX names like ``X-Y=1`` (codex-
+            # round-11 P1).
             if tok == "--":
                 shell_idx += 1
-                seen_env = False
+                in_env_flags = False
                 continue
             # `-S <payload>` (GNU env split-string): the payload is
             # re-split by env and CONCATENATED with any trailing
