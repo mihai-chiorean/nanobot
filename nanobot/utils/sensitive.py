@@ -280,6 +280,36 @@ def _is_script_carrying_option(token: str) -> bool:
     return "c" in letters
 
 
+# Short-option tokens (exact match, no cluster) that take the NEXT argv
+# slot as their VALUE (not a positional).  Occurs before ``-c`` in
+# invocations like ``bash -O extglob -c '...'`` or ``zsh -o no_aliases
+# -c '...'``.  We need to skip past the value when scanning for the
+# script-carrying option so that `extglob` / `no_aliases` don't falsely
+# terminate the scan.  Kept deliberately small — adding a shape here
+# means "skip the following token" during the option scan, which can
+# in principle hide a script-carrying cluster.  Only short-option
+# tokens that are BOTH (a) value-taking in at least one of our recognised
+# shells AND (b) do not themselves contain ``c`` belong here.
+_SHORT_OPTS_TAKING_VALUE: frozenset[str] = frozenset({
+    "-O",   # bash --shopt setting
+    "-o",   # sh/bash/zsh setopt name (`set -o <name>` family)
+    "+o",   # zsh setopt-off
+})
+
+# Long options (exact match) that consume the NEXT argv slot as their
+# value.  Same skip-next-token semantic as ``_SHORT_OPTS_TAKING_VALUE``.
+# The ``--option=value`` form is handled separately — it's a single
+# token so no skip is needed.  Only enumerate the ones commonly seen
+# before ``-c`` in wrapper-adjacent invocations; anything we miss here
+# merely causes early-termination of the scan on an option-value pair,
+# which is a false-NEGATIVE on some wrapper shapes.  Mitigation: if
+# this list turns out to be too narrow, add the missing option.
+_LONG_OPTS_TAKING_VALUE: frozenset[str] = frozenset({
+    "--rcfile",      # bash: alternate startup file
+    "--init-file",   # bash: same as --rcfile
+})
+
+
 def _extract_shell_wrapper_inner(command: str) -> str | None:
     """If *command* runs a shell with an inline script argument, return the script.
 
@@ -295,14 +325,40 @@ def _extract_shell_wrapper_inner(command: str) -> str | None:
     * ``bash --rcfile /dev/null -lc 'printenv'``    — several pre-options + bundle
     * ``/usr/bin/bash -lc "cat /etc/shadow"``       — path-prefixed shell
 
-    The script is always the token immediately AFTER the first
-    ``c``-bearing short-option cluster.  Everything before that cluster
-    is treated as an opaque option prefix and skipped over — we do not
-    try to model each shell's option grammar, we just look for the ``c``
-    token.  This is intentionally permissive: over-unwrapping a non-
-    wrapper shape only risks over-blocking (the inner regex check runs
-    again on a best-guess inner string), which is the safe direction
-    for a security prescreen.
+    Explicitly NOT recognised (correctly treated as non-wrapper shape):
+
+    * ``bash script.sh -c printenv``                — script-file mode;
+      ``script.sh`` is a positional, ``-c printenv`` is forwarded as
+      positional args to ``script.sh``.  Returns ``None``.
+    * ``bash -- script.sh -c printenv``             — ``--`` ends option
+      parsing; everything after is positional.  Returns ``None``.
+    * ``bash -O extglob script.sh``                 — no c-cluster at all.
+      Returns ``None``.
+
+    Algorithm:
+
+    1. Shlex-split the command; if split fails (unclosed quote), bail
+       out — the outer regex check is authoritative for malformed input.
+    2. Confirm ``tokens[0]`` is a recognised shell.
+    3. Walk ``tokens[1:]`` maintaining a cursor.  At each step:
+
+       a. If the token is ``--`` → end of options; RETURN None (we hit
+          positional territory without finding ``-c``).
+       b. If the token is a c-bearing short-option cluster (``-c``,
+          ``-lc``, ``-cl``, etc.) → RETURN the next token as the script.
+       c. If the token is in ``_SHORT_OPTS_TAKING_VALUE`` or
+          ``_LONG_OPTS_TAKING_VALUE`` → skip THIS token AND the next one
+          (the value).
+       d. If the token is any other option-shaped token
+          (``-<letters>`` with no c, or ``--<anything>``) → skip
+          THIS token only.
+       e. If the token is a POSITIONAL (no leading ``-``) → end of
+          options (shell is in script-file mode, not wrapper mode);
+          RETURN None.
+
+    Step (e) is the codex-round-3 fix: ``bash script.sh -c printenv``
+    is NOT a wrapper and must not be unwrapped — the ``-c`` in that
+    invocation is forwarded to ``script.sh`` as ``$2``.
 
     Uses :func:`shlex.split` so quoting forms (``'..'``, ``".."``,
     unquoted single-token) are all normalised uniformly.
@@ -327,22 +383,44 @@ def _extract_shell_wrapper_inner(command: str) -> str | None:
     if shell_basename not in _SHELL_WRAPPER_BASENAMES:
         return None
 
-    # Scan ALL tokens after the shell binary (no early-termination on
-    # positionals or long options — those can legitimately appear before
-    # ``-c``, e.g. ``bash --noprofile -c '...'`` or ``bash -O extglob -c
-    # '...'``).  Take the token AFTER the first ``c``-bearing short-option
-    # cluster as the script.  If we never find one, the command is not a
-    # wrapper shape.
-    #
-    # NOTE: scanning past arbitrary options is the security-safe direction.
-    # The alternative (bail on the first unrecognised token) is what
-    # codex-review round 2 flagged as bypassable via ``bash --noprofile
-    # -c '...'``.  Over-unwrapping a non-wrapper command just means we
-    # run the regex pass a second time on a best-guess inner string,
-    # which is harmless; under-unwrapping is a security hole.
-    for idx in range(1, len(tokens) - 1):
-        if _is_script_carrying_option(tokens[idx]):
+    # Walk option-prefix, looking for the script-carrying cluster.  The
+    # cursor advances by 1 for flags-without-value and by 2 for flags-
+    # with-value.  End-of-options (either ``--`` or a bare positional)
+    # exits with ``None`` — shell is in script-file mode, not wrapper
+    # mode.  See codex-review-round-3 rationale in the docstring.
+    idx = 1
+    while idx < len(tokens) - 1:
+        tok = tokens[idx]
+
+        # (a) `--` separator ends option parsing — not a wrapper.
+        if tok == "--":
+            return None
+
+        # (b) c-bearing cluster → NEXT token is the script.
+        if _is_script_carrying_option(tok):
             return tokens[idx + 1]
+
+        # (c) Value-taking option → skip this token AND the next.
+        if tok in _SHORT_OPTS_TAKING_VALUE or tok in _LONG_OPTS_TAKING_VALUE:
+            idx += 2
+            continue
+
+        # (d) Any other option-shaped token (short flag without ``c``,
+        # long flag without a value, or ``--opt=val`` form) — skip it.
+        if tok.startswith("-") and tok != "-":
+            # Short option: if the cluster contains ``c`` we already
+            # returned at (b); so this is a flag-only cluster.
+            # Long option: either no value or ``--opt=val`` (self-
+            # contained).  Either way, advance one step.
+            idx += 1
+            continue
+
+        # (e) Positional (not starting with ``-``, or bare ``-``) —
+        # shell is in script-file mode.  Not a wrapper.  See
+        # codex-round-3: ``bash script.sh -c printenv`` must not
+        # unwrap to ``printenv``.
+        return None
+
     return None
 
 

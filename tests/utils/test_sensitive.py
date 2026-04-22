@@ -638,3 +638,125 @@ def test_mit164r3_script_is_token_after_first_c_cluster() -> None:
     result = check_shell_command("bash -lc 'printenv' --somearg")
     assert result is not None
     assert "blocked by security policy" in result
+
+
+
+# ---------------------------------------------------------------------------
+# MIT-164 round 4 — codex review iteration 3
+#
+# Round 3 was too permissive: it unconditionally scanned all tokens for
+# a c-cluster, which false-positived on ``bash script.sh -c printenv``
+# (script-file mode, where ``-c`` and ``printenv`` are positional args
+# to ``script.sh``, not wrapper flags to bash).
+#
+# Round 4 introduces a structured option-prefix walker with three token
+# classes:
+#   * script-carrying short cluster (c-bearing) → unwrap
+#   * value-taking option (``-O``, ``-o``, ``+o``, ``--rcfile``,
+#     ``--init-file``) → skip 2 tokens
+#   * any other option-shaped token → skip 1 token
+#   * ``--`` separator or bare positional → END scan; not a wrapper
+#
+# That makes the scanner terminate on positional entry (script-file
+# mode) while still transparently skipping legitimate option-value
+# pairs before ``-c``.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Codex-raised regression cases — MUST NOT unwrap/block.
+        # ``bash script.sh -c printenv`` is script-file mode: bash runs
+        # script.sh with "-c" and "printenv" as $1 and $2, respectively.
+        "bash script.sh -c printenv",
+        "bash -- script.sh -c printenv",              # -- ends option parsing
+        # Login or xtrace + script-file — still script-file mode
+        "bash -l script.sh -c printenv",
+        "bash -x script.sh -c printenv",
+        # Value-taking option + script-file mode
+        "bash -O extglob script.sh -c printenv",
+        "bash --rcfile /dev/null script.sh -c printenv",
+        # Plain script execution
+        "sh script.sh",
+        "bash myscript",
+        # zsh script-file
+        "zsh script.sh -c printenv",
+    ],
+)
+def test_mit164r4_script_file_mode_is_not_a_wrapper(command: str) -> None:
+    """Codex-review round 3: ``bash script.sh -c <x>`` must NOT be treated as a wrapper.
+
+    In script-file mode, ``-c`` and anything after it are positional
+    arguments passed to the script (``$1``, ``$2``, ...).  The shell
+    is not executing them as shell code, so the prescreen must allow
+    the command through to its normal regex check (which, for these
+    literal strings, does NOT match — ``cat /etc/shadow`` as a
+    positional to a user script is the user's problem, not the
+    prescreen's concern).
+    """
+    assert check_shell_command(command) is None, f"False positive (script-file mode): {command!r}"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Value-taking option pair followed by c-cluster — pair is skipped, cluster wins.
+        "bash --init-file /dev/null -c 'printenv'",
+        "bash --rcfile /dev/null -c 'printenv'",
+        "bash --rcfile /dev/null -lc 'printenv'",
+        "bash -O extglob -c 'printenv'",
+        "bash -O extglob -lc 'printenv'",
+        "bash -O extglob -o errexit -c 'printenv'",   # multiple value pairs
+        "zsh -o no_aliases -c 'printenv'",
+        "zsh +o aliases -c 'printenv'",                # +o is also a value-taker
+    ],
+)
+def test_mit164r4_value_taking_options_skipped_when_c_follows(command: str) -> None:
+    """Value-taking option pairs (e.g. ``-O extglob``, ``--rcfile /dev/null``) must be transparently skipped.
+
+    The scanner must jump 2 tokens past a value-taking option so the
+    value doesn't falsely terminate the option-prefix scan.  A
+    subsequent c-cluster must still unwrap.
+    """
+    result = check_shell_command(command)
+    assert result is not None, f"Expected block (value-taker skipped): {command!r}"
+    assert "blocked by security policy" in result
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Value-taking option + NO c-cluster — must pass (no wrapper shape).
+        "bash -O extglob script.sh",
+        "bash -O extglob -O errexit script.sh",
+        "zsh -o no_aliases script.sh",
+        "bash --rcfile /dev/null -l",                 # long-pair + login flag, no c
+        # Benign wrappers + value-taker
+        "bash --rcfile /dev/null -c 'echo ok'",
+        "bash -O extglob -c 'npm test'",
+    ],
+)
+def test_mit164r4_value_taker_benign_usage_allowed(command: str) -> None:
+    """Value-taking options followed by positional scripts or benign wrappers must pass."""
+    assert check_shell_command(command) is None, f"False positive: {command!r}"
+
+
+def test_mit164r4_dashdash_ends_options_before_c() -> None:
+    """`bash -- -c printenv` treats `-c` and `printenv` as positionals, not a wrapper.
+
+    After ``--``, option parsing is done; everything is positional.
+    The prescreen must NOT descend into a ``-c`` that appears post-``--``.
+
+    Note: we test with ``printenv`` as the literal, not ``cat /etc/shadow``
+    — the outer regex denylist matches ``cat /etc/shadow`` anywhere in
+    the raw command text (it does not require the wrapper to be unwrapped),
+    which is a DIFFERENT layer from the wrapper-detection logic tested
+    here.  Using ``printenv`` ensures the only layer that can block is
+    the wrapper-detection path; if that path correctly treats ``-- -c``
+    as positional-only then ``printenv`` will not be examined as a
+    standalone command and no block fires.
+    """
+    assert check_shell_command("bash -- -c printenv") is None
+    # Same invariant with dash: -- stops option parsing.
+    assert check_shell_command("dash -- -c printenv") is None
