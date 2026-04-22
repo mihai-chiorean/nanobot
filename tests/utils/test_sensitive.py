@@ -1001,3 +1001,93 @@ def test_mit164r6_four_level_nesting_fails_closed_at_cap() -> None:
     result2 = check_shell_command(deep_benign)
     assert result2 is not None
     assert "blocked by security policy" in result2
+
+
+
+# ---------------------------------------------------------------------------
+# MIT-164 round 7 — codex review iteration 6
+#
+# Codex round 6 flagged two more bypasses:
+#
+#   P1. GNU env -S / --split-string.  `/usr/bin/env -S 'bash -c
+#       printenv'` re-splits the argument as if it were the whole
+#       command line, so the inner `bash -c printenv` was still
+#       executed but my previous env-flag stripper treated -S + value
+#       as just another "skip 2 tokens" pair.  Fix: when -S (or the
+#       `--split-string=VALUE` equals-form) is seen after env,
+#       RETURN the value directly as the inner script.  The outer
+#       check_shell_command recursion re-runs the whole prescreen
+#       on the re-split payload, so the inner wrapper gets unwrapped
+#       and the denylist fires.
+#
+#   P2. `env --` followed by assignments.  `env --` ends env's OWN
+#       options, but the prefix-strip was `break`ing entirely — so
+#       `/usr/bin/env -- FOO=1 bash -c '...'` lost the `FOO=1`
+#       consumption and tripped the shell-basename check.  Fix:
+#       instead of `break`, clear `seen_env` and `continue` so the
+#       outer assignment-recogniser branch picks up the `FOO=1`.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # -S with a denylisted wrapped inner
+        "/usr/bin/env -S 'bash -c printenv'",
+        "/usr/bin/env -S \"bash -c printenv\"",
+        "/usr/bin/env -S 'sh -c printenv'",
+        "/usr/bin/env -S 'bash -c \"cat ~/.ssh/id_rsa\"'",
+        # -S with a direct denylisted command (no inner wrapper)
+        "/usr/bin/env -S printenv",
+        # --split-string= (equals form)
+        "/usr/bin/env --split-string='bash -c printenv'",
+        "/usr/bin/env --split-string='sh -c printenv'",
+        # --split-string <value> (space form)
+        "/usr/bin/env --split-string 'bash -c printenv'",
+        # -S combined with other env flags
+        "/usr/bin/env -i -S 'bash -c printenv'",
+        "/usr/bin/env -u HOME -S 'bash -c printenv'",
+    ],
+)
+def test_mit164r7_env_split_string_is_unwrapped(command: str) -> None:
+    """MIT-164 round 7 (codex P1): env -S / --split-string payload must re-enter the prescreen."""
+    result = check_shell_command(command)
+    assert result is not None, f"Expected block for env-S: {command!r}"
+    assert "blocked by security policy" in result
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # env -- followed by assignments and a wrapped denylisted command
+        "/usr/bin/env -- FOO=1 bash -c 'printenv'",
+        "/usr/bin/env -i -- FOO=1 bash -c 'printenv'",
+        "/usr/bin/env -u HOME -- FOO=1 BAR=2 bash -c 'cat /etc/shadow'",
+        "/usr/bin/env -- bash -c 'printenv'",
+        "/usr/bin/env --ignore-environment -- FOO=1 bash -c 'printenv'",
+    ],
+)
+def test_mit164r7_env_dashdash_then_assignments_still_unwraps(command: str) -> None:
+    """MIT-164 round 7 (codex P2): `env --` must resume assignment-stripping, not break."""
+    result = check_shell_command(command)
+    assert result is not None, f"Expected block for env --: {command!r}"
+    assert "blocked by security policy" in result
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # -S with benign payload
+        "/usr/bin/env -S 'echo hi'",
+        "/usr/bin/env -S 'bash -c echo'",
+        "/usr/bin/env --split-string='git status'",
+        "/usr/bin/env --split-string='bash -c \"npm install\"'",
+        # env -- benign
+        "/usr/bin/env -- FOO=1 bash -c 'echo ok'",
+        "/usr/bin/env -- FOO=1 echo hi",
+        "/usr/bin/env -i -- FOO=1 bash -c 'git status'",
+    ],
+)
+def test_mit164r7_env_flags_benign_payloads_allowed(command: str) -> None:
+    """MIT-164 round 7: -S and -- with benign inner payloads must not false-positive."""
+    assert check_shell_command(command) is None, f"False positive: {command!r}"

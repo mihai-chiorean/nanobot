@@ -416,7 +416,11 @@ def _extract_shell_wrapper_inner(command: str) -> str | None:
         # through to "clean" exactly as before this change — no regression.
         return None
 
-    if len(tokens) < 3:
+    # Minimal: need at least 2 tokens (e.g. `env -S <payload>`) for any
+    # unwrap path to succeed.  The stricter `<shell> -c <script>` shape
+    # requires 3 and is enforced AFTER prefix stripping (see the
+    # `len(tokens) - shell_idx < 3` check below).
+    if len(tokens) < 2:
         return None
 
     # MIT-164 review 4-5 / codex P1: command-prefix stripping.  Tokens
@@ -441,7 +445,12 @@ def _extract_shell_wrapper_inner(command: str) -> str | None:
     # the same core set.
     shell_idx = 0
     seen_env = False
-    while shell_idx < len(tokens) - 2:
+    # Loop guard: keep going as long as there's at least ONE token to
+    # inspect.  The "at least `<shell> -c <script>` remaining" check
+    # happens AFTER the loop — this loop is only the prefix-stripping
+    # walk, which can terminate early by returning an inner (e.g. from
+    # `env -S <payload>`) regardless of how many tokens remain.
+    while shell_idx < len(tokens):
         tok = tokens[shell_idx]
         # (1) POSIX assignment — always allowed in the prefix, whether
         # we've seen `env` yet or not (`FOO=1 env bash ...` is valid).
@@ -457,11 +466,19 @@ def _extract_shell_wrapper_inner(command: str) -> str | None:
         # an assignment or the shell.  This closes the codex-round-5 P1:
         # `/usr/bin/env -i bash -c '...'`, `env -u HOME sh -c '...'`,
         # etc.  Flag recognition covers:
-        #   * `--` separator (end of env's options).
-        #   * Flags that take a VALUE: `-u NAME`, `--unset=NAME`,
-        #     `-C DIR`, `--chdir=DIR`, `-S CMD`, `--split-string=CMD`.
-        #     For the non-`=` forms we skip 2 tokens; the `=` forms are
-        #     self-contained (1 token).
+        #   * `--` separator (end of env's options — but NOT end of the
+        #     prefix strip: assignments may follow, e.g. `env -- FOO=1
+        #     bash -c '...'`).  Clear the env-flag state and continue.
+        #   * GNU env `-S`/`--split-string` (codex-round-6 P1): the
+        #     value IS a full command to be re-split and executed, so
+        #     we return it directly as the "inner" — outer recursion in
+        #     `check_shell_command` will re-run the whole prescreen on
+        #     the re-split payload (regex + unwrap + recurse).  This
+        #     transparently covers `/usr/bin/env -S 'bash -c printenv'`.
+        #   * Other value-taking flags: `-u NAME`, `--unset=NAME`,
+        #     `-C DIR`, `--chdir=DIR`.  Skip this token AND its value
+        #     (for non-`=` forms) or skip just this token (for `=`
+        #     forms — self-contained).
         #   * Flags without value: `-i`, `--ignore-environment`,
         #     `-0`, `--null`, `-v`, `--debug`, `--help`, `--version`.
         # Unknown `-*`/`--*` tokens in the env-flag position are skipped
@@ -470,10 +487,25 @@ def _extract_shell_wrapper_inner(command: str) -> str | None:
         # non-env-flag token is at worst a false-negative on an already-
         # unusual command shape, not a bypass).
         if seen_env and tok.startswith("-"):
+            # `--` ends env's OWN options but NOT the prefix strip.
+            # After `env -- FOO=1 bash -c '...'`, the `FOO=1` must
+            # still be consumed as an assignment before we hit the
+            # shell.  Clear env-flag state and continue the loop so
+            # assignments (branch 1) can fire on the next iteration.
             if tok == "--":
-                # End of env's options; next token is the command.
                 shell_idx += 1
-                break
+                seen_env = False
+                continue
+            # `-S <payload>` (GNU env split-string): the payload IS a
+            # shell invocation.  Return it directly — `check_shell_command`
+            # will re-run the whole prescreen on the payload, so any
+            # denylisted inner surfaces through the outer regex OR
+            # through another unwrap pass.
+            if tok in ("-S", "--split-string") and shell_idx + 1 < len(tokens):
+                return tokens[shell_idx + 1]
+            # `--split-string=PAYLOAD` — self-contained, strip the prefix.
+            if tok.startswith("--split-string="):
+                return tok[len("--split-string="):]
             if tok in _ENV_FLAGS_TAKING_VALUE and shell_idx + 1 < len(tokens):
                 shell_idx += 2
                 continue
