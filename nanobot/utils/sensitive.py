@@ -240,30 +240,74 @@ _SHELL_WRAPPER_BASENAMES: frozenset[str] = frozenset(
 _MAX_SHELL_WRAPPER_DEPTH = 3
 
 
+def _is_script_carrying_option(token: str) -> bool:
+    """Return True iff *token* is a short-option cluster containing ``c``.
+
+    The bash/sh/zsh/dash/ash/ksh family all parse short options as a
+    cluster after a single ``-`` (e.g. ``-lc`` == ``-l`` + ``-c``).  For
+    all of them, once ``c`` appears in the cluster the NEXT argv slot is
+    consumed as the script body.  Recognised shapes:
+
+    * ``-c`` (canonical)
+    * ``-lc``, ``-cl``, ``-ec``, ``-xc``, ``-ic``, ``-eic``, ``-lxc``, …
+      (cluster with ``c`` anywhere among the letters)
+
+    Deliberately excluded (NOT script-carrying, must return False):
+
+    * Long options: ``--login``, ``--noprofile``, ``--rcfile``, ``--``
+      — use ``tok.startswith("--")``.  Long options never introduce a
+      shell script; bash has no ``--command=`` form (verified: bash
+      rejects ``--command=echo hi`` with "invalid option").
+    * Other short options that take a value: ``-O extglob`` (bash shopt),
+      ``-o no_aliases`` (zsh setopt), ``-D`` (dump strings).  None of
+      these contain the letter ``c``, so "cluster contains c" correctly
+      excludes them.
+    * Non-letter shapes (``-123``, ``-`` alone).
+
+    This predicate is load-bearing for the MIT-164 fix — anything it
+    excludes must genuinely NOT carry a script, or we reopen the bypass.
+    """
+    if not token.startswith("-"):
+        return False
+    if token == "-" or token == "--" or token.startswith("--"):
+        return False
+    letters = token[1:]
+    # Short-option clusters are alphabetic in POSIX + bash + zsh.  If the
+    # token is e.g. `-123` or `-O2`, it's a numeric/value-style option
+    # and does not carry a script.
+    if not letters.isalpha():
+        return False
+    return "c" in letters
+
+
 def _extract_shell_wrapper_inner(command: str) -> str | None:
     """If *command* runs a shell with an inline script argument, return the script.
 
-    Handles the canonical ``<shell> -c <script>`` form *and* common flag
-    bundles that combine ``-c`` with other short options — ``bash -lc``
-    (login), ``bash -ic`` (interactive), ``bash -ec`` (errexit),
-    ``bash -xc`` (xtrace), or any short-option cluster containing ``c``.
-    All of those still execute the following argument as a shell script,
-    so all of them reopen the quote-wrapper bypass this function exists
-    to close.
+    Handles arbitrary orderings of shell options before the script-
+    carrying flag.  All of the following are recognised:
 
-    Uses :func:`shlex.split` so all three quoting forms are handled uniformly:
+    * ``sh -c 'printenv'``                          — canonical
+    * ``bash -lc "printenv"``                       — flag bundle
+    * ``bash -cl 'printenv'``                       — ``c`` first in bundle
+    * ``bash --noprofile -c 'printenv'``            — long option BEFORE -c
+    * ``bash -O extglob -c 'printenv'``             — short option with value
+    * ``zsh -o no_aliases -c 'env'``                — zsh setopt pair
+    * ``bash --rcfile /dev/null -lc 'printenv'``    — several pre-options + bundle
+    * ``/usr/bin/bash -lc "cat /etc/shadow"``       — path-prefixed shell
 
-    * ``sh -c 'printenv'``        — single-quoted
-    * ``bash -lc "printenv"``     — flag bundle + double-quoted
-    * ``sh -c printenv``          — unquoted (bash permits this for a single arg)
+    The script is always the token immediately AFTER the first
+    ``c``-bearing short-option cluster.  Everything before that cluster
+    is treated as an opaque option prefix and skipped over — we do not
+    try to model each shell's option grammar, we just look for the ``c``
+    token.  This is intentionally permissive: over-unwrapping a non-
+    wrapper shape only risks over-blocking (the inner regex check runs
+    again on a best-guess inner string), which is the safe direction
+    for a security prescreen.
 
-    The shell binary may appear with or without a path prefix
-    (``sh``, ``/bin/sh``, ``/usr/bin/bash``, …). Any trailing tokens after
-    the script (POSIX ``sh -c <script> [argv0 [args...]]``) are ignored —
-    the script is always the token immediately after the first ``-*c*``
-    option and is the only thing that gets executed as shell syntax.
+    Uses :func:`shlex.split` so quoting forms (``'..'``, ``".."``,
+    unquoted single-token) are all normalised uniformly.
 
-    Returns ``None`` when the command does not look like a recognized
+    Returns ``None`` when the command does not look like a recognised
     wrapper, or when :mod:`shlex` cannot parse it (malformed quoting).
     """
     try:
@@ -283,29 +327,21 @@ def _extract_shell_wrapper_inner(command: str) -> str | None:
     if shell_basename not in _SHELL_WRAPPER_BASENAMES:
         return None
 
-    # Find the first ``-*c*`` short-option token and treat the NEXT token
-    # as the script.  Accepts ``-c``, ``-lc``, ``-cl``, ``-ec``, ``-xc``,
-    # ``-ic``, ``-eic``, etc.  A token is a "script-carrying" option iff:
-    #   * it starts with a single ``-`` followed by at least one letter
-    #     (excludes positional args, long options, and ``--``),
-    #   * the letters include ``c``,
-    #   * it is not ``--`` (argument separator).
-    # We only scan across *contiguous* short-option tokens starting at
-    # index 1 — as soon as we see a non-option token, that is a positional
-    # and we are not in wrapper shape.  Once the ``c``-bearing option is
-    # found, its immediate successor is the script.
+    # Scan ALL tokens after the shell binary (no early-termination on
+    # positionals or long options — those can legitimately appear before
+    # ``-c``, e.g. ``bash --noprofile -c '...'`` or ``bash -O extglob -c
+    # '...'``).  Take the token AFTER the first ``c``-bearing short-option
+    # cluster as the script.  If we never find one, the command is not a
+    # wrapper shape.
+    #
+    # NOTE: scanning past arbitrary options is the security-safe direction.
+    # The alternative (bail on the first unrecognised token) is what
+    # codex-review round 2 flagged as bypassable via ``bash --noprofile
+    # -c '...'``.  Over-unwrapping a non-wrapper command just means we
+    # run the regex pass a second time on a best-guess inner string,
+    # which is harmless; under-unwrapping is a security hole.
     for idx in range(1, len(tokens) - 1):
-        tok = tokens[idx]
-        if not tok.startswith("-") or tok == "--" or tok.startswith("--"):
-            # Positional, `--`, or long option — break the option-scan.
-            return None
-        # Strip leading dash(es) and check for ``c`` among the letters.
-        if not tok[1:].isalpha():
-            # Short options are letters only; anything else (e.g. `-123`)
-            # isn't a flag bundle we recognise.  Fail closed on unknown
-            # shapes by aborting the wrapper-extraction path.
-            return None
-        if "c" in tok[1:]:
+        if _is_script_carrying_option(tokens[idx]):
             return tokens[idx + 1]
     return None
 

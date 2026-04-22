@@ -546,3 +546,95 @@ def test_mit164r2_flag_bundle_wrapper_is_blocked(command: str) -> None:
 def test_mit164r2_benign_flag_bundle_usage_still_allowed(command: str) -> None:
     """MIT-164 round 2: flag-bundle detection must not false-positive on benign shells."""
     assert check_shell_command(command) is None, f"False positive for: {command!r}"
+
+
+
+# ---------------------------------------------------------------------------
+# MIT-164 round 3 — codex review iteration 2
+#
+# Round 2 closed the short-option-bundle bypass (`bash -lc '...'`) but
+# still terminated the option scan on long options or value-taking short
+# options.  Codex flagged three new shapes that bypass:
+#
+#   * ``bash --noprofile -c 'printenv'``      (long option before -c)
+#   * ``bash -O extglob -c 'cat ~/.ssh/id_rsa'`` (short opt with value)
+#   * ``zsh -o no_aliases -c 'env'``          (zsh setopt pair)
+#
+# The round-3 fix makes the scanner permissive: it walks ALL tokens
+# after the shell binary and returns the first token following a
+# ``c``-bearing short-option cluster.  Over-unwrapping a non-wrapper
+# only risks over-blocking (safe direction); under-unwrapping is a
+# security hole.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Long option BEFORE -c
+        "bash --noprofile -c 'printenv'",
+        'bash --noprofile -c "cat /etc/shadow"',
+        "bash --norc -c 'printenv'",
+        "bash --noprofile --norc -c 'printenv'",
+        # Short option WITH VALUE (takes next token) before -c
+        "bash -O extglob -c 'printenv'",
+        "bash -O extglob -c 'cat ~/.ssh/id_rsa'",
+        "zsh -o no_aliases -c 'printenv'",
+        "zsh -o no_aliases -c 'env'",
+        # --rcfile path pair before -c
+        "bash --rcfile /dev/null -c 'printenv'",
+        # Combinations of long + bundle
+        "bash --rcfile /dev/null -lc 'printenv'",
+        "bash --noprofile -lc 'cat /etc/shadow'",
+        # Option with value followed by bundle (codex P1 round 2 + round 3 combined)
+        "bash -O extglob -lc 'printenv'",
+        # Path-prefixed shell + long option
+        "/usr/bin/bash --noprofile -c 'printenv'",
+        "/bin/bash --norc -c 'ssh-add -l'",
+    ],
+)
+def test_mit164r3_options_before_script_wrapper_is_blocked(command: str) -> None:
+    """MIT-164 round 3: long options and value-taking short options BEFORE -c must be transparent."""
+    result = check_shell_command(command)
+    assert result is not None, f"Expected block for: {command!r}"
+    assert "blocked by security policy" in result
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Benign inner with options-before — must still pass
+        "bash --noprofile -c 'echo hi'",
+        "bash -O extglob -c 'git status'",
+        "zsh -o no_aliases -c 'pytest'",
+        "bash --rcfile /dev/null -c 'make'",
+        "bash --norc -c 'ls /tmp'",
+        # Options-only, no -c — not a wrapper shape
+        "bash -O extglob script.sh",     # value-option + positional, no c-bundle
+        "bash --noprofile script.sh",    # long option + positional, no c
+        "bash --rcfile /dev/null -i",    # long-option-pair + -i (no c)
+        # Shell binaries NOT in our wrapper list — out of scope, allow
+        "fish -c 'printenv'",            # fish is not in _SHELL_WRAPPER_BASENAMES
+        # Arg-separator usage
+        "bash -- script.sh arg1",
+    ],
+)
+def test_mit164r3_benign_options_before_script_still_allowed(command: str) -> None:
+    """MIT-164 round 3: benign options-before shapes must not false-positive."""
+    assert check_shell_command(command) is None, f"False positive for: {command!r}"
+
+
+def test_mit164r3_script_is_token_after_first_c_cluster() -> None:
+    """The unwrapped script is always the token immediately after the first c-bundle.
+
+    Scanning past arbitrary options is intentional (the permissive direction),
+    but when a c-bundle IS found we must not skip past it — the very next
+    token is the script, even if more options trail (``bash -lc 'printenv'
+    --somearg`` runs `printenv`, not the trailing arg).
+    """
+    # printenv is the script; --somearg is a positional passed to the
+    # resulting shell (as argv[1]).  The prescreen should unwrap `printenv`
+    # and block.
+    result = check_shell_command("bash -lc 'printenv' --somearg")
+    assert result is not None
+    assert "blocked by security policy" in result
