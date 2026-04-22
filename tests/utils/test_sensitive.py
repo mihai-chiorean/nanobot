@@ -1243,3 +1243,100 @@ def test_mit164r9_env_S_concatenates_trailing_argv(command: str) -> None:
 def test_mit164r9_env_S_benign_trailing_argv_allowed(command: str) -> None:
     """MIT-164 round 9: env -S + trailing argv with benign inner must pass."""
     assert check_shell_command(command) is None, f"False positive: {command!r}"
+
+
+
+# ---------------------------------------------------------------------------
+# MIT-164 round 10 — codex review iteration 9
+#
+# Codex round 9 flagged two more P1s:
+#
+#   P1. `zsh --emulate <MODE> -c '...'` — zsh's emulation-mode flag
+#       takes a value, but `--emulate` was not in
+#       `_LONG_OPTS_TAKING_VALUE`, so the scanner treated MODE as a
+#       positional script name.  Fix: add `--emulate` to the
+#       allowlist.
+#
+#   P1. `env 'X-Y=1' bash -c '...'` — env(1) accepts assignment
+#       names that are NOT valid POSIX shell identifiers (`X-Y`,
+#       `A.B`), but the prefix-stripper's assignment regex only
+#       matched POSIX-compliant names.  Fix: `_is_assignment_token`
+#       now takes an `allow_env_style` kwarg that widens the LHS
+#       character class to any non-whitespace, non-`=`, non-`-`
+#       sequence — used only inside `seen_env` state so POSIX
+#       strictness is preserved for plain shell-assignment prefixes.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # zsh --emulate — emulation mode flag takes a value
+        "zsh --emulate sh -c 'printenv'",
+        "zsh --emulate ksh -c 'cat /etc/shadow'",
+        "zsh --emulate csh -c 'base64 ~/.ssh/id_rsa'",
+        # --emulate combined with other flags
+        "zsh -i --emulate sh -c 'printenv'",
+        "zsh --emulate sh -lc 'printenv'",
+    ],
+)
+def test_mit164r10_zsh_emulate_wrapper_blocks(command: str) -> None:
+    """MIT-164 round 10: `zsh --emulate MODE -c '...'` must unwrap as a wrapper."""
+    result = check_shell_command(command)
+    assert result is not None, f"Expected block: {command!r}"
+    assert "blocked by security policy" in result
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "zsh --emulate sh -c 'echo hi'",
+        "zsh --emulate ksh -c 'git status'",
+    ],
+)
+def test_mit164r10_zsh_emulate_benign_allowed(command: str) -> None:
+    """MIT-164 round 10: benign `zsh --emulate` invocations must not false-positive."""
+    assert check_shell_command(command) is None, f"False positive: {command!r}"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # env accepts non-POSIX assignment names
+        "/usr/bin/env 'X-Y=1' bash -c 'printenv'",
+        "/usr/bin/env 'A.B=2' bash -c 'printenv'",
+        "/usr/bin/env 'HTTP-Host=x' bash -c 'printenv'",
+        # Combined with POSIX assignments
+        "/usr/bin/env 'X-Y=1' FOO=2 bash -c 'printenv'",
+        "/usr/bin/env FOO=1 'X-Y=2' bash -c 'printenv'",
+        # With env flags + non-POSIX assignment
+        "/usr/bin/env -i 'X-Y=1' bash -c 'printenv'",
+    ],
+)
+def test_mit164r10_env_non_posix_assignment_stripped(command: str) -> None:
+    """MIT-164 round 10: env accepts non-POSIX NAME=value — must still unwrap."""
+    result = check_shell_command(command)
+    assert result is not None, f"Expected block: {command!r}"
+    assert "blocked by security policy" in result
+
+
+def test_mit164r10_posix_strictness_outside_env_preserved() -> None:
+    """Non-POSIX assignment WITHOUT env prefix must NOT be consumed as assignment.
+
+    `X-Y=1 bash -c 'printenv'` is not a valid shell invocation — POSIX
+    shells only accept identifier-named assignments in command prefixes.
+    The prefix-stripper must keep its strict regex when we haven't seen
+    `env`, otherwise we'd start unwrapping garbage before a shell token.
+
+    Expected behaviour: the strict regex doesn't match `X-Y=1`, so
+    prefix-stripping halts there, `shell_idx` stays at 0, tokens[0] is
+    `X-Y=1` whose basename isn't in `_SHELL_WRAPPER_BASENAMES`, and we
+    return None — i.e., NOT treated as a wrapper.
+    """
+    # The outer regex does NOT match `printenv` here because printenv
+    # is not at line-start and not after a pipe (it's after `-c `).
+    # With strict POSIX assignment regex, `X-Y=1` is not consumed,
+    # so the wrapper path returns None and the whole command passes
+    # the prescreen.  (At runtime the command would fail — POSIX
+    # shells reject `X-Y=1` — but that's the shell's problem.)
+    assert check_shell_command("X-Y=1 bash -c 'printenv'") is None

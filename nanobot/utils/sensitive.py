@@ -352,15 +352,26 @@ _ENV_FLAGS_TAKING_VALUE: frozenset[str] = frozenset({
 _LONG_OPTS_TAKING_VALUE: frozenset[str] = frozenset({
     "--rcfile",      # bash: alternate startup file
     "--init-file",   # bash: same as --rcfile
+    "--emulate",     # zsh: emulation mode (sh/ksh/csh) — closes
+                     # codex-round-9 P1 bypass `zsh --emulate sh -c '...'`
 })
 
 
 # Regex for a POSIX shell-style assignment token: `NAME=value`, where
-# `NAME` follows identifier rules (letter or underscore, then letters /
-# digits / underscores).  `value` can be empty or anything (shlex has
-# already handled quoting).  Used to skip over assignment prefixes
-# before the shell binary: `FOO=1 BAR=2 bash -c '...'`.
+# `NAME` follows POSIX identifier rules (letter or underscore, then
+# letters / digits / underscores).  `value` can be empty or anything
+# (shlex has already handled quoting).  Used to skip over assignment
+# prefixes before the shell binary: `FOO=1 BAR=2 bash -c '...'`.
 _ASSIGNMENT_TOKEN_RE: re.Pattern = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+# Broader regex for env(1)-style assignments: env accepts ANY `NAME=value`
+# where NAME has no `=` and no whitespace — including names that are NOT
+# valid POSIX shell identifiers (e.g. ``X-Y=1`` or ``A.B=2``).  Used only
+# inside the env-prefix state to close the codex-round-9 P1 bypass
+# (``/usr/bin/env 'X-Y=1' bash -c '...'``).  Still requires a non-empty
+# LHS, at least one character, and that the first character isn't ``-``
+# (so we don't eat option-looking tokens like `-foo=bar`).
+_ENV_ASSIGNMENT_TOKEN_RE: re.Pattern = re.compile(r"^[^-\s=][^\s=]*=")
 
 
 def _join_env_split_payload(payload: str, trailing: list[str]) -> str:
@@ -390,15 +401,27 @@ def _join_env_split_payload(payload: str, trailing: list[str]) -> str:
     return " ".join(parts)
 
 
-def _is_assignment_token(token: str) -> bool:
-    """Return True iff *token* looks like a POSIX `NAME=value` assignment.
+def _is_assignment_token(token: str, allow_env_style: bool = False) -> bool:
+    """Return True iff *token* looks like a `NAME=value` assignment.
 
-    Used to strip env-var-assignment prefixes from a command before the
-    wrapper extractor looks up the shell binary.  Matches both empty-value
-    (`FOO=`) and non-empty (`FOO=bar`, `PATH=/usr/bin`, `MSG=hello world`
-    — shlex already split the token on spaces in surrounding context).
+    Two modes:
+
+    * POSIX (default): NAME matches shell identifier rules —
+      `[A-Za-z_][A-Za-z0-9_]*`.  Used to strip pre-shell assignments
+      like `FOO=1 BAR=2 bash -c '...'`.
+
+    * env-style (``allow_env_style=True``): NAME is any non-whitespace,
+      non-``=``, non-``-`` sequence.  env(1) accepts arbitrary names
+      including shell-invalid ones (``X-Y=1``, ``A.B=2``); enabling
+      this mode inside the env-prefix state closes the bypass where
+      `env 'X-Y=1' bash -c '...'` would otherwise stop the scan on
+      `X-Y=1`.
     """
-    return bool(_ASSIGNMENT_TOKEN_RE.match(token))
+    if _ASSIGNMENT_TOKEN_RE.match(token):
+        return True
+    if allow_env_style and _ENV_ASSIGNMENT_TOKEN_RE.match(token):
+        return True
+    return False
 
 
 def _extract_shell_wrapper_inner(command: str) -> str | None:
@@ -506,9 +529,12 @@ def _extract_shell_wrapper_inner(command: str) -> str | None:
     # `env -S <payload>`) regardless of how many tokens remain.
     while shell_idx < len(tokens):
         tok = tokens[shell_idx]
-        # (1) POSIX assignment — always allowed in the prefix, whether
-        # we've seen `env` yet or not (`FOO=1 env bash ...` is valid).
-        if _is_assignment_token(tok):
+        # (1) Assignment token — always allowed in the prefix.  Before
+        # we've seen `env`, only POSIX-valid identifiers count (shell
+        # syntax).  AFTER `env`, we loosen the identifier rule because
+        # env accepts arbitrary NAME=value pairs (e.g. ``X-Y=1``) —
+        # closes the codex-round-9 P1 bypass.
+        if _is_assignment_token(tok, allow_env_style=seen_env):
             shell_idx += 1
             continue
         # (2) `env` runner — basename match catches path-prefixed forms.
