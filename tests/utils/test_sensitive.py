@@ -1708,3 +1708,65 @@ def test_mit164r16_append_assignment_and_passthrough_blocks(command: str) -> Non
 def test_mit164r16_append_assignment_and_passthrough_benign_allowed(command: str) -> None:
     """MIT-164 round 16: benign +=/passthrough usage must not false-positive."""
     assert check_shell_command(command) is None, f"False positive: {command!r}"
+
+
+
+# ---------------------------------------------------------------------------
+# MIT-164 round 17 — codex review iteration 16
+#
+# Codex round 16 flagged (P1) that the round-15 passthrough handler
+# only stripped the bare `command`/`exec` name.  Real forms include
+# the builtin's own flags: `command -p bash -c '...'`, `command --
+# bash -c '...'`, `exec -a ARGV0 bash -c '...'`, etc.  The first
+# non-shell token (`-p`, `--`, `-a`) halted the scan.
+#
+# Fix: add `in_passthrough_flags` state flag (analogous to
+# `in_env_flags`) that remains True after a passthrough token and
+# governs a new branch (2c) which strips the builtin's own options:
+#   * `--`        — end of options
+#   * `-a VALUE`  — exec's argv0 override (takes value)
+#   * other `-X`  — valueless flags (command: -p -v -V; exec: -c -l)
+#
+# Per-state exclusivity: entering env-state clears
+# `in_passthrough_flags` (and vice versa) so the two state machines
+# don't collide on a `command /usr/bin/env -Sbash -c ...` cascade.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # command / exec with builtin flags before the shell
+        "command -- bash -c 'printenv'",
+        "command -p bash -c 'printenv'",
+        "command -pV bash -c 'printenv'",
+        "command -v bash -c 'printenv'",
+        "exec -- bash -c 'printenv'",
+        "exec -a argv0 bash -c 'printenv'",
+        "exec -l bash -c 'printenv'",
+        "exec -c bash -c 'printenv'",  # exec -c = "clear env", not -c wrapper
+        # Combined with env + -Sbash cluster after passthrough flags
+        "command -p /usr/bin/env -Sbash -c printenv",
+        "exec -a argv0 /usr/bin/env bash -c 'printenv'",
+    ],
+)
+def test_mit164r17_passthrough_with_flags_blocks(command: str) -> None:
+    """MIT-164 round 17: command/exec flags before the wrapped shell must be stripped."""
+    result = check_shell_command(command)
+    assert result is not None, f"Expected block: {command!r}"
+    assert "blocked by security policy" in result
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "command -p bash -c 'echo hi'",
+        "command -- bash -c 'echo hi'",
+        "exec -a argv0 bash -c 'git status'",
+        "exec -l bash -c 'npm install'",
+        "exec -c bash -c 'echo hi'",  # not a -c wrapper — clear env
+    ],
+)
+def test_mit164r17_passthrough_with_flags_benign_allowed(command: str) -> None:
+    """MIT-164 round 17: benign passthrough+flags + inner must not false-positive."""
+    assert check_shell_command(command) is None, f"False positive: {command!r}"

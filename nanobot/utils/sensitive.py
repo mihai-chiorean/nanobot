@@ -580,6 +580,12 @@ def _extract_shell_wrapper_inner(command: str) -> str | None:
     # env's `--` or until we hit a non-flag token).  Only it governs
     # the env-flag-specific branches below (-i, -u, -S, etc.).
     in_env_flags = False
+    # `in_passthrough_flags` is a TRANSIENT flag that is True after
+    # seeing a `command` or `exec` passthrough token.  Allows
+    # stripping the builtin's OWN options (`command -p`, `exec -a
+    # ARGV0`, and `--` separator) before reaching the real shell.
+    # Codex-round-16 P1.
+    in_passthrough_flags = False
     # `past_env_dashdash` is a STICKY flag set after `env --` that
     # allows the MOST permissive assignment regex — including ``NAME=v``
     # where NAME starts with ``-`` — because env stops parsing options
@@ -619,22 +625,41 @@ def _extract_shell_wrapper_inner(command: str) -> str | None:
             shell_idx += 1
             seen_env = True
             in_env_flags = True
+            in_passthrough_flags = False  # env supersedes passthrough
             continue
         # (2b) Shell passthrough builtins `command` and `exec`
         # (codex-round-15 P1).  Both simply invoke their argument as
         # the command — `command bash -c '...'` and `exec bash -c '...'`
-        # both run the wrapped shell.  Skip the token and continue so
-        # the next iteration picks up the real shell.  Basename match
-        # (like env) catches unusual paths like `./command`.  Note:
-        # these are shell BUILTINS, so they only appear as the first
-        # token of a shell pipeline — if we see one elsewhere we're
-        # already in wrapper-extracted territory and the outer
-        # recursion handles it.
+        # both run the wrapped shell.  Skip the token and set
+        # in_passthrough_flags so we can strip the builtin's own
+        # options on subsequent iterations (codex-round-16 P1:
+        # `command -p bash -c '...'`, `exec -a argv0 bash -c '...'`,
+        # `command -- bash -c '...'`, etc.).
         if tok in _PASSTHROUGH_BUILTINS:
             shell_idx += 1
-            # These do NOT implicitly put us in env-flag state; they
-            # just pass through.  Any assignments AFTER them should
-            # use POSIX-strict parsing (no seen_env set).
+            in_passthrough_flags = True
+            continue
+        # (2c) Passthrough builtin flag handling — similar shape to
+        # the env-flag branch below but with a smaller surface.
+        # bash's `command` accepts `-p`, `-v`, `-V`, `--`; `exec`
+        # accepts `-c`, `-l`, `-a NAME`, `--`.  Notably `exec -c`
+        # means "clear env" for the exec, NOT "run script" — we
+        # MUST NOT confuse it with the shell -c wrapper.  Luckily
+        # exec -c's only valid form is as a bare flag, not taking a
+        # value, so a simple skip-1 is correct.
+        if in_passthrough_flags and tok.startswith("-"):
+            # `--` ends option parsing for the builtin.
+            if tok == "--":
+                shell_idx += 1
+                in_passthrough_flags = False
+                continue
+            # `-a ARGV0` (exec's override-argv0) takes a value.
+            if tok == "-a" and shell_idx + 1 < len(tokens):
+                shell_idx += 2
+                continue
+            # All other `-*` tokens are valueless flags (-p, -v, -V,
+            # -c, -l) — skip 1 token.
+            shell_idx += 1
             continue
         # (3) After we've seen `env`, skip env's own flags until we hit
         # an assignment or the shell.  This closes the codex-round-5 P1:
