@@ -764,7 +764,7 @@ class OpenAICompatProvider(LLMProvider):
         )
 
     @classmethod
-    def _parse_chunks(cls, chunks: list[Any]) -> LLMResponse:
+    def _parse_chunks(cls, chunks: list[Any], ttft_ms: float | None = None) -> LLMResponse:
         content_parts: list[str] = []
         reasoning_parts: list[str] = []
         tc_bufs: dict[int, dict[str, Any]] = {}
@@ -864,6 +864,7 @@ class OpenAICompatProvider(LLMProvider):
             finish_reason=finish_reason,
             usage=usage,
             reasoning_content="".join(reasoning_parts) or None,
+            ttft_ms=ttft_ms,
         )
 
     @classmethod
@@ -1041,8 +1042,10 @@ class OpenAICompatProvider(LLMProvider):
             )
             kwargs["stream"] = True
             kwargs["stream_options"] = {"include_usage": True}
+            _ttft_start = time.perf_counter()
             stream = await self._client.chat.completions.create(**kwargs)
             chunks: list[Any] = []
+            ttft_ms: float | None = None
             stream_iter = stream.__aiter__()
             while True:
                 try:
@@ -1053,11 +1056,19 @@ class OpenAICompatProvider(LLMProvider):
                 except StopAsyncIteration:
                     break
                 chunks.append(chunk)
+                if ttft_ms is None and chunk.choices:
+                    delta = chunk.choices[0].delta
+                    has_content = bool(getattr(delta, "content", None))
+                    has_reasoning = bool(getattr(delta, "reasoning_content", None))
+                    has_reasoning_alt = bool(getattr(delta, "reasoning", None))
+                    has_tool = bool(getattr(delta, "tool_calls", None))
+                    if has_content or has_reasoning or has_reasoning_alt or has_tool:
+                        ttft_ms = (time.perf_counter() - _ttft_start) * 1000
                 if on_content_delta and chunk.choices:
                     text = getattr(chunk.choices[0].delta, "content", None)
                     if text:
                         await on_content_delta(text)
-            return self._parse_chunks(chunks)
+            return self._parse_chunks(chunks, ttft_ms=ttft_ms)
         except asyncio.TimeoutError:
             return LLMResponse(
                 content=(
