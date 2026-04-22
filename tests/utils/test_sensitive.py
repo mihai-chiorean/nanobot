@@ -854,3 +854,150 @@ def test_mit164r5_env_token_alone_still_blocks() -> None:
     result = check_shell_command("env")
     assert result is not None
     assert "blocked by security policy" in result
+
+
+
+# ---------------------------------------------------------------------------
+# MIT-164 round 6 — codex review iteration 5
+#
+# Codex round 5 flagged two issues:
+#
+#   P1. env's own flags: `/usr/bin/env -i bash -c 'printenv'` and
+#       `/usr/bin/env -u HOME sh -c '...'` bypassed because the
+#       prefix-stripper didn't understand env's flags (`-i`,
+#       `-u NAME`, `-C DIR`, `-S CMD`, `--ignore-environment`, `--`).
+#       Fix: after skipping an `env` token, enter env-flag state and
+#       skip env's own flags (flag-only and value-taking) until we
+#       reach the shell or an assignment.
+#
+#   P2. Off-by-one on the depth cap.  Three legitimate wrapper layers
+#       (e.g. `sh -c "bash -c 'zsh -c \"echo ok\"'"`) were blocked
+#       because `_depth >= _MAX_SHELL_WRAPPER_DEPTH` fired on the
+#       already-unwrapped innermost non-wrapper (`echo ok`).  Fix:
+#       reorder — try extraction first, only consult the cap when
+#       there IS another wrapper to peel.  Non-wrapper inners exit
+#       cleanly at any depth.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # env-runner + env's own flags, various shapes
+        "/usr/bin/env -i bash -c 'printenv'",
+        "/usr/bin/env -u HOME sh -c 'ssh-add -l'",
+        "env -i bash -c 'printenv'",
+        "env -u FOO bash -c 'printenv'",
+        "env -u FOO -u BAR bash -c 'printenv'",
+        "env -i -u HOME bash -c 'printenv'",
+        "env -C /tmp bash -c 'printenv'",
+        "env -0 bash -c 'printenv'",
+        "env --ignore-environment bash -c 'printenv'",
+        "env --unset=HOME bash -c 'printenv'",
+        # env -- terminates env's options, then assignments + shell
+        "env -- FOO=1 bash -c 'printenv'",
+        # Combined: env with flags + env-vars + shell
+        "/usr/bin/env -i FOO=1 bash -c 'printenv'",
+        "/usr/bin/env -u HOME FOO=1 bash -c 'printenv'",
+        # Path-prefixed env with flags
+        "/bin/env -i sh -c 'printenv'",
+    ],
+)
+def test_mit164r6_env_flags_prefix_is_stripped(command: str) -> None:
+    """MIT-164 round 6: env's own flags (`-i`, `-u`, `-C`, `--`, etc.) must be skipped."""
+    result = check_shell_command(command)
+    assert result is not None, f"Expected block for: {command!r}"
+    assert "blocked by security policy" in result
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Benign env-flag usage — use path-prefixed `/usr/bin/env` so the
+        # pre-existing outer env-dumper regex (which anchors at `^env`
+        # word-boundary) doesn't fire.  This is a pre-MIT-164 behaviour
+        # (bare `env` at line-start is always blocked as an env-dumper)
+        # and is out of scope here.
+        "/usr/bin/env -i bash -c 'echo hi'",
+        "/usr/bin/env -u HOME bash -c 'npm install'",
+        "/usr/bin/env -i -u PATH bash -c 'git status'",
+        "/usr/bin/env --ignore-environment bash -c 'ls /tmp'",
+        # env flags but not followed by a recognised shell
+        "/usr/bin/env -i python3 -c 'print(hi)'",
+        "/usr/bin/env -i /bin/true",
+        # env + -- but no shell after (just a command with assignments)
+        "/usr/bin/env -- FOO=1 echo hi",
+    ],
+)
+def test_mit164r6_benign_env_flags_allowed(command: str) -> None:
+    """MIT-164 round 6: env-flag prefixes with benign inner must not false-positive.
+
+    Uses path-prefixed `/usr/bin/env` deliberately — bare `env` at line
+    start is pre-existing behaviour blocked by the outer regex (since
+    MIT-123), and is orthogonal to the wrapper-extractor logic under
+    test here.  See ``test_mit164r5_env_token_alone_still_blocks`` for
+    the bare-`env` regression guard.
+    """
+    assert check_shell_command(command) is None, f"False positive: {command!r}"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # 3 legitimate wrapper layers with a BENIGN innermost script —
+        # must pass.  Previously blocked by off-by-one depth cap.
+        'sh -c "bash -c \'zsh -c \\"echo ok\\"\'"',
+        "sh -c \"bash -c 'echo hello'\"",
+        "bash -c \"sh -c 'git status'\"",
+        # 2-level benign nesting — well within the cap.
+        "bash -c \"sh -c 'echo hi'\"",
+    ],
+)
+def test_mit164r6_three_level_nesting_with_benign_inner_allowed(command: str) -> None:
+    """MIT-164 round 6 (codex P2): 3 wrapper levels with a non-wrapper inner must pass.
+
+    The depth cap is a security fallback for "still another wrapper
+    to peel" territory — if the innermost layer is already a plain
+    (non-wrapper) script, the cap must not fire regardless of how
+    many wrapper layers we peeled to get here.
+    """
+    assert check_shell_command(command) is None, f"False positive at 3-layer benign: {command!r}"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # 3 wrapper layers + denylisted inner — must block via inner regex.
+        "sh -c \"bash -c 'zsh -c \\\"printenv\\\"'\"",
+        "sh -c \"bash -c 'printenv'\"",
+    ],
+)
+def test_mit164r6_three_level_nesting_with_denylist_inner_blocks(command: str) -> None:
+    """Three-level nesting that bottoms out at a denylisted command must still block."""
+    result = check_shell_command(command)
+    assert result is not None, f"Expected block for: {command!r}"
+    assert "blocked by security policy" in result
+
+
+def test_mit164r6_four_level_nesting_fails_closed_at_cap() -> None:
+    """4+ wrapper layers MUST hit the cap and block, regardless of innermost content.
+
+    This is the original fail-closed semantic from round 2: if the
+    caller stacks more wrappers than the cap allows AND there is
+    still another wrapper to peel at the cap, block.  Even if the
+    deepest layer were benign, we cannot see past the cap, so we
+    refuse.
+    """
+    # 4 layers — cap is 3, so this fails at the extraction attempt
+    # that would produce the 4th recursive call.
+    deep_denylist = "sh -c \"sh -c 'sh -c \\\"sh -c printenv\\\"'\""
+    result = check_shell_command(deep_denylist)
+    assert result is not None
+    assert "blocked by security policy" in result
+
+    # 4 layers with benign innermost — still blocks (we can't see
+    # past the cap to know it's benign).
+    deep_benign = "sh -c \"sh -c 'sh -c \\\"sh -c echo ok\\\"'\""
+    result2 = check_shell_command(deep_benign)
+    assert result2 is not None
+    assert "blocked by security policy" in result2

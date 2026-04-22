@@ -231,12 +231,12 @@ _SHELL_WRAPPER_BASENAMES: frozenset[str] = frozenset(
 )
 
 # Recursion depth cap for nested wrappers (`sh -c "bash -c '...'"`).  Three
-# is well beyond anything seen in practice.  Reaching the cap causes
-# `check_shell_command` to FAIL CLOSED (block) — see the comment in that
-# function for the security rationale.  Widening the cap is fine for
-# ergonomics, but the fail-closed semantic at the cap is load-bearing:
-# without it, an attacker can trivially bypass the whole recursion by
-# stacking one more wrapper than the cap.
+# is well beyond anything seen in practice.  Reaching the cap while there
+# is STILL another wrapper to peel causes `check_shell_command` to FAIL
+# CLOSED — see the function for rationale.  A non-wrapper inner script at
+# any depth is allowed regardless of the cap (codex-review-round-5 P2:
+# the cap applies only to wrapper-to-wrapper transitions, not to already-
+# unwrapped inner scripts).
 _MAX_SHELL_WRAPPER_DEPTH = 3
 
 
@@ -295,6 +295,23 @@ _SHORT_OPTS_TAKING_VALUE: frozenset[str] = frozenset({
     "+O",   # bash --shopt-off setting (mirror of -O)
     "-o",   # sh/bash/zsh setopt name (`set -o <name>` family)
     "+o",   # zsh / bash setopt-off
+})
+
+# env(1) flags that take a VALUE as the next argv slot.  Occurs in
+# prefixes like ``env -u HOME bash -c '...'`` or ``/usr/bin/env -C /tmp
+# sh -c '...'``.  The equivalent ``--option=value`` forms are self-
+# contained single tokens and handled by the generic ``-*``/``--*``
+# skip rule — only the space-separated forms need special handling.
+# Covers both GNU env and BSD env's flag surface:
+#   * ``-u NAME`` / ``--unset=NAME``     — remove NAME from env
+#   * ``-C DIR``  / ``--chdir=DIR``      — chdir before exec
+#   * ``-S CMD``  / ``--split-string=CMD`` — GNU env's multi-arg split
+# `-i` / `-0` / `-v` / `--help` / `--version` do NOT take a value and
+# are handled by the generic skip-1 rule.
+_ENV_FLAGS_TAKING_VALUE: frozenset[str] = frozenset({
+    "-u", "--unset",
+    "-C", "--chdir",
+    "-S", "--split-string",
 })
 
 # Long options (exact match) that consume the NEXT argv slot as their
@@ -402,39 +419,70 @@ def _extract_shell_wrapper_inner(command: str) -> str | None:
     if len(tokens) < 3:
         return None
 
-    # MIT-164 review 4 / codex P1: command-prefix stripping.  Tokens
+    # MIT-164 review 4-5 / codex P1: command-prefix stripping.  Tokens
     # before the shell can legitimately include:
     #
     #   * POSIX-style VAR=value assignments: `FOO=1 BAR=2 bash -c '...'`
     #   * an `env` (or `/usr/bin/env`) runner, optionally followed by
-    #     more VAR=value assignments: `/usr/bin/env FOO=1 bash -c '...'`
+    #     env's OWN flags (`-i` ignore-env, `-u NAME` unset,
+    #     `--chdir=/dir`, etc.) and then more VAR=value assignments:
+    #     `/usr/bin/env -i bash -c '...'`, `env -u HOME sh -c '...'`.
     #   * both combined.
     #
-    # All three are standard Unix idioms for invoking a shell with a
-    # modified environment, and all three bypass the prescreen if we
+    # All of these are standard Unix idioms for invoking a shell with a
+    # modified environment, and all of them bypass the prescreen if we
     # require the shell to be `tokens[0]`.  Advance a cursor past any
-    # such prefix and treat the next token as the shell binary.
+    # such prefix and treat the next non-prefix token as the shell.
     #
-    # Assignments are identified by an identifier-name followed by `=`
-    # (POSIX: `name` must start with letter/underscore and contain only
-    # letters/digits/underscore).  `env` is identified by its basename
-    # so `/usr/bin/env`, `/bin/env`, `env` are all recognised.
+    # Assignments are identified by an identifier-name followed by `=`.
+    # `env` is identified by basename so `/usr/bin/env`, `/bin/env`,
+    # `env` are all recognised.  env's own flags are enumerated in two
+    # sets (flags-only and value-taking) — both GNU and BSD env implement
+    # the same core set.
     shell_idx = 0
-    # Optional `env` runner.  Can appear either BEFORE any assignments
-    # (`env FOO=1 bash -c ...`) or after (`FOO=1 env bash -c ...`), so
-    # we do one pass that accepts each token type in either order until
-    # we hit the shell.
+    seen_env = False
     while shell_idx < len(tokens) - 2:
         tok = tokens[shell_idx]
+        # (1) POSIX assignment — always allowed in the prefix, whether
+        # we've seen `env` yet or not (`FOO=1 env bash ...` is valid).
         if _is_assignment_token(tok):
             shell_idx += 1
             continue
+        # (2) `env` runner — basename match catches path-prefixed forms.
         if os.path.basename(tok) == "env":
-            # Don't re-skip the `env` token itself as a shell — advance
-            # past it and continue looking for assignments and finally
-            # the real shell.
+            shell_idx += 1
+            seen_env = True
+            continue
+        # (3) After we've seen `env`, skip env's own flags until we hit
+        # an assignment or the shell.  This closes the codex-round-5 P1:
+        # `/usr/bin/env -i bash -c '...'`, `env -u HOME sh -c '...'`,
+        # etc.  Flag recognition covers:
+        #   * `--` separator (end of env's options).
+        #   * Flags that take a VALUE: `-u NAME`, `--unset=NAME`,
+        #     `-C DIR`, `--chdir=DIR`, `-S CMD`, `--split-string=CMD`.
+        #     For the non-`=` forms we skip 2 tokens; the `=` forms are
+        #     self-contained (1 token).
+        #   * Flags without value: `-i`, `--ignore-environment`,
+        #     `-0`, `--null`, `-v`, `--debug`, `--help`, `--version`.
+        # Unknown `-*`/`--*` tokens in the env-flag position are skipped
+        # as "some env flag we don't recognise" — the security-safe
+        # direction (same rationale as elsewhere: over-stripping a
+        # non-env-flag token is at worst a false-negative on an already-
+        # unusual command shape, not a bypass).
+        if seen_env and tok.startswith("-"):
+            if tok == "--":
+                # End of env's options; next token is the command.
+                shell_idx += 1
+                break
+            if tok in _ENV_FLAGS_TAKING_VALUE and shell_idx + 1 < len(tokens):
+                shell_idx += 2
+                continue
+            # All other `-*` tokens (flag-only or `--option=value`).
             shell_idx += 1
             continue
+        # (4) Not an assignment, not `env`, not an env-flag.  This is
+        # either the shell binary itself or a positional — let the
+        # caller decide.
         break
 
     # After stripping prefixes, require at least `<shell> -c <script>`
@@ -519,21 +567,31 @@ def check_shell_command(command: str, _depth: int = 0) -> str | None:
                 "accessing sensitive data (keys, credentials, secrets) is not permitted."
             )
 
-    # 2. MIT-164: shell-wrapper unwrap + recurse.  `_depth` is a runtime
-    # bound on pathological nesting like `sh -c "bash -c 'sh -c ...'"`.
-    # In practice depth > 1 is extremely rare; legitimate depth > 3 has
-    # never been observed.  At the cap we FAIL CLOSED: if the caller is
-    # trying to stack more than _MAX_SHELL_WRAPPER_DEPTH wrappers, that
-    # is itself strong evidence of an evasion attempt, and letting it
-    # through would reopen the bypass (the innermost script might be
-    # denylisted — we just stopped looking).  Return the same block
-    # string the regex layer would use.
+    # 2. MIT-164: shell-wrapper unwrap + recurse.  Extract the inner
+    # script FIRST; only consult the depth cap when we would actually
+    # recurse into another wrapper layer.
+    #
+    # Rationale (codex-review-round-5 P2): the previous ordering
+    # checked `_depth` before extraction, which rejected benign
+    # commands whose innermost script happened to be a non-wrapper
+    # (e.g. `sh -c "bash -c 'zsh -c \"echo ok\"'"` — 3 legitimate
+    # wrapper layers, innermost script is plain `echo ok`).  With
+    # extraction first, we only pay the cap when there IS another
+    # layer to process; a non-wrapper inner exits at step 3 below
+    # regardless of depth.
+    inner = _extract_shell_wrapper_inner(command)
+    if inner is None:
+        # 3. Clean bottom — regex already matched "clean" above and
+        # there's no further wrapper to peel.  Allow.
+        return None
+
+    # There IS another wrapper layer.  Enforce the cap.  `_depth` is a
+    # runtime bound on pathological nesting (`sh -c "bash -c 'sh -c
+    # ...'"`).  Reaching the cap while there is still another wrapper
+    # to unwrap is itself strong evidence of an evasion attempt —
+    # letting it through would reopen the bypass (we'd stop looking
+    # before reaching the denylisted innermost command).  Block.
     if _depth >= _MAX_SHELL_WRAPPER_DEPTH:
-        # Only reachable via the `check_shell_command(inner, _depth + 1)`
-        # tail call below — so `command` here is an already-unwrapped
-        # inner script.  A depth-cap block doubles as a canary: if this
-        # ever fires on legitimate traffic the cap should be revisited,
-        # not the fail-closed semantic.
         logger.warning(
             "Blocked shell command at max wrapper depth "
             "({} levels of sh/bash/zsh/dash/ash/ksh -c nesting): {}",
@@ -545,8 +603,5 @@ def check_shell_command(command: str, _depth: int = 0) -> str | None:
             "accessing sensitive data (keys, credentials, secrets) is not permitted."
         )
 
-    inner = _extract_shell_wrapper_inner(command)
-    if inner is not None:
-        return check_shell_command(inner, _depth + 1)
-
-    return None
+    # Under the cap — recurse into the unwrapped inner script.
+    return check_shell_command(inner, _depth + 1)
