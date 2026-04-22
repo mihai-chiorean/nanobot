@@ -366,12 +366,20 @@ _ASSIGNMENT_TOKEN_RE: re.Pattern = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 # Broader regex for env(1)-style assignments: env accepts ANY `NAME=value`
 # where NAME has no `=` and no whitespace — including names that are NOT
-# valid POSIX shell identifiers (e.g. ``X-Y=1`` or ``A.B=2``).  Used only
-# inside the env-prefix state to close the codex-round-9 P1 bypass
-# (``/usr/bin/env 'X-Y=1' bash -c '...'``).  Still requires a non-empty
-# LHS, at least one character, and that the first character isn't ``-``
-# (so we don't eat option-looking tokens like `-foo=bar`).
+# valid POSIX shell identifiers (e.g. ``X-Y=1`` or ``A.B=2``).  Used
+# inside the env-prefix state (pre-`--`) to close the codex-round-9 P1
+# bypass (``/usr/bin/env 'X-Y=1' bash -c '...'``).  Excludes leading
+# ``-`` so option-looking tokens aren't mistaken for assignments.
 _ENV_ASSIGNMENT_TOKEN_RE: re.Pattern = re.compile(r"^[^-\s=][^\s=]*=")
+
+# Even looser: POST-`env --` assignments.  GNU env treats tokens after
+# `--` as strictly positional, and any `NAME=value` is accepted
+# regardless of whether NAME starts with ``-`` — so
+# ``/usr/bin/env -- '-X=1' bash -c '...'`` is a valid env invocation.
+# This regex drops the leading-``-`` exclusion.  Used ONLY when the
+# `past_env_dashdash` flag is True; otherwise we stick with the
+# pre-`--` regex so we don't over-consume option-looking tokens.
+_ENV_POST_DASHDASH_ASSIGNMENT_TOKEN_RE: re.Pattern = re.compile(r"^[^\s=]+=")
 
 
 def _join_env_split_payload(payload: str, trailing: list[str]) -> str:
@@ -401,10 +409,14 @@ def _join_env_split_payload(payload: str, trailing: list[str]) -> str:
     return " ".join(parts)
 
 
-def _is_assignment_token(token: str, allow_env_style: bool = False) -> bool:
+def _is_assignment_token(
+    token: str,
+    allow_env_style: bool = False,
+    allow_post_dashdash_env: bool = False,
+) -> bool:
     """Return True iff *token* looks like a `NAME=value` assignment.
 
-    Two modes:
+    Three modes of increasing permissiveness:
 
     * POSIX (default): NAME matches shell identifier rules —
       `[A-Za-z_][A-Za-z0-9_]*`.  Used to strip pre-shell assignments
@@ -412,14 +424,24 @@ def _is_assignment_token(token: str, allow_env_style: bool = False) -> bool:
 
     * env-style (``allow_env_style=True``): NAME is any non-whitespace,
       non-``=``, non-``-`` sequence.  env(1) accepts arbitrary names
-      including shell-invalid ones (``X-Y=1``, ``A.B=2``); enabling
-      this mode inside the env-prefix state closes the bypass where
-      `env 'X-Y=1' bash -c '...'` would otherwise stop the scan on
-      `X-Y=1`.
+      including shell-invalid ones (``X-Y=1``, ``A.B=2``); enabled
+      inside the env-prefix state pre-`--`.
+
+    * post-dashdash env-style (``allow_post_dashdash_env=True``): NAME
+      is any non-whitespace, non-``=`` sequence INCLUDING ones that
+      start with ``-``.  After ``env --``, env stops parsing options
+      and accepts everything as positional — so ``-X=1`` is a valid
+      assignment in that position.  Closes codex-round-12 P1:
+      ``/usr/bin/env -- '-X=1' bash -c '...'``.
+
+    Each mode supersedes the previous; the most permissive mode that
+    is enabled determines acceptance.
     """
     if _ASSIGNMENT_TOKEN_RE.match(token):
         return True
     if allow_env_style and _ENV_ASSIGNMENT_TOKEN_RE.match(token):
+        return True
+    if allow_post_dashdash_env and _ENV_POST_DASHDASH_ASSIGNMENT_TOKEN_RE.match(token):
         return True
     return False
 
@@ -534,6 +556,12 @@ def _extract_shell_wrapper_inner(command: str) -> str | None:
     # env's `--` or until we hit a non-flag token).  Only it governs
     # the env-flag-specific branches below (-i, -u, -S, etc.).
     in_env_flags = False
+    # `past_env_dashdash` is a STICKY flag set after `env --` that
+    # allows the MOST permissive assignment regex — including ``NAME=v``
+    # where NAME starts with ``-`` — because env stops parsing options
+    # post-`--` and accepts arbitrary-name assignments.  Closes
+    # codex-round-12 P1: `/usr/bin/env -- '-X=1' bash -c '...'`.
+    past_env_dashdash = False
     # Loop guard: keep going as long as there's at least ONE token to
     # inspect.  The "at least `<shell> -c <script>` remaining" check
     # happens AFTER the loop — this loop is only the prefix-stripping
@@ -546,8 +574,13 @@ def _extract_shell_wrapper_inner(command: str) -> str | None:
         # syntax).  AFTER `env` (including post-`--`), we loosen the
         # identifier rule because env accepts arbitrary NAME=value
         # pairs (e.g. ``X-Y=1``) — closes the codex-round-9 and
-        # round-11 P1 bypasses.
-        if _is_assignment_token(tok, allow_env_style=seen_env):
+        # round-11 P1 bypasses.  Post-`env --` we loosen further to
+        # also accept dash-prefixed names (`-X=1`) — codex-round-12 P1.
+        if _is_assignment_token(
+            tok,
+            allow_env_style=seen_env,
+            allow_post_dashdash_env=past_env_dashdash,
+        ):
             shell_idx += 1
             continue
         # (2) `env` runner — basename match catches path-prefixed forms.
@@ -598,6 +631,7 @@ def _extract_shell_wrapper_inner(command: str) -> str | None:
             if tok == "--":
                 shell_idx += 1
                 in_env_flags = False
+                past_env_dashdash = True
                 continue
             # `-S <payload>` (GNU env split-string): the payload is
             # re-split by env and CONCATENATED with any trailing

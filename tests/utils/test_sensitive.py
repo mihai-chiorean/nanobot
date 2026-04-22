@@ -1446,3 +1446,75 @@ def test_mit164r12_env_dashdash_preserves_env_style_assignments(command: str) ->
 def test_mit164r12_env_dashdash_non_posix_benign_allowed(command: str) -> None:
     """MIT-164 round 12: benign `env -- 'X-Y=1' bash -c '...'` must not false-positive."""
     assert check_shell_command(command) is None, f"False positive: {command!r}"
+
+
+
+# ---------------------------------------------------------------------------
+# MIT-164 round 13 — codex review iteration 12
+#
+# Codex round 12 flagged (P1) that after `env --`, GNU env accepts
+# assignment names starting with ``-``:
+#
+#     /usr/bin/env -- '-X=1' bash -c 'printenv'
+#
+# is a valid invocation that executes the wrapped `bash -c printenv`.
+# The round-12 regex `_ENV_ASSIGNMENT_TOKEN_RE` still excluded leading
+# `-` (needed to avoid eating option tokens pre-`--`), so the strip
+# halted on `-X=1` and the shell never got classified.
+#
+# Fix: introduce a THIRD regex (`_ENV_POST_DASHDASH_ASSIGNMENT_TOKEN_RE`)
+# that drops the leading-`-` exclusion, and a `past_env_dashdash`
+# flag that's set at `env --` to select it.  Pre-`--` still uses the
+# middle regex to avoid false-unwrapping option tokens.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "/usr/bin/env -- '-X=1' bash -c 'printenv'",
+        "/usr/bin/env -- '-X=1' '-Y=2' bash -c 'printenv'",
+        "/usr/bin/env -i -- '-X=1' bash -c 'printenv'",
+        "/usr/bin/env -- '-X=1' FOO=2 bash -c 'printenv'",
+        "/usr/bin/env -u HOME -- '-X=1' 'A-B=2' bash -c 'printenv'",
+    ],
+)
+def test_mit164r13_env_dashdash_dash_prefixed_assignment_still_unwraps(
+    command: str,
+) -> None:
+    """MIT-164 round 13: post-`env --` assignments with dash-prefixed names must strip."""
+    result = check_shell_command(command)
+    assert result is not None, f"Expected block: {command!r}"
+    assert "blocked by security policy" in result
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "/usr/bin/env -- '-X=1' bash -c 'echo hi'",
+        "/usr/bin/env -i -- '-X=1' bash -c 'git status'",
+    ],
+)
+def test_mit164r13_env_dashdash_dash_prefixed_benign_allowed(command: str) -> None:
+    """MIT-164 round 13: benign post-`env --` dash-prefixed assignments must not false-positive."""
+    assert check_shell_command(command) is None, f"False positive: {command!r}"
+
+
+def test_mit164r13_pre_dashdash_dash_prefixed_not_treated_as_assignment() -> None:
+    """Pre-`env --`, dash-prefixed tokens like `-X=1` are NOT assignments — they'd be env options.
+
+    Invariant: the round-13 loosening (accept `-X=1` as an assignment)
+    applies ONLY post-`env --`.  Pre-`--`, `-X=1` would still be
+    treated as an unknown env flag (and skipped via the generic `-*`
+    skip-1 rule).  In that case env itself would error at runtime
+    (`env: invalid option -- 'X'`), so the command never actually
+    runs — over-blocking it in the prescreen is safe.
+    """
+    # This invocation errors on real env.  The prescreen's behaviour:
+    # `-X=1` is skipped as unknown env flag, then `bash -c printenv`
+    # is detected as wrapper → blocks.  That's a benign over-block;
+    # the assertion here is just that the command IS handled one
+    # way or the other without crashing (we don't mandate block vs
+    # allow because the command is invalid on real env).
+    result = check_shell_command("/usr/bin/env '-X=1' bash -c 'printenv'")
+    assert result is None or "blocked by security policy" in result
