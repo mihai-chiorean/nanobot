@@ -595,6 +595,16 @@ def _extract_shell_wrapper_inner(command: str) -> str | None:
                     tokens[shell_idx + 1],
                     tokens[shell_idx + 2 :],
                 )
+            # `-S<PAYLOAD>` attached-argument form (codex-round-10 P1).
+            # GNU env accepts `-Sbash -c printenv` as a single token
+            # that is equivalent to `-S bash -c printenv`.  Strip the
+            # `-S` prefix, treat the rest as the payload, and glue
+            # trailing argv.
+            if tok.startswith("-S") and len(tok) > 2 and not tok.startswith("-S-"):
+                return _join_env_split_payload(
+                    tok[2:],
+                    tokens[shell_idx + 1 :],
+                )
             # `--split-string=PAYLOAD` — self-contained, then trailing argv.
             if tok.startswith("--split-string="):
                 return _join_env_split_payload(

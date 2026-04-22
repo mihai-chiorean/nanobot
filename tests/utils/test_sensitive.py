@@ -1340,3 +1340,55 @@ def test_mit164r10_posix_strictness_outside_env_preserved() -> None:
     # the prescreen.  (At runtime the command would fail — POSIX
     # shells reject `X-Y=1` — but that's the shell's problem.)
     assert check_shell_command("X-Y=1 bash -c 'printenv'") is None
+
+
+
+# ---------------------------------------------------------------------------
+# MIT-164 round 11 — codex review iteration 10 (env -S attached-arg form)
+#
+# Codex round 10 flagged (P1) that GNU env accepts the short-option
+# attached-argument form for -S: `/usr/bin/env -Sbash -c printenv` is
+# equivalent to `/usr/bin/env -S bash -c printenv`.  The previous
+# extractor only recognised the exact `-S` token as the split-string
+# marker, so `-Sbash` fell through to the generic skip-1 and the
+# payload was lost.
+#
+# Fix: recognise `-S<PAYLOAD>` (where PAYLOAD is anything starting
+# with a non-`-` character) and extract PAYLOAD from the token,
+# combined with trailing argv via the same `_join_env_split_payload`
+# helper.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # -Sbash attached form (no space between -S and payload)
+        "/usr/bin/env -Sbash -c printenv",
+        "/usr/bin/env -Sbash -c 'cat /etc/shadow'",
+        "/usr/bin/env -Sbash -c 'base64 ~/.ssh/id_rsa'",
+        # Attached form with quoted payload containing spaces
+        "/usr/bin/env -S'bash -c printenv'",
+        '/usr/bin/env -S"bash -c printenv"',
+        # Combined with other env flags
+        "/usr/bin/env -i -Sbash -c printenv",
+        "/usr/bin/env -u HOME -Sbash -c printenv",
+    ],
+)
+def test_mit164r11_env_S_attached_form_blocks(command: str) -> None:
+    """MIT-164 round 11: `/usr/bin/env -SPAYLOAD ...` (attached form) must unwrap."""
+    result = check_shell_command(command)
+    assert result is not None, f"Expected block: {command!r}"
+    assert "blocked by security policy" in result
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "/usr/bin/env -Sbash -c 'echo hi'",
+        "/usr/bin/env -S'bash -c \"npm install\"'",
+    ],
+)
+def test_mit164r11_env_S_attached_form_benign_allowed(command: str) -> None:
+    """MIT-164 round 11: benign attached-form -S invocations must not false-positive."""
+    assert check_shell_command(command) is None, f"False positive: {command!r}"
