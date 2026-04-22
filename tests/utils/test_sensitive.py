@@ -1644,3 +1644,67 @@ def test_mit164r15_env_clustered_S_flag_blocks(command: str) -> None:
 def test_mit164r15_env_clustered_S_benign_allowed(command: str) -> None:
     """MIT-164 round 15: benign clustered -S invocations must not false-positive."""
     assert check_shell_command(command) is None, f"False positive: {command!r}"
+
+
+
+# ---------------------------------------------------------------------------
+# MIT-164 round 16 — codex review iteration 15
+#
+# Codex round 15 flagged (P1) two additional bypass classes:
+#
+#   P1a. bash's `NAME+=value` append-assignment form, e.g.
+#        `PATH+=:/tmp bash -c 'printenv'`.  The assignment regexes
+#        only matched plain `NAME=value`.  Fix: extend the regexes
+#        to accept an optional `+` before the `=`.
+#
+#   P1b. Shell passthrough builtins `command` and `exec`.  Both
+#        transparently invoke their argument as the command, so
+#        `command bash -c '...'` and `exec bash -c '...'` both run
+#        the wrapped shell.  Fix: add `_PASSTHROUGH_BUILTINS` set and
+#        a new branch (2b) in the prefix stripper that skips them.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # += assignment
+        "PATH+=:/tmp bash -c 'printenv'",
+        "FOO+=x bash -c 'printenv'",
+        "BAR+=hello bash -c 'cat /etc/shadow'",
+        "FOO=1 BAR+=2 bash -c 'printenv'",
+        # command / exec passthrough
+        "command bash -c 'printenv'",
+        "command sh -c 'cat /etc/shadow'",
+        "exec bash -c 'printenv'",
+        "exec sh -c 'base64 ~/.ssh/id_rsa'",
+        # Passthrough + env + shell
+        "command /usr/bin/env bash -c 'printenv'",
+        "exec /usr/bin/bash -c 'printenv'",
+        # Passthrough + env -S
+        "command /usr/bin/env -Sbash -c printenv",
+    ],
+)
+def test_mit164r16_append_assignment_and_passthrough_blocks(command: str) -> None:
+    """MIT-164 round 16: `NAME+=val` prefixes and `command`/`exec` passthroughs must strip."""
+    result = check_shell_command(command)
+    assert result is not None, f"Expected block: {command!r}"
+    assert "blocked by security policy" in result
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Benign +=
+        "PATH+=:/tmp bash -c 'echo hi'",
+        "FOO+=hello bash -c 'git status'",
+        # Benign passthrough
+        "command bash -c 'echo hi'",
+        "exec bash -c 'npm install'",
+        # Passthrough with non-shell target
+        "command python3 -c 'print(1)'",
+    ],
+)
+def test_mit164r16_append_assignment_and_passthrough_benign_allowed(command: str) -> None:
+    """MIT-164 round 16: benign +=/passthrough usage must not false-positive."""
+    assert check_shell_command(command) is None, f"False positive: {command!r}"

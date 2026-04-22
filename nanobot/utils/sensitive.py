@@ -337,6 +337,18 @@ _SHORT_OPTS_TAKING_VALUE: frozenset[str] = frozenset({
 # and handled by the generic skip-1 rule.
 # `-i` / `-0` / `-v` / `--help` / `--version` / `--null` do NOT take a
 # value and are handled by the generic skip-1 rule.
+# Shell passthrough builtins that transparently exec their argument
+# as the command.  `command <cmd>` and `exec <cmd>` both run the
+# wrapped command, so for prescreen purposes they're a no-op that
+# can be stripped from the prefix.  Codex-round-15 P1.  Only bare
+# names are matched (no path prefix) because `command` and `exec`
+# are shell builtins, not separate binaries — `/usr/bin/command`
+# doesn't exist on most systems; a workspace-local `./exec` would
+# be an unusual setup and accepting it as a passthrough is safe
+# (over-block only, not under-block).
+_PASSTHROUGH_BUILTINS: frozenset[str] = frozenset({"command", "exec"})
+
+
 _ENV_FLAGS_TAKING_VALUE: frozenset[str] = frozenset({
     "-u", "--unset",
     "-C", "--chdir",
@@ -367,12 +379,14 @@ _LONG_OPTS_TAKING_VALUE: frozenset[str] = frozenset({
 })
 
 
-# Regex for a POSIX shell-style assignment token: `NAME=value`, where
+# Regex for a POSIX/bash shell-style assignment token.  Accepts:
+#   * plain `NAME=value` (POSIX)
+#   * `NAME+=value`  (bash append — PATH+=:/tmp bash -c '...' is valid)
 # `NAME` follows POSIX identifier rules (letter or underscore, then
 # letters / digits / underscores).  `value` can be empty or anything
 # (shlex has already handled quoting).  Used to skip over assignment
-# prefixes before the shell binary: `FOO=1 BAR=2 bash -c '...'`.
-_ASSIGNMENT_TOKEN_RE: re.Pattern = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+# prefixes before the shell binary: `FOO=1 BAR+=:x bash -c '...'`.
+_ASSIGNMENT_TOKEN_RE: re.Pattern = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\+?=")
 
 # Broader regex for env(1)-style assignments: env accepts ANY `NAME=value`
 # where NAME has no `=` and no whitespace — including names that are NOT
@@ -380,7 +394,7 @@ _ASSIGNMENT_TOKEN_RE: re.Pattern = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 # inside the env-prefix state (pre-`--`) to close the codex-round-9 P1
 # bypass (``/usr/bin/env 'X-Y=1' bash -c '...'``).  Excludes leading
 # ``-`` so option-looking tokens aren't mistaken for assignments.
-_ENV_ASSIGNMENT_TOKEN_RE: re.Pattern = re.compile(r"^[^-\s=][^\s=]*=")
+_ENV_ASSIGNMENT_TOKEN_RE: re.Pattern = re.compile(r"^[^-\s=][^\s=]*\+?=")
 
 # Even looser: POST-`env --` assignments.  GNU env treats tokens after
 # `--` as strictly positional, and any `NAME=value` is accepted
@@ -389,7 +403,7 @@ _ENV_ASSIGNMENT_TOKEN_RE: re.Pattern = re.compile(r"^[^-\s=][^\s=]*=")
 # This regex drops the leading-``-`` exclusion.  Used ONLY when the
 # `past_env_dashdash` flag is True; otherwise we stick with the
 # pre-`--` regex so we don't over-consume option-looking tokens.
-_ENV_POST_DASHDASH_ASSIGNMENT_TOKEN_RE: re.Pattern = re.compile(r"^[^\s=]+=")
+_ENV_POST_DASHDASH_ASSIGNMENT_TOKEN_RE: re.Pattern = re.compile(r"^[^\s=]+\+?=")
 
 
 def _join_env_split_payload(payload: str, trailing: list[str]) -> str:
@@ -605,6 +619,22 @@ def _extract_shell_wrapper_inner(command: str) -> str | None:
             shell_idx += 1
             seen_env = True
             in_env_flags = True
+            continue
+        # (2b) Shell passthrough builtins `command` and `exec`
+        # (codex-round-15 P1).  Both simply invoke their argument as
+        # the command — `command bash -c '...'` and `exec bash -c '...'`
+        # both run the wrapped shell.  Skip the token and continue so
+        # the next iteration picks up the real shell.  Basename match
+        # (like env) catches unusual paths like `./command`.  Note:
+        # these are shell BUILTINS, so they only appear as the first
+        # token of a shell pipeline — if we see one elsewhere we're
+        # already in wrapper-extracted territory and the outer
+        # recursion handles it.
+        if tok in _PASSTHROUGH_BUILTINS:
+            shell_idx += 1
+            # These do NOT implicitly put us in env-flag state; they
+            # just pass through.  Any assignments AFTER them should
+            # use POSIX-strict parsing (no seen_env set).
             continue
         # (3) After we've seen `env`, skip env's own flags until we hit
         # an assignment or the shell.  This closes the codex-round-5 P1:
