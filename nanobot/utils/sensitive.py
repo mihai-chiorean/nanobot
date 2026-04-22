@@ -363,6 +363,33 @@ _LONG_OPTS_TAKING_VALUE: frozenset[str] = frozenset({
 _ASSIGNMENT_TOKEN_RE: re.Pattern = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 
+def _join_env_split_payload(payload: str, trailing: list[str]) -> str:
+    """Concatenate an `env -S PAYLOAD` split-string with its trailing argv.
+
+    GNU env's `-S PAYLOAD` (aka `--split-string=PAYLOAD`) re-splits
+    PAYLOAD as if it were a separate command line, then APPENDS the
+    remaining argv tokens as additional arguments.  So:
+
+        env -S 'bash -c' 'printenv'
+          → bash -c printenv          (payload: `bash -c`, trailing: `printenv`)
+
+        env -S bash -c printenv
+          → bash -c printenv          (payload: `bash`, trailing: `-c`, `printenv`)
+
+        env --split-string='bash -c printenv'
+          → bash -c printenv          (payload carries the whole command, no trailing)
+
+    The prescreen needs to see the full reconstructed command in order
+    to re-screen it via `check_shell_command` recursion.  We shlex-quote
+    each trailing token so the re-split by `check_shell_command` yields
+    identical tokenisation.
+    """
+    if not trailing:
+        return payload
+    parts = [payload] + [shlex.quote(t) for t in trailing]
+    return " ".join(parts)
+
+
 def _is_assignment_token(token: str) -> bool:
     """Return True iff *token* looks like a POSIX `NAME=value` assignment.
 
@@ -530,16 +557,24 @@ def _extract_shell_wrapper_inner(command: str) -> str | None:
                 shell_idx += 1
                 seen_env = False
                 continue
-            # `-S <payload>` (GNU env split-string): the payload IS a
-            # shell invocation.  Return it directly — `check_shell_command`
-            # will re-run the whole prescreen on the payload, so any
-            # denylisted inner surfaces through the outer regex OR
-            # through another unwrap pass.
+            # `-S <payload>` (GNU env split-string): the payload is
+            # re-split by env and CONCATENATED with any trailing
+            # argv tokens.  `/usr/bin/env -S 'bash -c' 'printenv'`
+            # actually executes `bash -c printenv`, so we must glue
+            # the payload and trailing argv together before recursing.
+            # Shlex-quote the trailing args so `check_shell_command`
+            # re-parses the joined string identically.
             if tok in ("-S", "--split-string") and shell_idx + 1 < len(tokens):
-                return tokens[shell_idx + 1]
-            # `--split-string=PAYLOAD` — self-contained, strip the prefix.
+                return _join_env_split_payload(
+                    tokens[shell_idx + 1],
+                    tokens[shell_idx + 2 :],
+                )
+            # `--split-string=PAYLOAD` — self-contained, then trailing argv.
             if tok.startswith("--split-string="):
-                return tok[len("--split-string="):]
+                return _join_env_split_payload(
+                    tok[len("--split-string="):],
+                    tokens[shell_idx + 1 :],
+                )
             if tok in _ENV_FLAGS_TAKING_VALUE and shell_idx + 1 < len(tokens):
                 shell_idx += 2
                 continue

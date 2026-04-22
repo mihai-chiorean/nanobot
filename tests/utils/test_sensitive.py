@@ -1176,3 +1176,70 @@ def test_mit164r8_space_separated_signal_flags_documented() -> None:
 def test_mit164r8_gnu_env_value_takers_benign_allowed(command: str) -> None:
     """MIT-164 round 8: -a / --argv0 / equals-signal with benign payloads must pass."""
     assert check_shell_command(command) is None, f"False positive: {command!r}"
+
+
+
+# ---------------------------------------------------------------------------
+# MIT-164 round 9 — codex review iteration 8 (env -S argv concatenation)
+#
+# Codex round 8 flagged (P1) that GNU env's `-S PAYLOAD` re-splits
+# PAYLOAD as if it were a command line AND APPENDS the trailing argv
+# tokens to that split, forming the final command.  So:
+#
+#     /usr/bin/env -S 'bash -c' 'printenv'   → actually runs `bash -c printenv`
+#     /usr/bin/env -S bash -c printenv        → actually runs `bash -c printenv`
+#
+# The round-7 fix returned just the PAYLOAD token, dropping the
+# trailing argv.  That missed the denylisted inner because `bash -c`
+# alone does not match any regex and its unwrap attempt saw no script.
+#
+# Round 9 fix: concatenate payload + shlex-quoted trailing argv before
+# recursing.  A new `_join_env_split_payload` helper does the join so
+# the downstream `shlex.split` in `_extract_shell_wrapper_inner`
+# tokenises identically to what env would have executed.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Codex-specific bypass shapes
+        "/usr/bin/env -S 'bash -c' 'printenv'",
+        "/usr/bin/env -S bash -c printenv",
+        "/usr/bin/env -S 'bash' -c 'printenv'",
+        "/usr/bin/env -S 'bash -c' 'cat /etc/shadow'",
+        # --split-string= equals form with trailing argv
+        "/usr/bin/env --split-string='bash -c' 'printenv'",
+        "/usr/bin/env --split-string='bash' -c 'printenv'",
+        "/usr/bin/env --split-string=bash -c 'printenv'",
+        # -S with other env flags + trailing argv
+        "/usr/bin/env -i -S 'bash -c' 'printenv'",
+        "/usr/bin/env -u HOME -S bash -c printenv",
+        # -S with even more trailing args (env appends all of them)
+        "/usr/bin/env -S 'bash' -c printenv",
+    ],
+)
+def test_mit164r9_env_S_concatenates_trailing_argv(command: str) -> None:
+    """MIT-164 round 9: env -S PAYLOAD must be recombined with trailing argv.
+
+    GNU env appends post-`-S` argv tokens to the payload before
+    executing.  The prescreen must reconstruct the full command
+    or it misses denylisted innermost calls.
+    """
+    result = check_shell_command(command)
+    assert result is not None, f"Expected block: {command!r}"
+    assert "blocked by security policy" in result
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "/usr/bin/env -S 'bash -c' 'echo hi'",
+        "/usr/bin/env -S bash -c 'echo hello'",
+        "/usr/bin/env --split-string='bash -c' 'echo hi'",
+        "/usr/bin/env -S 'bash' -c 'ls /tmp'",
+    ],
+)
+def test_mit164r9_env_S_benign_trailing_argv_allowed(command: str) -> None:
+    """MIT-164 round 9: env -S + trailing argv with benign inner must pass."""
+    assert check_shell_command(command) is None, f"False positive: {command!r}"
