@@ -1060,8 +1060,9 @@ class OpenAICompatProvider(LLMProvider):
                     delta = chunk.choices[0].delta
                     has_content = bool(getattr(delta, "content", None))
                     has_reasoning = bool(getattr(delta, "reasoning_content", None))
+                    has_reasoning_alt = bool(getattr(delta, "reasoning", None))
                     has_tool = bool(getattr(delta, "tool_calls", None))
-                    if has_content or has_reasoning or has_tool:
+                    if has_content or has_reasoning or has_reasoning_alt or has_tool:
                         ttft_ms = (time.perf_counter() - _ttft_start) * 1000
                 if on_content_delta and chunk.choices:
                     text = getattr(chunk.choices[0].delta, "content", None)

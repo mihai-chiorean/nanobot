@@ -17,11 +17,12 @@ import pytest
 from nanobot.providers.openai_compat_provider import OpenAICompatProvider
 
 
-def _make_chunk(*, content=None, reasoning_content=None, tool_calls=None, finish_reason=None):
+def _make_chunk(*, content=None, reasoning_content=None, reasoning=None, tool_calls=None, finish_reason=None):
     """Build a minimal streaming chunk SimpleNamespace matching the OpenAI SDK shape."""
     delta = SimpleNamespace(
         content=content,
         reasoning_content=reasoning_content,
+        reasoning=reasoning,
         tool_calls=tool_calls,
     )
     choice = SimpleNamespace(delta=delta, finish_reason=finish_reason)
@@ -121,6 +122,35 @@ async def test_chat_stream_ttft_set_on_first_delta_regardless_of_content_vs_tool
     )
     second_chunk = _make_chunk(tool_calls=[tool_arg_delta], finish_reason="tool_calls")
     chunks = [first_chunk, second_chunk, _make_usage_chunk()]
+
+    mock_stream = MagicMock()
+    mock_stream.__aiter__ = MagicMock(return_value=_async_iter(chunks))
+
+    async def fake_create(**kwargs):
+        return mock_stream
+
+    provider._client.chat.completions.create = fake_create
+    provider._should_use_responses_api = MagicMock(return_value=False)
+
+    result = await provider.chat_stream(
+        messages=[{"role": "user", "content": "hi"}],
+    )
+
+    assert result.ttft_ms is not None
+    assert isinstance(result.ttft_ms, float)
+    assert result.ttft_ms > 0
+
+
+async def test_chat_stream_ttft_set_on_stepfun_reasoning_field():
+    """ttft_ms is captured when first delta carries delta.reasoning (StepFun-style)."""
+    provider = _make_provider()
+
+    # StepFun Plan API: first tokens arrive in delta.reasoning, not delta.content
+    chunks = [
+        _make_chunk(reasoning="Thinking step 1..."),
+        _make_chunk(reasoning="step 2.", finish_reason="stop"),
+        _make_usage_chunk(),
+    ]
 
     mock_stream = MagicMock()
     mock_stream.__aiter__ = MagicMock(return_value=_async_iter(chunks))
