@@ -432,6 +432,44 @@ class DiscordChannel(BaseChannel):
             logger.warning("Discord stream edit failed: {}", e)
             raise
 
+    async def send_status(self, chat_id: str, text: str, metadata: dict | None = None) -> None:
+        """Edit (or create) the per-turn status message in place.
+
+        Reuses the same _StreamBuf as the content stream so the status
+        message and the final response share one Discord message.  buf.text
+        tracks real content only; status text is shown temporarily and is
+        replaced as soon as the first content delta arrives via send_delta.
+        Never overwrites a buf that already has real content.
+        """
+        client = self._client
+        if client is None or not client.is_ready():
+            return
+        buf = self._stream_bufs.get(chat_id)
+        # Don't clobber an in-progress content stream.
+        if buf is not None and buf.text:
+            return
+        target = await self._resolve_channel(chat_id)
+        if target is None:
+            return
+        if buf is None:
+            buf = _StreamBuf()
+            self._stream_bufs[chat_id] = buf
+        if buf.message is None:
+            try:
+                buf.message = await target.send(content=text)
+                buf.last_edit = time.monotonic()
+            except Exception as e:
+                logger.warning("Discord status initial send failed: {}", e)
+            return
+        now = time.monotonic()
+        if (now - buf.last_edit) < self._STREAM_EDIT_INTERVAL:
+            return
+        try:
+            await buf.message.edit(content=text)
+            buf.last_edit = now
+        except Exception as e:
+            logger.warning("Discord status edit failed: {}", e)
+
     async def _handle_discord_message(self, message: discord.Message) -> None:
         """Handle incoming Discord messages from discord.py.
 
