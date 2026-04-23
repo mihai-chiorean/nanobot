@@ -5,6 +5,7 @@ import json
 import re
 import shutil
 import time
+import random as _random
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -544,3 +545,65 @@ def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]
         gs.init()
     except Exception:
         logger.warning("Failed to initialize git store for {}", workspace)
+
+
+# ---------------------------------------------------------------------------
+# Discord heartbeat helpers
+# ---------------------------------------------------------------------------
+
+THINKING_EMOJIS: list[str] = ["🤔", "🧠", "💭", "🔍", "🤯", "📝", "💡", "🧩"]
+TOOL_EMOJIS: list[str] = ["🔧", "⚙️", "🛠️", "🔨", "🧰", "⚡"]
+
+_STATUS_MAX = 180
+_TOOL_CMD_MAX = 40
+_THINKING_SNIPPET_MAX = 120
+
+
+def pick_thinking_emoji(*, _rng: "_random.Random | None" = None) -> str:
+    """Return a random thinking-phase emoji."""
+    r = _rng or _random
+    return r.choice(THINKING_EMOJIS)
+
+
+def pick_tool_emoji(*, _rng: "_random.Random | None" = None) -> str:
+    """Return a random tool-phase emoji."""
+    r = _rng or _random
+    return r.choice(TOOL_EMOJIS)
+
+
+def summarize_tool_call(name: str, args: dict[str, Any]) -> str:
+    """Build a one-line tool status string, capped at _STATUS_MAX chars."""
+    if "path" in args:
+        detail = str(args["path"])
+    elif "command" in args:
+        cmd = str(args["command"])
+        detail = cmd if len(cmd) <= _TOOL_CMD_MAX else cmd[:_TOOL_CMD_MAX] + "..."
+    elif args:
+        # Grab the first arg value as a brief hint
+        first_val = str(next(iter(args.values())))
+        detail = first_val[:_TOOL_CMD_MAX] + "..." if len(first_val) > _TOOL_CMD_MAX else first_val
+    else:
+        detail = "searching"
+    line = f"{name}: {detail}"
+    return line[:_STATUS_MAX]
+
+
+def extract_latest_sentence(buf: str) -> str | None:
+    """Return the last complete sentence from *buf*, or None if none found.
+
+    A sentence boundary is any .!? followed by whitespace or end-of-string.
+    Strips <think>/<thought> wrappers before scanning so raw reasoning
+    streamed as embedded tags doesn't leak the tag text.
+    """
+    # Strip think wrappers so we work on clean text
+    clean = re.sub(r"<think>|</think>|<thought>|</thought>", "", buf)
+    clean = clean.strip()
+    if not clean:
+        return None
+    parts = re.split(r"[.!?](?=\s|$)", clean)
+    # parts[-1] is the fragment after the last boundary (may be incomplete)
+    completed = [p.strip() for p in parts[:-1] if p.strip()]
+    if not completed:
+        return None
+    sentence = completed[-1]
+    return sentence[:_THINKING_SNIPPET_MAX] + "..." if len(sentence) > _THINKING_SNIPPET_MAX else sentence
