@@ -89,6 +89,7 @@ class _LoopHook(AgentHook):
         on_progress: Callable[..., Awaitable[None]] | None = None,
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
+        on_status: Callable[[str], Awaitable[None]] | None = None,
         *,
         channel: str = "cli",
         chat_id: str = "direct",
@@ -99,6 +100,7 @@ class _LoopHook(AgentHook):
         self._on_progress = on_progress
         self._on_stream = on_stream
         self._on_stream_end = on_stream_end
+        self._on_status = on_status
         self._channel = channel
         self._chat_id = chat_id
         self._message_id = message_id
@@ -124,6 +126,11 @@ class _LoopHook(AgentHook):
 
     async def before_iteration(self, context: AgentHookContext) -> None:
         self._loop._current_iteration = context.iteration
+        if self._on_status is not None:
+            from nanobot.utils.helpers import pick_thinking_emoji
+            emoji = pick_thinking_emoji()
+            label = "Getting started..." if context.iteration == 0 else "Thinking..."
+            await self._on_status(f"{emoji} {label}")
 
     async def before_execute_tools(self, context: AgentHookContext) -> None:
         if self._on_progress:
@@ -135,6 +142,14 @@ class _LoopHook(AgentHook):
                     await self._on_progress(thought)
             tool_hint = self._loop._strip_think(self._loop._tool_hint(context.tool_calls))
             await self._on_progress(tool_hint, tool_hint=True)
+        if self._on_status is not None and context.tool_calls:
+            from nanobot.utils.helpers import pick_tool_emoji, summarize_tool_call
+            emoji = pick_tool_emoji()
+            tc0 = context.tool_calls[0]
+            summary = summarize_tool_call(tc0.name, tc0.arguments or {})
+            if len(context.tool_calls) > 1:
+                summary += f" (+{len(context.tool_calls) - 1} more)"
+            await self._on_status(f"{emoji} {summary}")
         for tc in context.tool_calls:
             args_str = json.dumps(tc.arguments, ensure_ascii=False)
             logger.info("Tool call: {}({})", tc.name, args_str[:200])
@@ -171,6 +186,24 @@ class _LoopHook(AgentHook):
             )
         except Exception:
             pass
+        # Update status with the last reasoning sentence when available — but
+        # only for tool-calling iterations (tool_calls is non-empty), i.e. the
+        # loop is continuing.  For final-content iterations the content stream
+        # is already flowing into the Discord buf; clobbering it here would
+        # replace partial response text with the reasoning snippet.
+        # Reasoning arrives as a complete string post-LLM (not incrementally)
+        # for both MiniMax via custom_provider and openai_compat_provider.
+        if self._on_status is not None and response is not None and context.tool_calls:
+            rc = getattr(response, "reasoning_content", None)
+            if rc:
+                from nanobot.utils.helpers import extract_latest_sentence, pick_thinking_emoji
+                sentence = extract_latest_sentence(rc)
+                if sentence:
+                    emoji = pick_thinking_emoji()
+                    try:
+                        await self._on_status(f"{emoji} {sentence}")
+                    except Exception:
+                        pass
 
     def finalize_content(self, context: AgentHookContext, content: str | None) -> str | None:
         return self._loop._strip_think(content)
@@ -449,6 +482,7 @@ class AgentLoop:
         on_progress: Callable[..., Awaitable[None]] | None = None,
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
+        on_status: Callable[[str], Awaitable[None]] | None = None,
         on_retry_wait: Callable[[str], Awaitable[None]] | None = None,
         *,
         session: Session | None = None,
@@ -471,6 +505,7 @@ class AgentLoop:
             on_progress=on_progress,
             on_stream=on_stream,
             on_stream_end=on_stream_end,
+            on_status=on_status,
             channel=channel,
             chat_id=chat_id,
             message_id=message_id,
@@ -645,7 +680,7 @@ class AgentLoop:
         try:
             async with lock, gate:
                 try:
-                    on_stream = on_stream_end = None
+                    on_stream = on_stream_end = on_status = None
                     if msg.metadata.get("_wants_stream"):
                         # Split one answer into distinct stream segments.
                         stream_base_id = f"{msg.session_key}:{time.time_ns()}"
@@ -677,8 +712,20 @@ class AgentLoop:
                             ))
                             stream_segment += 1
 
+                        async def on_status(text: str) -> None:
+                            # _status_delta is keyed by chat_id only (no _stream_id)
+                            # so the status message survives tool-call segment boundaries.
+                            meta = dict(msg.metadata or {})
+                            meta["_status_delta"] = True
+                            await self.bus.publish_outbound(OutboundMessage(
+                                channel=msg.channel, chat_id=msg.chat_id,
+                                content=text,
+                                metadata=meta,
+                            ))
+
                     response = await self._process_message(
                         msg, on_stream=on_stream, on_stream_end=on_stream_end,
+                        on_status=on_status,
                         pending_queue=pending,
                     )
                     if response is not None:
@@ -770,6 +817,7 @@ class AgentLoop:
         on_progress: Callable[[str], Awaitable[None]] | None = None,
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
+        on_status: Callable[[str], Awaitable[None]] | None = None,
         pending_queue: asyncio.Queue | None = None,
     ) -> OutboundMessage | None:
         """Process a single inbound message and return the response."""
@@ -916,6 +964,7 @@ class AgentLoop:
             on_progress=on_progress or _bus_progress,
             on_stream=on_stream,
             on_stream_end=on_stream_end,
+            on_status=on_status,
             on_retry_wait=_on_retry_wait,
             session=session,
             channel=msg.channel,
@@ -951,6 +1000,11 @@ class AgentLoop:
         meta = dict(msg.metadata or {})
         if on_stream is not None and stop_reason != "error":
             meta["_streamed"] = True
+            # max_iterations already fires on_stream_end; emit it for the
+            # normal "completed" path so Discord's _finalize_stream runs and
+            # typing stops.
+            if on_stream_end is not None and stop_reason != "max_iterations":
+                await on_stream_end(resuming=False)
         return OutboundMessage(
             channel=msg.channel,
             chat_id=msg.chat_id,
