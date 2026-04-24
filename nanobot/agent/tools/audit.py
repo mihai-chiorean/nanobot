@@ -5,6 +5,23 @@ Each line records the timestamp, tool name, sanitised arguments, result
 status, session_id, and originating channel so that operators can review
 what the agent did and when.
 
+Error-classification fields (MIT-203)
+-------------------------------------
+When ``result_status == "error"``, the entry optionally carries:
+
+- ``error``: human-readable failure message (already emitted today).
+- ``error_type``: one of ``prescreen``, ``timeout``, ``nonzero_exit``,
+  ``exception``, ``misclassified``. Lets dashboards separate user-painful
+  failures from safety-guard rejects and schema drops. Absent on
+  backward-compatible lines so the Prometheus bridge keeps parsing them.
+- ``exit_code``: integer exit code for subprocess-backed tools; ``None``
+  when the tool never reached a subprocess (e.g. prescreen rejects).
+- ``stderr_tail``: last ~256 chars of stderr, truncated, for post-hoc
+  triage. Secrets are scrubbed by the caller before we see them.
+
+All three are optional — old entries (no ``error_type`` key) remain
+JSON-valid and every downstream consumer must treat them as missing.
+
 Usage
 -----
     from nanobot.agent.tools.audit import AuditLogger
@@ -27,7 +44,18 @@ import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
+
+# Enum of classified error types, persisted in audit.jsonl when a tool call
+# fails. Kept as a Literal alias so type-checkers enforce the set without
+# pulling an enum class (and its runtime import cost) into the hot path.
+ErrorType = Literal[
+    "prescreen",      # blocked by safety guard / deny-list / SSRF / sensitive data
+    "timeout",        # command exceeded effective_timeout
+    "nonzero_exit",   # subprocess exited with non-zero status (user command failed)
+    "exception",      # unhandled Python exception raised by the tool
+    "misclassified",  # legacy "Error:"-prefixed string we could not bucket
+]
 
 # ---------------------------------------------------------------------------
 # Argument-level secret redaction
@@ -123,6 +151,9 @@ class AuditLogger:
         channel: str = "",
         error: str | None = None,
         duration_ms: float | None = None,
+        error_type: ErrorType | None = None,
+        exit_code: int | None = None,
+        stderr_tail: str | None = None,
     ) -> None:
         """Append one audit entry to the log file (synchronous).
 
@@ -145,6 +176,16 @@ class AuditLogger:
         duration_ms:
             Optional wall-clock duration of the tool execution in
             milliseconds.
+        error_type:
+            Optional classification bucket (see :data:`ErrorType`).
+            Absent on ``"ok"`` rows and on legacy callers that don't supply
+            it — backward compatible with existing audit readers.
+        exit_code:
+            Optional subprocess exit code, when the failure came from a
+            command that actually ran.
+        stderr_tail:
+            Optional last-N-chars slice of stderr, truncated to 256 chars
+            by the caller, for operator triage.
         """
         entry = self._build_entry(
             tool_name=tool_name,
@@ -154,6 +195,9 @@ class AuditLogger:
             channel=channel,
             error=error,
             duration_ms=duration_ms,
+            error_type=error_type,
+            exit_code=exit_code,
+            stderr_tail=stderr_tail,
         )
         self._append(entry)
 
@@ -271,8 +315,17 @@ class AuditLogger:
         channel: str,
         error: str | None,
         duration_ms: float | None,
+        error_type: ErrorType | None = None,
+        exit_code: int | None = None,
+        stderr_tail: str | None = None,
     ) -> dict[str, Any]:
-        """Construct the dict that will be serialised to one JSONL line."""
+        """Construct the dict that will be serialised to one JSONL line.
+
+        MIT-203: the ``error_type`` / ``exit_code`` / ``stderr_tail``
+        fields are only written when supplied, so older audit consumers
+        (Prometheus bridge, Evidence.dev dashboards) keep parsing lines
+        that don't carry them.
+        """
         entry: dict[str, Any] = {
             "timestamp": datetime.now(tz=timezone.utc).isoformat(),
             "tool_name": tool_name,
@@ -286,6 +339,12 @@ class AuditLogger:
             entry["error"] = error
         if duration_ms is not None:
             entry["duration_ms"] = round(duration_ms, 2)
+        if error_type is not None:
+            entry["error_type"] = error_type
+        if exit_code is not None:
+            entry["exit_code"] = exit_code
+        if stderr_tail is not None:
+            entry["stderr_tail"] = stderr_tail
         return entry
 
     def _append(self, entry: dict[str, Any]) -> None:
