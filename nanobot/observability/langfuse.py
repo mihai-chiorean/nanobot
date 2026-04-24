@@ -30,14 +30,25 @@ parentage.
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, Any, Iterator
 
 from loguru import logger
 
+from nanobot.utils.sensitive import redact_if_sensitive
+
 if TYPE_CHECKING:
     from langfuse import Langfuse as _LangfuseClient  # pragma: no cover
+
+
+# MIT-211: maximum characters pushed to Langfuse `input` fields.  The
+# previous 4096 budget is too loose for a tracing sink — tool arguments
+# and user prompts rarely need more than a few hundred chars of context,
+# and tighter bounds reduce the blast radius if a secret slips past the
+# redactor.
+_INPUT_CHAR_LIMIT = 512
 
 
 def _detect_enabled() -> bool:
@@ -129,6 +140,13 @@ def observe_turn(
     if chat_id:
         metadata["chat_id"] = str(chat_id)[:200]
 
+    # MIT-210: narrow the SDK-exception swallow scope to ONLY the SDK
+    # calls themselves (start_as_current_observation, propagate_attributes).
+    # The `yield` sits OUTSIDE the try/except so application exceptions
+    # raised inside the wrapped `with observe_turn(...)` block propagate
+    # normally instead of being caught and logged as "Langfuse context
+    # errored".  Prior to this fix, every app-side failure under tracing
+    # was silently hidden from callers.
     try:
         # Open the root turn span first.  propagate_attributes runs
         # inside so session/user/tags propagate to all child spans —
@@ -137,30 +155,31 @@ def observe_turn(
         span_cm = client.start_as_current_observation(
             name=name,
             as_type="agent",
-            input=_truncate(input_preview, 4096),
+            # MIT-211: redact + 512-char cap.  User messages routinely
+            # include secrets the operator pasted for the agent to
+            # handle (API keys, tokens, credentials); they must not
+            # land in the Langfuse UI in the clear.
+            input=_prepare_input(input_preview),
         )
     except Exception as exc:
         logger.debug("Langfuse start_as_current_observation failed: {}", exc)
         yield None
         return
 
-    try:
-        with span_cm as span:
-            try:
-                attr_cm = propagate_attributes(
-                    session_id=_sanitize_attr(session_id),
-                    user_id=_sanitize_attr(user_id),
-                    tags=tags,
-                    metadata=metadata or None,
-                )
-            except Exception as exc:
-                logger.debug("Langfuse propagate_attributes failed: {}", exc)
-                attr_cm = nullcontext()
+    with span_cm as span:
+        try:
+            attr_cm = propagate_attributes(
+                session_id=_sanitize_attr(session_id),
+                user_id=_sanitize_attr(user_id),
+                tags=tags,
+                metadata=metadata or None,
+            )
+        except Exception as exc:
+            logger.debug("Langfuse propagate_attributes failed: {}", exc)
+            attr_cm = nullcontext()
 
-            with attr_cm:
-                yield span
-    except Exception as exc:  # pragma: no cover — defensive
-        logger.debug("Langfuse turn span context errored: {}", exc)
+        with attr_cm:
+            yield span
 
 
 @contextmanager
@@ -199,11 +218,10 @@ def observe_llm_iteration(
         yield None
         return
 
-    try:
-        with cm as span:
-            yield span
-    except Exception as exc:  # pragma: no cover
-        logger.debug("Langfuse llm-iteration context errored: {}", exc)
+    # MIT-210: `yield` sits outside any exception-swallowing try so
+    # application errors raised under this span propagate normally.
+    with cm as span:
+        yield span
 
 
 @contextmanager
@@ -227,18 +245,22 @@ def observe_tool(
         cm = client.start_as_current_observation(
             name=f"tool:{tool_name}",
             as_type="tool",
-            input=_truncate(arguments, 4096),
+            # MIT-211: redact + 512-char cap on the tool argument payload.
+            # `exec` commands carry env vars with API keys, `web_fetch`
+            # carries Authorization headers, `write_file` carries raw
+            # file bodies — all bypass the audit-sink redactor unless
+            # we apply it here.
+            input=_prepare_input(arguments),
         )
     except Exception as exc:
         logger.debug("Langfuse tool span failed for {}: {}", tool_name, exc)
         yield None
         return
 
-    try:
-        with cm as span:
-            yield span
-    except Exception as exc:  # pragma: no cover
-        logger.debug("Langfuse tool span context errored: {}", exc)
+    # MIT-210: `yield` sits outside any exception-swallowing try so
+    # application errors raised under this span propagate normally.
+    with cm as span:
+        yield span
 
 
 def capture_trace_context() -> dict[str, str] | None:
@@ -316,11 +338,10 @@ def observe_subagent(
         yield None
         return
 
-    try:
-        with cm as span:
-            yield span
-    except Exception as exc:  # pragma: no cover
-        logger.debug("Langfuse subagent context errored: {}", exc)
+    # MIT-210: `yield` sits outside any exception-swallowing try so
+    # application errors raised under this span propagate normally.
+    with cm as span:
+        yield span
 
 
 def _sanitize_attr(value: str | None) -> str | None:
@@ -346,3 +367,47 @@ def _truncate(value: Any, limit: int) -> Any:
     if isinstance(value, str) and len(value) > limit:
         return value[:limit] + "…[truncated]"
     return value
+
+
+def _prepare_input(value: Any) -> Any:
+    """Redact + truncate a payload before pushing it to Langfuse.
+
+    MIT-211: the Langfuse ingest path bypassed the ``audit.jsonl``
+    redaction layer, so tool arguments and user messages carrying
+    secrets (AWS keys, GitHub PATs, ``Bearer`` headers, PEM blobs, …)
+    reached the observability UI verbatim.
+
+    Behaviour:
+
+    * ``None`` → returned as-is (no-op for observe_* calls that skip
+      the input kwarg).
+    * ``str`` → redacted via :func:`redact_if_sensitive` (from
+      ``nanobot/utils/sensitive.py`` — the same layer used by the
+      audit sink, so the 61-case ``secret_redaction_v0`` battery
+      covers this path transitively).  Then truncated to
+      :data:`_INPUT_CHAR_LIMIT` chars.
+    * ``dict`` / other JSON-serialisable → JSON-serialised, redacted,
+      then truncated.  The round-trip is lossy (we emit the possibly-
+      redacted string, not the original structure), which is
+      intentional: Langfuse displays a string in the UI either way,
+      and keeping the structured form would require walking nested
+      dicts to redact every leaf — deliberate non-goal per MIT-211
+      ("Don't try to be clever about nested dicts — convert to JSON,
+      redact the JSON string, truncate.").
+    * Non-JSON-serialisable objects → coerced via ``str()``.
+
+    Redaction ALWAYS runs before truncation so regex patterns aren't
+    split across the boundary (a 512-char truncation landing inside an
+    ``AKIA…`` token would otherwise let the prefix leak verbatim).
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value
+    else:
+        try:
+            text = json.dumps(value, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            text = str(value)
+    redacted = redact_if_sensitive(text)
+    return _truncate(redacted, _INPUT_CHAR_LIMIT)
