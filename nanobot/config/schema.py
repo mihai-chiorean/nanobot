@@ -192,6 +192,12 @@ class ExecToolConfig(Base):
     path_append: str = ""
     sandbox: str = ""  # sandbox backend: "" (none) or "bwrap"
     allowed_env_keys: list[str] = Field(default_factory=list)  # Env var names to pass through to subprocess (e.g. ["GOPATH", "JAVA_HOME"])
+    # MIT-203: when True, 127.0.0.0/8 and ::1 stop being treated as
+    # internal for SSRF purposes. Cloud-metadata (169.254.169.254),
+    # RFC1918, and CGNAT addresses stay blocked. Off by default — only
+    # wrappers that deliberately want to hit local dev servers (mkdocs,
+    # Langfuse at edge-builder-1:3000, etc.) should flip this.
+    allow_loopback: bool = False
 
 class MCPServerConfig(Base):
     """MCP server connection configuration (stdio or HTTP)."""

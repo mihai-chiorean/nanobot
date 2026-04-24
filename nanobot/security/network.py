@@ -20,9 +20,22 @@ _BLOCKED_NETWORKS = [
     ipaddress.ip_network("fe80::/10"),         # link-local v6
 ]
 
+# IPv4/IPv6 loopback only. When ``allow_loopback=True`` is passed through
+# (or ``configure_loopback_exception(True)`` has been called), these
+# ranges are treated as public. Cloud-metadata (169.254.0.0/16) stays
+# blocked either way — the SSRF guard is scope-reduced, not disabled.
+_LOOPBACK_NETWORKS = [
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("::1/128"),
+]
+
 _URL_RE = re.compile(r"https?://[^\s\"'`;|<>]+", re.IGNORECASE)
 
 _allowed_networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+# Module-level default for ``allow_loopback``. Ziggy's config flips this to
+# True at boot via :func:`configure_loopback_exception`; nanobot proper
+# leaves it False. Per-call ``allow_loopback=`` arguments take precedence.
+_loopback_allowed_default: bool = False
 
 
 def configure_ssrf_whitelist(cidrs: list[str]) -> None:
@@ -37,17 +50,48 @@ def configure_ssrf_whitelist(cidrs: list[str]) -> None:
     _allowed_networks = nets
 
 
-def _is_private(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+def configure_loopback_exception(allow: bool) -> None:
+    """Set the module-level default for the ``allow_loopback`` flag.
+
+    Called by the config loader at boot. When ``True``, ``127.0.0.0/8``
+    and ``::1/128`` stop being treated as internal for SSRF purposes —
+    but every other private range, and crucially the cloud metadata
+    service at ``169.254.169.254``, remains blocked.
+    """
+    global _loopback_allowed_default
+    _loopback_allowed_default = bool(allow)
+
+
+def _is_private(
+    addr: ipaddress.IPv4Address | ipaddress.IPv6Address,
+    *,
+    allow_loopback: bool = False,
+) -> bool:
     if _allowed_networks and any(addr in net for net in _allowed_networks):
+        return False
+    if allow_loopback and any(addr in net for net in _LOOPBACK_NETWORKS):
         return False
     return any(addr in net for net in _BLOCKED_NETWORKS)
 
 
-def validate_url_target(url: str) -> tuple[bool, str]:
+def validate_url_target(url: str, *, allow_loopback: bool | None = None) -> tuple[bool, str]:
     """Validate a URL is safe to fetch: scheme, hostname, and resolved IPs.
 
-    Returns (ok, error_message).  When ok is True, error_message is empty.
+    Returns ``(ok, error_message)``. When ``ok`` is ``True``,
+    ``error_message`` is empty.
+
+    ``allow_loopback``:
+        If ``True``, treat ``127.0.0.0/8`` / ``::1`` as public. If
+        ``False``, keep them blocked. If ``None`` (the default), fall back
+        to the module-level default set via
+        :func:`configure_loopback_exception` (Ziggy flips this to ``True``
+        at boot; upstream nanobot keeps it ``False``). Per-call ``True`` /
+        ``False`` always wins over the module default.
+
+        Cloud-metadata (169.254.0.0/16), RFC1918, CGNAT, and IPv6 ULAs
+        stay blocked regardless — this flag only relaxes loopback.
     """
+    effective_loopback = _loopback_allowed_default if allow_loopback is None else allow_loopback
     try:
         p = urlparse(url)
     except Exception as e:
@@ -72,14 +116,15 @@ def validate_url_target(url: str) -> tuple[bool, str]:
             addr = ipaddress.ip_address(info[4][0])
         except ValueError:
             continue
-        if _is_private(addr):
+        if _is_private(addr, allow_loopback=effective_loopback):
             return False, f"Blocked: {hostname} resolves to private/internal address {addr}"
 
     return True, ""
 
 
-def validate_resolved_url(url: str) -> tuple[bool, str]:
+def validate_resolved_url(url: str, *, allow_loopback: bool | None = None) -> tuple[bool, str]:
     """Validate an already-fetched URL (e.g. after redirect). Only checks the IP, skips DNS."""
+    effective_loopback = _loopback_allowed_default if allow_loopback is None else allow_loopback
     try:
         p = urlparse(url)
     except Exception:
@@ -91,7 +136,7 @@ def validate_resolved_url(url: str) -> tuple[bool, str]:
 
     try:
         addr = ipaddress.ip_address(hostname)
-        if _is_private(addr):
+        if _is_private(addr, allow_loopback=effective_loopback):
             return False, f"Redirect target is a private address: {addr}"
     except ValueError:
         # hostname is a domain name, resolve it
@@ -104,17 +149,22 @@ def validate_resolved_url(url: str) -> tuple[bool, str]:
                 addr = ipaddress.ip_address(info[4][0])
             except ValueError:
                 continue
-            if _is_private(addr):
+            if _is_private(addr, allow_loopback=effective_loopback):
                 return False, f"Redirect target {hostname} resolves to private address {addr}"
 
     return True, ""
 
 
-def contains_internal_url(command: str) -> bool:
-    """Return True if the command string contains a URL targeting an internal/private address."""
+def contains_internal_url(command: str, *, allow_loopback: bool | None = None) -> bool:
+    """Return True if the command string contains a URL targeting an internal/private address.
+
+    ``allow_loopback`` is forwarded to :func:`validate_url_target`; see that
+    docstring for the scope-reduction contract. Cloud-metadata, RFC1918,
+    and CGNAT addresses stay blocked regardless.
+    """
     for m in _URL_RE.finditer(command):
         url = m.group(0)
-        ok, _ = validate_url_target(url)
+        ok, _ = validate_url_target(url, allow_loopback=allow_loopback)
         if not ok:
             return True
     return False

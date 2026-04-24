@@ -51,6 +51,7 @@ def load_config(config_path: Path | None = None) -> Config:
             logger.warning("Using default configuration.")
 
     _apply_ssrf_whitelist(config)
+    _apply_loopback_exception(config)
     return config
 
 
@@ -59,6 +60,18 @@ def _apply_ssrf_whitelist(config: Config) -> None:
     from nanobot.security.network import configure_ssrf_whitelist
 
     configure_ssrf_whitelist(config.tools.ssrf_whitelist)
+
+
+def _apply_loopback_exception(config: Config) -> None:
+    """Apply the MIT-203 ``allow_loopback`` flag to the network module.
+
+    Sets the module-level default consulted by ``contains_internal_url``
+    when the per-call argument is ``None``. Tools can still pin an
+    explicit True/False at construction time; this is only the fallback.
+    """
+    from nanobot.security.network import configure_loopback_exception
+
+    configure_loopback_exception(config.tools.exec.allow_loopback)
 
 
 def save_config(config: Config, config_path: Path | None = None) -> None:

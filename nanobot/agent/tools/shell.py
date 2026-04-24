@@ -49,10 +49,15 @@ class ExecTool(Tool):
         sandbox: str = "",
         path_append: str = "",
         allowed_env_keys: list[str] | None = None,
+        allow_loopback: bool | None = None,
     ):
         self.timeout = timeout
         self.working_dir = working_dir
         self.sandbox = sandbox
+        # MIT-203: per-instance loopback override. ``None`` defers to the
+        # module-level default set by the config loader (False by default
+        # upstream; Ziggy flips to True). A hard True/False here wins.
+        self.allow_loopback = allow_loopback
         self.deny_patterns = deny_patterns or [
             r"\brm\s+-[rf]{1,2}\b",          # rm -r, rm -rf, rm -fr
             r"\bdel\s+/[fq]\b",              # del /f, del /q
@@ -338,7 +343,7 @@ class ExecTool(Tool):
                 return "Error: Command blocked by safety guard (not in allowlist)"
 
         from nanobot.security.network import contains_internal_url
-        if contains_internal_url(cmd):
+        if contains_internal_url(cmd, allow_loopback=self.allow_loopback):
             return "Error: Command blocked by safety guard (internal/private URL detected)"
 
         if self.restrict_to_workspace:
