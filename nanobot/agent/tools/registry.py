@@ -1,10 +1,92 @@
 """Tool registry for dynamic tool management."""
 
+import re
 import time
 from typing import Any
 
+from loguru import logger
+
+from nanobot.agent.tools.audit import ErrorType
 from nanobot.agent.tools.base import Tool
 from nanobot.utils.sensitive import redact_if_sensitive
+
+# MIT-203: explicit error-type classifier. Historically the registry used
+# ``result.startswith("Error")`` — brittle, and conflated a user command
+# whose stdout happens to start with "Error" with a framework-level failure.
+# We now match against known tool failure markers (shell tool returns the
+# only subprocess-backed failure strings today) and fall back to
+# ``misclassified`` for legacy tools that still emit "Error:"-prefixed
+# strings without a recognisable shape.
+
+_PRESCREEN_MARKERS: tuple[str, ...] = (
+    "Error: Command blocked by safety guard",
+    "Error: working_dir could not be resolved",
+    "Error: working_dir is outside the configured workspace",
+)
+_TIMEOUT_MARKER = "Error: Command timed out after"
+_EXEC_EXCEPTION_MARKER = "Error executing command:"
+
+# Captures the trailing "Exit code: N" footer appended by shell.py so we can
+# distinguish a user command that exited non-zero from a framework error.
+_EXIT_CODE_RE = re.compile(r"\nExit code:\s*(-?\d+)\s*$")
+
+
+def _classify_tool_error(result: str, tool_name: str) -> tuple[ErrorType, int | None, str | None]:
+    """Bucket a tool result string into an ``(error_type, exit_code, stderr_tail)`` triple.
+
+    Only called when :func:`_looks_like_error` already returned True. Returns
+    a best-effort classification — ``misclassified`` for anything we don't
+    recognise, with a debug log so we can notice new failure shapes.
+    """
+    exit_code: int | None = None
+    stderr_tail: str | None = None
+
+    exit_match = _EXIT_CODE_RE.search(result)
+    if exit_match is not None:
+        try:
+            exit_code = int(exit_match.group(1))
+        except ValueError:
+            exit_code = None
+
+    # Capture the tail of embedded STDERR (shell.py prefixes it with
+    # "STDERR:\n"). Truncate to ~256 chars for audit-log compactness.
+    stderr_idx = result.rfind("STDERR:\n")
+    if stderr_idx != -1:
+        tail = result[stderr_idx + len("STDERR:\n"):]
+        # Drop the trailing exit-code footer if present.
+        tail = _EXIT_CODE_RE.sub("", tail).strip()
+        if tail:
+            stderr_tail = tail[-256:]
+
+    for marker in _PRESCREEN_MARKERS:
+        if marker in result:
+            return "prescreen", None, None
+    if _TIMEOUT_MARKER in result:
+        return "timeout", None, stderr_tail
+    if _EXEC_EXCEPTION_MARKER in result:
+        return "exception", exit_code, stderr_tail
+    if exit_code is not None and exit_code != 0:
+        return "nonzero_exit", exit_code, stderr_tail
+
+    # Legacy tools that return free-form "Error:" strings without any of the
+    # known shell-tool markers. Log at DEBUG so we can fingerprint them later
+    # and promote them into a real bucket; don't spam at WARNING.
+    logger.debug(
+        "audit: misclassified error from tool={} preview={!r}",
+        tool_name,
+        result[:80],
+    )
+    return "misclassified", exit_code, stderr_tail
+
+
+def _looks_like_error(result: Any) -> bool:
+    """Preserve the historical ``startswith("Error")`` contract for now.
+
+    Downstream code (``AgentRunner._run_tool``, redaction) keys off this
+    same shape. MIT-203 keeps detection unchanged and focuses on *what*
+    gets recorded once we've decided a result is an error.
+    """
+    return isinstance(result, str) and result.startswith("Error")
 
 
 class ToolRegistry:
@@ -125,12 +207,33 @@ class ToolRegistry:
             params = tool.cast_params(params)
             errors = tool.validate_params(params)
             if errors:
-                self._audit("error", name, params, t0, sid, ch, error="; ".join(errors))
+                # Invalid-parameter rejection is a prescreen-class failure:
+                # the tool never ran, there's no exit code, and the message
+                # is the accumulated validator errors.
+                self._audit(
+                    "error", name, params, t0, sid, ch,
+                    error="; ".join(errors),
+                    error_type="prescreen",
+                )
                 return f"Error: Invalid parameters for tool '{name}': " + "; ".join(errors) + _HINT
             result = await tool.execute(**params)
             duration_ms = (time.monotonic() - t0) * 1000
-            status = "error" if isinstance(result, str) and result.startswith("Error") else "ok"
-            self._audit(status, name, params, t0, sid, ch)
+            if _looks_like_error(result):
+                status = "error"
+                error_type, exit_code, stderr_tail = _classify_tool_error(result, name)
+                # ``error`` persists the full (un-redacted-here; scrubbed below
+                # by ``redact_if_sensitive``) message so operators can triage
+                # without replaying the session. Keep it bounded.
+                self._audit(
+                    status, name, params, t0, sid, ch,
+                    error=result[:2048],
+                    error_type=error_type,
+                    exit_code=exit_code,
+                    stderr_tail=stderr_tail,
+                )
+            else:
+                status = "ok"
+                self._audit(status, name, params, t0, sid, ch)
             self._prom_observe(name, status, duration_ms)
             # Defence-in-depth: scrub embedded secrets from any string result,
             # both success AND error paths (MIT-147).
@@ -166,7 +269,11 @@ class ToolRegistry:
             return result
         except Exception as e:
             duration_ms = (time.monotonic() - t0) * 1000
-            self._audit("error", name, params, t0, sid, ch, error=str(e))
+            self._audit(
+                "error", name, params, t0, sid, ch,
+                error=str(e),
+                error_type="exception",
+            )
             self._prom_observe(name, "error", duration_ms)
             # Exception strings can also carry secrets — e.g. a ValueError
             # raised while parsing a file embeds the line that failed. Run
@@ -190,8 +297,17 @@ class ToolRegistry:
         session_id: str = "",
         channel: str = "",
         error: str | None = None,
+        error_type: ErrorType | None = None,
+        exit_code: int | None = None,
+        stderr_tail: str | None = None,
     ) -> None:
-        """Log a tool execution to the audit logger if attached."""
+        """Log a tool execution to the audit logger if attached.
+
+        MIT-203: when *status* is ``"error"``, callers pass ``error_type``
+        / ``exit_code`` / ``stderr_tail`` so downstream dashboards can
+        separate user-painful failures (``timeout``/``nonzero_exit``/
+        ``exception``) from safety-guard rejects (``prescreen``).
+        """
         if self._audit_logger is None:
             return
         try:
@@ -203,6 +319,9 @@ class ToolRegistry:
                 channel=channel,
                 error=error,
                 duration_ms=(time.monotonic() - t0) * 1000,
+                error_type=error_type,
+                exit_code=exit_code,
+                stderr_tail=stderr_tail,
             )
         except Exception:
             pass  # Audit must never crash tool execution

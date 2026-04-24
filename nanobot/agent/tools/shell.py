@@ -25,10 +25,10 @@ _IS_WINDOWS = sys.platform == "win32"
         command=StringSchema("The shell command to execute"),
         working_dir=StringSchema("Optional working directory for the command"),
         timeout=IntegerSchema(
-            60,
+            180,
             description=(
                 "Timeout in seconds. Increase for long-running commands "
-                "like compilation or installation (default 60, max 600)."
+                "like compilation or installation (default 180, max 600)."
             ),
             minimum=1,
             maximum=600,
@@ -41,7 +41,11 @@ class ExecTool(Tool):
 
     def __init__(
         self,
-        timeout: int = 60,
+        # MIT-203: 60s default was too short for ``claude`` subagent calls,
+        # ``go test`` runs, and pytest suites — observed in the Oct 2026
+        # diagnostic as a meaningful share of timeouts. 180s covers the
+        # 95th-percentile user command; 600s remains the hard cap.
+        timeout: int = 180,
         working_dir: str | None = None,
         deny_patterns: list[str] | None = None,
         allow_patterns: list[str] | None = None,
@@ -49,10 +53,15 @@ class ExecTool(Tool):
         sandbox: str = "",
         path_append: str = "",
         allowed_env_keys: list[str] | None = None,
+        allow_loopback: bool | None = None,
     ):
         self.timeout = timeout
         self.working_dir = working_dir
         self.sandbox = sandbox
+        # MIT-203: per-instance loopback override. ``None`` defers to the
+        # module-level default set by the config loader (False by default
+        # upstream; Ziggy flips to True). A hard True/False here wins.
+        self.allow_loopback = allow_loopback
         self.deny_patterns = deny_patterns or [
             r"\brm\s+-[rf]{1,2}\b",          # rm -r, rm -rf, rm -fr
             r"\bdel\s+/[fq]\b",              # del /f, del /q
@@ -91,7 +100,7 @@ class ExecTool(Tool):
             "Prefer read_file/write_file/edit_file over cat/echo/sed, "
             "and grep/glob over shell find/grep. "
             "Use -y or --yes flags to avoid interactive prompts. "
-            "Output is truncated at 10 000 chars; timeout defaults to 60s."
+            "Output is truncated at 10 000 chars; timeout defaults to 180s (max 600s)."
         )
 
     @property
@@ -338,7 +347,7 @@ class ExecTool(Tool):
                 return "Error: Command blocked by safety guard (not in allowlist)"
 
         from nanobot.security.network import contains_internal_url
-        if contains_internal_url(cmd):
+        if contains_internal_url(cmd, allow_loopback=self.allow_loopback):
             return "Error: Command blocked by safety guard (internal/private URL detected)"
 
         if self.restrict_to_workspace:
