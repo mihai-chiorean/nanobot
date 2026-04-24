@@ -37,6 +37,7 @@ from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
 from nanobot.config.schema import AgentDefaults
+from nanobot.observability import observe_turn
 from nanobot.providers.base import LLMProvider
 from nanobot.session.manager import Session, SessionManager
 from nanobot.utils.document import extract_documents
@@ -820,7 +821,51 @@ class AgentLoop:
         on_status: Callable[[str], Awaitable[None]] | None = None,
         pending_queue: asyncio.Queue | None = None,
     ) -> OutboundMessage | None:
-        """Process a single inbound message and return the response."""
+        """Process a single inbound message and return the response.
+
+        MIT-202: the entire message processing is wrapped in a Langfuse
+        root span so every LLM call, tool dispatch, and subagent task
+        for this turn shares a single ``trace_id`` with ``session_id``
+        and ``user_id`` propagated to every child observation.
+        """
+        effective_key = session_key or msg.session_key
+        turn_channel = msg.channel if msg.channel != "system" else (
+            msg.chat_id.split(":", 1)[0] if ":" in msg.chat_id else "cli"
+        )
+        turn_chat_id = msg.chat_id if msg.channel != "system" else (
+            msg.chat_id.split(":", 1)[1] if ":" in msg.chat_id else msg.chat_id
+        )
+        turn_input = msg.content[:200] if isinstance(msg.content, str) else None
+        with observe_turn(
+            name=f"turn:{turn_channel}",
+            session_id=effective_key,
+            user_id=msg.sender_id,
+            channel=turn_channel,
+            chat_id=turn_chat_id,
+            input_preview=turn_input,
+            tags=["ziggy", f"channel:{turn_channel}"],
+        ):
+            return await self._process_message_impl(
+                msg,
+                session_key=session_key,
+                on_progress=on_progress,
+                on_stream=on_stream,
+                on_stream_end=on_stream_end,
+                on_status=on_status,
+                pending_queue=pending_queue,
+            )
+
+    async def _process_message_impl(
+        self,
+        msg: InboundMessage,
+        session_key: str | None = None,
+        on_progress: Callable[[str], Awaitable[None]] | None = None,
+        on_stream: Callable[[str], Awaitable[None]] | None = None,
+        on_stream_end: Callable[..., Awaitable[None]] | None = None,
+        on_status: Callable[[str], Awaitable[None]] | None = None,
+        pending_queue: asyncio.Queue | None = None,
+    ) -> OutboundMessage | None:
+        """Original processing body; see ``_process_message`` for the trace wrapper."""
         # System messages: parse origin from chat_id ("channel:chat_id")
         if msg.channel == "system":
             channel, chat_id = (

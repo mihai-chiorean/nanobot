@@ -11,6 +11,7 @@ from typing import Any
 from loguru import logger
 
 from nanobot.agent.hook import AgentHook, AgentHookContext
+from nanobot.observability import capture_trace_context, observe_subagent
 from nanobot.utils.prompt_templates import render_template
 from nanobot.agent.runner import AgentRunSpec, AgentRunner
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
@@ -117,8 +118,18 @@ class SubagentManager:
         )
         self._task_statuses[task_id] = status
 
+        # MIT-202 / MIT-186: capture the parent turn's trace context on
+        # the main-loop side — *before* the subagent task is scheduled —
+        # so subagent work attaches as child observations of the same
+        # trace rather than starting a fresh one.  None when Langfuse is
+        # disabled; observe_subagent degrades to a no-op.
+        parent_trace_context = capture_trace_context()
+
         bg_task = asyncio.create_task(
-            self._run_subagent(task_id, task, display_label, origin, status)
+            self._run_subagent(
+                task_id, task, display_label, origin, status,
+                trace_context=parent_trace_context,
+            )
         )
         self._running_tasks[task_id] = bg_task
         if session_key:
@@ -144,8 +155,15 @@ class SubagentManager:
         label: str,
         origin: dict[str, str],
         status: SubagentStatus,
+        *,
+        trace_context: dict[str, str] | None = None,
     ) -> None:
-        """Execute the subagent task and announce the result."""
+        """Execute the subagent task and announce the result.
+
+        ``trace_context``, when present, links the subagent's work under
+        the parent turn's Langfuse trace (same ``trace_id``, new
+        ``parent_span_id``).
+        """
         logger.info("Subagent [{}] starting task: {}", task_id, label)
 
         async def _on_checkpoint(payload: dict) -> None:
@@ -181,18 +199,30 @@ class SubagentManager:
                 {"role": "user", "content": task},
             ]
 
-            result = await self.runner.run(AgentRunSpec(
-                initial_messages=messages,
-                tools=tools,
-                model=self.model,
-                max_iterations=15,
-                max_tool_result_chars=self.max_tool_result_chars,
-                hook=_SubagentHook(task_id, status),
-                max_iterations_message="Task completed but no final response was generated.",
-                error_message=None,
-                fail_on_tool_error=True,
-                checkpoint_callback=_on_checkpoint,
-            ))
+            # MIT-202 / MIT-186: open the subagent's root span as a
+            # child of the parent turn's trace when trace_context is
+            # provided.  The llm-iteration / tool spans that run inside
+            # runner.run() then nest under this subagent span, giving
+            # the "parent turn → subagent → subagent iterations →
+            # tools" hierarchy shown in the spike memo's trace sketch.
+            with observe_subagent(
+                task_id=task_id,
+                label=label,
+                trace_context=trace_context,
+                input_preview=task,
+            ):
+                result = await self.runner.run(AgentRunSpec(
+                    initial_messages=messages,
+                    tools=tools,
+                    model=self.model,
+                    max_iterations=15,
+                    max_tool_result_chars=self.max_tool_result_chars,
+                    hook=_SubagentHook(task_id, status),
+                    max_iterations_message="Task completed but no final response was generated.",
+                    error_message=None,
+                    fail_on_tool_error=True,
+                    checkpoint_callback=_on_checkpoint,
+                ))
             status.phase = "done"
             status.stop_reason = result.stop_reason
 
