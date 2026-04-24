@@ -188,7 +188,10 @@ class ExecToolConfig(Base):
     """Shell exec tool configuration."""
 
     enable: bool = True
-    timeout: int = 60
+    # MIT-203: raised from 60s. Covers claude CLI subagent calls and most
+    # go test / pytest runs that were timing out previously. 600s remains
+    # the hard cap enforced in ExecTool._MAX_TIMEOUT.
+    timeout: int = 180
     path_append: str = ""
     sandbox: str = ""  # sandbox backend: "" (none) or "bwrap"
     allowed_env_keys: list[str] = Field(default_factory=list)  # Env var names to pass through to subprocess (e.g. ["GOPATH", "JAVA_HOME"])
