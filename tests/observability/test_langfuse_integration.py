@@ -192,3 +192,99 @@ def test_truncate_helper_handles_string_and_other_types() -> None:
         assert "truncated" in _truncate("x" * 1000, 50)
         # Structured data passes through untouched.
         assert _truncate({"a": 1}, 10) == {"a": 1}
+
+
+# ---------------------------------------------------------------------------
+# MIT-210: application exceptions raised inside observed spans must propagate
+# ---------------------------------------------------------------------------
+
+
+def _mock_active_client() -> MagicMock:
+    """Return a Langfuse client mock whose observation CM enters/exits cleanly."""
+    mock_client = MagicMock()
+    mock_cm = MagicMock()
+    mock_cm.__enter__ = MagicMock(return_value=MagicMock(name="span"))
+    mock_cm.__exit__ = MagicMock(return_value=False)
+    mock_client.start_as_current_observation.return_value = mock_cm
+    return mock_client
+
+
+def test_observe_turn_propagates_application_exceptions() -> None:
+    """MIT-210: RuntimeError raised inside `with observe_turn(...)` must propagate."""
+    with _clean_langfuse_env():
+        os.environ["LANGFUSE_SECRET_KEY"] = "sk-test"
+        from nanobot.observability import langfuse as obs_mod
+        import pytest as _pytest
+        mock_client = _mock_active_client()
+        # Stub propagate_attributes to a trivial context manager so the
+        # import-inside-observe_turn works without a real Langfuse install.
+        stub_propagate = MagicMock(return_value=MagicMock(
+            __enter__=MagicMock(return_value=None),
+            __exit__=MagicMock(return_value=False),
+        ))
+        with patch.object(obs_mod, "_safe_get_client", return_value=mock_client):
+            # Patch `langfuse.propagate_attributes` import target.
+            fake_module = MagicMock()
+            fake_module.propagate_attributes = stub_propagate
+            with patch.dict(sys.modules, {"langfuse": fake_module}):
+                with _pytest.raises(RuntimeError, match="boom"):
+                    with obs_mod.observe_turn(name="turn:cli", session_id="s1"):
+                        raise RuntimeError("boom")
+
+
+def test_observe_llm_iteration_propagates_application_exceptions() -> None:
+    with _clean_langfuse_env():
+        os.environ["LANGFUSE_SECRET_KEY"] = "sk-test"
+        from nanobot.observability import langfuse as obs_mod
+        import pytest as _pytest
+        mock_client = _mock_active_client()
+        with patch.object(obs_mod, "_safe_get_client", return_value=mock_client):
+            with _pytest.raises(RuntimeError, match="boom"):
+                with obs_mod.observe_llm_iteration(iteration=0, model="test"):
+                    raise RuntimeError("boom")
+
+
+def test_observe_tool_propagates_application_exceptions() -> None:
+    """MIT-210 canonical test — tool-path suppression was the worst case
+    because it could leave `result` unset and produce UnboundLocalError."""
+    with _clean_langfuse_env():
+        os.environ["LANGFUSE_SECRET_KEY"] = "sk-test"
+        from nanobot.observability import langfuse as obs_mod
+        import pytest as _pytest
+        mock_client = _mock_active_client()
+        with patch.object(obs_mod, "_safe_get_client", return_value=mock_client):
+            with _pytest.raises(RuntimeError, match="boom"):
+                with obs_mod.observe_tool(tool_name="exec", arguments={"command": "ls"}):
+                    raise RuntimeError("boom")
+
+
+def test_observe_subagent_propagates_application_exceptions() -> None:
+    with _clean_langfuse_env():
+        os.environ["LANGFUSE_SECRET_KEY"] = "sk-test"
+        from nanobot.observability import langfuse as obs_mod
+        import pytest as _pytest
+        mock_client = _mock_active_client()
+        with patch.object(obs_mod, "_safe_get_client", return_value=mock_client):
+            with _pytest.raises(RuntimeError, match="boom"):
+                with obs_mod.observe_subagent(
+                    task_id="t1",
+                    label="x",
+                    trace_context=None,
+                    input_preview="plan",
+                ):
+                    raise RuntimeError("boom")
+
+
+def test_observe_tool_swallows_sdk_init_exception() -> None:
+    """MIT-210 counterpart: SDK errors at span CREATION time must still be
+    swallowed + fall back to yield None.  Regression guard so fixing the
+    propagation bug doesn't accidentally re-expose every SDK hiccup."""
+    with _clean_langfuse_env():
+        os.environ["LANGFUSE_SECRET_KEY"] = "sk-test"
+        from nanobot.observability import langfuse as obs_mod
+        broken_client = MagicMock()
+        broken_client.start_as_current_observation.side_effect = RuntimeError("sdk boom")
+        with patch.object(obs_mod, "_safe_get_client", return_value=broken_client):
+            # No exception must escape.
+            with obs_mod.observe_tool(tool_name="exec", arguments={"command": "ls"}) as span:
+                assert span is None

@@ -129,6 +129,13 @@ def observe_turn(
     if chat_id:
         metadata["chat_id"] = str(chat_id)[:200]
 
+    # MIT-210: narrow the SDK-exception swallow scope to ONLY the SDK
+    # calls themselves (start_as_current_observation, propagate_attributes).
+    # The `yield` sits OUTSIDE the try/except so application exceptions
+    # raised inside the wrapped `with observe_turn(...)` block propagate
+    # normally instead of being caught and logged as "Langfuse context
+    # errored".  Prior to this fix, every app-side failure under tracing
+    # was silently hidden from callers.
     try:
         # Open the root turn span first.  propagate_attributes runs
         # inside so session/user/tags propagate to all child spans —
@@ -144,23 +151,20 @@ def observe_turn(
         yield None
         return
 
-    try:
-        with span_cm as span:
-            try:
-                attr_cm = propagate_attributes(
-                    session_id=_sanitize_attr(session_id),
-                    user_id=_sanitize_attr(user_id),
-                    tags=tags,
-                    metadata=metadata or None,
-                )
-            except Exception as exc:
-                logger.debug("Langfuse propagate_attributes failed: {}", exc)
-                attr_cm = nullcontext()
+    with span_cm as span:
+        try:
+            attr_cm = propagate_attributes(
+                session_id=_sanitize_attr(session_id),
+                user_id=_sanitize_attr(user_id),
+                tags=tags,
+                metadata=metadata or None,
+            )
+        except Exception as exc:
+            logger.debug("Langfuse propagate_attributes failed: {}", exc)
+            attr_cm = nullcontext()
 
-            with attr_cm:
-                yield span
-    except Exception as exc:  # pragma: no cover — defensive
-        logger.debug("Langfuse turn span context errored: {}", exc)
+        with attr_cm:
+            yield span
 
 
 @contextmanager
@@ -199,11 +203,10 @@ def observe_llm_iteration(
         yield None
         return
 
-    try:
-        with cm as span:
-            yield span
-    except Exception as exc:  # pragma: no cover
-        logger.debug("Langfuse llm-iteration context errored: {}", exc)
+    # MIT-210: `yield` sits outside any exception-swallowing try so
+    # application errors raised under this span propagate normally.
+    with cm as span:
+        yield span
 
 
 @contextmanager
@@ -234,11 +237,10 @@ def observe_tool(
         yield None
         return
 
-    try:
-        with cm as span:
-            yield span
-    except Exception as exc:  # pragma: no cover
-        logger.debug("Langfuse tool span context errored: {}", exc)
+    # MIT-210: `yield` sits outside any exception-swallowing try so
+    # application errors raised under this span propagate normally.
+    with cm as span:
+        yield span
 
 
 def capture_trace_context() -> dict[str, str] | None:
@@ -316,11 +318,10 @@ def observe_subagent(
         yield None
         return
 
-    try:
-        with cm as span:
-            yield span
-    except Exception as exc:  # pragma: no cover
-        logger.debug("Langfuse subagent context errored: {}", exc)
+    # MIT-210: `yield` sits outside any exception-swallowing try so
+    # application errors raised under this span propagate normally.
+    with cm as span:
+        yield span
 
 
 def _sanitize_attr(value: str | None) -> str | None:
