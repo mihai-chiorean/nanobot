@@ -30,14 +30,25 @@ parentage.
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, Any, Iterator
 
 from loguru import logger
 
+from nanobot.utils.sensitive import redact_if_sensitive
+
 if TYPE_CHECKING:
     from langfuse import Langfuse as _LangfuseClient  # pragma: no cover
+
+
+# MIT-211: maximum characters pushed to Langfuse `input` fields.  The
+# previous 4096 budget is too loose for a tracing sink — tool arguments
+# and user prompts rarely need more than a few hundred chars of context,
+# and tighter bounds reduce the blast radius if a secret slips past the
+# redactor.
+_INPUT_CHAR_LIMIT = 512
 
 
 def _detect_enabled() -> bool:
@@ -144,7 +155,11 @@ def observe_turn(
         span_cm = client.start_as_current_observation(
             name=name,
             as_type="agent",
-            input=_truncate(input_preview, 4096),
+            # MIT-211: redact + 512-char cap.  User messages routinely
+            # include secrets the operator pasted for the agent to
+            # handle (API keys, tokens, credentials); they must not
+            # land in the Langfuse UI in the clear.
+            input=_prepare_input(input_preview),
         )
     except Exception as exc:
         logger.debug("Langfuse start_as_current_observation failed: {}", exc)
@@ -230,7 +245,12 @@ def observe_tool(
         cm = client.start_as_current_observation(
             name=f"tool:{tool_name}",
             as_type="tool",
-            input=_truncate(arguments, 4096),
+            # MIT-211: redact + 512-char cap on the tool argument payload.
+            # `exec` commands carry env vars with API keys, `web_fetch`
+            # carries Authorization headers, `write_file` carries raw
+            # file bodies — all bypass the audit-sink redactor unless
+            # we apply it here.
+            input=_prepare_input(arguments),
         )
     except Exception as exc:
         logger.debug("Langfuse tool span failed for {}: {}", tool_name, exc)
@@ -347,3 +367,47 @@ def _truncate(value: Any, limit: int) -> Any:
     if isinstance(value, str) and len(value) > limit:
         return value[:limit] + "…[truncated]"
     return value
+
+
+def _prepare_input(value: Any) -> Any:
+    """Redact + truncate a payload before pushing it to Langfuse.
+
+    MIT-211: the Langfuse ingest path bypassed the ``audit.jsonl``
+    redaction layer, so tool arguments and user messages carrying
+    secrets (AWS keys, GitHub PATs, ``Bearer`` headers, PEM blobs, …)
+    reached the observability UI verbatim.
+
+    Behaviour:
+
+    * ``None`` → returned as-is (no-op for observe_* calls that skip
+      the input kwarg).
+    * ``str`` → redacted via :func:`redact_if_sensitive` (from
+      ``nanobot/utils/sensitive.py`` — the same layer used by the
+      audit sink, so the 61-case ``secret_redaction_v0`` battery
+      covers this path transitively).  Then truncated to
+      :data:`_INPUT_CHAR_LIMIT` chars.
+    * ``dict`` / other JSON-serialisable → JSON-serialised, redacted,
+      then truncated.  The round-trip is lossy (we emit the possibly-
+      redacted string, not the original structure), which is
+      intentional: Langfuse displays a string in the UI either way,
+      and keeping the structured form would require walking nested
+      dicts to redact every leaf — deliberate non-goal per MIT-211
+      ("Don't try to be clever about nested dicts — convert to JSON,
+      redact the JSON string, truncate.").
+    * Non-JSON-serialisable objects → coerced via ``str()``.
+
+    Redaction ALWAYS runs before truncation so regex patterns aren't
+    split across the boundary (a 512-char truncation landing inside an
+    ``AKIA…`` token would otherwise let the prefix leak verbatim).
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value
+    else:
+        try:
+            text = json.dumps(value, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            text = str(value)
+    redacted = redact_if_sensitive(text)
+    return _truncate(redacted, _INPUT_CHAR_LIMIT)
