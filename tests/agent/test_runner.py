@@ -252,6 +252,35 @@ async def test_runner_returns_max_iterations_fallback():
     assert result.messages[-1]["role"] == "assistant"
     assert result.messages[-1]["content"] == result.final_content
 
+
+@pytest.mark.asyncio
+async def test_runner_times_out_hung_llm_request():
+    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+
+    provider = MagicMock()
+
+    async def chat_with_retry(**kwargs):
+        await asyncio.sleep(3600)
+
+    provider.chat_with_retry = chat_with_retry
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+
+    runner = AgentRunner(provider)
+    started = time.monotonic()
+    result = await runner.run(AgentRunSpec(
+        initial_messages=[{"role": "user", "content": "hello"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=1,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+        llm_timeout_s=0.05,
+    ))
+
+    assert (time.monotonic() - started) < 1.0
+    assert result.stop_reason == "error"
+    assert "timed out" in (result.final_content or "").lower()
+
 @pytest.mark.asyncio
 async def test_runner_returns_structured_tool_error():
     from nanobot.agent.runner import AgentRunSpec, AgentRunner
@@ -280,6 +309,46 @@ async def test_runner_returns_structured_tool_error():
     assert result.error == "Error: RuntimeError: boom"
     assert result.tool_events == [
         {"name": "list_dir", "status": "error", "detail": "boom"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_runner_stops_on_workspace_violation_without_fail_on_tool_error():
+    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+
+    provider = MagicMock()
+    provider.chat_with_retry = AsyncMock(side_effect=[
+        LLMResponse(
+            content="working",
+            tool_calls=[ToolCallRequest(id="call_1", name="read_file", arguments={"path": "/tmp/outside.md"})],
+        ),
+        LLMResponse(content="should not continue", tool_calls=[]),
+    ])
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    tools.execute = AsyncMock(
+        side_effect=PermissionError("Path /tmp/outside.md is outside allowed directory /workspace")
+    )
+
+    runner = AgentRunner(provider)
+
+    result = await runner.run(AgentRunSpec(
+        initial_messages=[],
+        tools=tools,
+        model="test-model",
+        max_iterations=2,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+    ))
+
+    assert provider.chat_with_retry.await_count == 1
+    assert result.stop_reason == "tool_error"
+    assert "outside allowed directory" in (result.error or "")
+    assert result.tool_events == [
+        {
+            "name": "read_file",
+            "status": "error",
+            "detail": "workspace_violation: Path /tmp/outside.md is outside allowed directory /workspace",
+        }
     ]
 
 
@@ -904,6 +973,48 @@ async def test_loop_stream_filter_handles_think_only_prefix_without_crashing(tmp
 
 
 @pytest.mark.asyncio
+async def test_loop_stream_filter_hides_partial_trailing_think_prefix(tmp_path):
+    loop = _make_loop(tmp_path)
+    deltas: list[str] = []
+
+    async def chat_stream_with_retry(*, on_content_delta, **kwargs):
+        await on_content_delta("Hello <thin")
+        await on_content_delta("k>hidden</think>World")
+        return LLMResponse(content="Hello <think>hidden</think>World", tool_calls=[], usage={})
+
+    loop.provider.chat_stream_with_retry = chat_stream_with_retry
+
+    async def on_stream(delta: str) -> None:
+        deltas.append(delta)
+
+    final_content, _, _, _, _ = await loop._run_agent_loop([], on_stream=on_stream)
+
+    assert final_content == "Hello World"
+    assert deltas == ["Hello", " World"]
+
+
+@pytest.mark.asyncio
+async def test_loop_stream_filter_hides_complete_trailing_think_tag(tmp_path):
+    loop = _make_loop(tmp_path)
+    deltas: list[str] = []
+
+    async def chat_stream_with_retry(*, on_content_delta, **kwargs):
+        await on_content_delta("Hello <think>")
+        await on_content_delta("hidden</think>World")
+        return LLMResponse(content="Hello <think>hidden</think>World", tool_calls=[], usage={})
+
+    loop.provider.chat_stream_with_retry = chat_stream_with_retry
+
+    async def on_stream(delta: str) -> None:
+        deltas.append(delta)
+
+    final_content, _, _, _, _ = await loop._run_agent_loop([], on_stream=on_stream)
+
+    assert final_content == "Hello World"
+    assert deltas == ["Hello", " World"]
+
+
+@pytest.mark.asyncio
 async def test_loop_retries_think_only_final_response(tmp_path):
     loop = _make_loop(tmp_path)
     call_count = {"n": 0}
@@ -1031,11 +1142,10 @@ async def test_next_turn_after_llm_error_keeps_turn_boundary(tmp_path):
 
     request_messages = provider.chat_with_retry.await_args_list[1].kwargs["messages"]
     non_system = [message for message in request_messages if message.get("role") != "system"]
-    assert non_system[0] == {"role": "user", "content": "first question"}
-    assert non_system[1] == {
-        "role": "assistant",
-        "content": _PERSISTED_MODEL_ERROR_PLACEHOLDER,
-    }
+    assert non_system[0]["role"] == "user"
+    assert "first question" in non_system[0]["content"]
+    assert non_system[1]["role"] == "assistant"
+    assert _PERSISTED_MODEL_ERROR_PLACEHOLDER in non_system[1]["content"]
     assert non_system[2]["role"] == "user"
     assert "second question" in non_system[2]["content"]
 

@@ -3,13 +3,14 @@
 import base64
 import mimetypes
 import platform
+from contextlib import suppress
 from importlib.resources import files as pkg_files
 from pathlib import Path
 from typing import Any
 
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.skills import SkillsLoader
-from nanobot.utils.helpers import build_assistant_message, current_time_str, detect_image_mime
+from nanobot.utils.helpers import build_assistant_message, current_time_str, detect_image_mime, truncate_text
 from nanobot.utils.prompt_templates import render_template
 
 
@@ -19,6 +20,7 @@ class ContextBuilder:
     BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md"]
     _RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
     _MAX_RECENT_HISTORY = 50
+    _MAX_HISTORY_CHARS = 32_000  # hard cap on recent history section size
     _RUNTIME_CONTEXT_END = "[/Runtime Context]"
 
     def __init__(self, workspace: Path, timezone: str | None = None, disabled_skills: list[str] | None = None):
@@ -56,9 +58,11 @@ class ContextBuilder:
         entries = self.memory.read_unprocessed_history(since_cursor=self.memory.get_last_dream_cursor())
         if entries:
             capped = entries[-self._MAX_RECENT_HISTORY:]
-            parts.append("# Recent History\n\n" + "\n".join(
+            history_text = "\n".join(
                 f"- [{e['timestamp']}] {e['content']}" for e in capped
-            ))
+            )
+            history_text = truncate_text(history_text, self._MAX_HISTORY_CHARS)
+            parts.append("# Recent History\n\n" + history_text)
 
         return "\n\n---\n\n".join(parts)
 
@@ -79,12 +83,14 @@ class ContextBuilder:
     @staticmethod
     def _build_runtime_context(
         channel: str | None, chat_id: str | None, timezone: str | None = None,
-        session_summary: str | None = None,
+        session_summary: str | None = None, sender_id: str | None = None,
     ) -> str:
         """Build untrusted runtime metadata block for injection before the user message."""
         lines = [f"Current Time: {current_time_str(timezone)}"]
         if channel and chat_id:
             lines += [f"Channel: {channel}", f"Chat ID: {chat_id}"]
+        if sender_id:
+            lines += [f"Sender ID: {sender_id}"]
         if session_summary:
             lines += ["", "[Resumed Session]", session_summary]
         return ContextBuilder._RUNTIME_CONTEXT_TAG + "\n" + "\n".join(lines) + "\n" + ContextBuilder._RUNTIME_CONTEXT_END
@@ -118,12 +124,10 @@ class ContextBuilder:
     @staticmethod
     def _is_template_content(content: str, template_path: str) -> bool:
         """Check if *content* is identical to the bundled template (user hasn't customized it)."""
-        try:
+        with suppress(Exception):
             tpl = pkg_files("nanobot") / "templates" / template_path
             if tpl.is_file():
                 return content.strip() == tpl.read_text(encoding="utf-8").strip()
-        except Exception:
-            pass
         return False
 
     def build_messages(
@@ -136,9 +140,10 @@ class ContextBuilder:
         chat_id: str | None = None,
         current_role: str = "user",
         session_summary: str | None = None,
+        sender_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
-        runtime_ctx = self._build_runtime_context(channel, chat_id, self.timezone, session_summary=session_summary)
+        runtime_ctx = self._build_runtime_context(channel, chat_id, self.timezone, session_summary=session_summary, sender_id=sender_id)
         user_content = self._build_user_content(current_message, media)
 
         # Merge runtime context and user content into a single user message
