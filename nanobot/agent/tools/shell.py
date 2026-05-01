@@ -6,6 +6,7 @@ import re
 import shutil
 import signal
 import sys
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -147,9 +148,10 @@ class ExecTool(Tool):
 
         if self.path_append:
             if _IS_WINDOWS:
-                env["PATH"] = env.get("PATH", "") + ";" + self.path_append
+                env["PATH"] = env.get("PATH", "") + os.pathsep + self.path_append
             else:
-                command = f'export PATH="$PATH:{self.path_append}"; {command}'
+                env["NANOBOT_PATH_APPEND"] = self.path_append
+                command = f'export PATH="$PATH{os.pathsep}$NANOBOT_PATH_APPEND"; {command}'
 
         process: asyncio.subprocess.Process | None = None
         try:
@@ -269,9 +271,8 @@ class ExecTool(Tool):
             pass
 
         try:
-            await asyncio.wait_for(process.wait(), timeout=5.0)
-        except asyncio.TimeoutError:
-            pass
+            with suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(process.wait(), timeout=5.0)
         finally:
             if not _IS_WINDOWS:
                 try:
