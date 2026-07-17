@@ -61,6 +61,12 @@ uv.lock
 .AppleDouble
 .LSOverride
 
+# Xcode / Swift
+DerivedData/
+*.xcuserstate
+xcuserdata/
+ios/Config/Local.xcconfig
+
 # Windows
 Thumbs.db
 ehthumbs.db
