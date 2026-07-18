@@ -1,26 +1,50 @@
 import SwiftUI
 
 enum ZiggyPalette {
-    static let canvas = Color(light: Color(red: 0.965, green: 0.970, blue: 0.972), dark: Color(red: 0.095, green: 0.105, blue: 0.115))
-    static let panel = Color(light: .white, dark: Color(red: 0.135, green: 0.145, blue: 0.155))
-    static let ink = Color(light: Color(red: 0.105, green: 0.120, blue: 0.135), dark: Color(red: 0.925, green: 0.925, blue: 0.900))
-    static let mutedInk = Color(light: Color(red: 0.360, green: 0.380, blue: 0.390), dark: Color(red: 0.690, green: 0.700, blue: 0.680))
-    static let teal = Color(light: Color(red: 0.035, green: 0.420, blue: 0.430), dark: Color(red: 0.250, green: 0.720, blue: 0.700))
-    static let amber = Color(light: Color(red: 0.700, green: 0.400, blue: 0.060), dark: Color(red: 0.950, green: 0.680, blue: 0.260))
-    static let coral = Color(light: Color(red: 0.700, green: 0.180, blue: 0.150), dark: Color(red: 0.950, green: 0.430, blue: 0.360))
-    static let moss = Color(light: Color(red: 0.270, green: 0.470, blue: 0.180), dark: Color(red: 0.520, green: 0.720, blue: 0.360))
-    static let line = Color(light: Color.black.opacity(0.10), dark: Color.white.opacity(0.13))
+    // Mirrors webui/src/globals.css. Color is reserved for status and errors.
+    static let background = Color(lightHex: 0xFFFFFF, darkHex: 0x1A1A1A)
+    static let foreground = Color(lightHex: 0x1F1F20, darkHex: 0xF5F5F6)
+    static let card = Color(lightHex: 0xFFFFFF, darkHex: 0x1F1F1F)
+    static let secondary = Color(lightHex: 0xF5F5F5, darkHex: 0x1F1F1F)
+    static let muted = Color(lightHex: 0xF5F5F5, darkHex: 0x212121)
+    static let mutedForeground = Color(lightHex: 0x737373, darkHex: 0x999999)
+    static let accent = Color(lightHex: 0xF5F5F5, darkHex: 0x262626)
+    static let border = Color(lightHex: 0xE5E5E5, darkHex: 0x2E2E2E)
+    static let sidebar = Color(lightHex: 0xFAFAFA, darkHex: 0x1F1F1F)
+    static let primary = Color(lightHex: 0x29292B, darkHex: 0xFAFAFA)
+    static let primaryForeground = Color(lightHex: 0xFAFAFA, darkHex: 0x171717)
+
+    static let emerald = Color(lightHex: 0x15803D, darkHex: 0x4ADE80)
+    static let amber = Color(lightHex: 0xB45309, darkHex: 0xFCD34D)
+    static let destructive = Color(lightHex: 0xDC2626, darkHex: 0xF87171)
+
+    // Compatibility names used by feature components.
+    static let canvas = background
+    static let panel = card
+    static let ink = foreground
+    static let mutedInk = mutedForeground
+    static let line = border
+    static let teal = foreground
+    static let coral = destructive
+    static let moss = emerald
 }
 
 private extension Color {
-    init(light: Color, dark: Color) {
-        #if os(iOS)
+    init(lightHex: UInt, darkHex: UInt) {
         self.init(uiColor: UIColor { traits in
-            traits.userInterfaceStyle == .dark ? UIColor(dark) : UIColor(light)
+            UIColor(hex: traits.userInterfaceStyle == .dark ? darkHex : lightHex)
         })
-        #else
-        self = light
-        #endif
+    }
+}
+
+private extension UIColor {
+    convenience init(hex: UInt) {
+        self.init(
+            red: CGFloat((hex >> 16) & 0xFF) / 255,
+            green: CGFloat((hex >> 8) & 0xFF) / 255,
+            blue: CGFloat(hex & 0xFF) / 255,
+            alpha: 1
+        )
     }
 }
 
@@ -30,16 +54,20 @@ struct ZiggyMarkdownText: View {
 
     var body: some View {
         Group {
-            if let attributed = try? AttributedString(markdown: markdown, options: .init(interpretedSyntax: .full)) {
+            if let attributed = try? AttributedString(
+                markdown: markdown,
+                options: .init(interpretedSyntax: .full)
+            ) {
                 Text(attributed)
             } else {
                 Text(markdown)
             }
         }
         .font(font)
-        .foregroundStyle(ZiggyPalette.ink)
+        .foregroundStyle(ZiggyPalette.foreground.opacity(0.94))
+        .lineSpacing(3)
         .textSelection(.enabled)
-        .tint(ZiggyPalette.teal)
+        .tint(ZiggyPalette.foreground)
     }
 }
 
@@ -47,8 +75,37 @@ struct ZiggySectionLabel: View {
     let title: String
 
     var body: some View {
-        Text(title.uppercased())
-            .font(.caption.weight(.semibold))
-            .foregroundStyle(ZiggyPalette.mutedInk)
+        Text(title)
+            .font(.caption.weight(.medium))
+            .foregroundStyle(ZiggyPalette.mutedForeground)
+    }
+}
+
+struct PWAIconButton: ButtonStyle {
+    var size: CGFloat = 34
+    var foreground: Color = ZiggyPalette.mutedForeground
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: 15, weight: .medium))
+            .foregroundStyle(foreground)
+            .frame(width: size, height: size)
+            .background(configuration.isPressed ? ZiggyPalette.accent : .clear)
+            .clipShape(RoundedRectangle(cornerRadius: 7))
+    }
+}
+
+struct PWAGroup<Content: View>: View {
+    let content: Content
+
+    init(@ViewBuilder content: () -> Content) {
+        self.content = content()
+    }
+
+    var body: some View {
+        VStack(spacing: 0) { content }
+            .background(ZiggyPalette.card.opacity(0.8))
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+            .overlay(RoundedRectangle(cornerRadius: 8).stroke(ZiggyPalette.border.opacity(0.7)))
     }
 }

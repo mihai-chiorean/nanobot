@@ -8,6 +8,7 @@ struct ZiggyApp: App {
         WindowGroup {
             RootView()
                 .environment(appModel)
+                .preferredColorScheme(appModel.theme.colorScheme)
         }
     }
 }

@@ -5,7 +5,7 @@ enum ZiggyWorkStatus: String, CaseIterable, Sendable {
 
     var title: String { rawValue.capitalized }
     var color: Color {
-        switch self { case .queued: ZiggyPalette.mutedInk; case .running: ZiggyPalette.teal; case .waiting: ZiggyPalette.amber; case .completed: ZiggyPalette.moss; case .failed: ZiggyPalette.coral; case .cancelled: ZiggyPalette.mutedInk }
+        switch self { case .queued: ZiggyPalette.mutedForeground; case .running: ZiggyPalette.emerald; case .waiting: ZiggyPalette.amber; case .completed: ZiggyPalette.emerald; case .failed: ZiggyPalette.destructive; case .cancelled: ZiggyPalette.mutedForeground }
     }
     var symbol: String {
         switch self { case .queued: "clock"; case .running: "bolt.horizontal.circle"; case .waiting: "pause.circle"; case .completed: "checkmark.circle"; case .failed: "exclamationmark.circle"; case .cancelled: "xmark.circle" }
@@ -17,9 +17,10 @@ struct ZiggyWorkStatusBadge: View {
 
     var body: some View {
         Label(status.title, systemImage: status.symbol)
-            .font(.caption.weight(.semibold)).foregroundStyle(status.color)
-            .padding(.horizontal, 8).padding(.vertical, 5)
-            .background(status.color.opacity(0.12), in: RoundedRectangle(cornerRadius: 6))
+            .font(.caption2.weight(.semibold)).foregroundStyle(status.color)
+            .padding(.horizontal, 7).padding(.vertical, 4)
+            .background(status.color.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
+            .overlay(RoundedRectangle(cornerRadius: 6).stroke(ZiggyPalette.border.opacity(0.7)))
             .accessibilityLabel("Work status: \(status.title)")
     }
 }
@@ -35,32 +36,30 @@ struct ZiggyWorkTask: Identifiable, Sendable {
 
 struct ZiggyWorkTaskRow: View {
     let task: ZiggyWorkTask
-    var onSelect: () -> Void = {}
 
     var body: some View {
-        Button(action: onSelect) {
-            HStack(alignment: .top, spacing: 12) {
-                Image(systemName: task.status.symbol).font(.title3).foregroundStyle(task.status.color).frame(width: 24)
-                VStack(alignment: .leading, spacing: 5) {
-                    HStack(alignment: .firstTextBaseline) {
-                        Text(task.title).font(.headline).foregroundStyle(ZiggyPalette.ink).lineLimit(2)
-                        Spacer(minLength: 8)
-                        ZiggyWorkStatusBadge(status: task.status)
-                    }
-                    Text(task.summary).font(.subheadline).foregroundStyle(ZiggyPalette.mutedInk).lineLimit(2).multilineTextAlignment(.leading)
-                    HStack {
-                        Text(task.updatedAt).font(.caption).foregroundStyle(ZiggyPalette.mutedInk)
-                        if let progress = task.progress {
-                            ProgressView(value: progress).tint(task.status.color).frame(maxWidth: 100)
-                        }
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: task.status.symbol).font(.system(size: 15)).foregroundStyle(task.status.color).frame(width: 20)
+            VStack(alignment: .leading, spacing: 5) {
+                HStack(alignment: .firstTextBaseline) {
+                    Text(task.title).font(.system(size: 14, weight: .medium)).foregroundStyle(ZiggyPalette.foreground).lineLimit(2)
+                    Spacer(minLength: 8)
+                    ZiggyWorkStatusBadge(status: task.status)
+                }
+                Text(task.summary).font(.caption).foregroundStyle(ZiggyPalette.mutedForeground).lineLimit(2).multilineTextAlignment(.leading)
+                HStack {
+                    Text(task.updatedAt).font(.caption2).foregroundStyle(ZiggyPalette.mutedForeground)
+                    if let progress = task.progress {
+                        ProgressView(value: progress).tint(task.status.color).frame(maxWidth: 100)
                     }
                 }
-                Image(systemName: "chevron.right").font(.caption.weight(.bold)).foregroundStyle(ZiggyPalette.mutedInk).padding(.top, 5)
             }
-            .padding(.vertical, 12)
-            .contentShape(Rectangle())
+            Image(systemName: "chevron.right").font(.caption2.weight(.bold)).foregroundStyle(ZiggyPalette.mutedForeground).padding(.top, 5)
         }
-        .buttonStyle(.plain).accessibilityLabel("Work task: \(task.title), \(task.status.title)")
+        .padding(.vertical, 11)
+        .contentShape(Rectangle())
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Work task: \(task.title), \(task.status.title)")
     }
 }
 
@@ -84,16 +83,16 @@ struct ZiggyWorkTimelineRow: View {
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
             VStack(spacing: 0) {
-                Text("\(event.order)").font(.caption.weight(.bold)).foregroundStyle(.white).frame(width: 24, height: 24).background(event.isFailure ? ZiggyPalette.coral : ZiggyPalette.teal, in: Circle())
-                if !isLast { Rectangle().fill(ZiggyPalette.line).frame(width: 1).frame(minHeight: 34) }
+                Text("\(event.order)").font(.caption2.weight(.bold)).foregroundStyle(event.isFailure ? .white : ZiggyPalette.primaryForeground).frame(width: 22, height: 22).background(event.isFailure ? ZiggyPalette.destructive : ZiggyPalette.primary, in: Circle())
+                if !isLast { Rectangle().fill(ZiggyPalette.border).frame(width: 1).frame(minHeight: 34) }
             }
             VStack(alignment: .leading, spacing: 4) {
                 HStack(alignment: .firstTextBaseline) {
-                    Text(event.title).font(.subheadline.weight(.semibold)).foregroundStyle(event.isFailure ? ZiggyPalette.coral : ZiggyPalette.ink)
+                    Text(event.title).font(.subheadline.weight(.medium)).foregroundStyle(event.isFailure ? ZiggyPalette.destructive : ZiggyPalette.foreground)
                     Spacer(minLength: 8)
-                    Text(event.timestamp).font(.caption).foregroundStyle(ZiggyPalette.mutedInk)
+                    Text(event.timestamp).font(.caption2).foregroundStyle(ZiggyPalette.mutedForeground)
                 }
-                Text(event.detail).font(.subheadline).foregroundStyle(ZiggyPalette.mutedInk).textSelection(.enabled)
+                Text(event.detail).font(.caption).foregroundStyle(ZiggyPalette.mutedForeground).textSelection(.enabled)
             }
         }
         .accessibilityElement(children: .combine)

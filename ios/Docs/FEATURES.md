@@ -31,6 +31,10 @@
 ### Settings and transport
 
 - Account, server, model, connection, and transport diagnostics.
+- Compact native interface using the PWA's neutral color tokens, message
+  hierarchy, composer layout, and conversation-list density.
+- System, light, and dark appearance modes with a persisted preference and a
+  quick toggle in chat and enrollment headers.
 - Remove saved enrollment and reconnect controls.
 - Bidirectional Ziggy chat/work over WebSocket.
 - A reusable OpenAI-compatible SSE parser and client for stateless streaming

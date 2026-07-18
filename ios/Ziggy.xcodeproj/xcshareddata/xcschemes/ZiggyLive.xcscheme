@@ -78,6 +78,11 @@
             value = "$(ZIGGY_SERVER_URL)"
             isEnabled = "YES">
          </EnvironmentVariable>
+         <EnvironmentVariable
+            key = "ZIGGY_THEME"
+            value = "$(ZIGGY_THEME)"
+            isEnabled = "YES">
+         </EnvironmentVariable>
       </EnvironmentVariables>
    </TestAction>
    <LaunchAction

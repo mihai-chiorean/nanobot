@@ -7,25 +7,39 @@ struct WorkListView: View {
         NavigationStack {
             Group {
                 if appModel.workTasks.isEmpty {
-                    ContentUnavailableView(
-                        "No background work",
-                        systemImage: "bolt.horizontal.circle",
-                        description: Text("Tasks sent from a conversation appear here.")
-                    )
-                } else {
-                    List(appModel.workTasks, id: \.id) { task in
-                        NavigationLink {
-                            WorkDetailView(taskID: task.id)
-                        } label: {
-                            ZiggyWorkTaskRow(task: task.presentation)
-                        }
+                    VStack(spacing: 8) {
+                        Image(systemName: "bolt.horizontal").foregroundStyle(ZiggyPalette.mutedForeground)
+                        Text("No background work").font(.subheadline.weight(.medium))
+                        Text("Tasks sent from a conversation appear here.")
+                            .font(.caption).foregroundStyle(ZiggyPalette.mutedForeground)
                     }
-                    .listStyle(.plain)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    ScrollView {
+                        LazyVStack(spacing: 0) {
+                            ForEach(appModel.workTasks, id: \.id) { task in
+                                NavigationLink {
+                                    WorkDetailView(taskID: task.id)
+                                } label: {
+                                    ZiggyWorkTaskRow(task: task.presentation)
+                                }
+                                Rectangle().fill(ZiggyPalette.border.opacity(0.6)).frame(height: 1)
+                            }
+                        }
+                        .padding(.horizontal, 14)
+                    }
                     .refreshable { await appModel.loadWork() }
                 }
             }
-            .background(ZiggyPalette.canvas)
+            .background(ZiggyPalette.background)
             .navigationTitle("Work")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button { Task { await appModel.loadWork() } } label: { Image(systemName: "arrow.clockwise") }
+                        .buttonStyle(PWAIconButton(size: 32))
+                }
+            }
         }
     }
 }
@@ -50,11 +64,12 @@ private struct WorkDetailView: View {
                     HStack(alignment: .top) {
                         VStack(alignment: .leading, spacing: 7) {
                             Text(task.title ?? "Background task")
-                                .font(.title2.bold())
-                                .foregroundStyle(ZiggyPalette.ink)
+                                .font(.headline)
+                                .foregroundStyle(ZiggyPalette.foreground)
                             if let description = task.description, !description.isEmpty {
                                 Text(description)
-                                    .foregroundStyle(ZiggyPalette.mutedInk)
+                                    .font(.subheadline)
+                                    .foregroundStyle(ZiggyPalette.mutedForeground)
                             }
                         }
                         Spacer(minLength: 12)
@@ -65,7 +80,7 @@ private struct WorkDetailView: View {
 
                     if events.isEmpty {
                         ProgressView("Waiting for activity")
-                            .foregroundStyle(ZiggyPalette.mutedInk)
+                            .foregroundStyle(ZiggyPalette.mutedForeground)
                             .frame(maxWidth: .infinity, alignment: .center)
                             .padding(.vertical, 36)
                     } else {
@@ -84,7 +99,7 @@ private struct WorkDetailView: View {
             }
             .padding(16)
         }
-        .background(ZiggyPalette.canvas)
+        .background(ZiggyPalette.background)
         .navigationTitle("Task")
         .navigationBarTitleDisplayMode(.inline)
         .safeAreaInset(edge: .bottom) {
@@ -92,14 +107,22 @@ private struct WorkDetailView: View {
                 HStack(spacing: 10) {
                     TextField("Follow up", text: $followUp, axis: .vertical)
                         .lineLimit(1...4)
-                        .textFieldStyle(.roundedBorder)
+                        .textFieldStyle(.plain)
+                        .padding(.horizontal, 12)
+                        .frame(minHeight: 42)
+                        .background(ZiggyPalette.card)
+                        .clipShape(RoundedRectangle(cornerRadius: 10))
+                        .overlay(RoundedRectangle(cornerRadius: 10).stroke(ZiggyPalette.border))
                     Button {
                         let value = followUp
                         followUp = ""
                         Task { await appModel.sendFollowUp(value, to: task) }
                     } label: {
-                        Image(systemName: "arrow.up.circle.fill")
-                            .font(.title2)
+                        Image(systemName: "arrow.up")
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(ZiggyPalette.primaryForeground)
+                            .frame(width: 34, height: 34)
+                            .background(ZiggyPalette.primary, in: Circle())
                     }
                     .disabled(followUp.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     .accessibilityLabel("Send follow-up")
@@ -108,13 +131,13 @@ private struct WorkDetailView: View {
                             Task { await appModel.cancel(task: task) }
                         } label: {
                             Image(systemName: "stop.circle")
-                                .font(.title2)
+                                .font(.title3)
                         }
                         .accessibilityLabel("Cancel task")
                     }
                 }
                 .padding(10)
-                .background(.bar)
+                .background(ZiggyPalette.background)
             }
         }
         .task {

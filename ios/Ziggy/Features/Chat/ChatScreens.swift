@@ -4,58 +4,110 @@ import UIKit
 
 struct ChatListView: View {
     @Environment(AppModel.self) private var appModel
+    @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
         @Bindable var appModel = appModel
 
         NavigationStack(path: $appModel.chatNavigationPath) {
-            Group {
-                if appModel.sessions.isEmpty {
-                    ContentUnavailableView {
-                        Label("No conversations", systemImage: "bubble.left.and.bubble.right")
-                    } actions: {
-                        Button("New Conversation") { Task { await appModel.newChat() } }
-                            .buttonStyle(.borderedProminent)
-                    }
-                } else {
-                    List(appModel.sessions, id: \.key) { session in
-                        Button {
-                            appModel.chatNavigationPath.append(session.key)
-                        } label: {
-                            HStack(spacing: 10) {
-                                ChatSessionRow(session: session)
-                                Spacer(minLength: 4)
-                                Image(systemName: "chevron.right")
-                                    .font(.caption.bold())
-                                    .foregroundStyle(ZiggyPalette.mutedInk)
-                            }
-                        }
-                        .buttonStyle(.plain)
-                    }
-                    .listStyle(.plain)
-                    .refreshable { await appModel.loadSessions() }
-                }
-            }
-            .background(ZiggyPalette.canvas)
-            .navigationTitle("Ziggy")
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
+            VStack(spacing: 0) {
+                HStack(spacing: 10) {
+                    Image("ZiggyAvatar")
+                        .resizable()
+                        .scaledToFit()
+                        .frame(width: 27, height: 27)
+                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                    Text("Ziggy")
+                        .font(.system(size: 17, weight: .semibold))
+                        .foregroundStyle(ZiggyPalette.foreground)
                     ZiggyConnectionStatus(state: connectionStatus, showsLabel: false)
-                }
-                ToolbarItem(placement: .topBarTrailing) {
+                    Spacer()
+                    Button {
+                        appModel.toggleTheme(currentScheme: colorScheme)
+                    } label: {
+                        Image(systemName: colorScheme == .dark ? "sun" : "moon")
+                    }
+                    .buttonStyle(PWAIconButton(size: 34))
+                    .accessibilityLabel("Toggle theme")
                     Button { Task { await appModel.newChat() } } label: {
                         Image(systemName: "square.and.pencil")
                     }
+                    .buttonStyle(PWAIconButton(size: 34))
                     .accessibilityLabel("New conversation")
                 }
+                .padding(.horizontal, 14)
+                .padding(.top, 10)
+                .padding(.bottom, 8)
+
+                Button {
+                    Task { await appModel.newChat() }
+                } label: {
+                    Label("New chat", systemImage: "square.and.pencil")
+                        .font(.system(size: 14, weight: .medium))
+                        .foregroundStyle(ZiggyPalette.foreground.opacity(0.9))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 13)
+                        .frame(height: 42)
+                        .background(ZiggyPalette.accent.opacity(0.5))
+                        .clipShape(RoundedRectangle(cornerRadius: 7))
+                }
+                .buttonStyle(.plain)
+                .padding(.horizontal, 10)
+                .padding(.bottom, 8)
+
+                HStack {
+                    ZiggySectionLabel(title: "Recent")
+                    Spacer()
+                    Button { Task { await appModel.loadSessions() } } label: {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                    .buttonStyle(PWAIconButton(size: 28))
+                    .accessibilityLabel("Refresh conversations")
+                }
+                .padding(.leading, 14)
+                .padding(.trailing, 10)
+                .padding(.top, 5)
+                .padding(.bottom, 3)
+
+                ScrollView {
+                    LazyVStack(spacing: 2) {
+                        if appModel.sessions.isEmpty {
+                            Text("No conversations yet")
+                                .font(.caption)
+                                .foregroundStyle(ZiggyPalette.mutedForeground)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 20)
+                        } else {
+                            ForEach(appModel.sessions, id: \.key) { session in
+                                Button {
+                                    appModel.chatNavigationPath.append(session.key)
+                                } label: {
+                                    ChatSessionRow(session: session)
+                                }
+                                .buttonStyle(.plain)
+                                .accessibilityIdentifier("chat-session")
+                            }
+                        }
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.bottom, 12)
+                }
+                .refreshable { await appModel.loadSessions() }
             }
+            .background(ZiggyPalette.sidebar)
+            .toolbar(.hidden, for: .navigationBar)
             .navigationDestination(for: String.self) { sessionKey in
                 ChatConversationView(
                     sessionKey: sessionKey,
-                    title: appModel.sessions.first(where: { $0.key == sessionKey })?.title
+                    title: appModel.sessions.first(where: { $0.key == sessionKey }).map(sessionTitle)
                 )
             }
         }
+    }
+
+    private func sessionTitle(_ session: SessionSummary) -> String {
+        session.title?.nilIfEmpty ?? session.preview?.nilIfEmpty ?? "Conversation"
     }
 
     private var connectionStatus: ZiggyConnectionState {
@@ -72,32 +124,37 @@ private struct ChatSessionRow: View {
     let session: SessionSummary
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            HStack(alignment: .firstTextBaseline) {
+        HStack(spacing: 8) {
+            VStack(alignment: .leading, spacing: 2) {
                 Text(session.title?.nilIfEmpty ?? session.preview?.nilIfEmpty ?? "Conversation")
-                    .font(.headline)
-                    .foregroundStyle(ZiggyPalette.ink)
+                    .font(.system(size: 13.5, weight: .medium))
+                    .foregroundStyle(ZiggyPalette.foreground.opacity(0.9))
                     .lineLimit(1)
-                Spacer(minLength: 8)
-                if let date = session.updatedAt?.date ?? session.createdAt?.date {
-                    Text(date, format: .relative(presentation: .named))
-                        .font(.caption)
-                        .foregroundStyle(ZiggyPalette.mutedInk)
-                }
+                Text(timestamp)
+                    .font(.system(size: 11))
+                    .foregroundStyle(ZiggyPalette.mutedForeground.opacity(0.85))
             }
-            if let preview = session.preview?.nilIfEmpty ?? session.lastMessage?.nilIfEmpty {
-                Text(preview)
-                    .font(.subheadline)
-                    .foregroundStyle(ZiggyPalette.mutedInk)
-                    .lineLimit(2)
-            }
+            Spacer(minLength: 4)
+            Image(systemName: "chevron.right")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(ZiggyPalette.mutedForeground.opacity(0.65))
         }
-        .padding(.vertical, 7)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .contentShape(Rectangle())
+        .background(ZiggyPalette.accent.opacity(0.001))
+        .clipShape(RoundedRectangle(cornerRadius: 7))
+    }
+
+    private var timestamp: String {
+        guard let date = session.updatedAt?.date ?? session.createdAt?.date else { return "-" }
+        return date.formatted(.relative(presentation: .named))
     }
 }
 
 struct ChatConversationView: View {
     @Environment(AppModel.self) private var appModel
+    @Environment(\.dismiss) private var dismiss
     let sessionKey: String
     let title: String?
 
@@ -121,43 +178,55 @@ struct ChatConversationView: View {
     }
 
     var body: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(spacing: 12) {
-                    if messages.isEmpty {
-                        ContentUnavailableView(
-                            "Ready when you are",
-                            systemImage: "sparkles",
-                            description: Text("Send Ziggy a message.")
-                        )
-                        .padding(.top, 90)
-                    } else {
-                        ForEach(messages) { message in
-                            ZiggyMessageBubble(
-                                kind: kind(for: message.role),
-                                text: message.text,
-                                author: author(for: message.role),
-                                isStreaming: message.isStreaming
-                            )
-                            .id(message.id)
+        VStack(spacing: 0) {
+            conversationHeader
+
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(spacing: 20) {
+                        if messages.isEmpty {
+                            VStack(alignment: .leading, spacing: 9) {
+                                HStack(spacing: 7) {
+                                    Image("ZiggyAvatar")
+                                        .resizable()
+                                        .frame(width: 18, height: 18)
+                                        .clipShape(RoundedRectangle(cornerRadius: 4))
+                                    Text("Ziggy")
+                                        .font(.caption.weight(.medium))
+                                        .foregroundStyle(ZiggyPalette.foreground.opacity(0.82))
+                                }
+                                Text("Ask about your workspace, start a task, or continue where you left off.")
+                                    .font(.system(size: 14))
+                                    .foregroundStyle(ZiggyPalette.mutedForeground)
+                                    .lineSpacing(4)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.top, 44)
+                        } else {
+                            ForEach(messages) { message in
+                                ZiggyMessageBubble(
+                                    kind: kind(for: message.role),
+                                    text: message.text,
+                                    isStreaming: message.isStreaming
+                                )
+                                .id(message.id)
+                            }
                         }
                     }
+                    .padding(.horizontal, 18)
+                    .padding(.top, 14)
+                    .padding(.bottom, 28)
                 }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 16)
+                .scrollDismissesKeyboard(.interactively)
+                .onChange(of: messages.count) { _, _ in scrollToBottom(proxy) }
+                .onChange(of: messages.last?.text) { _, _ in scrollToBottom(proxy) }
             }
-            .background(ZiggyPalette.canvas)
-            .onChange(of: messages.count) { _, _ in scrollToBottom(proxy) }
-            .onChange(of: messages.last?.text) { _, _ in scrollToBottom(proxy) }
-        }
-        .navigationTitle(title?.nilIfEmpty ?? "Ziggy")
-        .navigationBarTitleDisplayMode(.inline)
-        .safeAreaInset(edge: .bottom) {
+
             VStack(spacing: 5) {
                 if isDictating {
                     Label("Listening", systemImage: "waveform")
-                        .font(.caption.weight(.medium))
-                        .foregroundStyle(ZiggyPalette.coral)
+                        .font(.caption2.weight(.medium))
+                        .foregroundStyle(ZiggyPalette.destructive)
                 }
                 ZiggyComposer(
                     text: $composerText,
@@ -165,15 +234,19 @@ struct ChatConversationView: View {
                     photoItems: $photoItems,
                     isSending: appModel.isSending,
                     isBackgroundWork: sendsAsBackgroundWork,
+                    modelLabel: appModel.modelName,
                     onSend: send,
                     onToggleBackgroundWork: { sendsAsBackgroundWork.toggle() },
                     onMic: toggleDictation
                 )
             }
-            .padding(.horizontal, 10)
-            .padding(.top, 8)
-            .background(.bar)
+            .padding(.horizontal, 14)
+            .padding(.top, 7)
+            .padding(.bottom, 8)
+            .background(ZiggyPalette.background)
         }
+        .background(ZiggyPalette.background)
+        .toolbar(.hidden, for: .navigationBar)
         .task {
             let session = appModel.sessions.first(where: { $0.key == sessionKey })
                 ?? SessionSummary(key: sessionKey)
@@ -186,6 +259,38 @@ struct ChatConversationView: View {
         .onDisappear {
             dictationTask?.cancel()
             speechService.cancel()
+        }
+    }
+
+    private var conversationHeader: some View {
+        HStack(spacing: 7) {
+            Button { dismiss() } label: {
+                Image(systemName: "chevron.left")
+            }
+            .buttonStyle(PWAIconButton(size: 34))
+            .accessibilityLabel("Back to chats")
+
+            Image("ZiggyAvatar")
+                .resizable()
+                .frame(width: 18, height: 18)
+                .clipShape(RoundedRectangle(cornerRadius: 4))
+            Text(title?.nilIfEmpty ?? "Ziggy")
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(ZiggyPalette.mutedForeground)
+                .lineLimit(1)
+            Spacer()
+            ZiggyConnectionStatus(state: connectionStatus, showsLabel: false)
+        }
+        .padding(.horizontal, 10)
+        .frame(height: 46)
+    }
+
+    private var connectionStatus: ZiggyConnectionState {
+        switch appModel.connectionState {
+        case .connected: .connected
+        case .connecting, .reconnecting: .connecting
+        case .failed(let message): .failed(message)
+        case .idle, .stopped: .offline
         }
     }
 
@@ -263,9 +368,6 @@ struct ChatConversationView: View {
         }
     }
 
-    private func author(for role: MessageRole) -> String {
-        role == .user ? "You" : "Ziggy"
-    }
 }
 
 private enum ImageAttachmentFactory {

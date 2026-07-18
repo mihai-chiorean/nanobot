@@ -99,3 +99,4 @@ schemes:
       environmentVariables:
         ZIGGY_GUEST_CODE: "$(ZIGGY_GUEST_CODE)"
         ZIGGY_SERVER_URL: "$(ZIGGY_SERVER_URL)"
+        ZIGGY_THEME: "$(ZIGGY_THEME)"

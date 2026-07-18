@@ -20,9 +20,9 @@ enum ZiggyConnectionState: Equatable, Sendable {
 
     var color: Color {
         switch self {
-        case .connected: ZiggyPalette.moss
+        case .connected: ZiggyPalette.emerald
         case .connecting, .waiting: ZiggyPalette.amber
-        case .failed, .offline: ZiggyPalette.coral
+        case .failed, .offline: ZiggyPalette.destructive
         }
     }
 }
@@ -32,13 +32,23 @@ struct ZiggyConnectionStatus: View {
     var showsLabel = true
 
     var body: some View {
-        Label {
+        HStack(spacing: 6) {
+            Circle()
+                .fill(state.color)
+                .frame(width: 6, height: 6)
             if showsLabel { Text(state.label) }
-        } icon: {
-            Circle().fill(state.color).frame(width: 8, height: 8)
         }
-        .font(.caption.weight(.medium))
-        .foregroundStyle(ZiggyPalette.mutedInk)
+        .font(.caption2.weight(.medium))
+        .foregroundStyle(state.color)
+        .padding(.horizontal, showsLabel ? 8 : 0)
+        .padding(.vertical, showsLabel ? 5 : 0)
+        .background(showsLabel ? state.color.opacity(0.08) : .clear)
+        .clipShape(RoundedRectangle(cornerRadius: 6))
+        .overlay {
+            if showsLabel {
+                RoundedRectangle(cornerRadius: 6).stroke(ZiggyPalette.border.opacity(0.65))
+            }
+        }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("Connection status: \(state.label)")
     }
@@ -56,32 +66,63 @@ struct ZiggyMessageBubble: View {
     var author: String? = nil
     var isStreaming = false
 
-    private var isUser: Bool { kind == .user }
-
     var body: some View {
-        HStack(alignment: .bottom, spacing: 8) {
-            if isUser { Spacer(minLength: 44) }
-            VStack(alignment: isUser ? .trailing : .leading, spacing: 6) {
-                if let author {
-                    Text(author)
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(isUser ? ZiggyPalette.teal : ZiggyPalette.mutedInk)
+        Group {
+            switch kind {
+            case .user:
+                HStack {
+                    Spacer(minLength: 52)
+                    Text(text)
+                        .font(.system(size: 17))
+                        .foregroundStyle(ZiggyPalette.foreground)
+                        .lineSpacing(4)
+                        .textSelection(.enabled)
+                        .padding(.horizontal, 15)
+                        .padding(.vertical, 9)
+                        .background(ZiggyPalette.secondary.opacity(0.9))
+                        .clipShape(RoundedRectangle(cornerRadius: 18))
                 }
-                HStack(alignment: .bottom, spacing: 8) {
+            case .assistant:
+                HStack(alignment: .lastTextBaseline, spacing: 5) {
                     ZiggyMarkdownText(markdown: text)
-                    if isStreaming { ZiggyStreamingIndicator() }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    if isStreaming { StreamCursor() }
                 }
+            case .progress:
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: "wrench.and.screwdriver")
+                        .font(.caption2)
+                        .padding(.top, 3)
+                    Text(text)
+                        .font(.caption.monospaced())
+                        .lineSpacing(2)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .foregroundStyle(ZiggyPalette.mutedForeground)
+                .padding(.vertical, 3)
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 10)
-            .background(isUser ? ZiggyPalette.teal.opacity(0.13) : ZiggyPalette.panel, in: RoundedRectangle(cornerRadius: 8))
-            .overlay(RoundedRectangle(cornerRadius: 8).stroke(isUser ? ZiggyPalette.teal.opacity(0.18) : ZiggyPalette.line, lineWidth: 1))
-            if !isUser { Spacer(minLength: 20) }
         }
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(kind.rawValue.capitalized) message")
         .accessibilityIdentifier("\(kind.rawValue)-message")
         .accessibilityValue(text)
+    }
+}
+
+private struct StreamCursor: View {
+    @State private var visible = true
+
+    var body: some View {
+        RoundedRectangle(cornerRadius: 1)
+            .fill(ZiggyPalette.foreground.opacity(0.7))
+            .frame(width: 3, height: 17)
+            .opacity(visible ? 1 : 0.25)
+            .onAppear {
+                withAnimation(.easeInOut(duration: 0.65).repeatForever(autoreverses: true)) {
+                    visible = false
+                }
+            }
+            .accessibilityHidden(true)
     }
 }
 
@@ -92,49 +133,46 @@ struct ZiggyTraceGroup: Identifiable, Sendable {
     var isFailure = false
 
     init(id: UUID = UUID(), title: String, detail: String, isFailure: Bool = false) {
-        self.id = id; self.title = title; self.detail = detail; self.isFailure = isFailure
+        self.id = id
+        self.title = title
+        self.detail = detail
+        self.isFailure = isFailure
     }
 }
 
 struct ZiggyTraceDisclosure: View {
     let title: String
     let traces: [ZiggyTraceGroup]
-    var initiallyExpanded = false
     @State private var isExpanded: Bool
 
-    init(title: String = "Activity", traces: [ZiggyTraceGroup], initiallyExpanded: Bool = false) {
-        self.title = title; self.traces = traces; self.initiallyExpanded = initiallyExpanded
+    init(title: String = "Tools", traces: [ZiggyTraceGroup], initiallyExpanded: Bool = true) {
+        self.title = title
+        self.traces = traces
         _isExpanded = State(initialValue: initiallyExpanded)
     }
 
     var body: some View {
         DisclosureGroup(isExpanded: $isExpanded) {
-            VStack(alignment: .leading, spacing: 10) {
+            VStack(alignment: .leading, spacing: 5) {
                 ForEach(traces) { trace in
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text(trace.title).font(.subheadline.weight(.medium))
-                        Text(trace.detail).font(.caption).foregroundStyle(ZiggyPalette.mutedInk).textSelection(.enabled)
-                    }
-                    .foregroundStyle(trace.isFailure ? ZiggyPalette.coral : ZiggyPalette.ink)
+                    Text(trace.detail)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(trace.isFailure ? ZiggyPalette.destructive : ZiggyPalette.mutedForeground)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
-            .padding(.top, 8)
+            .padding(.leading, 12)
+            .padding(.top, 6)
+            .overlay(alignment: .leading) {
+                Rectangle().fill(ZiggyPalette.border).frame(width: 1)
+            }
         } label: {
-            Label(title, systemImage: "list.bullet.rectangle")
-                .font(.subheadline.weight(.medium))
-                .foregroundStyle(ZiggyPalette.mutedInk)
+            Label(title, systemImage: "wrench.and.screwdriver")
+                .font(.caption.weight(.medium))
+                .foregroundStyle(ZiggyPalette.mutedForeground)
         }
-        .tint(ZiggyPalette.teal)
-        .padding(12)
-        .background(ZiggyPalette.panel, in: RoundedRectangle(cornerRadius: 8))
-        .overlay(RoundedRectangle(cornerRadius: 8).stroke(ZiggyPalette.line, lineWidth: 1))
-    }
-}
-
-struct ZiggyStreamingIndicator: View {
-    var body: some View {
-        ProgressView().controlSize(.small).tint(ZiggyPalette.teal)
-            .accessibilityLabel("Assistant is responding")
+        .tint(ZiggyPalette.mutedForeground)
+        .padding(.vertical, 4)
     }
 }
 
@@ -170,13 +208,22 @@ struct ZiggyImageAttachmentStrip: View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
                 ForEach(attachments) { attachment in
-                    attachment.image.resizable().scaledToFill()
-                        .frame(width: 64, height: 64).clipShape(RoundedRectangle(cornerRadius: 6))
+                    attachment.image
+                        .resizable()
+                        .scaledToFill()
+                        .frame(width: 64, height: 64)
+                        .clipShape(RoundedRectangle(cornerRadius: 10))
+                        .overlay(RoundedRectangle(cornerRadius: 10).stroke(ZiggyPalette.border))
                         .overlay(alignment: .topTrailing) {
-                            Button { attachments.removeAll { $0.id == attachment.id } } label: {
-                                Image(systemName: "xmark.circle.fill").symbolRenderingMode(.palette).foregroundStyle(.white, .black.opacity(0.65))
+                            Button {
+                                attachments.removeAll { $0.id == attachment.id }
+                            } label: {
+                                Image(systemName: "xmark.circle.fill")
+                                    .symbolRenderingMode(.palette)
+                                    .foregroundStyle(.white, .black.opacity(0.68))
                             }
-                            .buttonStyle(.plain).padding(3)
+                            .buttonStyle(.plain)
+                            .padding(3)
                             .accessibilityLabel("Remove \(attachment.title)")
                         }
                         .accessibilityLabel(attachment.title)
@@ -193,55 +240,110 @@ struct ZiggyComposer: View {
     @Binding var photoItems: [PhotosPickerItem]
     var isSending = false
     var isBackgroundWork = false
+    var modelLabel: String? = nil
     var onSend: () -> Void = {}
     var onToggleBackgroundWork: () -> Void = {}
     var onMic: () -> Void = {}
 
+    private var canSend: Bool {
+        !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attachments.isEmpty
+    }
+
     var body: some View {
-        VStack(spacing: 8) {
-            if !attachments.isEmpty { ZiggyImageAttachmentStrip(attachments: $attachments) }
-            HStack(alignment: .bottom, spacing: 8) {
-                TextField("Message Ziggy", text: $text, axis: .vertical)
-                    .lineLimit(1...6).textFieldStyle(.plain).padding(.vertical, 10)
-                    .accessibilityLabel("Message")
+        VStack(spacing: 0) {
+            if !attachments.isEmpty {
+                ZiggyImageAttachmentStrip(attachments: $attachments)
+                    .padding(.horizontal, 12)
+                    .padding(.top, 10)
+            }
+
+            TextField("Type your message...", text: $text, axis: .vertical)
+                .lineLimit(1...7)
+                .textFieldStyle(.plain)
+                .font(.body)
+                .padding(.horizontal, 14)
+                .padding(.top, attachments.isEmpty ? 13 : 9)
+                .padding(.bottom, 8)
+                .accessibilityLabel("Message")
+
+            HStack(spacing: 4) {
+                PhotosPicker(selection: $photoItems, maxSelectionCount: 6, matching: .images) {
+                    Image(systemName: "paperclip")
+                }
+                .buttonStyle(PWAIconButton(size: 32))
+                .accessibilityLabel("Attach photos")
+
+                Button(action: onMic) { Image(systemName: "mic") }
+                    .buttonStyle(PWAIconButton(size: 32))
+                    .accessibilityLabel("Dictate message")
+
+                if let modelLabel, !modelLabel.isEmpty {
+                    HStack(spacing: 6) {
+                        Circle().fill(ZiggyPalette.emerald).frame(width: 6, height: 6)
+                        Text(modelLabel.split(separator: "/").last.map(String.init) ?? modelLabel)
+                            .lineLimit(1)
+                    }
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(ZiggyPalette.foreground.opacity(0.8))
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 5)
+                    .background(ZiggyPalette.foreground.opacity(0.035))
+                    .clipShape(Capsule())
+                    .overlay(Capsule().stroke(ZiggyPalette.foreground.opacity(0.1)))
+                }
+
+                Spacer(minLength: 4)
+
                 Button(action: onToggleBackgroundWork) {
                     Image(systemName: isBackgroundWork ? "bolt.fill" : "bolt")
                 }
-                .buttonStyle(.borderless).foregroundStyle(isBackgroundWork ? ZiggyPalette.amber : ZiggyPalette.mutedInk)
+                .buttonStyle(PWAIconButton(
+                    size: 32,
+                    foreground: isBackgroundWork ? ZiggyPalette.amber : ZiggyPalette.mutedForeground
+                ))
                 .accessibilityLabel(isBackgroundWork ? "Send as background work" : "Send as chat message")
-                .accessibilityHint("Toggles background work mode")
-                Button(action: onMic) { Image(systemName: "mic") }
-                    .buttonStyle(.borderless).foregroundStyle(ZiggyPalette.mutedInk).accessibilityLabel("Dictate message")
-                PhotosPicker(selection: $photoItems, maxSelectionCount: 6, matching: .images) {
-                    Image(systemName: "photo")
-                }
-                .buttonStyle(.borderless).foregroundStyle(ZiggyPalette.mutedInk).accessibilityLabel("Attach photos")
+
                 Button(action: onSend) {
-                    if isSending { ProgressView().controlSize(.small) } else { Image(systemName: "arrow.up.circle.fill") }
+                    Group {
+                        if isSending {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Image(systemName: "arrow.up")
+                                .font(.system(size: 14, weight: .semibold))
+                        }
+                    }
+                    .frame(width: 32, height: 32)
+                    .foregroundStyle(canSend ? ZiggyPalette.primaryForeground : ZiggyPalette.mutedForeground)
+                    .background(canSend ? ZiggyPalette.primary : ZiggyPalette.secondary)
+                    .clipShape(Circle())
+                    .overlay(Circle().stroke(ZiggyPalette.border.opacity(0.75)))
                 }
-                .buttonStyle(.borderless).disabled(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && attachments.isEmpty)
-                .foregroundStyle(ZiggyPalette.teal).accessibilityLabel(isSending ? "Sending message" : "Send message")
+                .buttonStyle(.plain)
+                .disabled(!canSend || isSending)
+                .accessibilityLabel(isSending ? "Sending message" : "Send message")
             }
-            .padding(.horizontal, 12).background(ZiggyPalette.panel, in: RoundedRectangle(cornerRadius: 8))
-            .overlay(RoundedRectangle(cornerRadius: 8).stroke(ZiggyPalette.line, lineWidth: 1))
+            .padding(.horizontal, 9)
+            .padding(.bottom, 9)
         }
+        .background(ZiggyPalette.card)
+        .clipShape(RoundedRectangle(cornerRadius: 16))
+        .overlay(RoundedRectangle(cornerRadius: 16).stroke(ZiggyPalette.border.opacity(0.75)))
     }
 }
 
-#Preview("Chat states") {
-    @Previewable @State var attachments: [ZiggyImageAttachment] = [
-        ZiggyImageAttachment(image: Image(systemName: "photo"), title: "Status screenshot")
-    ]
+#Preview("PWA chat") {
+    @Previewable @State var attachments: [ZiggyImageAttachment] = []
     @Previewable @State var text = ""
     @Previewable @State var photos: [PhotosPickerItem] = []
-    ScrollView { VStack(alignment: .leading, spacing: 14) {
-        ZiggyConnectionStatus(state: .connected)
-        ZiggyConnectionStatus(state: .waiting("Waiting for server"))
-        ZiggyMessageBubble(kind: .assistant, text: "**Ready.** I found the deployment notes and can summarize them.\n\n- Three services are healthy\n- One worker is waiting", author: "Ziggy")
-        ZiggyMessageBubble(kind: .user, text: "Please keep the summary short.", author: "You")
-        ZiggyMessageBubble(kind: .progress, text: "Checking the latest task status…", isStreaming: true)
-        ZiggyTraceDisclosure(traces: [ZiggyTraceGroup(title: "Fetch status", detail: "Request timed out", isFailure: true)], initiallyExpanded: true)
-        ZiggyComposer(text: $text, attachments: $attachments, photoItems: $photos)
-    }.padding().background(ZiggyPalette.canvas) }
+    ScrollView {
+        VStack(spacing: 20) {
+            ZiggyMessageBubble(kind: .user, text: "Please keep the summary short.")
+            ZiggyMessageBubble(kind: .assistant, text: "**Ready.** I found the deployment notes and can summarize them.")
+            ZiggyMessageBubble(kind: .progress, text: "Checking deployment status")
+            ZiggyComposer(text: $text, attachments: $attachments, photoItems: $photos, modelLabel: "qwen3.6-35b")
+        }
+        .padding()
+    }
+    .background(ZiggyPalette.background)
     .preferredColorScheme(.dark)
 }

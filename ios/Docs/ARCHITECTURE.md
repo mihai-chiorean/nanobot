@@ -13,8 +13,9 @@
 
 `ZiggyApp` builds the dependency graph and owns scene lifecycle. `AppModel` is
 the V1 main-actor state machine for enrollment, routing, conversation state,
-work state, and global connection status. Its transport-facing methods are
-small enough to extract into feature stores when local persistence arrives.
+work state, global connection status, and persisted appearance preference. Its
+transport-facing methods are small enough to extract into feature stores when
+local persistence arrives.
 
 ### Core models
 
@@ -51,6 +52,9 @@ endpoint and future stateless completion surfaces.
 - `Work`: task list, detail timeline, cancellation, follow-up.
 - `Settings`: enrollment, endpoint, diagnostics, owner-only controls.
 - `Speech`: permission and dictation service behind a protocol.
+
+The SwiftUI design system mirrors the PWA's neutral light/dark tokens and
+compact interaction hierarchy without embedding the web client.
 
 UI state is held by a `@MainActor @Observable` reference type. Transport actors
 emit `AsyncStream` values that are reduced into stable view state.

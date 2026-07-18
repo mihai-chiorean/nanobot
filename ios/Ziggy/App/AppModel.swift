@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import SwiftUI
 
 struct ZiggyIdentity: Sendable {
     let name: String
@@ -9,6 +10,22 @@ struct ZiggyIdentity: Sendable {
         name: "Mihai Chiorean",
         email: "mihai.v.chiorean@gmail.com"
     )
+}
+
+enum ZiggyTheme: String, CaseIterable, Identifiable, Sendable {
+    case system
+    case light
+    case dark
+
+    var id: String { rawValue }
+    var label: String { rawValue.capitalized }
+    var colorScheme: ColorScheme? {
+        switch self {
+        case .system: nil
+        case .light: .light
+        case .dark: .dark
+        }
+    }
 }
 
 struct ChatItem: Identifiable, Hashable, Sendable {
@@ -47,6 +64,7 @@ final class AppModel {
 
     let identity = ZiggyIdentity.owner
     var selectedTab: Tab = .chats
+    var theme: ZiggyTheme
     var chatNavigationPath: [String] = []
     var phase: Phase = .launching
     var serverURLText = "https://chat.mihaichiorean.com"
@@ -95,6 +113,7 @@ final class AppModel {
 
     init(credentialStore: any CredentialStoring = KeychainCredentialStore()) {
         self.credentialStore = credentialStore
+        self.theme = ZiggyTheme(rawValue: UserDefaults.standard.string(forKey: "ziggy.theme") ?? "") ?? .system
     }
 
     func start() async {
@@ -102,6 +121,9 @@ final class AppModel {
         hasStarted = true
 
         let environment = ProcessInfo.processInfo.environment
+        if let rawTheme = environment["ZIGGY_THEME"], let theme = ZiggyTheme(rawValue: rawTheme) {
+            self.theme = theme
+        }
         if let server = environment["ZIGGY_SERVER_URL"], !server.isEmpty {
             serverURLText = server
         }
@@ -123,6 +145,15 @@ final class AppModel {
         } catch {
             phase = .failed(Self.message(for: error))
         }
+    }
+
+    func setTheme(_ theme: ZiggyTheme) {
+        self.theme = theme
+        UserDefaults.standard.set(theme.rawValue, forKey: "ziggy.theme")
+    }
+
+    func toggleTheme(currentScheme: ColorScheme) {
+        setTheme(currentScheme == .dark ? .light : .dark)
     }
 
     func connect(persist: Bool = true) async {
@@ -343,8 +374,11 @@ final class AppModel {
                 Task { await loadSessions(showSpinner: false) }
             }
         case .message(let message):
+            let role: MessageRole = ["trace", "progress", "tool"].contains(message.kind?.lowercased() ?? "")
+                ? .progress
+                : .assistant
             messagesByChatID[message.chatID, default: []].append(
-                ChatItem(chatID: message.chatID, role: .assistant, text: message.text)
+                ChatItem(chatID: message.chatID, role: role, text: message.text)
             )
         case .delta(let delta):
             guard let chatID = delta.sessionKey else { return }

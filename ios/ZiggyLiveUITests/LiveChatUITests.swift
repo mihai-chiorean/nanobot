@@ -12,9 +12,12 @@ final class LiveChatUITests: XCTestCase {
         app.launchEnvironment["ZIGGY_GUEST_CODE"] = accessCode
         app.launchEnvironment["ZIGGY_SERVER_URL"] = environment["ZIGGY_SERVER_URL"]
             ?? "https://chat.mihaichiorean.com"
+        if let theme = environment["ZIGGY_THEME"], !theme.isEmpty {
+            app.launchEnvironment["ZIGGY_THEME"] = theme
+        }
         app.launch()
 
-        let conversation = app.staticTexts["New conversation"]
+        let conversation = app.buttons.matching(identifier: "chat-session").firstMatch
         XCTAssertTrue(conversation.waitForExistence(timeout: 15), "Ziggy did not create a chat")
         conversation.tap()
 
@@ -31,6 +34,12 @@ final class LiveChatUITests: XCTestCase {
             assistantMessage.waitForExistence(timeout: 90),
             "Ziggy did not stream a response back to the native app"
         )
+
+        app.buttons["Back to chats"].tap()
+        XCTAssertTrue(conversation.waitForExistence(timeout: 5))
+        conversation.tap()
+        XCTAssertTrue(app.buttons["Back to chats"].waitForExistence(timeout: 5))
+        XCTAssertTrue(assistantMessage.waitForExistence(timeout: 5))
 
         let screenshot = XCTAttachment(screenshot: app.screenshot())
         screenshot.name = "Live Ziggy chat response"
