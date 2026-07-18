@@ -25,7 +25,7 @@ struct ChatListView: View {
                     Button {
                         appModel.toggleTheme(currentScheme: colorScheme)
                     } label: {
-                        Image(systemName: colorScheme == .dark ? "sun" : "moon")
+                        Image(systemName: colorScheme == .dark ? "sun.max" : "moon")
                     }
                     .buttonStyle(PWAIconButton(size: 34))
                     .accessibilityLabel("Toggle theme")

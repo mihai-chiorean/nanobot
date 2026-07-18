@@ -15,7 +15,7 @@ struct EnrollmentView: View {
                     Button {
                         appModel.toggleTheme(currentScheme: colorScheme)
                     } label: {
-                        Image(systemName: colorScheme == .dark ? "sun" : "moon")
+                        Image(systemName: colorScheme == .dark ? "sun.max" : "moon")
                     }
                     .buttonStyle(PWAIconButton())
                     .accessibilityLabel("Toggle theme")
