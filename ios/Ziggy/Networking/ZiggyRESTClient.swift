@@ -3,20 +3,36 @@ import Foundation
 public struct ZiggyRESTClient: Sendable {
     public let baseURL: URL
     public let session: URLSession
+    public let maxResponseBytes: Int
     private let bearerToken: String?
 
-    public init(baseURL: URL, bearerToken: String? = nil, session: URLSession = .shared) {
+    public init(baseURL: URL, bearerToken: String? = nil, session: URLSession = .shared,
+                maxResponseBytes: Int = ZiggyProtocolLimits.maxRESTResponseBytes) {
         self.baseURL = baseURL
         self.bearerToken = bearerToken
         self.session = session
+        self.maxResponseBytes = max(1, maxResponseBytes)
     }
 
     public func withBearerToken(_ token: String?) -> ZiggyRESTClient {
-        ZiggyRESTClient(baseURL: baseURL, bearerToken: token, session: session)
+        ZiggyRESTClient(baseURL: baseURL, bearerToken: token, session: session,
+                        maxResponseBytes: maxResponseBytes)
     }
 
     public func bootstrapGuest(code: String) async throws -> BootstrapResponse {
-        try await request(path: ["webui", "guest", "bootstrap"], query: [URLQueryItem(name: "code", value: code)], token: nil)
+        var form = URLComponents()
+        form.queryItems = [URLQueryItem(name: "code", value: code)]
+        guard let encoded = form.percentEncodedQuery,
+              let body = encoded.data(using: .utf8) else {
+            throw ZiggyRESTError.invalidResponse
+        }
+        return try await request(
+            path: ["webui", "guest", "bootstrap"],
+            headers: ["Content-Type": "application/x-www-form-urlencoded"],
+            token: nil,
+            method: "POST",
+            body: body
+        )
     }
 
     public func bootstrapOwner(ownerCode: String) async throws -> BootstrapResponse {
@@ -61,15 +77,18 @@ public struct ZiggyRESTClient: Sendable {
     }
 
     private func request<Value: Codable & Sendable>(path: [String], query: [URLQueryItem] = [],
-                                                    headers: [String: String] = [:], token: String? = nil) async throws -> Value {
-        let data = try await data(path: path, query: query, headers: headers, token: token)
+                                                    headers: [String: String] = [:], token: String? = nil,
+                                                    method: String = "GET", body: Data? = nil) async throws -> Value {
+        let data = try await data(path: path, query: query, headers: headers, token: token,
+                                  method: method, body: body)
         let decoder = JSONDecoder.ziggy
         if let direct = try? decoder.decode(Value.self, from: data) { return direct }
         if let envelope = try? decoder.decode(RESTEnvelope<Value>.self, from: data), let value = envelope.value { return value }
         throw ZiggyRESTError.decoding
     }
 
-    private func data(path: [String], query: [URLQueryItem] = [], headers: [String: String] = [:], token: String? = nil) async throws -> Data {
+    private func data(path: [String], query: [URLQueryItem] = [], headers: [String: String] = [:],
+                      token: String? = nil, method: String = "GET", body: Data? = nil) async throws -> Data {
         var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false)
         let basePath = components?.percentEncodedPath ?? baseURL.path
         let encodedPath = path.map(Self.encodePathSegment).joined(separator: "/")
@@ -78,13 +97,20 @@ public struct ZiggyRESTClient: Sendable {
         guard let url = components?.url else { throw ZiggyRESTError.invalidURL }
 
         var request = URLRequest(url: url)
-        request.httpMethod = "GET"
+        request.httpMethod = method
+        request.httpBody = body
         for (header, value) in headers { request.setValue(value, forHTTPHeaderField: header) }
         if let token = token ?? bearerToken { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
         let (responseData, response) = try await session.data(for: request)
         guard let response = response as? HTTPURLResponse else { throw ZiggyRESTError.invalidResponse }
+        guard response.expectedContentLength <= 0 || response.expectedContentLength <= Int64(maxResponseBytes),
+              responseData.count <= maxResponseBytes else {
+            throw ZiggyRESTError.responseTooLarge(limit: maxResponseBytes)
+        }
         guard (200..<300).contains(response.statusCode) else {
-            throw ZiggyRESTError.http(statusCode: response.statusCode, body: String(data: responseData, encoding: .utf8))
+            let boundedBody = String(data: responseData, encoding: .utf8)?
+                .ziggyTruncatedUTF8(maxBytes: ZiggyProtocolLimits.maxUnsupportedPayloadBytes)
+            throw ZiggyRESTError.http(statusCode: response.statusCode, body: boundedBody)
         }
         return responseData
     }
@@ -124,5 +150,6 @@ public enum ZiggyRESTError: Error, Equatable, Sendable {
     case invalidURL
     case invalidResponse
     case http(statusCode: Int, body: String?)
+    case responseTooLarge(limit: Int)
     case decoding
 }

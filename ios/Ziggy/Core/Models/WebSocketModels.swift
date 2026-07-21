@@ -23,6 +23,12 @@ public struct AssistantDelta: Codable, Hashable, Sendable {
         text = try c.decodeIfPresent(String.self, forAny: ["text", "content", "delta"]) ?? ""
         role = try c.decodeIfPresent(MessageRole.self, forAny: ["role"])
         sequence = try c.decodeIfPresent(Int.self, forAny: ["seq", "sequence"])
+        guard (sessionKey ?? "").utf8.count <= RichContentLimits.maxChatIDBytes,
+              (messageID ?? "").utf8.count <= RichContentLimits.maxMessageIDBytes,
+              text.utf8.count <= ZiggyProtocolLimits.maxDeltaTextBytes,
+              sequence.map({ $0 >= 0 }) ?? true else {
+            throw RichContentDecodingError.limit("stream delta")
+        }
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -38,10 +44,10 @@ public struct AssistantDelta: Codable, Hashable, Sendable {
 public struct AssistantCompletion: Codable, Hashable, Sendable {
     public let sessionKey: String?
     public let messageID: String?
-    public let message: ZiggyMessage?
+    public let message: StreamFinalMessage?
     public let finishReason: String?
 
-    public init(sessionKey: String? = nil, messageID: String? = nil, message: ZiggyMessage? = nil,
+    public init(sessionKey: String? = nil, messageID: String? = nil, message: StreamFinalMessage? = nil,
                 finishReason: String? = nil) {
         self.sessionKey = sessionKey
         self.messageID = messageID
@@ -51,10 +57,52 @@ public struct AssistantCompletion: Codable, Hashable, Sendable {
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: AnyCodingKey.self)
+        message = try c.decodeIfPresent(StreamFinalMessage.self, forAny: ["message"])
         sessionKey = try c.decodeIfPresent(String.self, forAny: ["chat_id", "session_key", "chat_key"])
+            ?? message?.chatID
         messageID = try c.decodeIfPresent(String.self, forAny: ["stream_id", "message_id", "id"])
-        message = try c.decodeIfPresent(ZiggyMessage.self, forAny: ["message"])
+            ?? message?.id
         finishReason = try c.decodeIfPresent(String.self, forAny: ["finish_reason", "reason"])
+        guard (sessionKey ?? "").utf8.count <= RichContentLimits.maxChatIDBytes,
+              (messageID ?? "").utf8.count <= RichContentLimits.maxMessageIDBytes,
+              (finishReason ?? "").utf8.count <= RichContentLimits.maxToolFieldBytes else {
+            throw RichContentDecodingError.limit("stream completion")
+        }
+    }
+}
+
+public enum StreamFinalMessage: Codable, Hashable, Sendable {
+    case rich(RichContentMessage)
+    case legacy(ZiggyMessage)
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: AnyCodingKey.self)
+        if c.contains(AnyCodingKey("version")), c.contains(AnyCodingKey("blocks")) {
+            self = .rich(try RichContentMessage(from: decoder))
+        } else {
+            self = .legacy(try ZiggyMessage(from: decoder))
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        switch self {
+        case .rich(let value): try value.encode(to: encoder)
+        case .legacy(let value): try value.encode(to: encoder)
+        }
+    }
+
+    public var id: String {
+        switch self {
+        case .rich(let value): value.id
+        case .legacy(let value): value.id
+        }
+    }
+
+    public var chatID: String? {
+        switch self {
+        case .rich(let value): value.chatID
+        case .legacy(let value): value.sessionKey
+        }
     }
 }
 
@@ -78,18 +126,55 @@ public struct ConnectionInfo: Codable, Hashable, Sendable {
 }
 
 public struct InboundChatMessage: Codable, Hashable, Sendable {
+    public let id: String?
     public let chatID: String
     public let text: String
+    public let role: MessageRole
+    public let richContent: RichContentMessage?
     public let replyTo: String?
     public let mediaURLs: [String]
     public let buttons: [String]
     public let buttonPrompt: String?
     public let kind: String?
 
+    public init(id: String? = nil, chatID: String, text: String, role: MessageRole = .assistant,
+                richContent: RichContentMessage? = nil, replyTo: String? = nil,
+                mediaURLs: [String] = [], buttons: [String] = [], buttonPrompt: String? = nil,
+                kind: String? = nil) {
+        self.id = id
+        self.chatID = chatID
+        self.text = text
+        self.role = role
+        self.richContent = richContent
+        self.replyTo = replyTo
+        self.mediaURLs = mediaURLs
+        self.buttons = buttons
+        self.buttonPrompt = buttonPrompt
+        self.kind = kind
+    }
+
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: AnyCodingKey.self)
-        chatID = try c.decode(String.self, forAny: ["chat_id"])
-        text = try c.decodeIfPresent(String.self, forAny: ["text", "content"]) ?? ""
+        let directRich: RichContentMessage?
+        if c.contains(AnyCodingKey("version")), c.contains(AnyCodingKey("blocks")) {
+            directRich = try RichContentMessage(from: decoder)
+        } else {
+            let nested = try c.decodeIfPresent(JSONValue.self, forAny: ["message", "content"])
+            if let object = nested?.objectValue,
+               object["version"]?.stringValue == RichContentVersion.v1.rawValue,
+               object["blocks"] != nil {
+                let data = try JSONEncoder().encode(nested)
+                directRich = try JSONDecoder.ziggy.decode(RichContentMessage.self, from: data)
+            } else {
+                directRich = nil
+            }
+        }
+        richContent = directRich
+        chatID = try directRich?.chatID ?? c.decode(String.self, forAny: ["chat_id"])
+        id = try directRich?.id ?? c.decodeIfPresent(String.self, forAny: ["message_id", "id"])
+        let legacyText = (try? c.decodeIfPresent(String.self, forAny: ["text", "content"])) ?? nil
+        text = legacyText ?? directRich.map { LegacyContentAdapter.plainText(for: $0.blocks) } ?? ""
+        role = try directRich?.role ?? c.decodeIfPresent(MessageRole.self, forAny: ["role"]) ?? .assistant
         replyTo = try c.decodeIfPresent(String.self, forAny: ["reply_to"])
         if let urls = try c.decodeIfPresent([String].self, forAny: ["media_urls"]) {
             mediaURLs = urls
@@ -98,6 +183,10 @@ public struct InboundChatMessage: Codable, Hashable, Sendable {
             mediaURLs = media.compactMap { item in
                 item.stringValue ?? item.objectString(for: ["url", "media_url", "data_url"])
             }
+        }
+        guard mediaURLs.count <= 16,
+              mediaURLs.allSatisfy({ $0.utf8.count <= RichContentLimits.maxMediaURLBytes }) else {
+            throw RichContentDecodingError.limit("legacy media")
         }
         if let labels = try? c.decodeIfPresent([String].self, forAny: ["buttons"]) {
             buttons = labels
@@ -109,6 +198,16 @@ public struct InboundChatMessage: Codable, Hashable, Sendable {
         }
         buttonPrompt = try c.decodeIfPresent(String.self, forAny: ["button_prompt"])
         kind = try c.decodeIfPresent(String.self, forAny: ["kind"])
+        guard !chatID.isEmpty, chatID.utf8.count <= RichContentLimits.maxChatIDBytes,
+              (id ?? "").utf8.count <= RichContentLimits.maxMessageIDBytes,
+              text.utf8.count <= ZiggyProtocolLimits.maxLegacyTextBytes,
+              (replyTo ?? "").utf8.count <= RichContentLimits.maxMessageIDBytes,
+              buttons.count <= 32,
+              buttons.allSatisfy({ $0.utf8.count <= 256 }),
+              (buttonPrompt ?? "").utf8.count <= 1_024,
+              (kind ?? "").utf8.count <= 128 else {
+            throw RichContentDecodingError.limit("legacy message")
+        }
     }
 }
 
@@ -167,6 +266,9 @@ public enum InboundWebSocketEvent: Decodable, Hashable, Sendable {
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: AnyCodingKey.self)
         let type = try c.decode(String.self, forAny: ["event", "type"])
+        guard !type.isEmpty, type.utf8.count <= RichContentLimits.maxBlockTypeBytes else {
+            throw RichContentDecodingError.invalid("event type")
+        }
 
         switch type {
         case "ready":
@@ -192,7 +294,7 @@ public enum InboundWebSocketEvent: Decodable, Hashable, Sendable {
         case "work.event":
             self = .workEvent(try WorkEvent(from: decoder))
         default:
-            let payload = (try? JSONValue(from: decoder)) ?? .object([:])
+            let payload = ((try? JSONValue(from: decoder)) ?? .object([:])).boundedForUnsupportedContent()
             self = .unknown(type: type, payload: payload)
         }
     }

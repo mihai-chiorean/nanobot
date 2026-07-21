@@ -13,6 +13,12 @@ a private guest code, stores that code in Keychain, and exchanges it for
 short-lived `nbwt_` credentials. Those credentials are never committed or
 persisted by the app.
 
+The enrollment exchange sends the private code in a JSON `POST` body. REST and
+WebSocket traffic use `Authorization: Bearer <short-lived token>` headers; no
+credential is placed in a URL. Token refresh is serialized, honors both
+absolute and relative expiry values, and retries an authenticated REST request
+once after a `401`.
+
 All conversations, work, and memory continue to use Ziggy's existing personal
 namespace. V1 intentionally has no per-user data partitioning.
 

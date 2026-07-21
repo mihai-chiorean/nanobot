@@ -16,13 +16,26 @@ public enum ZiggyWebSocketEvent: Sendable, Hashable {
     case outboundQueueFull
 }
 
+public struct WebSocketCredential: Sendable, Hashable {
+    public let bearerToken: String
+    public let capabilities: RichContentCapabilities
+
+    public init(bearerToken: String, capabilities: RichContentCapabilities = .legacyOnly) {
+        self.bearerToken = bearerToken
+        self.capabilities = capabilities
+    }
+}
+
+public enum ZiggyWebSocketClientError: Error, Equatable, Sendable {
+    case frameTooLarge(limit: Int)
+}
+
 public actor ZiggyWebSocketClient {
     public nonisolated let events: AsyncStream<ZiggyWebSocketEvent>
 
     private let baseURL: URL
     private let session: URLSession
-    private let tokenProvider: @Sendable () async throws -> String
-    private let tokenQueryName: String
+    private let credentialProvider: @Sendable () async throws -> WebSocketCredential
     private let maxOutboundQueue: Int
     private let eventContinuation: AsyncStream<ZiggyWebSocketEvent>.Continuation
     private var assistantContinuations: [UUID: AsyncStream<AssistantStreamEvent>.Continuation] = [:]
@@ -33,14 +46,25 @@ public actor ZiggyWebSocketClient {
     private var shouldRun = false
     private var backoffNanoseconds: UInt64 = 500_000_000
 
-    public init(baseURL: URL, session: URLSession = .shared,
-                tokenQueryName: String = "token", maxOutboundQueue: Int = 100,
+    public init(baseURL: URL, session: URLSession = .shared, maxOutboundQueue: Int = 100,
                 tokenProvider: @escaping @Sendable () async throws -> String) {
         self.baseURL = baseURL
         self.session = session
-        self.tokenQueryName = tokenQueryName
         self.maxOutboundQueue = max(1, maxOutboundQueue)
-        self.tokenProvider = tokenProvider
+        self.credentialProvider = {
+            WebSocketCredential(bearerToken: try await tokenProvider())
+        }
+        var continuation: AsyncStream<ZiggyWebSocketEvent>.Continuation!
+        self.events = AsyncStream { continuation = $0 }
+        self.eventContinuation = continuation
+    }
+
+    public init(baseURL: URL, session: URLSession = .shared, maxOutboundQueue: Int = 100,
+                credentialProvider: @escaping @Sendable () async throws -> WebSocketCredential) {
+        self.baseURL = baseURL
+        self.session = session
+        self.maxOutboundQueue = max(1, maxOutboundQueue)
+        self.credentialProvider = credentialProvider
         var continuation: AsyncStream<ZiggyWebSocketEvent>.Continuation!
         self.events = AsyncStream { continuation = $0 }
         self.eventContinuation = continuation
@@ -96,9 +120,9 @@ public actor ZiggyWebSocketClient {
         while shouldRun && !Task.isCancelled {
             emit(.state(hasOpened ? .reconnecting : .connecting))
             do {
-                let token = try await tokenProvider()
-                let url = try makeWebSocketURL(token: token)
-                let task = session.webSocketTask(with: url)
+                let credential = try await credentialProvider()
+                let request = try Self.makeWebSocketRequest(baseURL: baseURL, credential: credential)
+                let task = session.webSocketTask(with: request)
                 socket = task
                 task.resume()
                 hasOpened = true
@@ -115,7 +139,7 @@ public actor ZiggyWebSocketClient {
                     }
                 }
                 try await flushQueue(on: task)
-                try await receiveLoop(on: task)
+                try await receiveLoop(on: task, capabilities: credential.capabilities)
             } catch is CancellationError {
                 break
             } catch {
@@ -129,7 +153,8 @@ public actor ZiggyWebSocketClient {
         }
     }
 
-    private func receiveLoop(on task: URLSessionWebSocketTask) async throws {
+    private func receiveLoop(on task: URLSessionWebSocketTask,
+                             capabilities: RichContentCapabilities) async throws {
         while shouldRun && !Task.isCancelled {
             let message = try await task.receive()
             let data: Data
@@ -140,13 +165,15 @@ public actor ZiggyWebSocketClient {
             }
             let event: InboundWebSocketEvent
             do {
-                event = try JSONDecoder.ziggy.decode(InboundWebSocketEvent.self, from: data)
+                event = try Self.decodeFrame(data, capabilities: capabilities)
             } catch {
                 emit(.decodingFailure("Ziggy sent an event this app could not read."))
                 continue
             }
             emit(.inbound(event))
             switch event {
+            case .message(let message):
+                if let rich = message.richContent { publishAssistant(.message(rich)) }
             case .delta(let delta): publishAssistant(.delta(delta))
             case .streamEnd(let completion): publishAssistant(.completed(completion))
             case .error(let error): publishAssistant(.failed(AssistantStreamFailure(message: error.message, code: error.code)))
@@ -190,15 +217,28 @@ public actor ZiggyWebSocketClient {
         }
     }
 
-    private func makeWebSocketURL(token: String) throws -> URL {
+    static func makeWebSocketRequest(baseURL: URL, credential: WebSocketCredential) throws -> URLRequest {
         guard var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false) else { throw ZiggyRESTError.invalidURL }
         if components.scheme == "https" { components.scheme = "wss" }
         else if components.scheme == "http" { components.scheme = "ws" }
-        var query = components.queryItems ?? []
-        query.append(URLQueryItem(name: tokenQueryName, value: token))
-        components.queryItems = query
+        let secretQueryNames: Set<String> = ["token", "access_token", "authorization", "code"]
+        components.queryItems = components.queryItems?.filter {
+            !secretQueryNames.contains($0.name.lowercased())
+        }
+        if components.queryItems?.isEmpty == true { components.queryItems = nil }
         guard let url = components.url else { throw ZiggyRESTError.invalidURL }
-        return url
+        var request = URLRequest(url: url)
+        request.setValue("Bearer \(credential.bearerToken)", forHTTPHeaderField: "Authorization")
+        return request
+    }
+
+    static func decodeFrame(_ data: Data,
+                            capabilities: RichContentCapabilities) throws -> InboundWebSocketEvent {
+        guard data.count <= ZiggyProtocolLimits.maxWebSocketFrameBytes else {
+            throw ZiggyWebSocketClientError.frameTooLarge(limit: ZiggyProtocolLimits.maxWebSocketFrameBytes)
+        }
+        return try JSONDecoder.ziggy.decode(InboundWebSocketEvent.self, from: data)
+            .applying(capabilities: capabilities)
     }
 
     private func sleepBackoff() async {
@@ -217,4 +257,52 @@ public actor ZiggyWebSocketClient {
     }
 
     private func encode(_ envelope: OutboundWebSocketEnvelope) throws -> String { try Self.encode(envelope) }
+}
+
+extension InboundWebSocketEvent {
+    func applying(capabilities: RichContentCapabilities) -> InboundWebSocketEvent {
+        switch self {
+        case .message(let message):
+            let rich = message.richContent.flatMap {
+                capabilities.richContentV1 ? capabilities.sanitize($0) : nil
+            }
+            return .message(InboundChatMessage(
+                id: message.id,
+                chatID: message.chatID,
+                text: message.text,
+                role: message.role,
+                richContent: rich,
+                replyTo: message.replyTo,
+                mediaURLs: message.mediaURLs,
+                buttons: message.buttons,
+                buttonPrompt: message.buttonPrompt,
+                kind: message.kind
+            ))
+        case .streamEnd(let completion):
+            guard let message = completion.message else { return self }
+            let normalized: StreamFinalMessage
+            switch message {
+            case .rich(let rich) where capabilities.richContentV1:
+                normalized = .rich(capabilities.sanitize(rich))
+            case .rich(let rich):
+                normalized = .legacy(ZiggyMessage(
+                    id: rich.id,
+                    sessionKey: rich.chatID,
+                    role: rich.role,
+                    content: .text(LegacyContentAdapter.plainText(for: rich.blocks)),
+                    createdAt: rich.createdAt
+                ))
+            case .legacy(let legacy):
+                normalized = .legacy(legacy)
+            }
+            return .streamEnd(AssistantCompletion(
+                sessionKey: completion.sessionKey,
+                messageID: completion.messageID,
+                message: normalized,
+                finishReason: completion.finishReason
+            ))
+        default:
+            return self
+        }
+    }
 }

@@ -6,6 +6,10 @@ public enum RichContentVersion: String, Codable, Hashable, Sendable {
 
 public enum RichContentLimits {
     public static let maxBlockTextBytes = 512 * 1024
+    public static let maxMessageContentBytes = 1024 * 1024
+    public static let maxMessageIDBytes = 256
+    public static let maxChatIDBytes = 256
+    public static let maxBlockTypeBytes = 128
     public static let maxLanguageBytes = 128
     public static let maxTaskItems = 128
     public static let maxTaskIDBytes = 128
@@ -23,6 +27,14 @@ public enum RichContentLimits {
     public static let maxChartPoints = 500
     public static let maxChartLabelBytes = 256
     public static let maxMessageBlocks = 128
+    public static let maxMediaIDBytes = 256
+    public static let maxMediaURLBytes = 2_048
+    public static let maxMediaTypeBytes = 128
+    public static let maxMediaNameBytes = 1_024
+    public static let maxMediaAltBytes = 4_096
+    public static let maxMediaDimension = 32_768
+    public static let maxMediaPixels = 100_000_000
+    public static let maxFileSizeBytes: Int64 = 2 * 1_024 * 1_024 * 1_024
 }
 
 public struct RichContentMessage: Codable, Hashable, Sendable {
@@ -46,8 +58,16 @@ public struct RichContentMessage: Codable, Hashable, Sendable {
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         version = try c.decode(RichContentVersion.self, forKey: .version)
-        id = try c.decode(String.self, forKey: .id)
-        chatID = try c.decode(String.self, forKey: .chatID)
+        let id = try c.decode(String.self, forKey: .id)
+        let chatID = try c.decode(String.self, forKey: .chatID)
+        guard !id.isEmpty, id.utf8.count <= RichContentLimits.maxMessageIDBytes else {
+            throw RichContentDecodingError.invalid("message id")
+        }
+        guard !chatID.isEmpty, chatID.utf8.count <= RichContentLimits.maxChatIDBytes else {
+            throw RichContentDecodingError.invalid("chat id")
+        }
+        self.id = id
+        self.chatID = chatID
         role = try c.decode(MessageRole.self, forKey: .role)
         let rawBlocks = try c.decode([JSONValue].self, forKey: .blocks)
         blocks = try Self.decodeBlocks(rawBlocks)
@@ -58,19 +78,27 @@ public struct RichContentMessage: Codable, Hashable, Sendable {
         guard rawBlocks.count <= RichContentLimits.maxMessageBlocks else {
             throw RichContentDecodingError.limit("message blocks")
         }
-        return rawBlocks.map { rawBlock in
+        guard rawBlocks.reduce(0, { $0 + $1.aggregateStringBytes }) <= RichContentLimits.maxMessageContentBytes else {
+            throw RichContentDecodingError.limit("message content")
+        }
+        let blocks = rawBlocks.map { rawBlock in
             guard let data = try? JSONEncoder().encode(rawBlock) else {
-                return .unsupported(type: "malformed", payload: rawBlock)
+                return RichBlock.unsupported(type: "malformed", payload: rawBlock.boundedForUnsupportedContent())
             }
             do {
                 // Keep direct RichBlock decoding strict. The envelope is the
                 // compatibility boundary that isolates malformed neighbors.
                 return try JSONDecoder.ziggy.decode(RichBlock.self, from: data)
             } catch {
-                let type = rawBlock.objectValue?["type"]?.stringValue ?? "malformed"
-                return .unsupported(type: type, payload: rawBlock)
+                let type = (rawBlock.objectValue?["type"]?.stringValue ?? "malformed")
+                    .ziggyTruncatedUTF8(maxBytes: RichContentLimits.maxBlockTypeBytes)
+                return .unsupported(type: type, payload: rawBlock.boundedForUnsupportedContent())
             }
         }
+        guard blocks.reduce(0, { $0 + $1.decodedContentByteCount }) <= RichContentLimits.maxMessageContentBytes else {
+            throw RichContentDecodingError.limit("message content")
+        }
+        return blocks
     }
 
     enum CodingKeys: String, CodingKey {
@@ -257,20 +285,34 @@ public enum MediaSource: Codable, Hashable, Sendable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         switch try c.decode(String.self, forKey: .type) {
         case "authenticated_asset":
+            let id = try c.decode(String.self, forKey: .id)
+            try Self.validateID(id)
             self = .authenticatedAsset(
-                id: try c.decode(String.self, forKey: .id),
+                id: id,
                 expiresAt: try c.decodeIfPresent(ZiggyTimestamp.self, forKey: .expiresAt)
             )
         case "allowlisted_url":
             let url = try c.decode(URL.self, forKey: .url)
-            guard url.scheme?.lowercased() == "https" else {
+            guard url.scheme?.lowercased() == "https",
+                  url.host?.isEmpty == false,
+                  url.user == nil,
+                  url.password == nil,
+                  url.absoluteString.utf8.count <= RichContentLimits.maxMediaURLBytes else {
                 throw RichContentDecodingError.invalid("media URL scheme")
             }
             self = .allowlistedURL(url)
         case "local_file":
-            self = .localFile(id: try c.decode(String.self, forKey: .id))
+            let id = try c.decode(String.self, forKey: .id)
+            try Self.validateID(id)
+            self = .localFile(id: id)
         default:
             throw RichContentDecodingError.invalid("media source type")
+        }
+    }
+
+    private static func validateID(_ id: String) throws {
+        guard !id.isEmpty, id.utf8.count <= RichContentLimits.maxMediaIDBytes else {
+            throw RichContentDecodingError.invalid("media id")
         }
     }
 
@@ -313,6 +355,42 @@ public struct MediaBlock: Codable, Hashable, Sendable {
         case source
         case mediaType = "media_type"
         case name, width, height, alt
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let source = try c.decode(MediaSource.self, forKey: .source)
+        let mediaType = try c.decode(String.self, forKey: .mediaType)
+        let name = try c.decodeIfPresent(String.self, forKey: .name)
+        let width = try c.decodeIfPresent(Int.self, forKey: .width)
+        let height = try c.decodeIfPresent(Int.self, forKey: .height)
+        let alt = try c.decodeIfPresent(String.self, forKey: .alt)
+        try Self.validate(mediaType: mediaType, name: name, width: width, height: height, alt: alt)
+        self.source = source
+        self.mediaType = mediaType
+        self.name = name
+        self.width = width
+        self.height = height
+        self.alt = alt
+    }
+
+    private static func validate(mediaType: String, name: String?, width: Int?, height: Int?, alt: String?) throws {
+        guard RichContentStructuralValidation.isValidMediaType(mediaType) else {
+            throw RichContentDecodingError.invalid("media type")
+        }
+        guard (name ?? "").utf8.count <= RichContentLimits.maxMediaNameBytes,
+              (alt ?? "").utf8.count <= RichContentLimits.maxMediaAltBytes else {
+            throw RichContentDecodingError.limit("media metadata")
+        }
+        guard [width, height].compactMap({ $0 }).allSatisfy({
+            $0 > 0 && $0 <= RichContentLimits.maxMediaDimension
+        }) else {
+            throw RichContentDecodingError.invalid("media dimensions")
+        }
+        if let width, let height,
+           width > RichContentLimits.maxMediaPixels / height {
+            throw RichContentDecodingError.limit("media pixels")
+        }
     }
 }
 
@@ -455,6 +533,30 @@ public struct FileBlock: Codable, Hashable, Sendable {
         case mediaType = "media_type"
         case sizeBytes = "size_bytes"
     }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let id = try c.decode(String.self, forKey: .id)
+        let name = try c.decode(String.self, forKey: .name)
+        let mediaType = try c.decodeIfPresent(String.self, forKey: .mediaType)
+        let sizeBytes = try c.decodeIfPresent(Int64.self, forKey: .sizeBytes)
+        guard !id.isEmpty, id.utf8.count <= RichContentLimits.maxMediaIDBytes else {
+            throw RichContentDecodingError.invalid("file id")
+        }
+        guard !name.isEmpty, name.utf8.count <= RichContentLimits.maxMediaNameBytes else {
+            throw RichContentDecodingError.invalid("file name")
+        }
+        guard mediaType.map(RichContentStructuralValidation.isValidMediaType) ?? true else {
+            throw RichContentDecodingError.invalid("file media type")
+        }
+        guard sizeBytes.map({ $0 >= 0 && $0 <= RichContentLimits.maxFileSizeBytes }) ?? true else {
+            throw RichContentDecodingError.limit("file size")
+        }
+        self.id = id
+        self.name = name
+        self.mediaType = mediaType
+        self.sizeBytes = sizeBytes
+    }
 }
 
 public struct ProgressBlock: Codable, Hashable, Sendable {
@@ -532,6 +634,9 @@ public enum RichBlock: Codable, Hashable, Sendable {
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         let type = try c.decode(String.self, forKey: .type)
+        guard !type.isEmpty, type.utf8.count <= RichContentLimits.maxBlockTypeBytes else {
+            throw RichContentDecodingError.invalid("block type")
+        }
         switch type {
         case "markdown": self = .markdown(try MarkdownBlock(from: decoder))
         case "code": self = .code(try CodeBlock(from: decoder))
@@ -545,7 +650,9 @@ public enum RichBlock: Codable, Hashable, Sendable {
         case "file": self = .file(try FileBlock(from: decoder))
         case "progress": self = .progress(try ProgressBlock(from: decoder))
         case "tool": self = .tool(try ToolBlock(from: decoder))
-        default: self = .unsupported(type: type, payload: (try? JSONValue(from: decoder)) ?? .object([:]))
+        default:
+            let payload = ((try? JSONValue(from: decoder)) ?? .object([:])).boundedForUnsupportedContent()
+            self = .unsupported(type: type, payload: payload)
         }
     }
 
@@ -601,6 +708,17 @@ public enum RichBlock: Codable, Hashable, Sendable {
 public enum RichContentDecodingError: Error, Equatable, Sendable {
     case invalid(String)
     case limit(String)
+}
+
+private enum RichContentStructuralValidation {
+    static func isValidMediaType(_ value: String) -> Bool {
+        !value.isEmpty
+            && value.utf8.count <= RichContentLimits.maxMediaTypeBytes
+            && value.range(
+                of: #"^[A-Za-z0-9][A-Za-z0-9.+-]*/[A-Za-z0-9][A-Za-z0-9.+-]*$"#,
+                options: .regularExpression
+            ) != nil
+    }
 }
 
 public enum RichContentSafety {

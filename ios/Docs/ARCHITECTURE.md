@@ -47,9 +47,8 @@ endpoint and future stateless completion surfaces.
 - `CredentialStore` stores the long-lived guest enrollment code in Keychain.
 - Short-lived `nbwt_` tokens remain in memory and are refreshed for reconnects.
 - REST sends tokens in the `Authorization` header.
-- The current server requires the token as a WebSocket query item. The client
-  constructs that URL only at connection time and never logs it. A future
-  server revision should accept an authorization header or initial auth frame.
+- WebSocket handshakes send short-lived credentials in the `Authorization`
+  header. Credentials are never placed in WebSocket URLs.
 
 ### Features
 
@@ -68,7 +67,7 @@ emit `AsyncStream` values that are reduced into stable view state.
 
 ### Bootstrap and REST
 
-- `GET /webui/guest/bootstrap?code=...`
+- `POST /webui/guest/bootstrap` with a JSON enrollment body
 - `GET /api/sessions`
 - `GET /api/sessions/{key}/messages`
 - `GET /api/work`
@@ -77,6 +76,7 @@ emit `AsyncStream` values that are reduced into stable view state.
 - `GET /api/settings` for owner scope
 
 REST requests use `Authorization: Bearer <short-lived token>`.
+Enrollment codes are sent only in request bodies or headers and never in URLs.
 
 ### WebSocket client frames
 

@@ -14,6 +14,25 @@ final class ModelAndEnvelopeTests: XCTestCase {
         XCTAssertEqual(response.isOwner, false)
     }
 
+    func testCapabilitiesRemainIndependent() {
+        let capabilities = RichContentCapabilities(advertised: [
+            "rich_content_v1": .boolean(true),
+            "mermaid_v1": .boolean(true)
+        ])
+        XCTAssertTrue(capabilities.richContentV1)
+        XCTAssertFalse(capabilities.mediaV1)
+        XCTAssertTrue(capabilities.mermaidV1)
+    }
+
+    func testBootstrapAcceptsCapabilityNameArray() throws {
+        let data = Data(#"{"token":"t","capabilities":["rich_content_v1","media_v1"]}"#.utf8)
+        let response = try JSONDecoder().decode(BootstrapResponse.self, from: data)
+        let capabilities = RichContentCapabilities(advertised: response.capabilities)
+        XCTAssertTrue(capabilities.richContentV1)
+        XCTAssertTrue(capabilities.mediaV1)
+        XCTAssertFalse(capabilities.mermaidV1)
+    }
+
     func testUnknownStatusAndFieldsDoNotBreakMessageDecoding() throws {
         let data = Data(#"{"id":"m1","role":"future_role","content":"hello","status":"future_state","ignored":{"x":1}}"#.utf8)
         let message = try JSONDecoder().decode(ZiggyMessage.self, from: data)
