@@ -33,6 +33,15 @@ func TestLoadFromDefaults(t *testing.T) {
 	if config.ReadinessTimeout != 2*time.Second {
 		t.Errorf("ReadinessTimeout = %s", config.ReadinessTimeout)
 	}
+	if config.ReadinessCacheTTL != 2*time.Second {
+		t.Errorf("ReadinessCacheTTL = %s", config.ReadinessCacheTTL)
+	}
+	if config.UpstreamReadyPath != "/" {
+		t.Errorf("UpstreamReadyPath = %q", config.UpstreamReadyPath)
+	}
+	if config.MaxRequestBody != 64<<20 {
+		t.Errorf("MaxRequestBody = %d", config.MaxRequestBody)
+	}
 	if config.LogLevel != slog.LevelInfo {
 		t.Errorf("LogLevel = %s", config.LogLevel)
 	}
@@ -118,16 +127,19 @@ func TestLoadFromRejectsInvalidSecretSources(t *testing.T) {
 
 func TestLoadFromOverrides(t *testing.T) {
 	environment := map[string]string{
-		"ZIGGY_UPSTREAM_URL":           "https://upstream.example/base",
-		"ZIGGY_OWNER_EMAIL":            "owner@example.com",
-		"ZIGGY_OWNER_SUBJECT":          "user_123",
-		"CLERK_SECRET_KEY":             "secret",
-		"ZIGGY_LISTEN_ADDR":            ":9000",
-		"ZIGGY_AUTHORIZED_PARTIES":     "https://app.example, native://ziggy,https://app.example",
-		"ZIGGY_BLOCKED_PATHS":          "private,/internal",
-		"ZIGGY_SHUTDOWN_TIMEOUT":       "3s",
-		"ZIGGY_UPSTREAM_READY_TIMEOUT": "750ms",
-		"ZIGGY_LOG_LEVEL":              "debug",
+		"ZIGGY_UPSTREAM_URL":             "https://upstream.example/base",
+		"ZIGGY_OWNER_EMAIL":              "owner@example.com",
+		"ZIGGY_OWNER_SUBJECT":            "user_123",
+		"CLERK_SECRET_KEY":               "secret",
+		"ZIGGY_LISTEN_ADDR":              ":9000",
+		"ZIGGY_AUTHORIZED_PARTIES":       "https://app.example, native://ziggy,https://app.example",
+		"ZIGGY_BLOCKED_PATHS":            "private,/internal",
+		"ZIGGY_SHUTDOWN_TIMEOUT":         "3s",
+		"ZIGGY_UPSTREAM_READY_TIMEOUT":   "750ms",
+		"ZIGGY_UPSTREAM_READY_CACHE_TTL": "250ms",
+		"ZIGGY_UPSTREAM_READY_PATH":      "/healthz",
+		"ZIGGY_MAX_REQUEST_BODY_BYTES":   "1024",
+		"ZIGGY_LOG_LEVEL":                "debug",
 	}
 
 	config, err := LoadFrom(mapLookup(environment))
@@ -145,6 +157,12 @@ func TestLoadFromOverrides(t *testing.T) {
 	}
 	if _, ok := config.BlockedPaths["/webui/bootstrap"]; !ok {
 		t.Error("mandatory /webui/bootstrap block was removed")
+	}
+	if config.ReadinessCacheTTL != 250*time.Millisecond || config.UpstreamReadyPath != "/healthz" {
+		t.Errorf("readiness overrides not applied: %+v", config)
+	}
+	if config.MaxRequestBody != 1024 {
+		t.Errorf("MaxRequestBody = %d, want 1024", config.MaxRequestBody)
 	}
 }
 
@@ -164,8 +182,12 @@ func TestLoadFromRejectsInvalidConfiguration(t *testing.T) {
 		{name: "unsupported scheme", key: "ZIGGY_UPSTREAM_URL", value: "ftp://example.com"},
 		{name: "upstream credentials", key: "ZIGGY_UPSTREAM_URL", value: "http://user:pass@example.com"},
 		{name: "bad email", key: "ZIGGY_OWNER_EMAIL", value: "owner"},
+		{name: "malformed email", key: "ZIGGY_OWNER_EMAIL", value: "@example.com"},
 		{name: "bad listen address", key: "ZIGGY_LISTEN_ADDR", value: "localhost"},
 		{name: "non-positive timeout", key: "ZIGGY_SHUTDOWN_TIMEOUT", value: "0s"},
+		{name: "relative readiness path", key: "ZIGGY_UPSTREAM_READY_PATH", value: "healthz"},
+		{name: "readiness path query", key: "ZIGGY_UPSTREAM_READY_PATH", value: "/healthz?full=1"},
+		{name: "non-positive body limit", key: "ZIGGY_MAX_REQUEST_BODY_BYTES", value: "0"},
 		{name: "bad log level", key: "ZIGGY_LOG_LEVEL", value: "verbose"},
 	}
 

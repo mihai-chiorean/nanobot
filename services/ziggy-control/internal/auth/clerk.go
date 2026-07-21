@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/clerk/clerk-sdk-go/v2"
@@ -29,6 +30,11 @@ type customClaims struct {
 	PrimaryEmail string `json:"primaryEmail"`
 }
 
+type cachedEmail struct {
+	value     string
+	expiresAt time.Time
+}
+
 func New(config Config) (func(http.Handler) http.Handler, error) {
 	if strings.TrimSpace(config.SecretKey) == "" {
 		return nil, errors.New("Clerk secret key is required")
@@ -36,20 +42,24 @@ func New(config Config) (func(http.Handler) http.Handler, error) {
 
 	httpClient := config.HTTPClient
 	if httpClient == nil {
-		httpClient = &http.Client{Timeout: 5 * time.Second}
+		transport := http.DefaultTransport.(*http.Transport).Clone()
+		transport.MaxIdleConns = 32
+		transport.MaxIdleConnsPerHost = 16
+		transport.IdleConnTimeout = 90 * time.Second
+		httpClient = &http.Client{Timeout: 5 * time.Second, Transport: transport}
 	}
 	clientConfig := &clerk.ClientConfig{BackendConfig: clerk.BackendConfig{
 		HTTPClient: httpClient,
 		Key:        clerk.String(config.SecretKey),
 	}}
 	userClient := user.NewClient(clientConfig)
-	resolver := func(ctx context.Context, subject string) (string, error) {
+	resolver := cacheEmailResolver(func(ctx context.Context, subject string) (string, error) {
 		account, err := userClient.Get(ctx, subject)
 		if err != nil {
 			return "", fmt.Errorf("get Clerk user: %w", err)
 		}
 		return primaryEmail(account)
-	}
+	}, 5*time.Minute)
 
 	options := []clerkhttp.AuthorizationOption{
 		clerkhttp.JWKSClient(jwks.NewClient(clientConfig)),
@@ -71,6 +81,26 @@ func New(config Config) (func(http.Handler) http.Handler, error) {
 	return func(next http.Handler) http.Handler {
 		return verify(withPrincipal(next, resolver))
 	}, nil
+}
+
+func cacheEmailResolver(resolve emailResolver, ttl time.Duration) emailResolver {
+	var cache sync.Map
+	return func(ctx context.Context, subject string) (string, error) {
+		if cached, ok := cache.Load(subject); ok {
+			entry := cached.(cachedEmail)
+			if time.Now().Before(entry.expiresAt) {
+				return entry.value, nil
+			}
+			cache.Delete(subject)
+		}
+
+		email, err := resolve(ctx, subject)
+		if err != nil {
+			return "", err
+		}
+		cache.Store(subject, cachedEmail{value: email, expiresAt: time.Now().Add(ttl)})
+		return email, nil
+	}
 }
 
 func withPrincipal(next http.Handler, resolveEmail emailResolver) http.Handler {

@@ -13,6 +13,7 @@ func NewReverseProxy(target *url.URL, logger *slog.Logger) *httputil.ReverseProx
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.MaxIdleConns = 100
 	transport.MaxIdleConnsPerHost = 32
+	transport.MaxConnsPerHost = 256
 	transport.IdleConnTimeout = 90 * time.Second
 	transport.ResponseHeaderTimeout = 30 * time.Second
 	transport.TLSHandshakeTimeout = 10 * time.Second
@@ -26,6 +27,7 @@ func NewReverseProxy(target *url.URL, logger *slog.Logger) *httputil.ReverseProx
 		FlushInterval: -1,
 		Rewrite: func(request *httputil.ProxyRequest) {
 			request.SetURL(target)
+			request.Out.Header.Del("X-Forwarded-For")
 			request.SetXForwarded()
 			request.Out.Host = target.Host
 			request.Out.Header.Del("X-Nanobot-Auth")

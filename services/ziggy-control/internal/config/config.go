@@ -4,18 +4,23 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/mail"
 	"net/url"
 	"os"
 	"path"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 )
 
 const (
-	defaultListenAddr       = "127.0.0.1:8787"
-	defaultShutdownTimeout  = 10 * time.Second
-	defaultReadinessTimeout = 2 * time.Second
+	defaultListenAddr          = "127.0.0.1:8787"
+	defaultShutdownTimeout     = 10 * time.Second
+	defaultReadinessTimeout    = 2 * time.Second
+	defaultReadinessCacheTTL   = 2 * time.Second
+	defaultUpstreamReadyPath   = "/"
+	defaultMaxRequestBodyBytes = int64(64 << 20)
 )
 
 type Config struct {
@@ -28,6 +33,9 @@ type Config struct {
 	BlockedPaths      map[string]struct{}
 	ShutdownTimeout   time.Duration
 	ReadinessTimeout  time.Duration
+	ReadinessCacheTTL time.Duration
+	UpstreamReadyPath string
+	MaxRequestBody    int64
 	LogLevel          slog.Level
 }
 
@@ -57,7 +65,8 @@ func loadFrom(lookup LookupEnv, readFile ReadFile) (Config, error) {
 		return Config{}, err
 	}
 	ownerEmail = strings.ToLower(strings.TrimSpace(ownerEmail))
-	if !strings.Contains(ownerEmail, "@") {
+	parsedEmail, err := mail.ParseAddress(ownerEmail)
+	if err != nil || parsedEmail.Address != ownerEmail {
 		return Config{}, fmt.Errorf("ZIGGY_OWNER_EMAIL: invalid email address")
 	}
 
@@ -79,6 +88,18 @@ func loadFrom(lookup LookupEnv, readFile ReadFile) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	readinessCacheTTL, err := duration(lookup, "ZIGGY_UPSTREAM_READY_CACHE_TTL", defaultReadinessCacheTTL)
+	if err != nil {
+		return Config{}, err
+	}
+	readyPath, err := absolutePath(lookup, "ZIGGY_UPSTREAM_READY_PATH", defaultUpstreamReadyPath)
+	if err != nil {
+		return Config{}, err
+	}
+	maxRequestBody, err := positiveInt64(lookup, "ZIGGY_MAX_REQUEST_BODY_BYTES", defaultMaxRequestBodyBytes)
+	if err != nil {
+		return Config{}, err
+	}
 	logLevel, err := parseLogLevel(valueOrDefault(lookup, "ZIGGY_LOG_LEVEL", "info"))
 	if err != nil {
 		return Config{}, err
@@ -94,8 +115,28 @@ func loadFrom(lookup LookupEnv, readFile ReadFile) (Config, error) {
 		BlockedPaths:      blockedPaths(lookup),
 		ShutdownTimeout:   shutdownTimeout,
 		ReadinessTimeout:  readinessTimeout,
+		ReadinessCacheTTL: readinessCacheTTL,
+		UpstreamReadyPath: readyPath,
+		MaxRequestBody:    maxRequestBody,
 		LogLevel:          logLevel,
 	}, nil
+}
+
+func absolutePath(lookup LookupEnv, key, fallback string) (string, error) {
+	value := valueOrDefault(lookup, key, fallback)
+	if !strings.HasPrefix(value, "/") || strings.ContainsAny(value, "?#") {
+		return "", fmt.Errorf("%s must be an absolute path without query or fragment", key)
+	}
+	return path.Clean(value), nil
+}
+
+func positiveInt64(lookup LookupEnv, key string, fallback int64) (int64, error) {
+	value := valueOrDefault(lookup, key, strconv.FormatInt(fallback, 10))
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || parsed <= 0 {
+		return 0, fmt.Errorf("%s must be a positive integer", key)
+	}
+	return parsed, nil
 }
 
 func clerkSecret(lookup LookupEnv, readFile ReadFile) (string, error) {

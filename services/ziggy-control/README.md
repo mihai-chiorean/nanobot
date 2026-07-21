@@ -20,6 +20,8 @@ iOS / web -> Cloudflare -> ziggy-control -> private Nanobot -> Spark models
 - Keep `/webui/bootstrap`, `/auth/token`, and configured private paths out of
   the public proxy.
 - Expose `/healthz` and upstream-aware `/readyz` endpoints.
+- Emit structured request logs with correlation ID, route, status, response
+  bytes, duration, Cloudflare ray ID, service, and build version.
 
 Configuration is immutable after startup. Request handling uses no global
 mutable state or application locks. The standard HTTP transport provides
@@ -53,6 +55,8 @@ Optional variables are documented in [`.env.example`](.env.example). Pin
 `ZIGGY_OWNER_SUBJECT` after the first successful login so an email change or
 account replacement cannot transfer access. Configure
 `ZIGGY_AUTHORIZED_PARTIES` when the Clerk clients emit a stable `azp` claim.
+Startup emits explicit warnings while either the subject pin or authorized-party
+check is absent.
 
 Do not expose the default `127.0.0.1:8787` listener directly. Cloudflare should
 route `chat.mihaichiorean.com` to it, while Nanobot remains bound to loopback on
@@ -99,6 +103,11 @@ curl --fail http://127.0.0.1:8787/readyz
 
 Rollback is an artifact swap followed by `systemctl restart ziggy-control`;
 no Nanobot, model, or data service is rebuilt.
+
+`/healthz` reports only process health. `/readyz` requires a 2xx response from
+`ZIGGY_UPSTREAM_READY_PATH` and caches the result briefly to avoid turning
+health polling into upstream load. Neither endpoint proves that a user can
+authenticate; deployment smoke tests must also exercise `/auth/bootstrap`.
 
 ## Lab workflow
 
