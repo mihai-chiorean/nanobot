@@ -22,6 +22,12 @@ import (
 
 type checkerFunc func(context.Context) error
 
+type writerFunc func([]byte) (int, error)
+
+func (write writerFunc) Write(body []byte) (int, error) {
+	return write(body)
+}
+
 func (check checkerFunc) Check(ctx context.Context) error {
 	return check(ctx)
 }
@@ -282,7 +288,18 @@ func TestWebSocketUpgradePassesThrough(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	handler := newTestHandler(t, upstream.URL, principalMiddleware(identity.Principal{}))
+	logEvents := make(chan []byte, 1)
+	logger := slog.New(slog.NewJSONHandler(writerFunc(func(body []byte) (int, error) {
+		logEvents <- bytes.Clone(body)
+		return len(body), nil
+	}), nil))
+	handler := newTestHandlerWithLogger(
+		t,
+		upstream.URL,
+		principalMiddleware(identity.Principal{}),
+		logger,
+		64<<20,
+	)
 	frontDoor := httptest.NewServer(handler)
 	defer frontDoor.Close()
 	frontURL, err := url.Parse(frontDoor.URL)
@@ -307,6 +324,20 @@ func TestWebSocketUpgradePassesThrough(t *testing.T) {
 	}
 	if status != "HTTP/1.1 101 Switching Protocols\r\n" {
 		t.Errorf("status line = %q", status)
+	}
+	_ = connection.Close()
+
+	select {
+	case rawEvent := <-logEvents:
+		var event map[string]any
+		if err := json.Unmarshal(rawEvent, &event); err != nil {
+			t.Fatalf("decode WebSocket access log: %v", err)
+		}
+		if event["status"] != float64(http.StatusSwitchingProtocols) {
+			t.Errorf("WebSocket access log status = %v, want 101", event["status"])
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for WebSocket access log")
 	}
 }
 
