@@ -2,7 +2,9 @@ package httpapi
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -137,8 +139,10 @@ func TestPrivateRoutesAreNotProxied(t *testing.T) {
 
 func TestOrdinaryRequestsAreProxiedWithNewRequestID(t *testing.T) {
 	var upstreamRequestID string
+	var forwardedFor string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		upstreamRequestID = r.Header.Get("X-Request-ID")
+		forwardedFor = r.Header.Get("X-Forwarded-For")
 		if got := r.Header.Get("Authorization"); got != "Bearer nanobot-token" {
 			t.Errorf("Authorization = %q", got)
 		}
@@ -154,6 +158,7 @@ func TestOrdinaryRequestsAreProxiedWithNewRequestID(t *testing.T) {
 	request.Header.Set("Authorization", "Bearer nanobot-token")
 	request.Header.Set("X-Request-ID", "untrusted")
 	request.Header.Set("X-Nanobot-Auth", "spoofed")
+	request.Header.Set("X-Forwarded-For", "203.0.113.99")
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 
@@ -166,6 +171,66 @@ func TestOrdinaryRequestsAreProxiedWithNewRequestID(t *testing.T) {
 	}
 	if upstreamRequestID != responseRequestID {
 		t.Errorf("upstream request ID = %q, response = %q", upstreamRequestID, responseRequestID)
+	}
+	if strings.Contains(forwardedFor, "203.0.113.99") {
+		t.Errorf("spoofed X-Forwarded-For was forwarded: %q", forwardedFor)
+	}
+}
+
+func TestOversizedRequestBodyIsRejected(t *testing.T) {
+	var requests atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		requests.Add(1)
+	}))
+	defer upstream.Close()
+	handler := newTestHandlerWithLogger(
+		t,
+		upstream.URL,
+		principalMiddleware(identity.Principal{}),
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		8,
+	)
+
+	request := httptest.NewRequest(http.MethodPost, "/api/documents", strings.NewReader("too many bytes"))
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("status = %d, want 413", response.Code)
+	}
+	if requests.Load() != 0 {
+		t.Errorf("upstream requests = %d, want 0", requests.Load())
+	}
+}
+
+func TestAccessLogIncludesRequestOutcome(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusTeapot)
+		_, _ = io.WriteString(w, "short and stout")
+	}))
+	defer upstream.Close()
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logs, nil))
+	handler := newTestHandlerWithLogger(
+		t,
+		upstream.URL,
+		principalMiddleware(identity.Principal{}),
+		logger,
+		64<<20,
+	)
+
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/conversations", nil))
+
+	var event map[string]any
+	if err := json.Unmarshal(logs.Bytes(), &event); err != nil {
+		t.Fatalf("decode access log: %v; log = %s", err, logs.String())
+	}
+	if event["request_id"] == "" || event["status"] != float64(http.StatusTeapot) {
+		t.Errorf("access log identity/outcome = %+v", event)
+	}
+	if event["bytes"] != float64(len("short and stout")) || event["route"] != "proxy" {
+		t.Errorf("access log response fields = %+v", event)
 	}
 }
 
@@ -261,18 +326,35 @@ func TestHealthAndReadiness(t *testing.T) {
 
 func newTestHandler(t *testing.T, upstreamURL string, authenticate Middleware) http.Handler {
 	t.Helper()
+	return newTestHandlerWithLogger(
+		t,
+		upstreamURL,
+		authenticate,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		64<<20,
+	)
+}
+
+func newTestHandlerWithLogger(
+	t *testing.T,
+	upstreamURL string,
+	authenticate Middleware,
+	logger *slog.Logger,
+	maxRequestBody int64,
+) http.Handler {
+	t.Helper()
 	target, err := url.Parse(upstreamURL)
 	if err != nil {
 		t.Fatal(err)
 	}
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	handler, err := New(Config{
-		Authenticate: authenticate,
-		Proxy:        NewReverseProxy(target, logger),
-		Readiness:    checkerFunc(func(context.Context) error { return nil }),
-		Logger:       logger,
-		OwnerEmail:   "owner@example.com",
-		OwnerSubject: "user_123",
+		Authenticate:   authenticate,
+		Proxy:          NewReverseProxy(target, logger),
+		Readiness:      checkerFunc(func(context.Context) error { return nil }),
+		Logger:         logger,
+		OwnerEmail:     "owner@example.com",
+		OwnerSubject:   "user_123",
+		MaxRequestBody: maxRequestBody,
 		BlockedPaths: map[string]struct{}{
 			"/webui/bootstrap": {},
 			"/auth/token":      {},

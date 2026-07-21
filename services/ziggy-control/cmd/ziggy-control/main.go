@@ -30,8 +30,17 @@ func run() error {
 		return err
 	}
 
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel}))
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel})).With(
+		"service", "ziggy-control",
+		"version", version,
+	)
 	slog.SetDefault(logger)
+	if cfg.OwnerSubject == "" {
+		logger.Warn("owner subject is not pinned")
+	}
+	if len(cfg.AuthorizedParties) == 0 {
+		logger.Warn("Clerk authorized-party validation is disabled")
+	}
 
 	authenticate, err := auth.New(auth.Config{
 		SecretKey:         cfg.ClerkSecretKey,
@@ -42,14 +51,15 @@ func run() error {
 	}
 
 	handler, err := httpapi.New(httpapi.Config{
-		Authenticate: httpapi.Middleware(authenticate),
-		Proxy:        httpapi.NewReverseProxy(cfg.UpstreamURL, logger),
-		Readiness:    httpapi.NewHTTPReadinessChecker(cfg.UpstreamURL, cfg.ReadinessTimeout),
-		Logger:       logger,
-		OwnerEmail:   cfg.OwnerEmail,
-		OwnerSubject: cfg.OwnerSubject,
-		BlockedPaths: cfg.BlockedPaths,
-		Version:      version,
+		Authenticate:   httpapi.Middleware(authenticate),
+		Proxy:          httpapi.NewReverseProxy(cfg.UpstreamURL, logger),
+		Readiness:      httpapi.NewHTTPReadinessChecker(cfg.UpstreamURL, cfg.UpstreamReadyPath, cfg.ReadinessTimeout, cfg.ReadinessCacheTTL),
+		Logger:         logger,
+		OwnerEmail:     cfg.OwnerEmail,
+		OwnerSubject:   cfg.OwnerSubject,
+		BlockedPaths:   cfg.BlockedPaths,
+		MaxRequestBody: cfg.MaxRequestBody,
+		Version:        version,
 	})
 	if err != nil {
 		return err
@@ -61,6 +71,8 @@ func run() error {
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       90 * time.Second,
 		MaxHeaderBytes:    1 << 20,
+		// WriteTimeout and ReadTimeout remain zero because this endpoint carries
+		// long-lived WebSocket/SSE traffic. Request bodies are size-bounded in the handler.
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -88,7 +100,10 @@ func run() error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancel()
 	if err := server.Shutdown(shutdownCtx); err != nil {
-		return err
+		logger.Warn("graceful shutdown deadline reached", "error", err)
+		if closeErr := server.Close(); closeErr != nil {
+			return closeErr
+		}
 	}
 	if err := <-serveErr; !errors.Is(err, http.ErrServerClosed) {
 		return err

@@ -5,10 +5,12 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -214,5 +216,40 @@ func TestPrimaryEmailRequiresVerifiedPrimaryAddress(t *testing.T) {
 	account.EmailAddresses[0].Verification.Status = "unverified"
 	if _, err := primaryEmail(account); err == nil {
 		t.Fatal("primaryEmail() accepted an unverified address")
+	}
+}
+
+func TestCacheEmailResolverCachesSuccessesOnly(t *testing.T) {
+	var calls atomic.Int32
+	resolver := cacheEmailResolver(func(context.Context, string) (string, error) {
+		switch calls.Add(1) {
+		case 1:
+			return "owner@example.com", nil
+		case 2:
+			return "", errors.New("temporary failure")
+		default:
+			return "other@example.com", nil
+		}
+	}, time.Minute)
+
+	for range 2 {
+		email, err := resolver(context.Background(), "user_123")
+		if err != nil || email != "owner@example.com" {
+			t.Fatalf("cached resolve = %q, %v", email, err)
+		}
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("resolver calls = %d, want 1", calls.Load())
+	}
+
+	if _, err := resolver(context.Background(), "user_456"); err == nil {
+		t.Fatal("first user_456 resolve succeeded, want temporary failure")
+	}
+	email, err := resolver(context.Background(), "user_456")
+	if err != nil || email != "other@example.com" {
+		t.Fatalf("retried resolve = %q, %v", email, err)
+	}
+	if calls.Load() != 3 {
+		t.Errorf("resolver calls = %d, want 3", calls.Load())
 	}
 }

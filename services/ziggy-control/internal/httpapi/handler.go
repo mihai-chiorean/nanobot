@@ -18,24 +18,26 @@ import (
 type Middleware func(http.Handler) http.Handler
 
 type Config struct {
-	Authenticate Middleware
-	Proxy        http.Handler
-	Readiness    ReadinessChecker
-	Logger       *slog.Logger
-	OwnerEmail   string
-	OwnerSubject string
-	BlockedPaths map[string]struct{}
-	Version      string
+	Authenticate   Middleware
+	Proxy          http.Handler
+	Readiness      ReadinessChecker
+	Logger         *slog.Logger
+	OwnerEmail     string
+	OwnerSubject   string
+	BlockedPaths   map[string]struct{}
+	MaxRequestBody int64
+	Version        string
 }
 
 type API struct {
-	proxy        http.Handler
-	readiness    ReadinessChecker
-	logger       *slog.Logger
-	ownerEmail   string
-	ownerSubject string
-	blockedPaths map[string]struct{}
-	version      string
+	proxy          http.Handler
+	readiness      ReadinessChecker
+	logger         *slog.Logger
+	ownerEmail     string
+	ownerSubject   string
+	blockedPaths   map[string]struct{}
+	maxRequestBody int64
+	version        string
 }
 
 type requestIDKey struct{}
@@ -56,15 +58,19 @@ func New(config Config) (http.Handler, error) {
 	if strings.TrimSpace(config.OwnerEmail) == "" {
 		return nil, errors.New("owner email is required")
 	}
+	if config.MaxRequestBody <= 0 {
+		return nil, errors.New("maximum request body must be positive")
+	}
 
 	api := &API{
-		proxy:        config.Proxy,
-		readiness:    config.Readiness,
-		logger:       config.Logger,
-		ownerEmail:   strings.ToLower(strings.TrimSpace(config.OwnerEmail)),
-		ownerSubject: strings.TrimSpace(config.OwnerSubject),
-		blockedPaths: cloneBlockedPaths(config.BlockedPaths),
-		version:      config.Version,
+		proxy:          config.Proxy,
+		readiness:      config.Readiness,
+		logger:         config.Logger,
+		ownerEmail:     strings.ToLower(strings.TrimSpace(config.OwnerEmail)),
+		ownerSubject:   strings.TrimSpace(config.OwnerSubject),
+		blockedPaths:   cloneBlockedPaths(config.BlockedPaths),
+		maxRequestBody: config.MaxRequestBody,
+		version:        config.Version,
 	}
 	for _, reserved := range []string{"/auth/bootstrap", "/healthz", "/readyz"} {
 		api.blockedPaths[reserved] = struct{}{}
@@ -112,9 +118,17 @@ func (api *API) bootstrap(w http.ResponseWriter, r *http.Request) {
 	}
 	principal, ok := identity.FromContext(r.Context())
 	if !ok || !api.isOwner(principal) {
+		api.logger.WarnContext(r.Context(), "bootstrap authorization denied",
+			"request_id", RequestID(r.Context()),
+			"subject", principal.Subject,
+		)
 		writeError(w, http.StatusForbidden, "account not authorized")
 		return
 	}
+	api.logger.InfoContext(r.Context(), "bootstrap authorized",
+		"request_id", RequestID(r.Context()),
+		"subject", principal.Subject,
+	)
 	api.proxy.ServeHTTP(w, r)
 }
 
@@ -123,7 +137,18 @@ func (api *API) forward(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	if !isWebSocketUpgrade(r) && r.Body != nil {
+		if r.ContentLength > api.maxRequestBody {
+			writeError(w, http.StatusRequestEntityTooLarge, "request body too large")
+			return
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, api.maxRequestBody)
+	}
 	api.proxy.ServeHTTP(w, r)
+}
+
+func isWebSocketUpgrade(r *http.Request) bool {
+	return strings.EqualFold(strings.TrimSpace(r.Header.Get("Upgrade")), "websocket")
 }
 
 func (api *API) isOwner(principal identity.Principal) bool {
@@ -161,7 +186,6 @@ func (api *API) assignRequestID(next http.Handler) http.Handler {
 		}
 
 		request := r.Clone(context.WithValue(r.Context(), requestIDKey{}, requestID))
-		request.Header = r.Header.Clone()
 		request.Header.Set("X-Request-ID", requestID)
 		w.Header().Set("X-Request-ID", requestID)
 		next.ServeHTTP(w, request)
@@ -171,14 +195,67 @@ func (api *API) assignRequestID(next http.Handler) http.Handler {
 func (api *API) observe(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		started := time.Now()
-		next.ServeHTTP(w, r)
+		observed := &observedResponseWriter{ResponseWriter: w}
+		next.ServeHTTP(observed, r)
+		duration := time.Since(started)
 		api.logger.InfoContext(r.Context(), "request completed",
 			"request_id", RequestID(r.Context()),
 			"method", r.Method,
 			"path", r.URL.Path,
-			"duration", time.Since(started),
+			"route", routeName(r.URL.Path),
+			"status", observed.statusCode(),
+			"bytes", observed.bytes,
+			"duration_ms", float64(duration)/float64(time.Millisecond),
+			"cf_ray", r.Header.Get("CF-Ray"),
 		)
 	})
+}
+
+type observedResponseWriter struct {
+	http.ResponseWriter
+	status int
+	bytes  int64
+}
+
+func (w *observedResponseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
+func (w *observedResponseWriter) WriteHeader(status int) {
+	if w.status != 0 {
+		return
+	}
+	w.status = status
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *observedResponseWriter) Write(body []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	written, err := w.ResponseWriter.Write(body)
+	w.bytes += int64(written)
+	return written, err
+}
+
+func (w *observedResponseWriter) statusCode() int {
+	if w.status == 0 {
+		return http.StatusOK
+	}
+	return w.status
+}
+
+func routeName(requestPath string) string {
+	switch requestPath {
+	case "/healthz":
+		return "health"
+	case "/readyz":
+		return "readiness"
+	case "/auth/bootstrap":
+		return "bootstrap"
+	default:
+		return "proxy"
+	}
 }
 
 func RequestID(ctx context.Context) string {
