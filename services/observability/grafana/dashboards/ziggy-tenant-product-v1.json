@@ -1,0 +1,219 @@
+{
+  "annotations": {"list": []},
+  "description": "Version 1 tenant inventory, usage, and product reporting contract. Tenant panels require the pending PostgreSQL reporting views; only the fleet aggregate panel is live today.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "datasource": null,
+      "description": "The current branch has no durable tenancy database or inventory scanner.",
+      "gridPos": {"h": 5, "w": 24, "x": 0, "y": 0},
+      "id": 1,
+      "options": {
+        "content": "## Pending durable tenant source\nThe invited/active/disabled, inventory, usage, and product panels below query versioned `reporting.*_v1` PostgreSQL views that are **not implemented today**. No tenant values are inferred from OTel. The only live panel is the explicitly fleet-wide request aggregate. A future `single_owner_filesystem` inventory source is temporary migration metadata, not a tenant boundary; no scanner exists on this branch.",
+        "mode": "markdown"
+      },
+      "title": "Implementation status",
+      "type": "text"
+    },
+    {
+      "datasource": {"type": "postgres", "uid": "$product_ds"},
+      "description": "PENDING: reporting.admin_tenant_state_counts_v1. Authoritative application state, not an OTel metric.",
+      "fieldConfig": {"defaults": {"color": {"mode": "fixedColor", "fixedColor": "blue"}, "decimals": 0}, "overrides": []},
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 5},
+      "id": 2,
+      "options": {"colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "wideLayout": true},
+      "targets": [{"datasource": {"type": "postgres", "uid": "$product_ds"}, "editorMode": "code", "format": "table", "rawQuery": true, "rawSql": "SELECT tenant_count AS value FROM reporting.admin_tenant_state_counts_v1 WHERE tenant_state = 'invited'", "refId": "A"}],
+      "title": "Invited tenants (pending)",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "postgres", "uid": "$product_ds"},
+      "description": "PENDING: reporting.admin_tenant_state_counts_v1. Authoritative application state, not an OTel metric.",
+      "fieldConfig": {"defaults": {"color": {"mode": "fixedColor", "fixedColor": "green"}, "decimals": 0}, "overrides": []},
+      "gridPos": {"h": 4, "w": 6, "x": 6, "y": 5},
+      "id": 3,
+      "options": {"colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "wideLayout": true},
+      "targets": [{"datasource": {"type": "postgres", "uid": "$product_ds"}, "editorMode": "code", "format": "table", "rawQuery": true, "rawSql": "SELECT tenant_count AS value FROM reporting.admin_tenant_state_counts_v1 WHERE tenant_state = 'active'", "refId": "A"}],
+      "title": "Active tenants (pending)",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "postgres", "uid": "$product_ds"},
+      "description": "PENDING: reporting.admin_tenant_state_counts_v1. Authoritative application state, not an OTel metric.",
+      "fieldConfig": {"defaults": {"color": {"mode": "fixedColor", "fixedColor": "orange"}, "decimals": 0}, "overrides": []},
+      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 5},
+      "id": 4,
+      "options": {"colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "wideLayout": true},
+      "targets": [{"datasource": {"type": "postgres", "uid": "$product_ds"}, "editorMode": "code", "format": "table", "rawQuery": true, "rawSql": "SELECT tenant_count AS value FROM reporting.admin_tenant_state_counts_v1 WHERE tenant_state = 'disabled'", "refId": "A"}],
+      "title": "Disabled tenants (pending)",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "$metrics_ds"},
+      "description": "LIVE NOW: anonymous fleet aggregate only. This is not an authoritative tenant usage count.",
+      "fieldConfig": {"defaults": {"unit": "reqps", "color": {"mode": "fixedColor", "fixedColor": "purple"}}, "overrides": []},
+      "gridPos": {"h": 4, "w": 6, "x": 18, "y": 5},
+      "id": 5,
+      "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "wideLayout": true},
+      "targets": [{"editorMode": "code", "expr": "sum(rate(ziggy_control_http_server_requests_total{service_name=\"ziggy-control\"}[$__rate_interval]))", "instant": true, "legendFormat": "fleet requests", "range": false, "refId": "A"}],
+      "title": "Fleet request rate (live)",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "postgres", "uid": "$product_ds"},
+      "description": "PENDING: latest durable inventory snapshot per opaque tenant_ref. source=single_owner_filesystem is temporary and must never be presented as multi-tenant isolation.",
+      "fieldConfig": {"defaults": {}, "overrides": []},
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 9},
+      "id": 6,
+      "options": {"cellHeight": "sm", "footer": {"countRows": false, "fields": "", "reducer": ["sum"], "show": false}, "showHeader": true, "sortBy": [{"desc": false, "displayName": "Tenant"}]},
+      "targets": [{"datasource": {"type": "postgres", "uid": "$product_ds"}, "editorMode": "code", "format": "table", "rawQuery": true, "rawSql": "SELECT tenant_ref AS \"Tenant\", tenant_state AS \"State\", inventory_source AS \"Source\", inventory_complete AS \"Complete\", captured_at AS \"Captured\", runtime_count AS \"Runtimes\", runtime_bytes AS \"Runtime bytes\", runtime_file_count AS \"Runtime files\", session_count AS \"Sessions\", session_bytes AS \"Session bytes\", session_file_count AS \"Session files\", memory_count AS \"Memories\", memory_bytes AS \"Memory bytes\", memory_file_count AS \"Memory files\", workspace_count AS \"Workspaces\", workspace_bytes AS \"Workspace bytes\", workspace_file_count AS \"Workspace files\" FROM reporting.admin_tenant_inventory_latest_v1 WHERE tenant_ref = ${tenant_ref:sqlstring}", "refId": "A"}],
+      "title": "Per-tenant runtime, session, memory, and workspace inventory (pending)",
+      "type": "table"
+    },
+    {
+      "datasource": {"type": "postgres", "uid": "$product_ds"},
+      "description": "PENDING: authoritative hourly usage rollup for the selected opaque tenant_ref.",
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 17},
+      "id": 7,
+      "options": {"legend": {"calcs": ["lastNotNull", "sum"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"datasource": {"type": "postgres", "uid": "$product_ds"}, "editorMode": "code", "format": "time_series", "rawQuery": true, "rawSql": "SELECT bucket_start AS time, turns, failed_turns, rejected_turns FROM reporting.admin_tenant_usage_hourly_v1 WHERE $__timeFilter(bucket_start) AND tenant_ref = ${tenant_ref:sqlstring} ORDER BY bucket_start", "refId": "A"}
+      ],
+      "title": "Turns and errors over time (pending)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "postgres", "uid": "$product_ds"},
+      "description": "PENDING: authoritative token totals, never derived from sampled traces.",
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 17},
+      "id": 8,
+      "options": {"legend": {"calcs": ["lastNotNull", "sum"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"datasource": {"type": "postgres", "uid": "$product_ds"}, "editorMode": "code", "format": "time_series", "rawQuery": true, "rawSql": "SELECT bucket_start AS time, input_tokens, output_tokens FROM reporting.admin_tenant_usage_hourly_v1 WHERE $__timeFilter(bucket_start) AND tenant_ref = ${tenant_ref:sqlstring} ORDER BY bucket_start", "refId": "A"}
+      ],
+      "title": "Tokens over time (pending)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "postgres", "uid": "$product_ds"},
+      "description": "PENDING: per-hour p50/p95 turn latency from durable rollups.",
+      "fieldConfig": {"defaults": {"unit": "ms"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 25},
+      "id": 9,
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [{"datasource": {"type": "postgres", "uid": "$product_ds"}, "editorMode": "code", "format": "time_series", "rawQuery": true, "rawSql": "SELECT bucket_start AS time, turn_latency_p50_ms, turn_latency_p95_ms FROM reporting.admin_tenant_usage_hourly_v1 WHERE $__timeFilter(bucket_start) AND tenant_ref = ${tenant_ref:sqlstring} ORDER BY bucket_start", "refId": "A"}],
+      "title": "Turn latency (pending)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "postgres", "uid": "$product_ds"},
+      "description": "PENDING: per-hour queue wait distribution from durable rollups.",
+      "fieldConfig": {"defaults": {"unit": "ms"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 25},
+      "id": 10,
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [{"datasource": {"type": "postgres", "uid": "$product_ds"}, "editorMode": "code", "format": "time_series", "rawQuery": true, "rawSql": "SELECT bucket_start AS time, queue_wait_p50_ms, queue_wait_p95_ms FROM reporting.admin_tenant_usage_hourly_v1 WHERE $__timeFilter(bucket_start) AND tenant_ref = ${tenant_ref:sqlstring} ORDER BY bucket_start", "refId": "A"}],
+      "title": "Queue wait (pending)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "postgres", "uid": "$product_ds"},
+      "description": "PENDING: queued and queue-rejected turns from authoritative hourly usage rollups.",
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 33},
+      "id": 12,
+      "options": {"legend": {"calcs": ["lastNotNull", "sum"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [{"datasource": {"type": "postgres", "uid": "$product_ds"}, "editorMode": "code", "format": "time_series", "rawQuery": true, "rawSql": "SELECT bucket_start AS time, queued_turns, queue_rejected_turns FROM reporting.admin_tenant_usage_hourly_v1 WHERE $__timeFilter(bucket_start) AND tenant_ref = ${tenant_ref:sqlstring} ORDER BY bucket_start", "refId": "A"}],
+      "title": "Queue usage (pending)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "postgres", "uid": "$product_ds"},
+      "description": "PENDING: content-free memory search counts from the authoritative hourly rollup.",
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 33},
+      "id": 13,
+      "options": {"legend": {"calcs": ["lastNotNull", "sum"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [{"datasource": {"type": "postgres", "uid": "$product_ds"}, "editorMode": "code", "format": "time_series", "rawQuery": true, "rawSql": "SELECT bucket_start AS time, searches, failed_searches, result_count FROM reporting.admin_tenant_memory_search_hourly_v1 WHERE $__timeFilter(bucket_start) AND tenant_ref = ${tenant_ref:sqlstring} ORDER BY bucket_start", "refId": "A"}],
+      "title": "Memory search usage (pending)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "postgres", "uid": "$product_ds"},
+      "description": "PENDING: reviewed, versioned product events only. No free-form properties or content.",
+      "fieldConfig": {"defaults": {}, "overrides": []},
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 41},
+      "id": 11,
+      "options": {"cellHeight": "sm", "footer": {"countRows": false, "fields": "", "reducer": ["sum"], "show": false}, "showHeader": true, "sortBy": []},
+      "targets": [{"datasource": {"type": "postgres", "uid": "$product_ds"}, "editorMode": "code", "format": "table", "rawQuery": true, "rawSql": "SELECT day AS \"Day\", event_name AS \"Event\", client_platform AS \"Platform\", event_count AS \"Events\", success_count AS \"Successful\" FROM reporting.admin_product_daily_v1 WHERE $__timeFilter(day) AND tenant_ref = ${tenant_ref:sqlstring} ORDER BY day DESC, event_name", "refId": "A"}],
+      "title": "Product event rollup (pending)",
+      "type": "table"
+    }
+  ],
+  "refresh": "5m",
+  "schemaVersion": 41,
+  "tags": ["ziggy", "tenant", "product", "contract-v1", "pending-durable-store"],
+  "templating": {
+    "list": [
+      {
+        "current": {},
+        "hide": 0,
+        "includeAll": false,
+        "label": "Product reporting data source",
+        "multi": false,
+        "name": "product_ds",
+        "options": [],
+        "query": "postgres",
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "type": "datasource"
+      },
+      {
+        "current": {},
+        "hide": 0,
+        "includeAll": false,
+        "label": "Metrics data source",
+        "multi": false,
+        "name": "metrics_ds",
+        "options": [],
+        "query": "prometheus",
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "type": "datasource"
+      },
+      {
+        "current": {},
+        "datasource": {"type": "postgres", "uid": "$product_ds"},
+        "definition": "SELECT tenant_ref AS __text, tenant_ref AS __value FROM reporting.admin_tenant_inventory_latest_v1 ORDER BY tenant_ref",
+        "hide": 0,
+        "includeAll": false,
+        "label": "Tenant reference",
+        "multi": false,
+        "name": "tenant_ref",
+        "options": [],
+        "query": "SELECT tenant_ref AS __text, tenant_ref AS __value FROM reporting.admin_tenant_inventory_latest_v1 ORDER BY tenant_ref",
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 1,
+        "type": "query"
+      }
+    ]
+  },
+  "time": {"from": "now-30d", "to": "now"},
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Ziggy Tenant and Product v1",
+  "uid": "ziggy-tenant-product-v1",
+  "version": 1,
+  "weekStart": ""
+}

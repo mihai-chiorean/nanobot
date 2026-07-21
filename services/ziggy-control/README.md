@@ -17,11 +17,21 @@ iOS / web -> Cloudflare -> ziggy-control -> private Nanobot -> Spark models
 - Forward the existing bootstrap request and response without changing their
   shape.
 - Proxy Nanobot REST bearer tokens, SSE streams, and WebSocket upgrades.
+- Accept WebSocket bearer credentials in the upgrade `Authorization` header and
+  translate them for the current private Nanobot protocol. Query-token support
+  remains a deprecated compatibility path.
+- Accept guest enrollment at `POST /webui/guest/bootstrap` using a form `code`
+  or `join_code` field, or a Bearer `Authorization` header. Legacy GET/query
+  enrollment remains temporarily available and returns `Deprecation: true`.
 - Keep `/webui/bootstrap`, `/auth/token`, and configured private paths out of
   the public proxy.
 - Expose `/healthz` and upstream-aware `/readyz` endpoints.
-- Emit structured request logs with correlation ID, route, status, response
-  bytes, duration, Cloudflare ray ID, service, and build version.
+- Emit structured request logs with only bounded route, method, status,
+  response bytes, duration, service, and build version. Request-time warnings
+  and errors use bounded error classes and contain no raw path, URL, identity,
+  credential, query, request ID, or session ID.
+- Optionally emit content-free OpenTelemetry metrics and traces to a loopback
+  OTLP/HTTP collector.
 
 Configuration is immutable after startup. Request handling uses no global
 mutable state or application locks. The standard HTTP transport provides
@@ -58,6 +68,38 @@ account replacement cannot transfer access. Configure
 Startup emits explicit warnings while either the subject pin or authorized-party
 check is absent.
 
+Set `ZIGGY_OTEL_ENDPOINT=http://127.0.0.1:4318` and
+`ZIGGY_OTEL_AUTH_FILE` to enable application metrics and traces through the
+local collector. The credential file contains one bounded
+`ziggy-control:<plain random password>` value in production. The parser also
+accepts a bounded preformatted `Basic <base64(username:password)>` value for
+compatibility.
+Empty is the default; endpoint-only or credential-only configuration disables
+OTel with a secret-free warning. The endpoint must be loopback. This is a
+collector-local credential, not a Grafana credential, and it must be supplied
+through systemd `LoadCredential`, never an environment value.
+`ZIGGY_OTEL_TRACE_SAMPLE_RATIO` defaults to `1.0`, allowing the authenticated
+local collector to retain every error/slow trace and two percent of normal
+traces. Lower the ratio only for emergency resource control. A remote sampled
+parent cannot force local acceptance. `ZIGGY_DEPLOYMENT_ENVIRONMENT` defaults
+to `production`. Export uses bounded
+background queues and three-second attempts, so a missing collector cannot
+block or fail HTTP serving.
+
+The current metric names are:
+
+- `ziggy.control.service.uptime`
+- `ziggy.control.http.server.requests`, `.duration`, `.response.size`, and
+  `.active_requests`
+- `ziggy.control.auth.bootstrap.attempts`
+- `ziggy.control.upstream.requests`, `.duration`, and `.active_requests`
+
+Their labels are limited to route, canonical HTTP method, status class,
+upstream operation, and outcome enums. They never contain user, tenant,
+workspace, conversation, session, request, or credential values. The complete
+contract is in
+[`../../docs/architecture/ziggy-tenant-product-observability.md`](../../docs/architecture/ziggy-tenant-product-observability.md).
+
 Do not expose the default `127.0.0.1:8787` listener directly. Cloudflare should
 route `chat.mihaichiorean.com` to it, while Nanobot remains bound to loopback on
 its own port.
@@ -89,6 +131,13 @@ The checked-in unit expects:
 - non-secret config: `/etc/ziggy/ziggy-control.env`, mode `0600`
 - Clerk credential: `/etc/ziggy/secrets/clerk-secret-key`, owned by root and
   mode `0400`; systemd exposes it to the service with `LoadCredential`
+- local OTel client credential: `/etc/ziggy/secrets/otel-local-auth`, owned by
+  root and mode `0400`; it contains
+  `ziggy-control:<plain random password>`, and the checked-in unit maps it to
+  `ZIGGY_OTEL_AUTH_FILE` with `LoadCredential`. The separate collector file
+  `/etc/ziggy/secrets/otel-local-users.htpasswd` contains the same username and
+  a hash of the same password. The two files are not interchangeable. The
+  generated client file is required by the production unit.
 - unprivileged system account: `ziggy-control`
 
 Install or upgrade the versioned binary atomically, retain the previous binary

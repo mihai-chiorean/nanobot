@@ -21,6 +21,8 @@ const (
 	defaultReadinessCacheTTL   = 2 * time.Second
 	defaultUpstreamReadyPath   = "/"
 	defaultMaxRequestBodyBytes = int64(64 << 20)
+	defaultOTelTraceSampleRate = 1.0
+	defaultDeploymentEnv       = "production"
 )
 
 type Config struct {
@@ -37,6 +39,10 @@ type Config struct {
 	UpstreamReadyPath string
 	MaxRequestBody    int64
 	LogLevel          slog.Level
+	OTelEndpoint      string
+	OTelAuthFile      string
+	OTelTraceSample   float64
+	DeploymentEnv     string
 }
 
 type LookupEnv func(string) (string, bool)
@@ -104,6 +110,14 @@ func loadFrom(lookup LookupEnv, readFile ReadFile) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	otelTraceSample, err := fraction(lookup, "ZIGGY_OTEL_TRACE_SAMPLE_RATIO", defaultOTelTraceSampleRate)
+	if err != nil {
+		return Config{}, err
+	}
+	deploymentEnv, err := deploymentEnvironment(valueOrDefault(lookup, "ZIGGY_DEPLOYMENT_ENVIRONMENT", defaultDeploymentEnv))
+	if err != nil {
+		return Config{}, err
+	}
 
 	return Config{
 		ListenAddr:        listenAddr,
@@ -119,6 +133,10 @@ func loadFrom(lookup LookupEnv, readFile ReadFile) (Config, error) {
 		UpstreamReadyPath: readyPath,
 		MaxRequestBody:    maxRequestBody,
 		LogLevel:          logLevel,
+		OTelEndpoint:      optional(lookup, "ZIGGY_OTEL_ENDPOINT"),
+		OTelAuthFile:      optional(lookup, "ZIGGY_OTEL_AUTH_FILE"),
+		OTelTraceSample:   otelTraceSample,
+		DeploymentEnv:     deploymentEnv,
 	}, nil
 }
 
@@ -137,6 +155,25 @@ func positiveInt64(lookup LookupEnv, key string, fallback int64) (int64, error) 
 		return 0, fmt.Errorf("%s must be a positive integer", key)
 	}
 	return parsed, nil
+}
+
+func fraction(lookup LookupEnv, key string, fallback float64) (float64, error) {
+	value := valueOrDefault(lookup, key, strconv.FormatFloat(fallback, 'f', -1, 64))
+	parsed, err := strconv.ParseFloat(value, 64)
+	if err != nil || parsed < 0 || parsed > 1 {
+		return 0, fmt.Errorf("%s must be between 0 and 1", key)
+	}
+	return parsed, nil
+}
+
+func deploymentEnvironment(value string) (string, error) {
+	value = strings.ToLower(strings.TrimSpace(value))
+	switch value {
+	case "development", "local", "staging", "production", "test":
+		return value, nil
+	default:
+		return "", fmt.Errorf("ZIGGY_DEPLOYMENT_ENVIRONMENT: unsupported environment")
+	}
 }
 
 func clerkSecret(lookup LookupEnv, readFile ReadFile) (string, error) {

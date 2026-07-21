@@ -45,6 +45,12 @@ func TestLoadFromDefaults(t *testing.T) {
 	if config.LogLevel != slog.LevelInfo {
 		t.Errorf("LogLevel = %s", config.LogLevel)
 	}
+	if config.OTelEndpoint != "" || config.OTelAuthFile != "" || config.OTelTraceSample != 1.0 {
+		t.Errorf("OpenTelemetry defaults = endpoint %q, auth file %q, sample %v", config.OTelEndpoint, config.OTelAuthFile, config.OTelTraceSample)
+	}
+	if config.DeploymentEnv != "production" {
+		t.Errorf("DeploymentEnv = %q, want production", config.DeploymentEnv)
+	}
 	for _, blocked := range []string{"/webui/bootstrap", "/auth/token"} {
 		if _, ok := config.BlockedPaths[blocked]; !ok {
 			t.Errorf("BlockedPaths does not contain %q", blocked)
@@ -140,6 +146,10 @@ func TestLoadFromOverrides(t *testing.T) {
 		"ZIGGY_UPSTREAM_READY_PATH":      "/healthz",
 		"ZIGGY_MAX_REQUEST_BODY_BYTES":   "1024",
 		"ZIGGY_LOG_LEVEL":                "debug",
+		"ZIGGY_OTEL_ENDPOINT":            "http://127.0.0.1:4318",
+		"ZIGGY_OTEL_AUTH_FILE":           "/run/credentials/otel-local-auth",
+		"ZIGGY_OTEL_TRACE_SAMPLE_RATIO":  "0.25",
+		"ZIGGY_DEPLOYMENT_ENVIRONMENT":   "staging",
 	}
 
 	config, err := LoadFrom(mapLookup(environment))
@@ -163,6 +173,12 @@ func TestLoadFromOverrides(t *testing.T) {
 	}
 	if config.MaxRequestBody != 1024 {
 		t.Errorf("MaxRequestBody = %d, want 1024", config.MaxRequestBody)
+	}
+	if config.OTelEndpoint != "http://127.0.0.1:4318" || config.OTelAuthFile != "/run/credentials/otel-local-auth" || config.OTelTraceSample != 0.25 {
+		t.Errorf("OpenTelemetry overrides not applied: %+v", config)
+	}
+	if config.DeploymentEnv != "staging" {
+		t.Errorf("DeploymentEnv = %q, want staging", config.DeploymentEnv)
 	}
 }
 
@@ -189,6 +205,9 @@ func TestLoadFromRejectsInvalidConfiguration(t *testing.T) {
 		{name: "readiness path query", key: "ZIGGY_UPSTREAM_READY_PATH", value: "/healthz?full=1"},
 		{name: "non-positive body limit", key: "ZIGGY_MAX_REQUEST_BODY_BYTES", value: "0"},
 		{name: "bad log level", key: "ZIGGY_LOG_LEVEL", value: "verbose"},
+		{name: "negative trace ratio", key: "ZIGGY_OTEL_TRACE_SAMPLE_RATIO", value: "-0.1"},
+		{name: "high trace ratio", key: "ZIGGY_OTEL_TRACE_SAMPLE_RATIO", value: "1.1"},
+		{name: "bad deployment environment", key: "ZIGGY_DEPLOYMENT_ENVIRONMENT", value: "tenant-123"},
 	}
 
 	for _, test := range tests {

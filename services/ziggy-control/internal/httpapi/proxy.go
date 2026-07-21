@@ -7,9 +7,11 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"time"
+
+	"github.com/mihai-chiorean/nanobot/services/ziggy-control/internal/telemetry"
 )
 
-func NewReverseProxy(target *url.URL, logger *slog.Logger) *httputil.ReverseProxy {
+func NewReverseProxy(target *url.URL, logger *slog.Logger, observability *telemetry.Recorder) *httputil.ReverseProxy {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.MaxIdleConns = 100
 	transport.MaxIdleConnsPerHost = 32
@@ -22,8 +24,11 @@ func NewReverseProxy(target *url.URL, logger *slog.Logger) *httputil.ReverseProx
 		KeepAlive: 30 * time.Second,
 	}).DialContext
 
+	if observability == nil {
+		observability = telemetry.Noop()
+	}
 	proxy := &httputil.ReverseProxy{
-		Transport:     transport,
+		Transport:     observability.WrapTransport(transport, ""),
 		FlushInterval: -1,
 		Rewrite: func(request *httputil.ProxyRequest) {
 			request.SetURL(target)
@@ -36,10 +41,8 @@ func NewReverseProxy(target *url.URL, logger *slog.Logger) *httputil.ReverseProx
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			logger.ErrorContext(r.Context(), "upstream request failed",
-				"request_id", RequestID(r.Context()),
-				"method", r.Method,
-				"path", r.URL.Path,
-				"error", err,
+				"route", routeName(r.URL.Path),
+				"error_class", requestErrorClass(err),
 			)
 			writeError(w, http.StatusBadGateway, "upstream unavailable")
 		},

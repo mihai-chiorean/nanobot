@@ -15,12 +15,14 @@ import (
 	"github.com/clerk/clerk-sdk-go/v2/jwks"
 	"github.com/clerk/clerk-sdk-go/v2/user"
 	"github.com/mihai-chiorean/nanobot/services/ziggy-control/internal/identity"
+	"github.com/mihai-chiorean/nanobot/services/ziggy-control/internal/telemetry"
 )
 
 type Config struct {
 	SecretKey         string
 	AuthorizedParties []string
 	HTTPClient        *http.Client
+	Telemetry         *telemetry.Recorder
 }
 
 type emailResolver func(context.Context, string) (string, error)
@@ -46,7 +48,14 @@ func New(config Config) (func(http.Handler) http.Handler, error) {
 		transport.MaxIdleConns = 32
 		transport.MaxIdleConnsPerHost = 16
 		transport.IdleConnTimeout = 90 * time.Second
-		httpClient = &http.Client{Timeout: 5 * time.Second, Transport: transport}
+		observability := config.Telemetry
+		if observability == nil {
+			observability = telemetry.Noop()
+		}
+		httpClient = &http.Client{
+			Timeout:   5 * time.Second,
+			Transport: observability.WrapTransport(transport, "identity"),
+		}
 	}
 	clientConfig := &clerk.ClientConfig{BackendConfig: clerk.BackendConfig{
 		HTTPClient: httpClient,

@@ -2,12 +2,16 @@ package httpapi
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"sync/atomic"
 	"time"
+
+	"github.com/mihai-chiorean/nanobot/services/ziggy-control/internal/telemetry"
 )
 
 type ReadinessChecker interface {
@@ -28,18 +32,34 @@ type readinessSnapshot struct {
 	err       error
 }
 
+type upstreamStatusError struct {
+	status string
+}
+
+func (err upstreamStatusError) Error() string {
+	return "upstream returned " + err.status
+}
+
 var errReadinessRefreshInProgress = fmt.Errorf("readiness refresh in progress")
 
-func NewHTTPReadinessChecker(target *url.URL, readyPath string, timeout, cacheTTL time.Duration) *HTTPReadinessChecker {
+func NewHTTPReadinessChecker(
+	target *url.URL,
+	readyPath string,
+	timeout, cacheTTL time.Duration,
+	observability *telemetry.Recorder,
+) *HTTPReadinessChecker {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.ResponseHeaderTimeout = timeout
+	if observability == nil {
+		observability = telemetry.Noop()
+	}
 	probeTarget := *target
 	probeTarget.Path = readyPath
 	probeTarget.RawPath = ""
 	probeTarget.RawQuery = ""
 	probeTarget.Fragment = ""
 	return &HTTPReadinessChecker{
-		client:   &http.Client{Transport: transport},
+		client:   &http.Client{Transport: observability.WrapTransport(transport, "readiness")},
 		target:   &probeTarget,
 		timeout:  timeout,
 		cacheTTL: cacheTTL,
@@ -79,7 +99,28 @@ func (checker *HTTPReadinessChecker) check(ctx context.Context) error {
 	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4<<10))
 
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		return fmt.Errorf("upstream returned %s", response.Status)
+		return upstreamStatusError{status: response.Status}
 	}
 	return nil
+}
+
+func requestErrorClass(err error) string {
+	switch {
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "timeout"
+	}
+	var statusError upstreamStatusError
+	if errors.As(err, &statusError) {
+		return "upstream_status"
+	}
+	var networkError net.Error
+	if errors.As(err, &networkError) {
+		if networkError.Timeout() {
+			return "timeout"
+		}
+		return "network"
+	}
+	return "upstream_transport"
 }
