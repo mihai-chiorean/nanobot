@@ -1,0 +1,237 @@
+#!/bin/sh
+set -eu
+
+version=0.147.0
+service=otelcol-contrib.service
+state_root=/var/lib/ziggy-otelcol-deployments
+config_target=/etc/otelcol-contrib/config.yaml
+unit_target=/etc/systemd/system/otelcol-contrib.service
+dropin_target=/etc/systemd/system/otelcol-contrib.service.d/ziggy.conf
+launcher_target=/usr/local/libexec/ziggy-otelcol-start
+binary_link=/usr/local/bin/otelcol-contrib
+grafana_secret=/etc/ziggy/secrets/grafana-cloud-otel-token
+otlp_users_secret=/etc/ziggy/secrets/otel-local-users.htpasswd
+otlp_client_secret=/etc/ziggy/secrets/otel-local-auth
+grafana_endpoint=https://otlp-gateway-prod-us-west-0.grafana.net/otlp
+grafana_instance_id=1731821
+script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+
+usage() {
+  echo "usage: $0 deploy {beelink|spark} | rollback" >&2
+  exit 2
+}
+
+require_root() {
+  if [ "$(id -u)" -ne 0 ]; then
+    echo "this command must run as root" >&2
+    exit 1
+  fi
+}
+
+validate_secret() {
+  secret=$1
+  if [ ! -s "${secret}" ]; then
+    echo "required credential is unavailable or empty: ${secret}" >&2
+    exit 1
+  fi
+  owner="$(stat -c '%u' "${secret}")"
+  mode="$(stat -c '%a' "${secret}")"
+  if [ "${owner}" != 0 ] || [ "${mode}" != 400 ]; then
+    echo "credential must be owned by root with mode 0400: ${secret}" >&2
+    exit 1
+  fi
+}
+
+validate_otlp_pair() {
+  if ! command -v htpasswd >/dev/null 2>&1; then
+    echo "required command is unavailable: htpasswd" >&2
+    exit 1
+  fi
+  if [ "$(awk 'END { print NR }' "${otlp_client_secret}")" -ne 1 ]; then
+    echo "OTLP client credential must contain exactly one username:password line" >&2
+    exit 1
+  fi
+  credential="$(sed -n '1p' "${otlp_client_secret}")"
+  case "${credential}" in
+    ziggy-control:?*) password=${credential#ziggy-control:} ;;
+    *)
+      echo "OTLP client credential must use the ziggy-control username" >&2
+      exit 1
+      ;;
+  esac
+  if ! printf '%s\n' "${password}" \
+    | htpasswd -vi "${otlp_users_secret}" ziggy-control >/dev/null 2>&1; then
+    echo "OTLP client and collector credentials do not match" >&2
+    exit 1
+  fi
+  unset credential password
+}
+
+validate_candidate() (
+  validation_tmp="$(mktemp -d)"
+  trap 'rm -rf "${validation_tmp}"' EXIT HUP INT TERM
+  otlp_port=$((24000 + ($$ % 10000)))
+  metrics_port=$((otlp_port + 1))
+  validation_config="${validation_tmp}/config.yaml"
+
+  sed \
+    -e "s|127.0.0.1:4318|127.0.0.1:${otlp_port}|g" \
+    -e "s|127.0.0.1:8888|127.0.0.1:${metrics_port}|g" \
+    -e "s|port: 8888|port: ${metrics_port}|g" \
+    -e "s|/var/lib/ziggy-otelcol/storage|${validation_tmp}/storage|g" \
+    -e "s|/var/lib/ziggy-otelcol/compaction|${validation_tmp}/compaction|g" \
+    "${candidate_config}" > "${validation_config}"
+
+  GRAFANA_CLOUD_OTLP_ENDPOINT="${grafana_endpoint}" \
+  GRAFANA_CLOUD_INSTANCE_ID="${grafana_instance_id}" \
+  GRAFANA_CLOUD_API_KEY_FILE="${grafana_secret}" \
+  ZIGGY_OTLP_HTPASSWD_FILE="${otlp_users_secret}" \
+  HOSTNAME="$(hostname)" \
+    "${candidate_binary}" validate --config="${validation_config}"
+)
+
+backup_target() {
+  target=$1
+  name=$2
+  if [ -e "${target}" ] || [ -L "${target}" ]; then
+    cp -a "${target}" "${backup_dir}/${name}"
+  else
+    : > "${backup_dir}/${name}.absent"
+  fi
+}
+
+restore_target() {
+  target=$1
+  name=$2
+  if [ -e "${backup_dir}/${name}.absent" ]; then
+    rm -f "${target}"
+  elif [ -e "${backup_dir}/${name}" ] || [ -L "${backup_dir}/${name}" ]; then
+    rm -f "${target}"
+    cp -a "${backup_dir}/${name}" "${target}"
+  fi
+}
+
+rollback_from() {
+  backup_dir=$1
+  systemctl stop "${service}" >/dev/null 2>&1 || true
+  restore_target "${config_target}" config.yaml
+  restore_target "${unit_target}" otelcol-contrib.service
+  restore_target "${dropin_target}" ziggy.conf
+  restore_target "${launcher_target}" ziggy-otelcol-start
+  restore_target "${binary_link}" otelcol-contrib
+  systemctl daemon-reload
+  if [ -e "${backup_dir}/otelcol-contrib.service.absent" ]; then
+    systemctl disable "${service}" >/dev/null 2>&1 || true
+  else
+    systemctl enable "${service}" >/dev/null
+    systemctl restart "${service}"
+  fi
+}
+
+exporter_ready() {
+  attempts=18
+  while [ "${attempts}" -gt 0 ]; do
+    metrics="$(curl --fail --silent --show-error --max-time 3 \
+      http://127.0.0.1:8888/metrics 2>/dev/null || true)"
+    if printf '%s\n' "${metrics}" | grep -q '^otelcol_process_uptime_seconds_total{' \
+      && printf '%s\n' "${metrics}" | grep -q '^otelcol_exporter_queue_capacity{' \
+      && printf '%s\n' "${metrics}" | awk '
+        $1 ~ /^otelcol_exporter_sent_metric_points_total[{]/ && $NF + 0 > 0 { found = 1 }
+        END { exit(found ? 0 : 1) }
+      '; then
+      return 0
+    fi
+    attempts=$((attempts - 1))
+    sleep 5
+  done
+  return 1
+}
+
+require_root
+action=${1:-}
+
+if [ "${action}" = rollback ]; then
+  [ "$#" -eq 1 ] || usage
+  rollback_link="${state_root}/rollback"
+  if [ ! -L "${rollback_link}" ]; then
+    echo "no recorded collector deployment to roll back" >&2
+    exit 1
+  fi
+  backup_dir="$(readlink -f "${rollback_link}")"
+  rollback_from "${backup_dir}"
+  echo "collector rollback restored ${backup_dir}"
+  exit 0
+fi
+
+[ "${action}" = deploy ] || usage
+[ "$#" -eq 2 ] || usage
+host=$2
+case "${host}" in
+  beelink|spark) ;;
+  *) usage ;;
+esac
+
+if ! getent group otelcol-contrib >/dev/null; then
+  groupadd --system otelcol-contrib
+fi
+if ! id otelcol-contrib >/dev/null 2>&1; then
+  useradd --system --gid otelcol-contrib --home-dir /nonexistent \
+    --shell /usr/sbin/nologin otelcol-contrib
+fi
+
+validate_secret "${grafana_secret}"
+if [ "${host}" = beelink ]; then
+  validate_secret "${otlp_users_secret}"
+  validate_secret "${otlp_client_secret}"
+  validate_otlp_pair
+fi
+
+candidate_binary="$("${script_dir}/install-otelcol-contrib")"
+candidate_config="${script_dir}/${host}.yaml"
+candidate_dropin="${script_dir}/systemd/otelcol-contrib-${host}.conf"
+
+validate_candidate
+
+install -o root -g root -m 0755 -d \
+  /etc/otelcol-contrib /etc/systemd/system/otelcol-contrib.service.d \
+  /usr/local/bin /usr/local/libexec
+install -o root -g root -m 0700 -d "${state_root}"
+backup_dir="${state_root}/$(date -u +%Y%m%dT%H%M%SZ)-$$"
+install -o root -g root -m 0700 -d "${backup_dir}"
+backup_target "${config_target}" config.yaml
+backup_target "${unit_target}" otelcol-contrib.service
+backup_target "${dropin_target}" ziggy.conf
+backup_target "${launcher_target}" ziggy-otelcol-start
+backup_target "${binary_link}" otelcol-contrib
+
+install -o root -g root -m 0644 "${candidate_config}" "${config_target}"
+install -o root -g root -m 0644 \
+  "${script_dir}/systemd/otelcol-contrib.service" "${unit_target}"
+install -o root -g root -m 0644 "${candidate_dropin}" "${dropin_target}"
+install -o root -g root -m 0755 "${script_dir}/ziggy-otelcol-start" "${launcher_target}"
+next_link="${binary_link}.next"
+rm -f "${next_link}"
+ln -s "${candidate_binary}" "${next_link}"
+mv -Tf "${next_link}" "${binary_link}"
+
+ln -sfn "${backup_dir}" "${state_root}/rollback"
+systemctl daemon-reload
+systemctl enable "${service}" >/dev/null
+if ! systemctl restart "${service}" || ! systemctl is-active --quiet "${service}"; then
+  echo "collector failed to start; restoring previous deployment" >&2
+  rollback_from "${backup_dir}"
+  exit 1
+fi
+sleep 3
+if ! systemctl is-active --quiet "${service}"; then
+  echo "collector exited during startup; restoring previous deployment" >&2
+  rollback_from "${backup_dir}"
+  exit 1
+fi
+if ! exporter_ready; then
+  echo "collector heartbeat or successful Grafana metric export was not observed; restoring previous deployment" >&2
+  rollback_from "${backup_dir}"
+  exit 1
+fi
+
+echo "collector ${version} deployed for ${host}; rollback: $0 rollback"

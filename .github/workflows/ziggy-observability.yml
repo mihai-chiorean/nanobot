@@ -12,29 +12,77 @@ permissions:
 
 jobs:
   validate-otelcol:
-    runs-on: ubuntu-latest
+    name: Validate collector (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
     env:
       OTELCOL_VERSION: "0.147.0"
       GRAFANA_CLOUD_OTLP_ENDPOINT: https://example.invalid/otlp
       GRAFANA_CLOUD_INSTANCE_ID: "1"
-      GRAFANA_CLOUD_API_KEY: validation-only
-      GRAFANA_CLOUD_BASIC_AUTH_HEADER: Basic validation-only
       HOSTNAME: validation-host
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download pinned collector and checksum
+      - name: Download and verify pinned collector
+        working-directory: services/observability/otelcol
         run: |
-          curl -fsSLO "https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v${OTELCOL_VERSION}/otelcol-contrib_${OTELCOL_VERSION}_linux_amd64.tar.gz"
-          curl -fsSLo checksums.txt "https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v${OTELCOL_VERSION}/opentelemetry-collector-releases_otelcol-contrib_checksums.txt"
-          grep " otelcol-contrib_${OTELCOL_VERSION}_linux_amd64.tar.gz$" checksums.txt | sha256sum --check
-          tar -xzf "otelcol-contrib_${OTELCOL_VERSION}_linux_amd64.tar.gz"
+          set -eu
+          archive="otelcol-contrib_${OTELCOL_VERSION}_linux_${{ matrix.arch }}.tar.gz"
+          curl --fail --show-error --silent --location \
+            --proto '=https' --tlsv1.2 \
+            --output "${archive}" \
+            "https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v${OTELCOL_VERSION}/${archive}"
+          grep " ${archive}$" "otelcol-contrib-${OTELCOL_VERSION}-linux.sha256" | sha256sum --check
+          tar -xzf "${archive}"
+          ./otelcol-contrib --version | grep "${OTELCOL_VERSION}"
+
+      - name: Create validation-only credentials
+        run: |
+          set -eu
+          printf 'validation-only\n' > "${RUNNER_TEMP}/grafana-token"
+          hash="$(openssl passwd -apr1 validation-password)"
+          printf 'ziggy-control:%s\n' "${hash}" > "${RUNNER_TEMP}/otel-local-users.htpasswd"
+
+      - name: Parse YAML
+        run: |
+          ruby -e 'require "yaml"; ARGV.each { |path| YAML.safe_load_file(path, aliases: true) }' \
+            .github/workflows/ziggy-observability.yml \
+            services/observability/otelcol/beelink.yaml \
+            services/observability/otelcol/spark.yaml \
+            services/observability/otelcol/privacy-canary.yaml
 
       - name: Validate collector profiles
+        env:
+          GRAFANA_CLOUD_API_KEY_FILE: ${{ runner.temp }}/grafana-token
+          ZIGGY_OTLP_HTPASSWD_FILE: ${{ runner.temp }}/otel-local-users.htpasswd
+          PRIVACY_CANARY_ENDPOINT: 127.0.0.1:24318
+          PRIVACY_CANARY_OUTPUT: ${{ runner.temp }}/privacy-canary-output.json
+          PRIVACY_CANARY_HTPASSWD_FILE: ${{ runner.temp }}/otel-local-users.htpasswd
+          PRIVACY_CANARY_UNREACHABLE_ENDPOINT: http://127.0.0.1:24319
         run: |
-          ./otelcol-contrib validate --config=services/observability/otelcol/beelink.yaml
-          ./otelcol-contrib validate --config=services/observability/otelcol/spark.yaml
+          collector=services/observability/otelcol/otelcol-contrib
+          "${collector}" validate --config=services/observability/otelcol/beelink.yaml
+          "${collector}" validate --config=services/observability/otelcol/spark.yaml
+          "${collector}" validate --config=services/observability/otelcol/privacy-canary.yaml
 
-      - name: Validate launcher
-        run: sh -n services/observability/otelcol/ziggy-otelcol-start
+      - name: Validate privacy boundary
+        run: |
+          services/observability/otelcol/validate-privacy-canary \
+            services/observability/otelcol/otelcol-contrib
+
+      - name: Validate shell scripts
+        run: |
+          sh -n \
+            services/observability/otelcol/generate-otel-credentials \
+            services/observability/otelcol/install-otelcol-contrib \
+            services/observability/otelcol/validate-privacy-canary \
+            services/observability/otelcol/ziggy-otelcol-deploy \
+            services/observability/otelcol/ziggy-otelcol-start

@@ -1,81 +1,182 @@
 # Ziggy OpenTelemetry Collector
 
-These profiles send a deliberately narrow operational telemetry set to the
-ordinary Grafana Cloud OTLP endpoint. They do not enable Grafana Application
-Observability and do not use Grafana's broad default Linux profile.
+These profiles send a deliberately narrow, content-free operational telemetry
+set to the ordinary Grafana Cloud OTLP endpoint. They do not enable Grafana
+Application Observability or use Grafana's broad default Linux profile.
 
-## Credential
+## Pinned binary
 
-Create one Grafana Cloud access policy with only `metrics:write`, `logs:write`,
-and `traces:write`. Create a separate token for each host so either credential
-can be revoked independently.
+Production uses `otelcol-contrib` `v0.147.0`. The reviewed Linux AMD64 and
+ARM64 archive hashes are in `otelcol-contrib-0.147.0-linux.sha256`.
+`install-otelcol-contrib` selects the native architecture, downloads only the
+exact release archive over HTTPS, verifies the checked-in SHA-256, and installs
+the binary under:
 
-The token is the `GRAFANA_CLOUD_API_KEY`. The numeric instance ID is the Basic
-Auth username. `ziggy-otelcol-start` derives the Basic Auth header at process
-startup and reads the token through a systemd credential; no token belongs in
-this repository, the collector YAML, or a persistent environment file.
+```text
+/opt/ziggy/otelcol-contrib/0.147.0/{amd64|arm64}/otelcol-contrib
+```
 
-The deployed credential path is:
+The deployment script switches `/usr/local/bin/otelcol-contrib` only after the
+candidate binary validates the candidate host profile. CI downloads and runs
+the matching binary on native AMD64 and ARM64 runners.
+
+## Credentials
+
+Grafana Cloud uses one write-only token per host. The token source file is:
 
 ```text
 /etc/ziggy/secrets/grafana-cloud-otel-token
 ```
 
-It must be owned by root with mode `0400`.
+It is root-owned mode `0400`. systemd loads it as the
+`grafana-cloud-api-key` credential. The collector's Basic auth client reads
+the credential file directly through `password_file`; the token is never
+copied into a process environment variable.
+
+Beelink OTLP/HTTP requires a separate local Basic credential. Generate the
+paired server and client files on Beelink with:
+
+```sh
+sudo services/observability/otelcol/generate-otel-credentials
+```
+
+This installs:
+
+```text
+/etc/ziggy/secrets/otel-local-users.htpasswd  # collector server credential
+/etc/ziggy/secrets/otel-local-auth            # ziggy-control username:password
+```
+
+Both are root-owned mode `0400` and are derived from the same random password.
+The collector unit loads the first as systemd credential `otel-local-users`.
+The ziggy-control unit loads the second as `otel-local-auth` and points
+`ZIGGY_OTEL_AUTH_FILE` at `%d/otel-local-auth`. The client file contains one
+`ziggy-control:<plain random password>` line; the Go client converts it to an
+Authorization header internally. Neither secret belongs in
+the repository, an environment file, command arguments, terminal output, or a
+container image.
+
+After credential rotation, restart both services. Restart the collector first;
+ziggy-control telemetry fails closed during the brief mismatch and application
+serving continues without telemetry.
 
 ## Profiles
 
-- `beelink.yaml` receives loopback-only OTLP, host and systemd unit metrics,
-  Ziggy health probes, Cloudflare metrics, selected warning/error logs, and
-  lifecycle/kernel events.
-- `spark.yaml` receives loopback-only OTLP metrics, host metrics, model health,
-  Qwen Prometheus metrics, and only lifecycle/kernel events. It intentionally
-  does not export Nanobot, model, transcript, prompt, or tool logs.
+`beelink.yaml` collects:
 
-The Spark unit is capped at 192 MiB and 5% CPU. The collector has no GPU
-dependency. NVIDIA metrics require a small separate exporter and are not
-enabled until Spark's existing exporter state is inspected.
+- authenticated loopback OTLP/HTTP metrics and traces from only
+  `service.name=ziggy-control`;
+- an exact application metric-name and attribute allowlist;
+- exact, bounded span names and attributes, with every span event removed and
+  spans with links dropped;
+- host, health-check, Cloudflared, and system-level unit-state metrics;
+- content-free service lifecycle and kernel health events.
 
-## Install
+`spark.yaml` collects host metrics, three named health probes, an exact Qwen
+Prometheus metric allowlist, and content-free kernel OOM/GPU/storage events.
+Spark has no OTLP receiver or application trace pipeline. It does not collect
+Spark application logs or user-systemd state metrics.
 
-Install the pinned `otelcol-contrib` package for the host architecture, then
-copy the profile and launcher:
+Journal records are selected by explicit source and message class. Before
+export, the collector maps each accepted record to a fixed `event.name`, erases
+the body, and retains only the event name plus stable service/host resources.
+There is no broad warning stream for ziggy-control, Cloudflared, Docker, Qwen,
+Nanobot, or any other application.
 
-```sh
-install -o root -g root -m 0755 -d /usr/local/libexec
-install -o root -g root -m 0755 -d /etc/systemd/system/otelcol-contrib.service.d
-install -o root -g root -m 0644 HOST.yaml /etc/otelcol-contrib/config.yaml
-install -o root -g root -m 0755 ziggy-otelcol-start /usr/local/libexec/ziggy-otelcol-start
-install -o root -g root -m 0644 systemd/otelcol-contrib-HOST.conf \
-  /etc/systemd/system/otelcol-contrib.service.d/ziggy.conf
-usermod -aG systemd-journal otelcol-contrib
-systemctl daemon-reload
-systemctl restart otelcol-contrib
+Filesystem mountpoint attributes are dropped because they can expose user or
+workspace paths. Prometheus scrape-time relabeling keeps only reviewed metric
+names, drops identity/high-cardinality labels, then applies a short label
+allowlist. Probe URLs are mapped to fixed target names and removed. Unknown
+metrics, labels, OTLP resources, attributes, span names, span links, span
+events, and metric exemplars are dropped.
+
+## Sampling and buffering
+
+Beelink tail sampling waits 10 seconds and keeps all received error traces,
+traces slower than two seconds, and 2% of other traces. The tail sampler is
+bounded to 1,000 in-flight traces with bounded decision caches. To let it see
+errors and latency before making a decision, production ziggy-control must use:
+
+```text
+ZIGGY_OTEL_TRACE_SAMPLE_RATIO=1.0
 ```
 
-Restarting after the group change is required. Validate with:
+The client still has a bounded in-memory batch queue. A lower client head
+sample ratio would discard traces before collector error/latency policies can
+inspect them.
+
+Exporter queues and journald cursors use `file_storage` under
+`/var/lib/ziggy-otelcol`. The Beelink exporter queue is capped at 64 MiB and
+Spark at 32 MiB by the byte sizer; BoltDB metadata and compaction temporarily
+add limited overhead beyond those payload caps. Batches are size-limited,
+storage is fsynced and compacted, and export retries continue for up to 30
+minutes. The systemd `StateDirectory` is private to the collector user. Queue
+overflow or storage failure drops optional telemetry rather than consuming
+unbounded disk or blocking application work.
+
+## Deploy and rollback
+
+Install `curl`, `openssl`, `apache2-utils`, `systemd`, and `journalctl`. Stage
+the root-owned Grafana credential on each host and the local OTLP credential
+pair on Beelink. From a reviewed repository checkout, run:
 
 ```sh
-otelcol-contrib validate --config=/etc/otelcol-contrib/config.yaml
+sudo services/observability/otelcol/ziggy-otelcol-deploy deploy beelink
+sudo services/observability/otelcol/ziggy-otelcol-deploy deploy spark
+```
+
+The deploy command:
+
+1. Creates the unprivileged `otelcol-contrib` account if needed.
+2. Downloads and verifies the architecture-specific pinned binary.
+3. Validates the candidate profile with the candidate binary and credential
+   file paths before changing the live service.
+4. Saves the current config, unit, drop-in, launcher, and binary symlink under
+   `/var/lib/ziggy-otelcol-deployments`.
+5. Installs the candidate, enables and restarts the service, and confirms the
+   local `otelcol_process_uptime_seconds_total` heartbeat, exporter queue
+   capacity, and a positive `otelcol_exporter_sent_metric_points_total`
+   counter. The last signal is
+   incremented only after Grafana accepts a metric export.
+6. Automatically restores the saved deployment if startup fails.
+
+Manual rollback restores the immediately preceding deployment:
+
+```sh
+sudo services/observability/otelcol/ziggy-otelcol-deploy rollback
+```
+
+Rollback changes collector code/config only. Persistent cursors and queued
+telemetry remain under the stable state directory and should not be deleted.
+If a new collector version changes the storage schema, test downgrade against
+a copied state directory before promotion.
+
+## Verification
+
+Run before deployment:
+
+```sh
+sh -n \
+  services/observability/otelcol/generate-otel-credentials \
+  services/observability/otelcol/install-otelcol-contrib \
+  services/observability/otelcol/validate-privacy-canary \
+  services/observability/otelcol/ziggy-otelcol-deploy \
+  services/observability/otelcol/ziggy-otelcol-start
+services/observability/otelcol/validate-privacy-canary \
+  /usr/local/bin/otelcol-contrib
+```
+
+After deployment:
+
+```sh
 systemctl status otelcol-contrib --no-pager
 journalctl -u otelcol-contrib --since -5m --no-pager
 ```
 
-The service must be healthy before adding dashboards or alerts. Confirm in
-Grafana Explore that each host has `system.uptime`, `httpcheck.status`, and
-collector self-metrics. Then verify that exported logs contain only the
-allowlisted lifecycle/error classes and no user content.
-
-## Secret staging from the Mac
-
-Replacement tokens are staged locally, outside the repository:
-
-```text
-~/.config/ziggy/secrets/grafana-cloud/beelink-token
-~/.config/ziggy/secrets/grafana-cloud/spark-token
-```
-
-The directory must be mode `0700` and each file mode `0600`. Copy each file to
-the matching host without printing it, then install it as the root-owned
-credential above. Revoke a token immediately if it appears in terminal output,
-chat, logs, source control, or command history.
+The deploy command already requires an active process, local collector
+heartbeat, bounded queue metric, and successful Grafana metric response. Then
+verify the expected host uptime, named probe, queue/failure/refusal metrics, and
+selected service metrics in Grafana. Inject the privacy canary only in CI/local
+test collectors; never send test secrets to the production endpoint. Full
+journals remain local and are the forensic source when content-free cloud
+events are insufficient.
