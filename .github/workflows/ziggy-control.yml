@@ -1,0 +1,29 @@
+name: Ziggy Control
+
+on:
+  push:
+    paths:
+      - "services/ziggy-control/**"
+      - ".github/workflows/ziggy-control.yml"
+  pull_request:
+    paths:
+      - "services/ziggy-control/**"
+      - ".github/workflows/ziggy-control.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/ziggy-control
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: services/ziggy-control/go.mod
+          cache-dependency-path: services/ziggy-control/go.sum
+      - run: make verify linux-amd64 linux-arm64
