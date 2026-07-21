@@ -4,7 +4,9 @@
 
 - Swift 6 and SwiftUI.
 - iOS 17 minimum, tested primarily on iOS 26 and iPhone 17 Pro.
-- No third-party runtime dependencies in V1.
+- No third-party runtime dependencies in V1. Textual 0.5.0 was evaluated but
+  its package manifest requires iOS 18, so iOS 17 keeps Foundation's native
+  AttributedString Markdown path with link/image safety gates.
 - XcodeGen owns deterministic project generation through `project.yml`.
 
 ## Layers
@@ -20,7 +22,10 @@ local persistence arrives.
 ### Core models
 
 `Models` contains Codable wire payloads and small domain models. Wire types do
-not import SwiftUI. UI-specific formatting stays in feature modules.
+not import SwiftUI. UI-specific formatting stays in feature modules. The
+versioned `RichContentMessage` model preserves unknown blocks as placeholders;
+`LegacyContentAdapter` maps current string/JSON messages and progress/tool
+metadata without interpreting HTML.
 
 ### Networking
 

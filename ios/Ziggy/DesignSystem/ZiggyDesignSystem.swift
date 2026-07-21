@@ -54,7 +54,11 @@ struct ZiggyMarkdownText: View {
 
     var body: some View {
         Group {
-            if let attributed = try? AttributedString(
+            // Textual 0.5.0 is pinned to iOS 18 in its Package.swift, so it cannot
+            // be added while Ziggy supports iOS 17. Keep Foundation's native path
+            // until a compatible release is available.
+            if RichContentSafety.allowsAttributedString(markdown),
+               let attributed = try? AttributedString(
                 markdown: markdown,
                 options: .init(interpretedSyntax: .full)
             ) {

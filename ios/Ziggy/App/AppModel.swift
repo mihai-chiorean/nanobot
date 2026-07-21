@@ -33,15 +33,22 @@ struct ChatItem: Identifiable, Hashable, Sendable {
     let chatID: String
     let role: MessageRole
     var text: String
+    var blocks: [RichBlock]
     var isStreaming: Bool
 
     init(id: String = UUID().uuidString, chatID: String, role: MessageRole,
-         text: String, isStreaming: Bool = false) {
+         text: String, blocks: [RichBlock]? = nil, isStreaming: Bool = false) {
         self.id = id
         self.chatID = chatID
         self.role = role
         self.text = text
+        self.blocks = blocks ?? LegacyContentAdapter.blocks(text: text, role: role)
         self.isStreaming = isStreaming
+    }
+
+    mutating func append(delta: String) {
+        text += delta
+        blocks = [.markdown(MarkdownBlock(text: text))]
     }
 }
 
@@ -263,11 +270,13 @@ final class AppModel {
             let response = try await authenticatedRESTClient().fetchMessages(sessionKey: sessionKey)
             let chatID = Self.chatID(from: sessionKey)
             messagesByChatID[chatID] = response.items.map { message in
-                ChatItem(
+                let blocks = LegacyContentAdapter.content(for: message)
+                return ChatItem(
                     id: message.id,
                     chatID: chatID,
                     role: message.role,
-                    text: message.content.text ?? "",
+                    text: LegacyContentAdapter.plainText(for: blocks),
+                    blocks: blocks,
                     isStreaming: false
                 )
             }
@@ -377,14 +386,15 @@ final class AppModel {
             let role: MessageRole = ["trace", "progress", "tool"].contains(message.kind?.lowercased() ?? "")
                 ? .progress
                 : .assistant
+            let blocks = LegacyContentAdapter.blocks(text: message.text, role: role, kind: message.kind)
             messagesByChatID[message.chatID, default: []].append(
-                ChatItem(chatID: message.chatID, role: role, text: message.text)
+                ChatItem(chatID: message.chatID, role: role, text: message.text, blocks: blocks)
             )
         case .delta(let delta):
             guard let chatID = delta.sessionKey else { return }
             let id = "stream-\(delta.messageID ?? chatID)"
             if let index = messagesByChatID[chatID, default: []].firstIndex(where: { $0.id == id }) {
-                messagesByChatID[chatID]?[index].text += delta.text
+                messagesByChatID[chatID]?[index].append(delta: delta.text)
             } else {
                 messagesByChatID[chatID, default: []].append(
                     ChatItem(id: id, chatID: chatID, role: .assistant, text: delta.text, isStreaming: true)

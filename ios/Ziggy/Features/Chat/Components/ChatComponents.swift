@@ -63,6 +63,7 @@ enum ZiggyMessageKind: String, Sendable {
 struct ZiggyMessageBubble: View {
     let kind: ZiggyMessageKind
     let text: String
+    var blocks: [RichBlock]? = nil
     var author: String? = nil
     var isStreaming = false
 
@@ -84,7 +85,7 @@ struct ZiggyMessageBubble: View {
                 }
             case .assistant:
                 HStack(alignment: .lastTextBaseline, spacing: 5) {
-                    ZiggyMarkdownText(markdown: text)
+                    RichContentView(blocks: blocks ?? [.markdown(MarkdownBlock(text: text))])
                         .frame(maxWidth: .infinity, alignment: .leading)
                     if isStreaming { StreamCursor() }
                 }
