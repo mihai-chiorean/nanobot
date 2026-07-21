@@ -1,0 +1,40 @@
+name: Ziggy observability
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/ziggy-observability.yml
+      - docs/architecture/ziggy-observability.md
+      - services/observability/**
+
+permissions:
+  contents: read
+
+jobs:
+  validate-otelcol:
+    runs-on: ubuntu-latest
+    env:
+      OTELCOL_VERSION: "0.147.0"
+      GRAFANA_CLOUD_OTLP_ENDPOINT: https://example.invalid/otlp
+      GRAFANA_CLOUD_INSTANCE_ID: "1"
+      GRAFANA_CLOUD_API_KEY: validation-only
+      GRAFANA_CLOUD_BASIC_AUTH_HEADER: Basic validation-only
+      HOSTNAME: validation-host
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download pinned collector and checksum
+        run: |
+          curl -fsSLO "https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v${OTELCOL_VERSION}/otelcol-contrib_${OTELCOL_VERSION}_linux_amd64.tar.gz"
+          curl -fsSLo checksums.txt "https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v${OTELCOL_VERSION}/opentelemetry-collector-releases_otelcol-contrib_checksums.txt"
+          grep " otelcol-contrib_${OTELCOL_VERSION}_linux_amd64.tar.gz$" checksums.txt | sha256sum --check
+          tar -xzf "otelcol-contrib_${OTELCOL_VERSION}_linux_amd64.tar.gz"
+
+      - name: Validate collector profiles
+        run: |
+          ./otelcol-contrib validate --config=services/observability/otelcol/beelink.yaml
+          ./otelcol-contrib validate --config=services/observability/otelcol/spark.yaml
+
+      - name: Validate launcher
+        run: sh -n services/observability/otelcol/ziggy-otelcol-start

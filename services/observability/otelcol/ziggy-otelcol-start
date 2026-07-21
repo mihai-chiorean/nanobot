@@ -1,0 +1,25 @@
+#!/bin/sh
+set -eu
+
+: "${CREDENTIALS_DIRECTORY:?systemd credential directory is unavailable}"
+: "${GRAFANA_CLOUD_INSTANCE_ID:?Grafana Cloud instance ID is unavailable}"
+: "${GRAFANA_CLOUD_OTLP_ENDPOINT:?Grafana Cloud OTLP endpoint is unavailable}"
+
+credential="${CREDENTIALS_DIRECTORY}/grafana-cloud-api-key"
+if [ ! -r "${credential}" ]; then
+  echo "Grafana Cloud API key credential is unavailable" >&2
+  exit 1
+fi
+
+GRAFANA_CLOUD_API_KEY="$(tr -d '\r\n' < "${credential}")"
+if [ -z "${GRAFANA_CLOUD_API_KEY}" ]; then
+  echo "Grafana Cloud API key credential is empty" >&2
+  exit 1
+fi
+
+HOSTNAME="$(hostname)"
+GRAFANA_CLOUD_BASIC_AUTH_HEADER="Basic $(printf '%s:%s' "${GRAFANA_CLOUD_INSTANCE_ID}" "${GRAFANA_CLOUD_API_KEY}" | base64 | tr -d '\r\n')"
+
+export GRAFANA_CLOUD_API_KEY GRAFANA_CLOUD_BASIC_AUTH_HEADER HOSTNAME
+exec /usr/bin/otelcol-contrib "$@"
+

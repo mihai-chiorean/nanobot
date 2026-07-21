@@ -1,0 +1,230 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 127.0.0.1:4317
+      http:
+        endpoint: 127.0.0.1:4318
+
+  hostmetrics:
+    collection_interval: 60s
+    scrapers:
+      cpu:
+        metrics:
+          system.cpu.logical.count:
+            enabled: true
+          system.cpu.utilization:
+            enabled: true
+      disk: {}
+      filesystem:
+        exclude_mount_points:
+          mount_points:
+            - /dev/*
+            - /proc/*
+            - /sys/*
+            - /run/*
+            - /var/lib/docker/*
+          match_type: regexp
+        exclude_fs_types:
+          fs_types:
+            - autofs
+            - bpf
+            - cgroup2
+            - configfs
+            - debugfs
+            - devpts
+            - devtmpfs
+            - fusectl
+            - overlay
+            - proc
+            - pstore
+            - securityfs
+            - squashfs
+            - sysfs
+            - tmpfs
+            - tracefs
+          match_type: strict
+      load: {}
+      memory:
+        metrics:
+          system.memory.limit:
+            enabled: true
+          system.memory.utilization:
+            enabled: true
+      network: {}
+      paging: {}
+      system:
+        metrics:
+          system.uptime:
+            enabled: true
+
+  httpcheck/ziggy:
+    collection_interval: 30s
+    metrics:
+      httpcheck.duration:
+        enabled: true
+      httpcheck.tls.cert_remaining:
+        enabled: true
+    targets:
+      - endpoint: http://127.0.0.1:8787/healthz
+      - endpoint: http://127.0.0.1:8787/readyz
+      - endpoint: https://chat.mihaichiorean.com/healthz
+
+  prometheus/cloudflared:
+    config:
+      scrape_configs:
+        - job_name: ziggy-cloudflared
+          scrape_interval: 30s
+          static_configs:
+            - targets: [127.0.0.1:20241]
+
+  systemd/ziggy:
+    scope: system
+    units:
+      - ziggy-control.service
+      - ziggy-cloudflared.service
+      - docker.service
+
+  journald/ziggy_errors:
+    start_at: end
+    priority: warning
+    units:
+      - ziggy-control.service
+      - ziggy-cloudflared.service
+      - docker.service
+    retry_on_failure:
+      enabled: true
+      max_elapsed_time: 1m
+
+  journald/ziggy_lifecycle:
+    start_at: end
+    priority: info
+    identifiers: [systemd]
+    grep: '(?i)(((ziggy-control|ziggy-cloudflared|docker).*(started|stopped|starting|stopping|failed|main process exited|scheduled restart))|((started|stopped|starting|stopping|failed|main process exited|scheduled restart).*(ziggy-control|ziggy-cloudflared|docker)))'
+
+  journald/kernel:
+    start_at: end
+    priority: warning
+    dmesg: true
+    grep: '(?i)(out of memory|oom-kill|killed process|nvme|i/o error|filesystem)'
+
+processors:
+  memory_limiter:
+    check_interval: 5s
+    limit_mib: 384
+    spike_limit_mib: 64
+
+  batch:
+    send_batch_size: 512
+    timeout: 10s
+
+  resourcedetection:
+    detectors: [env, system]
+    system:
+      resource_attributes:
+        host.id:
+          enabled: true
+        host.name:
+          enabled: true
+
+  resource/ziggy:
+    attributes:
+      - key: deployment.environment
+        value: production
+        action: upsert
+      - key: service.namespace
+        value: ziggy
+        action: upsert
+      - key: ziggy.host.role
+        value: beelink
+        action: upsert
+
+  transform/promote_host:
+    metric_statements:
+      - set(datapoint.attributes["host.name"], resource.attributes["host.name"])
+
+  transform/journald:
+    error_mode: ignore
+    log_statements:
+      - set(log.attributes, log.body)
+      - set(log.body, log.body["MESSAGE"])
+      - set(resource.attributes["service.name"], log.attributes["_SYSTEMD_UNIT"]) where log.attributes["_SYSTEMD_UNIT"] != nil
+      - set(resource.attributes["service.name"], log.attributes["SYSLOG_IDENTIFIER"]) where resource.attributes["service.name"] == nil
+      - keep_keys(log.attributes, ["PRIORITY", "_SYSTEMD_UNIT", "SYSLOG_IDENTIFIER", "_BOOT_ID"])
+
+  attributes/trace_privacy:
+    actions:
+      - key: http.request.header.authorization
+        action: delete
+      - key: http.request.header.cookie
+        action: delete
+      - key: http.response.header.set-cookie
+        action: delete
+      - key: http.request.body
+        action: delete
+      - key: http.response.body
+        action: delete
+      - key: url.full
+        action: delete
+      - key: url.query
+        action: delete
+      - key: enduser.id
+        action: delete
+      - key: user.id
+        action: delete
+
+  filter/ziggy_traces:
+    error_mode: ignore
+    traces:
+      span:
+        - resource.attributes["service.name"] == nil
+        - resource.attributes["service.name"] != "ziggy-control"
+
+exporters:
+  otlphttp/grafana_cloud:
+    endpoint: ${env:GRAFANA_CLOUD_OTLP_ENDPOINT}
+    auth:
+      authenticator: basicauth/grafana_cloud
+    sending_queue:
+      enabled: true
+      num_consumers: 2
+      queue_size: 128
+    retry_on_failure:
+      enabled: true
+      max_elapsed_time: 5m
+
+extensions:
+  basicauth/grafana_cloud:
+    client_auth:
+      username: ${env:GRAFANA_CLOUD_INSTANCE_ID}
+      password: ${env:GRAFANA_CLOUD_API_KEY}
+
+service:
+  extensions: [basicauth/grafana_cloud]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, filter/ziggy_traces, attributes/trace_privacy, resourcedetection, resource/ziggy, batch]
+      exporters: [otlphttp/grafana_cloud]
+    metrics:
+      receivers: [otlp, hostmetrics, httpcheck/ziggy, prometheus/cloudflared, systemd/ziggy]
+      processors: [memory_limiter, resourcedetection, resource/ziggy, transform/promote_host, batch]
+      exporters: [otlphttp/grafana_cloud]
+    logs:
+      receivers: [journald/ziggy_errors, journald/ziggy_lifecycle, journald/kernel]
+      processors: [memory_limiter, transform/journald, resourcedetection, resource/ziggy, batch]
+      exporters: [otlphttp/grafana_cloud]
+  telemetry:
+    resource:
+      service.name: ziggy-otelcol
+      host.name: ${env:HOSTNAME}
+    metrics:
+      readers:
+        - periodic:
+            exporter:
+              otlp:
+                protocol: http/protobuf
+                endpoint: ${env:GRAFANA_CLOUD_OTLP_ENDPOINT}/v1/metrics
+                headers:
+                  - name: authorization
+                    value: ${env:GRAFANA_CLOUD_BASIC_AUTH_HEADER}
