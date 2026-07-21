@@ -6,20 +6,18 @@ Status: proposed
 
 Use OpenTelemetry and Prometheus formats as the instrumentation boundary and
 send a deliberately small, content-free telemetry set to Grafana Cloud. Run the
-full Grafana Alloy gateway on Beelink. Run one resource-capped Alloy process on
-Spark only for local journal access, host/GPU metrics, and forwarding its
-existing Prometheus targets. Keep Langfuse local for LLM-specific traces,
-prompts, token use, cost, and evaluation.
+official `otelcol-contrib` distribution on Beelink as the gateway. Run one
+resource-capped collector on Spark only for local journal access, host/model
+metrics, and forwarding selected Prometheus targets. Keep Langfuse local for
+LLM-specific traces, prompts, token use, cost, and evaluation.
 
 This gives the system an off-site control plane that remains available when
-Spark, Beelink, the home network, or their storage is down. Alloy is an open
-source OpenTelemetry Collector distribution with native Prometheus, Loki,
-Tempo, and generic OTLP support, so changing the storage backend does not
-require replacing application instrumentation.
+Spark, Beelink, the home network, or their storage is down. The collector is
+vendor-neutral and supports Prometheus and generic OTLP inputs, so changing the
+storage backend does not require replacing application instrumentation.
 
 References:
 
-- [Grafana Alloy overview](https://grafana.com/oss/alloy-opentelemetry-collector/)
 - [OpenTelemetry Collector](https://opentelemetry.io/docs/collector/)
 - [Grafana Cloud pricing and free retention](https://grafana.com/pricing/)
 
@@ -63,17 +61,17 @@ an unavailable Spark host.
 public /healthz and /readyz <---------- Grafana synthetic probes
 
 ziggy-control -- OTLP metadata only ---+
-cloudflared ---- Prometheus -----------+      +-------------------------+
-Beelink journal allowlist ------------+----->| Alloy gateway on Beelink|
-Docker service state -----------------+      +------------+------------+
+cloudflared ---- Prometheus -----------+      +---------------------------+
+Beelink journal allowlist ------------+----->| OTel gateway on Beelink   |
+Docker service state -----------------+      +------------+--------------+
                                                                |
 Spark endpoint probes over Tailscale --------------------------+
                                                                | TLS
 Spark selected journal events ----------+                      |
-Spark host/GPU/systemd metrics ----------+  +-------------------v---+
-Nanobot/Qwen Prometheus metrics ---------+->| Alloy lite on Spark  |
-                                            | MemoryMax/CPUQuota    |
-                                            +-----------+-----------+
+Spark host/model health metrics ---------+  +-------------------v---+
+Qwen Prometheus metrics -----------------+->| OTel collector on Spark|
+                                            | MemoryMax/CPUQuota     |
+                                            +-----------+------------+
                                                         |
                            +----------------------------+-----------+
                            | metrics / selected logs / sampled spans|
@@ -82,7 +80,7 @@ Nanobot/Qwen Prometheus metrics ---------+->| Alloy lite on Spark  |
                     operational view                      private AI data
 ```
 
-Alloy enriches every signal with stable `service.name`, `service.version`,
+The collector enriches every signal with stable `service.name`, `service.version`,
 `deployment.environment`, and `host.name` attributes. The Spark service has a
 systemd memory limit and CPU quota and does no trace processing, secret
 scanning, or broad journal ingestion.
@@ -148,7 +146,7 @@ evidence needed to confirm it.
 1. Create one Grafana Cloud Free stack with separate least-privilege write
    credentials for metrics, logs, and traces. Disable Application
    Observability.
-2. Install the full Alloy gateway on Beelink and resource-capped Alloy Lite on
+2. Install the full OTel gateway on Beelink and resource-capped collector on
    Spark through Lab.
 3. Collect host/GPU/service-state metrics, only the selected journald events,
    Cloudflare metrics, and the existing Spark Prometheus targets.
@@ -260,9 +258,9 @@ Reference: [OpenObserve documentation](https://openobserve.ai/docs/)
   or secret detection as the primary privacy control.
 - Put Grafana Cloud credentials in systemd credentials, not environment files,
   and give each host write-only scopes. The dashboard account has MFA.
-- Cap Spark Alloy with systemd `MemoryMax` and `CPUQuota`; do not run eBPF
+- Cap the Spark collector with systemd `MemoryMax` and `CPUQuota`; do not run eBPF
   auto-instrumentation or local Loki/Tempo databases on Spark.
-- Start Spark Alloy with `MemoryMax=192M` and `CPUQuota=5%`. Treat those as hard
+- Start the Spark collector with `MemoryMax=192M` and `CPUQuota=5%`. Treat those as hard
   ceilings to validate under load, not resource reservations; lower them only
   after measuring collection gaps and queue behavior.
 - Pin container and collector versions instead of deploying `latest` tags.
