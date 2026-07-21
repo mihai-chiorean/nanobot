@@ -648,6 +648,82 @@ per-workspace runtime and Go routing gate supply the missing boundary. See
 
 ## 11. Runtime Lifecycle and Capacity
 
+### Pilot isolation runtime
+
+For the first external pilot, package each warm Nanobot runtime as a separate
+rootless Docker container. A container remains an implementation of the
+existing isolation unit: one Nanobot process plus one workspace. Qwen,
+Whisper, embedding, reranking, the model gateway, and connector services remain
+shared services; they are not duplicated per user.
+
+The container is disposable. The workspace volume and control-plane records
+are durable. Each runtime has:
+
+- one pinned Nanobot image digest and generated tenant-specific config;
+- one workspace volume mounted read-write, with no other workspace or host
+  directory visible;
+- a read-only root filesystem plus bounded temporary filesystems;
+- a non-root UID, all Linux capabilities dropped, `no-new-privileges`, and
+  explicit CPU, memory, PID, and file-size limits;
+- no published host port, Docker socket, host network, provider key, Clerk
+  secret, database credential, or Tailscale administration access;
+- a private runtime endpoint and short-lived credential bound to workspace,
+  runtime generation, allowed routes, and expiry; and
+- network access only to product-owned model and MCP gateways. Those gateways
+  enforce workspace capabilities and proxy any required access to Spark.
+
+Docker is hidden behind a Go `RuntimeDriver` interface. The initial driver uses
+a rootless daemon owned by the runtime-manager account. `ziggy-control` must
+not receive a Docker socket: a separate node-local `ziggy-runtime-manager`
+service owns container lifecycle and exposes a narrow Unix-socket API. This
+keeps a public gateway compromise from becoming host root and lets the driver
+move later to containerd, systemd isolation, or Lab without changing the
+identity or routing contracts.
+
+Container overhead is not a second VM or model copy. Most per-tenant RAM is the
+Nanobot Python process and any libraries it loads, which would exist with bare
+processes too. Container namespaces and cgroups provide a substantially clearer
+pilot boundary for a small incremental cost. Keep up to ten pilot runtimes warm;
+at larger admission counts, use the cold/warm lifecycle below rather than one
+permanently running container per registered user.
+
+### Supervisor contract
+
+The runtime manager reconciles durable desired state instead of treating the
+Docker daemon as authoritative:
+
+1. `ziggy-control` verifies the user and resolves a workspace before requesting
+   a runtime. Client workspace IDs never reach the driver as authorization.
+2. The manager serializes operations per workspace through a keyed work queue;
+   unrelated workspaces start and stop concurrently without a global lock.
+3. `EnsureRunning` creates or validates the volume, writes generated config,
+   records a new runtime generation, creates the labeled container, starts it,
+   and waits for the private health check before publishing its endpoint.
+4. Requests increment an active-turn lease. Idle eviction marks the runtime
+   draining, rejects new turns, waits for active work or its deadline, stops and
+   removes the container, and preserves the workspace volume.
+5. A crash uses bounded exponential restart backoff. After the retry budget,
+   the runtime is failed, routing stops, and observability links the state
+   transition to its selected logs. It never silently routes to another
+   workspace or stale generation.
+6. On manager restart, reconciliation lists containers by Ziggy labels and
+   compares workspace, runtime ID, generation, image digest, and desired state.
+   It adopts only an exact live match, removes orphaned containers, and prevents
+   duplicate owners of one workspace.
+7. Disable and deletion revoke sessions first, drain and remove the runtime,
+   inventory and remove tenant data, and preserve only the configured audit
+   record. Removing a TestFlight tester is not runtime revocation.
+8. Upgrades drain the old generation, start the pinned replacement, run its
+   compatibility/health probe, then atomically publish the new endpoint. A
+   failed replacement leaves the workspace stopped or restores the previous
+   compatible image; two generations never serve writes concurrently.
+
+The minimum manager API is `EnsureRunning`, `AcquireTurn`, `ReleaseTurn`,
+`Drain`, `Stop`, `Delete`, `Status`, and `Reconcile`. Calls carry an internal
+workspace capability and idempotency key. Runtime status and lease metadata are
+stored in PostgreSQL; an in-memory keyed queue coordinates only work executing
+inside one manager process and is rebuilt by reconciliation.
+
 ```mermaid
 stateDiagram-v2
     [*] --> Cold
