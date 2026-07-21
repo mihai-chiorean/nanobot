@@ -66,7 +66,8 @@ receivers:
     targets:
       - endpoint: http://127.0.0.1:8012/health
       - endpoint: http://127.0.0.1:8001/health
-      - endpoint: http://127.0.0.1:18792/health
+      # Nanobot is intentionally bound to Spark's Tailscale address, not loopback.
+      - endpoint: http://spark-094a.tail6faf85.ts.net:18792/health
 
   prometheus/qwen:
     config:
