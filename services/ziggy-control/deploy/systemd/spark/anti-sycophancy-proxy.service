@@ -1,0 +1,13 @@
+[Unit]
+Description=Anti-sycophancy proxy for Qwen (:8001 -> :8012)
+After=network-online.target qwen-vllm.service
+Wants=network-online.target qwen-vllm.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /home/mihai/workspace/anti-sycophancy-proxy/anti_sycophancy_proxy.py --listen-port 8001 --backend-port 8012
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
