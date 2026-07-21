@@ -207,6 +207,7 @@ struct ChatConversationView: View {
                                 ZiggyMessageBubble(
                                     kind: kind(for: message.role),
                                     text: message.text,
+                                    blocks: message.blocks,
                                     isStreaming: message.isStreaming
                                 )
                                 .id(message.id)
