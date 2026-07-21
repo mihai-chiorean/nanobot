@@ -104,6 +104,13 @@ curl --fail http://127.0.0.1:8787/readyz
 Rollback is an artifact swap followed by `systemctl restart ziggy-control`;
 no Nanobot, model, or data service is rebuilt.
 
+The production Cloudflare connector runs on the same host using
+`deploy/systemd/ziggy-cloudflared.service`. Its tunnel token is loaded as a
+systemd credential from `/etc/ziggy/secrets/cloudflare-ziggy-tunnel-token`;
+do not place the token in the unit, environment file, or command line. The
+connector proxies only to `http://127.0.0.1:8787`, keeping Spark private as the
+Nanobot and model upstream.
+
 `/healthz` reports only process health. `/readyz` requires a 2xx response from
 `ZIGGY_UPSTREAM_READY_PATH` and caches the result briefly to avoid turning
 health polling into upstream load. Neither endpoint proves that a user can
