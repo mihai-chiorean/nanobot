@@ -30,30 +30,44 @@ func main() {
 func run() error {
 	cfg, err := config.Load()
 	if err != nil {
-		return err
+		return classify("startup_configuration", err)
 	}
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
 	stateSigner := crypto.NewStateSigner(cfg.StateSigningKey)
 	tokenCipher, err := crypto.NewAESGCM(cfg.TokenEncryptionKey)
 	if err != nil {
-		return err
+		return classify("startup_crypto", err)
 	}
 	var accounts store.AccountRepository = store.NewMemoryRepository()
 	var transactions store.OAuthTransactionRepository = store.NewMemoryRepository()
 	if cfg.DatabaseURL != "" {
 		db, err := sql.Open("pgx", cfg.DatabaseURL)
 		if err != nil {
-			return err
+			return classify("startup_database", err)
 		}
 		defer db.Close()
 		postgres, err := store.NewPostgresRepository(db)
 		if err != nil {
-			return err
+			return classify("startup_database", err)
 		}
 		accounts = postgres
 		transactions = postgres
 	}
+	api, err := newAPI(cfg, accounts, transactions, logger, tokenCipher, stateSigner)
+	if err != nil {
+		return classify("startup_api", err)
+	}
+	server := &http.Server{Addr: cfg.ListenAddr, Handler: api, ReadHeaderTimeout: 10 * time.Second}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	if err := httpapi.Serve(ctx, server, cfg.ShutdownTimeout); err != nil {
+		return classify("runtime_http", err)
+	}
+	return nil
+}
+
+func newAPI(cfg config.Config, accounts store.AccountRepository, transactions store.OAuthTransactionRepository, logger *slog.Logger, tokenCipher crypto.Cipher, stateSigner *crypto.StateSigner) (http.Handler, error) {
 	google := provider.NewGoogle(provider.GoogleConfig{
 		ClientID:     cfg.GoogleClientID,
 		ClientSecret: cfg.GoogleClientSecret,
@@ -61,13 +75,13 @@ func run() error {
 		TokenURL:     cfg.GoogleTokenURL,
 		UserInfoURL:  cfg.GoogleUserInfoURL,
 		ProfileURL:   cfg.GoogleProfileURL,
-		HTTPClient:   http.DefaultClient,
 	})
-	api, err := httpapi.New(httpapi.Config{
+	return httpapi.New(httpapi.Config{
 		Environment:       cfg.Environment,
 		Version:           cfg.Version,
 		GoogleRedirectURI: cfg.GoogleRedirectURI,
 		GoogleScopes:      cfg.GoogleScopes,
+		StateTTL:          cfg.StateTTL,
 		StateSigner:       stateSigner,
 		TokenCipher:       tokenCipher,
 		Accounts:          accounts,
@@ -76,18 +90,27 @@ func run() error {
 		PrincipalVerifier: principal.NewVerifier(cfg.TrustKey),
 		Logger:            logger,
 	})
-	if err != nil {
-		return err
-	}
-	server := &http.Server{Addr: cfg.ListenAddr, Handler: api, ReadHeaderTimeout: 10 * time.Second}
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-	return httpapi.Serve(ctx, server, cfg.ShutdownTimeout)
 }
 
 func errorClass(err error) string {
+	var classified *classifiedError
+	if errors.As(err, &classified) {
+		return classified.class
+	}
 	if errors.Is(err, context.Canceled) {
 		return "canceled"
 	}
 	return "startup_or_shutdown_failure"
+}
+
+type classifiedError struct {
+	class string
+	err   error
+}
+
+func (e *classifiedError) Error() string { return e.err.Error() }
+func (e *classifiedError) Unwrap() error { return e.err }
+
+func classify(class string, err error) error {
+	return &classifiedError{class: class, err: err}
 }
