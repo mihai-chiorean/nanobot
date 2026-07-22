@@ -2,16 +2,6 @@ import Foundation
 import Observation
 import SwiftUI
 
-struct ZiggyIdentity: Sendable {
-    let name: String
-    let email: String
-
-    static let owner = ZiggyIdentity(
-        name: "Mihai Chiorean",
-        email: "mihai.v.chiorean@gmail.com"
-    )
-}
-
 enum ZiggyTheme: String, CaseIterable, Identifiable, Sendable {
     case system
     case light
@@ -76,13 +66,12 @@ final class AppModel {
         case failed(String)
     }
 
-    let identity = ZiggyIdentity.owner
+    var identity = ZiggyIdentity.signedOut
     var selectedTab: Tab = .chats
     var theme: ZiggyTheme
     var chatNavigationPath: [String] = []
     var phase: Phase = .launching
     var serverURLText = "https://chat.mihaichiorean.com"
-    var accessCode = ""
     var connectionState: ZiggySocketConnectionState = .idle
     var modelName = "Ziggy"
     var sessions: [SessionSummary] = []
@@ -116,6 +105,7 @@ final class AppModel {
     }
 
     private let credentialStore: any CredentialStoring
+    private let authSession: any AuthSessionProviding
     private var restClient: ZiggyRESTClient?
     private var restTokenExpiresAt: Date?
     private var currentBootstrap: BootstrapResponse?
@@ -125,13 +115,16 @@ final class AppModel {
     private var socket: ZiggyWebSocketClient?
     private var socketEventTask: Task<Void, Never>?
     private var configuredServerURL: URL?
-    private var configuredAccessCode: String?
     private var pendingNewChat = false
     private var hasStarted = false
     private var chatReconciler = ChatStreamReconciler()
 
-    init(credentialStore: any CredentialStoring = KeychainCredentialStore()) {
+    init(
+        credentialStore: any CredentialStoring = KeychainCredentialStore(),
+        authSession: any AuthSessionProviding = UnconfiguredAuthSession()
+    ) {
         self.credentialStore = credentialStore
+        self.authSession = authSession
         self.theme = ZiggyTheme(rawValue: UserDefaults.standard.string(forKey: "ziggy.theme") ?? "") ?? .system
     }
 
@@ -146,18 +139,12 @@ final class AppModel {
         if let server = environment["ZIGGY_SERVER_URL"], !server.isEmpty {
             serverURLText = server
         }
-        if let code = environment["ZIGGY_GUEST_CODE"], !code.isEmpty {
-            accessCode = code
-            await connect(persist: false)
-            return
-        }
-
         do {
-            if let savedURL = try await credentialStore.serverURL(),
-               let savedCode = try await credentialStore.guestEnrollmentCode() {
+            if let savedURL = try await credentialStore.serverURL() {
                 serverURLText = savedURL.absoluteString
-                accessCode = savedCode
-                await connect(persist: false)
+            }
+            if authSession.isSignedIn {
+                await connectAuthenticated()
             } else {
                 phase = .needsEnrollment
             }
@@ -175,14 +162,13 @@ final class AppModel {
         setTheme(currentScheme == .dark ? .light : .dark)
     }
 
-    func connect(persist: Bool = true) async {
-        let trimmedCode = accessCode.trimmingCharacters(in: .whitespacesAndNewlines)
+    func connectAuthenticated() async {
         guard let serverURL = ZiggyServerURLValidation.url(from: serverURLText) else {
             phase = .failed("Enter a valid Ziggy server URL.")
             return
         }
-        guard !trimmedCode.isEmpty else {
-            phase = .failed("Enter the private access code.")
+        guard authSession.isSignedIn else {
+            phase = .needsEnrollment
             return
         }
 
@@ -197,17 +183,14 @@ final class AppModel {
         contentCapabilities = .legacyOnly
 
         do {
-            let bootstrapClient = ZiggyRESTClient(baseURL: serverURL)
-            let bootstrap = try await bootstrapClient.bootstrapGuest(code: trimmedCode)
+            let identityToken = try await authSession.sessionToken()
+            let bootstrap = try await ZiggyRESTClient(baseURL: serverURL)
+                .bootstrapAuthenticated(identityToken: identityToken)
+            try await credentialStore.save(serverURL: serverURL)
+            identity = authSession.identity ?? .signedOut
             configuredServerURL = serverURL
-            configuredAccessCode = trimmedCode
             installRESTClient(from: bootstrap, serverURL: serverURL)
             modelName = bootstrap.model ?? "Ziggy"
-
-            if persist {
-                try await credentialStore.save(serverURL: serverURL)
-                try await credentialStore.save(guestEnrollmentCode: trimmedCode)
-            }
 
             let webSocketURL = Self.webSocketURL(baseURL: serverURL, path: bootstrap.webSocketPath)
             let socket = ZiggyWebSocketClient(baseURL: webSocketURL) { [weak self] in
@@ -227,14 +210,32 @@ final class AppModel {
         }
     }
 
-    func retryConnection() async {
-        await connect(persist: false)
+    func authenticationDidChange() async {
+        if authSession.isSignedIn {
+            identity = authSession.identity ?? .signedOut
+            await connectAuthenticated()
+        } else {
+            await clearConnectionState()
+            phase = .needsEnrollment
+        }
     }
 
-    func disconnectAndForget() async {
+    func retryConnection() async {
+        await connectAuthenticated()
+    }
+
+    func signOut() async {
+        do {
+            try await authSession.signOut()
+            await clearConnectionState()
+            phase = .needsEnrollment
+        } catch {
+            bannerMessage = Self.message(for: error)
+        }
+    }
+
+    private func clearConnectionState() async {
         await stopSocket()
-        try? await credentialStore.removeServerURL()
-        try? await credentialStore.removeGuestEnrollmentCode()
         restClient = nil
         currentBootstrap = nil
         bootstrapRefreshTask?.cancel()
@@ -244,8 +245,7 @@ final class AppModel {
         credentialGeneration = 0
         chatReconciler = ChatStreamReconciler()
         configuredServerURL = nil
-        configuredAccessCode = nil
-        accessCode = ""
+        identity = .signedOut
         sessions = []
         workTasks = []
         messagesByChatID = [:]
@@ -510,12 +510,14 @@ final class AppModel {
             }
             return bootstrap
         }
-        guard let serverURL = configuredServerURL, let code = configuredAccessCode else {
+        guard let serverURL = configuredServerURL else {
             throw ZiggyRESTError.invalidURL
         }
 
-        let task = Task {
-            try await ZiggyRESTClient(baseURL: serverURL).bootstrapGuest(code: code)
+        let task = Task { @MainActor in
+            let identityToken = try await authSession.sessionToken()
+            return try await ZiggyRESTClient(baseURL: serverURL)
+                .bootstrapAuthenticated(identityToken: identityToken)
         }
         bootstrapRefreshTask = task
         do {
@@ -573,7 +575,7 @@ final class AppModel {
             switch restError {
             case .http(let statusCode, _):
                 return statusCode == 401 || statusCode == 403
-                    ? "The private access code was rejected."
+                    ? "This account is not authorized for Ziggy."
                     : "Ziggy returned HTTP \(statusCode)."
             case .invalidURL: return "The Ziggy server URL is invalid."
             case .invalidResponse: return "Ziggy returned an invalid response."

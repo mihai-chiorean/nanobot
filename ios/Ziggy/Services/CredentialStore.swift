@@ -1,39 +1,14 @@
 import Foundation
 
-enum EnrollmentCredentialMode: String, Sendable, CaseIterable {
-    case ownerAccessCode = "owner-access-code"
-    case guestCode = "guest-code"
-
-    var displayName: String {
-        switch self {
-        case .ownerAccessCode:
-            "owner access code"
-        case .guestCode:
-            "guest code"
-        }
-    }
-}
-
 enum CredentialKey: Hashable, Sendable {
     case serverURL
-    case enrollment(EnrollmentCredentialMode)
 
     var account: String {
-        switch self {
-        case .serverURL:
-            "server-url"
-        case let .enrollment(mode):
-            "enrollment-\(mode.rawValue)"
-        }
+        "server-url"
     }
 
     var displayName: String {
-        switch self {
-        case .serverURL:
-            "server URL"
-        case let .enrollment(mode):
-            mode.displayName
-        }
+        "server URL"
     }
 }
 
@@ -47,7 +22,6 @@ enum CredentialValueValidationReason: Sendable, Equatable {
     case empty
     case invalidServerURL
     case leadingOrTrailingWhitespace
-    case ephemeralToken
 }
 
 enum CredentialStoreError: Error, Equatable, LocalizedError, Sendable {
@@ -66,8 +40,6 @@ enum CredentialStoreError: Error, Equatable, LocalizedError, Sendable {
                 "The server URL must use HTTPS, or HTTP on localhost, 127.0.0.1, or ::1, with no user info, query, or fragment."
             case .leadingOrTrailingWhitespace:
                 "The \(key.displayName) contains leading or trailing whitespace."
-            case .ephemeralToken:
-                "Short-lived nbwt_ tokens are kept in memory and cannot be saved."
             }
         case let .invalidStoredValue(key):
             "The saved \(key.displayName) is invalid."
@@ -115,46 +87,9 @@ extension CredentialStoring {
         try await setValue(serverURL.absoluteString, for: .serverURL)
     }
 
-    func enrollmentCredential(for mode: EnrollmentCredentialMode) async throws -> String? {
-        try await value(for: .enrollment(mode))
-    }
-
-    func saveEnrollmentCredential(_ credential: String, for mode: EnrollmentCredentialMode) async throws {
-        try await setValue(credential, for: .enrollment(mode))
-    }
-
-    func removeEnrollmentCredential(for mode: EnrollmentCredentialMode) async throws {
-        try await removeValue(for: .enrollment(mode))
-    }
-
-    func guestEnrollmentCode() async throws -> String? {
-        try await enrollmentCredential(for: .guestCode)
-    }
-
-    func ownerAccessCode() async throws -> String? {
-        try await enrollmentCredential(for: .ownerAccessCode)
-    }
-
-    func save(guestEnrollmentCode: String) async throws {
-        try await saveEnrollmentCredential(guestEnrollmentCode, for: .guestCode)
-    }
-
-    func save(ownerAccessCode: String) async throws {
-        try await saveEnrollmentCredential(ownerAccessCode, for: .ownerAccessCode)
-    }
-
     func removeServerURL() async throws {
         try await removeValue(for: .serverURL)
     }
-
-    func removeGuestEnrollmentCode() async throws {
-        try await removeEnrollmentCredential(for: .guestCode)
-    }
-
-    func removeOwnerAccessCode() async throws {
-        try await removeEnrollmentCredential(for: .ownerAccessCode)
-    }
-
 }
 
 enum CredentialStoreValidation {
@@ -166,14 +101,8 @@ enum CredentialStoreValidation {
             throw CredentialStoreError.invalidValue(key: key, reason: .leadingOrTrailingWhitespace)
         }
 
-        if case .enrollment = key, value.hasPrefix("nbwt_") {
-            throw CredentialStoreError.invalidValue(key: key, reason: .ephemeralToken)
-        }
-
-        if case .serverURL = key {
-            guard ZiggyServerURLValidation.url(from: value) != nil else {
-                throw CredentialStoreError.invalidValue(key: key, reason: .invalidServerURL)
-            }
+        guard ZiggyServerURLValidation.url(from: value) != nil else {
+            throw CredentialStoreError.invalidValue(key: key, reason: .invalidServerURL)
         }
     }
 }

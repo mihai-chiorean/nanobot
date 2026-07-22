@@ -4,12 +4,11 @@ final class LiveChatUITests: XCTestCase {
     @MainActor
     func testLiveChatRoundTrip() throws {
         let environment = ProcessInfo.processInfo.environment
-        guard let accessCode = environment["ZIGGY_GUEST_CODE"], !accessCode.isEmpty else {
-            throw XCTSkip("Set ZIGGY_GUEST_CODE to run the live gateway test.")
+        guard environment["ZIGGY_LIVE_SESSION_READY"] == "1" else {
+            throw XCTSkip("Sign in once on this simulator, then set ZIGGY_LIVE_SESSION_READY=1.")
         }
 
         let app = XCUIApplication()
-        app.launchEnvironment["ZIGGY_GUEST_CODE"] = accessCode
         app.launchEnvironment["ZIGGY_SERVER_URL"] = environment["ZIGGY_SERVER_URL"]
             ?? "https://chat.mihaichiorean.com"
         if let theme = environment["ZIGGY_THEME"], !theme.isEmpty {

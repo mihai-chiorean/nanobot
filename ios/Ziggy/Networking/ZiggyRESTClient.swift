@@ -19,24 +19,8 @@ public struct ZiggyRESTClient: Sendable {
                         maxResponseBytes: maxResponseBytes)
     }
 
-    public func bootstrapGuest(code: String) async throws -> BootstrapResponse {
-        var form = URLComponents()
-        form.queryItems = [URLQueryItem(name: "code", value: code)]
-        guard let encoded = form.percentEncodedQuery,
-              let body = encoded.data(using: .utf8) else {
-            throw ZiggyRESTError.invalidResponse
-        }
-        return try await request(
-            path: ["webui", "guest", "bootstrap"],
-            headers: ["Content-Type": "application/x-www-form-urlencoded"],
-            token: nil,
-            method: "POST",
-            body: body
-        )
-    }
-
-    public func bootstrapOwner(ownerCode: String) async throws -> BootstrapResponse {
-        try await request(path: ["webui", "bootstrap"], headers: ["X-Ziggy-Owner-Code": ownerCode], token: nil)
+    public func bootstrapAuthenticated(identityToken: String) async throws -> BootstrapResponse {
+        try await request(path: ["auth", "bootstrap"], token: identityToken)
     }
 
     public func fetchSessions() async throws -> RESTListResponse<SessionSummary> {

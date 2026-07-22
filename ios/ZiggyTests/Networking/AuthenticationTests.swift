@@ -8,25 +8,20 @@ final class AuthenticationTests: XCTestCase {
         super.tearDown()
     }
 
-    func testGuestBootstrapPostsSecretInBodyNotURL() async throws {
+    func testAuthenticatedBootstrapUsesBearerTokenAndNoURLCredential() async throws {
         let session = makeSession()
         URLProtocolStub.handler = { request in
-            XCTAssertEqual(request.httpMethod, "POST")
+            XCTAssertEqual(request.httpMethod, "GET")
             XCTAssertNil(URLComponents(url: try XCTUnwrap(request.url), resolvingAgainstBaseURL: false)?.query)
-            XCTAssertEqual(
-                request.value(forHTTPHeaderField: "Content-Type"),
-                "application/x-www-form-urlencoded"
-            )
-            let body = try XCTUnwrap(String(data: try XCTUnwrap(Self.bodyData(for: request)), encoding: .utf8))
-            XCTAssertEqual(URLComponents(string: "?" + body)?.queryItems?.first?.value, "private-code")
-            XCTAssertFalse(try XCTUnwrap(request.url).absoluteString.contains("private-code"))
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer clerk-session-token")
+            XCTAssertFalse(try XCTUnwrap(request.url).absoluteString.contains("clerk-session-token"))
             return Self.response(for: request, body: #"{"token":"short","expires_in":300}"#)
         }
 
         let result = try await ZiggyRESTClient(
             baseURL: try XCTUnwrap(URL(string: "https://example.test")),
             session: session
-        ).bootstrapGuest(code: "private-code")
+        ).bootstrapAuthenticated(identityToken: "clerk-session-token")
         XCTAssertEqual(result.restToken, "short")
     }
 
@@ -80,21 +75,6 @@ final class AuthenticationTests: XCTestCase {
         return (response, Data(body.utf8))
     }
 
-    private static func bodyData(for request: URLRequest) -> Data? {
-        if let body = request.httpBody { return body }
-        guard let stream = request.httpBodyStream else { return nil }
-        stream.open()
-        defer { stream.close() }
-        var data = Data()
-        var buffer = [UInt8](repeating: 0, count: 1_024)
-        while stream.hasBytesAvailable {
-            let count = stream.read(&buffer, maxLength: buffer.count)
-            guard count >= 0 else { return nil }
-            if count == 0 { break }
-            data.append(buffer, count: count)
-        }
-        return data
-    }
 }
 
 private final class URLProtocolStub: URLProtocol, @unchecked Sendable {
