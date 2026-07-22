@@ -8,6 +8,18 @@ export function deriveTitle(preview: string | undefined, fallback: string): stri
   return oneLine.length > 60 ? `${oneLine.slice(0, 57)}…` : oneLine;
 }
 
+/** Compact stable label for raw websocket chat IDs.
+ *
+ * Guest chat IDs are scoped as ``guest:<guest-code>:<uuid>``. Use the final
+ * segment for fallback titles so the UI does not render every new guest
+ * conversation as "Chat guest".
+ */
+export function shortChatId(chatId: string): string {
+  const parts = chatId.split(":").filter(Boolean);
+  const raw = parts[parts.length - 1] || chatId;
+  return raw.slice(0, 8);
+}
+
 /** Loose ISO-or-epoch parser; returns ``null`` for missing/invalid input. */
 function parseDate(value: string | number | null | undefined): Date | null {
   if (value === null || value === undefined || value === "") return null;

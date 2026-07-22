@@ -1,20 +1,20 @@
 {
   "app": {
-    "brand": "nanobot",
+    "brand": "Ziggy",
     "loading": {
-      "connecting": "Đang kết nối tới nanobot…",
-      "boot": "Đang tải nanobot…"
+      "connecting": "Đang kết nối tới Ziggy…",
+      "boot": "Đang tải Ziggy…"
     },
     "error": {
-      "title": "Không thể kết nối tới nanobot",
+      "title": "Không thể kết nối tới Ziggy",
       "gatewayHint": "Hãy chắc chắn gateway đang chạy (`nanobot gateway`) và trang này được mở trên cùng máy."
     },
     "documentTitle": {
-      "base": "nanobot",
-      "chat": "{{title}} · nanobot"
+      "base": "Ziggy",
+      "chat": "{{title}} · Ziggy"
     },
     "meta": {
-      "description": "Giao diện web nanobot — trò chuyện với workspace nanobot của bạn."
+      "description": "Giao diện web Ziggy — trò chuyện với workspace Ziggy của bạn."
     }
   },
   "sidebar": {

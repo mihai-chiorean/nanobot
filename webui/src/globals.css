@@ -71,8 +71,18 @@
     @apply h-full;
   }
 
+  html {
+    @apply overflow-hidden;
+  }
+
   body {
-    @apply bg-background text-foreground font-sans antialiased;
+    @apply overflow-hidden bg-background text-foreground font-sans antialiased;
+    padding-top: env(safe-area-inset-top);
+    padding-right: env(safe-area-inset-right);
+    padding-bottom: env(safe-area-inset-bottom);
+    padding-left: env(safe-area-inset-left);
+    overscroll-behavior: none;
+    touch-action: manipulation;
   }
 
   ::selection {

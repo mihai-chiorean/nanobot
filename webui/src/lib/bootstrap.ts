@@ -1,4 +1,13 @@
-import type { BootstrapResponse } from "./types";
+import type { BootstrapResponse, GuestJoinResponse } from "./types";
+
+export class BootstrapError extends Error {
+  status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.status = status;
+    this.name = "BootstrapError";
+  }
+}
 
 /**
  * Fetch a short-lived token + the WebSocket path from the gateway's
@@ -6,17 +15,50 @@ import type { BootstrapResponse } from "./types";
  */
 export async function fetchBootstrap(
   baseUrl: string = "",
+  guestCode?: string | null,
+  ownerCode?: string | null,
 ): Promise<BootstrapResponse> {
-  const res = await fetch(`${baseUrl}/webui/bootstrap`, {
+  const path = guestCode
+    ? `/webui/guest/bootstrap?code=${encodeURIComponent(guestCode)}`
+    : "/webui/bootstrap";
+  const headers: Record<string, string> = {};
+  const trimmedOwnerCode = ownerCode?.trim();
+  if (!guestCode && trimmedOwnerCode) {
+    headers["X-Ziggy-Owner-Code"] = trimmedOwnerCode;
+  }
+  const res = await fetch(`${baseUrl}${path}`, {
     method: "GET",
     credentials: "same-origin",
+    headers,
   });
   if (!res.ok) {
-    throw new Error(`bootstrap failed: HTTP ${res.status}`);
+    throw new BootstrapError(res.status, `bootstrap failed: HTTP ${res.status}`);
   }
   const body = (await res.json()) as BootstrapResponse;
   if (!body.token || !body.ws_path) {
     throw new Error("bootstrap response missing token or ws_path");
+  }
+  return body;
+}
+
+export async function joinGuest(
+  email: string,
+  invite?: string,
+  baseUrl: string = "",
+): Promise<GuestJoinResponse> {
+  const query = new URLSearchParams({ email });
+  const trimmedInvite = invite?.trim();
+  if (trimmedInvite) query.set("invite", trimmedInvite);
+  const res = await fetch(`${baseUrl}/api/guest/join?${query}`, {
+    method: "GET",
+    credentials: "same-origin",
+  });
+  if (!res.ok) {
+    throw new BootstrapError(res.status, `join failed: HTTP ${res.status}`);
+  }
+  const body = (await res.json()) as GuestJoinResponse;
+  if (!body.code || !body.guest_url) {
+    throw new Error("join response missing guest code");
   }
   return body;
 }

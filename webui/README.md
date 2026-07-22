@@ -25,6 +25,28 @@ webui/                 source tree (this directory)
 nanobot/web/dist/      build output served by the gateway
 ```
 
+## Runtime boundary
+
+This WebUI is part of the nanobot runtime, not a separate product or a
+LibreChat/Open WebUI frontend. The boundary is:
+
+```text
+nanobot backend/runtime
+  ├─ agent loop, memory, tools, MCP, sessions
+  ├─ channels/websocket.py
+  │   ├─ WebSocket chat protocol
+  │   └─ embedded REST API: /webui/bootstrap, /api/sessions,
+  │      /api/settings, /api/media, /api/activity
+  └─ embedded React WebUI
+      └─ built from webui/ into nanobot/web/dist/
+```
+
+That tight coupling is intentional for dogfooding: frontend changes can use
+session state and WebSocket activity directly from the local gateway. It is not
+yet the long-term product boundary. A future hosted/control-plane product would
+likely split these into a local agent runtime, a standalone web/PWA frontend, a
+connector/relay, and an org/auth/billing control plane.
+
 ## Develop from source
 
 ### 1. Install nanobot from source
@@ -71,6 +93,25 @@ If your gateway listens on a non-default port, point the dev server at it:
 ```bash
 NANOBOT_API_URL=http://127.0.0.1:9000 bun run dev
 ```
+
+For Ziggy's current edge-builder setup, the live gateway is usually reached via
+the SSH-forwarded edge-builder port:
+
+```bash
+NANOBOT_API_URL=http://127.0.0.1:18793 npm run dev -- --host 0.0.0.0
+```
+
+Plain `npm run preview` is only a production static-asset preview unless it is
+also pointed at a live gateway. If no gateway is listening at the configured
+`NANOBOT_API_URL` (default `127.0.0.1:8765`), the browser will fail at
+`/webui/bootstrap` with `bootstrap failed: HTTP 500` or a proxy
+`ECONNREFUSED` error.
+
+When the frontend is newer than the deployed gateway, routes added in
+`channels/websocket.py` may not exist yet. For example, a local frontend with
+the Activity view requires the backend `/api/activity` route to be deployed to
+the running gateway; otherwise the request may fall through to the older static
+SPA response.
 
 ## Build for packaged runtime
 

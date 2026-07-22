@@ -39,12 +39,24 @@ vi.mock("@/hooks/useTheme", () => ({
 }));
 
 vi.mock("@/lib/bootstrap", () => ({
+  BootstrapError: class BootstrapError extends Error {
+    status: number;
+    constructor(status: number, message: string) {
+      super(message);
+      this.status = status;
+    }
+  },
   fetchBootstrap: vi.fn().mockResolvedValue({
     token: "tok",
     ws_path: "/",
     expires_in: 300,
   }),
   deriveWsUrl: vi.fn(() => "ws://test"),
+  joinGuest: vi.fn().mockResolvedValue({
+    code: "guest-code",
+    guest_url: "/?guest=guest-code",
+    created: true,
+  }),
 }));
 
 vi.mock("@/lib/nanobot-client", () => {
@@ -69,6 +81,7 @@ import App from "@/App";
 
 describe("App layout", () => {
   beforeEach(() => {
+    window.history.replaceState(null, "", "/owner");
     mockSessions = [];
     connectSpy.mockClear();
     refreshSpy.mockReset();

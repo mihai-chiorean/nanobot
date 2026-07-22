@@ -35,6 +35,7 @@ export interface UIMessage {
   role: Role;
   content: string;
   kind?: MessageKind;
+  traceKind?: "tool" | "progress";
   isStreaming?: boolean;
   createdAt: number;
   /** For trace rows: each individual hint line, so consecutive hints can
@@ -59,11 +60,101 @@ export interface ChatSummary {
   preview: string;
 }
 
+export type ActivityStatus = "active" | "waiting" | "idle";
+
+export interface ActivityItem {
+  key: string;
+  chatId: string;
+  createdAt: string | null;
+  updatedAt: string | null;
+  preview: string;
+  status: ActivityStatus;
+  live: boolean;
+  messageCount: number;
+  lastRole: string | null;
+  lastText: string;
+}
+
+export type WorkStatus =
+  | "scheduled"
+  | "queued"
+  | "running"
+  | "waiting"
+  | "succeeded"
+  | "failed"
+  | "cancelled"
+  | "interrupted";
+
+export interface WorkArtifact {
+  artifact_id: string;
+  task_id: string;
+  step_id?: string | null;
+  kind: string;
+  name: string;
+  mime: string;
+  size_bytes: number;
+  sha256: string;
+  created_at: string;
+  summary?: string | null;
+  url?: string;
+}
+
+export interface WorkStep {
+  step_id: string;
+  task_id: string;
+  seq_start: number;
+  title: string;
+  status: string;
+  started_at?: string | null;
+  completed_at?: string | null;
+  summary?: string | null;
+}
+
+export interface WorkTask {
+  task_id: string;
+  scope: string;
+  session_key: string;
+  chat_id: string;
+  title: string;
+  prompt_preview: string;
+  status: WorkStatus;
+  mode: string;
+  model: string;
+  created_at: string;
+  updated_at: string;
+  started_at?: string | null;
+  completed_at?: string | null;
+  last_seq: number;
+  result_summary?: string | null;
+  error?: string | null;
+  artifact_count: number;
+  steps?: WorkStep[];
+  artifacts?: WorkArtifact[];
+}
+
+export interface WorkEventItem {
+  task_id: string;
+  seq: number;
+  type: string;
+  actor?: string | null;
+  step_id?: string | null;
+  created_at: string;
+  payload: Record<string, unknown>;
+}
+
 export interface BootstrapResponse {
   token: string;
   ws_path: string;
   expires_in: number;
   model_name?: string | null;
+  access?: "owner" | "guest";
+  guest_code?: string | null;
+}
+
+export interface GuestJoinResponse {
+  code: string;
+  guest_url: string;
+  created: boolean;
 }
 
 export interface SettingsPayload {
@@ -80,12 +171,29 @@ export interface SettingsPayload {
   runtime: {
     config_path: string;
   };
+  model_runtime?: ModelRuntime;
   requires_restart: boolean;
 }
 
 export interface SettingsUpdate {
   model?: string;
   provider?: string;
+}
+
+export type ModelSwitchTarget = "qwen" | "minimax";
+
+export interface ModelRuntime {
+  status: "unknown" | "switching" | "active" | "failed" | string;
+  active_model?: string | null;
+  engine?: string | null;
+  backend?: string | null;
+  backend_port?: number | null;
+  proxy_port?: number | null;
+  switched_at?: string | null;
+  requested_target?: string | null;
+  error?: string | null;
+  log_path?: string | null;
+  state_source?: string | null;
 }
 
 export type ConnectionStatus =
@@ -124,6 +232,18 @@ export type InboundEvent =
       chat_id: string;
       stream_id?: string;
     }
+  | { event: "work.created"; task_id: string; task: WorkTask }
+  | { event: "work.subscribed"; task_id: string }
+  | {
+      event: "work.event";
+      task_id: string;
+      seq: number;
+      type: string;
+      actor?: string | null;
+      step_id?: string | null;
+      created_at?: string | null;
+      payload?: Record<string, unknown>;
+    }
   | { event: "error"; chat_id?: string; detail?: string };
 
 /** Base64-encoded image attached to an outbound ``message`` envelope.
@@ -147,4 +267,14 @@ export type Outbound =
       chat_id: string;
       content: string;
       media?: OutboundMedia[];
-    };
+    }
+  | {
+      type: "work.create";
+      chat_id: string;
+      content: string;
+      mode?: "background";
+      media?: OutboundMedia[];
+    }
+  | { type: "work.subscribe"; task_id: string; after_seq?: number }
+  | { type: "work.cancel"; task_id: string }
+  | { type: "work.message"; task_id: string; content: string };

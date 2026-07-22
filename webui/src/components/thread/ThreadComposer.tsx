@@ -8,6 +8,7 @@ import {
 } from "react";
 import {
   ArrowUp,
+  BriefcaseBusiness,
   ImageIcon,
   Loader2,
   Paperclip,
@@ -38,6 +39,7 @@ function formatBytes(n: number): string {
 
 interface ThreadComposerProps {
   onSend: (content: string, images?: SendImage[]) => void;
+  onSendBackground?: (content: string, images?: SendImage[]) => void;
   disabled?: boolean;
   placeholder?: string;
   modelLabel?: string | null;
@@ -46,6 +48,7 @@ interface ThreadComposerProps {
 
 export function ThreadComposer({
   onSend,
+  onSendBackground,
   disabled,
   placeholder,
   modelLabel = null,
@@ -116,28 +119,21 @@ export function ThreadComposer({
     && !hasErrors
     && (value.trim().length > 0 || readyImages.length > 0);
 
-  const submit = useCallback(() => {
-    if (!canSend) return;
-    const trimmed = value.trim();
-    // Share the same normalized ``data:`` URL with both the wire payload and
-    // the optimistic bubble preview: data URLs are self-contained (no blob
-    // lifetime, safe under React StrictMode double-mount) and keep the
-    // bubble in sync with whatever the backend actually sees.
-    const payload: SendImage[] | undefined =
-      readyImages.length > 0
-        ? readyImages.map((img) => ({
-            media: {
-              data_url: img.dataUrl,
-              name: img.file.name,
-            },
-            preview: { url: img.dataUrl, name: img.file.name },
-          }))
-        : undefined;
-    onSend(trimmed, payload);
+  const buildPayload = useCallback((): SendImage[] | undefined => {
+    return readyImages.length > 0
+      ? readyImages.map((img) => ({
+          media: {
+            data_url: img.dataUrl,
+            name: img.file.name,
+          },
+          preview: { url: img.dataUrl, name: img.file.name },
+        }))
+      : undefined;
+  }, [readyImages]);
+
+  const resetComposer = useCallback(() => {
     setValue("");
     setInlineError(null);
-    // Bubble owns the data URL copy; safe to revoke every staged blob
-    // preview here without affecting the rendered message.
     clear();
     requestAnimationFrame(() => {
       const el = textareaRef.current;
@@ -146,7 +142,24 @@ export function ThreadComposer({
         el.focus();
       }
     });
-  }, [canSend, clear, onSend, readyImages, value]);
+  }, [clear]);
+
+  const submit = useCallback(() => {
+    if (!canSend) return;
+    const trimmed = value.trim();
+    // Share the same normalized ``data:`` URL with both the wire payload and
+    // the optimistic bubble preview: data URLs are self-contained (no blob
+    // lifetime, safe under React StrictMode double-mount) and keep the
+    // bubble in sync with whatever the backend actually sees.
+    onSend(trimmed, buildPayload());
+    resetComposer();
+  }, [buildPayload, canSend, onSend, resetComposer, value]);
+
+  const submitBackground = useCallback(() => {
+    if (!canSend || !onSendBackground) return;
+    onSendBackground(value.trim(), buildPayload());
+    resetComposer();
+  }, [buildPayload, canSend, onSendBackground, resetComposer, value]);
 
   const onKeyDown = (e: ReactKeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
@@ -333,19 +346,37 @@ export function ThreadComposer({
             </span>
           </div>
           <span className="sm:hidden" aria-hidden />
-          <Button
-            type="submit"
-            size="icon"
-            disabled={!canSend}
-            aria-label={t("thread.composer.send")}
-            className={cn(
-              "rounded-full border border-border/70 bg-secondary/85 text-secondary-foreground shadow-none transition-transform hover:bg-accent",
-              isHero ? "h-8.5 w-8.5" : "h-7.5 w-7.5",
-              canSend && "hover:scale-[1.03] active:scale-95",
-            )}
-          >
-            <ArrowUp className={cn(isHero ? "h-4.5 w-4.5" : "h-4 w-4")} />
-          </Button>
+          <div className="flex items-center gap-1.5">
+            {onSendBackground ? (
+              <Button
+                type="button"
+                size="icon"
+                variant="ghost"
+                disabled={!canSend}
+                aria-label="Run in background"
+                onClick={submitBackground}
+                className={cn(
+                  "rounded-full text-muted-foreground hover:text-foreground",
+                  isHero ? "h-8.5 w-8.5" : "h-7.5 w-7.5",
+                )}
+              >
+                <BriefcaseBusiness className={cn(isHero ? "h-4 w-4" : "h-3.5 w-3.5")} />
+              </Button>
+            ) : null}
+            <Button
+              type="submit"
+              size="icon"
+              disabled={!canSend}
+              aria-label={t("thread.composer.send")}
+              className={cn(
+                "rounded-full border border-border/70 bg-secondary/85 text-secondary-foreground shadow-none transition-transform hover:bg-accent",
+                isHero ? "h-8.5 w-8.5" : "h-7.5 w-7.5",
+                canSend && "hover:scale-[1.03] active:scale-95",
+              )}
+            >
+              <ArrowUp className={cn(isHero ? "h-4.5 w-4.5" : "h-4 w-4")} />
+            </Button>
+          </div>
         </div>
       </div>
     </form>

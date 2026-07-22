@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { setAppLanguage } from "@/i18n";
-import { fmtDateTime, relativeTime } from "@/lib/format";
+import { fmtDateTime, relativeTime, shortChatId } from "@/lib/format";
 
 describe("localized format helpers", () => {
   beforeEach(() => {
@@ -60,5 +60,10 @@ describe("localized format helpers", () => {
       }).format(date),
     );
     expect(english).not.toBe(french);
+  });
+
+  it("uses the unique suffix for guest chat title fallbacks", () => {
+    expect(shortChatId("guest:spark-preview:12345678-abcdef")).toBe("12345678");
+    expect(shortChatId("regular-chat-id")).toBe("regular-");
   });
 });

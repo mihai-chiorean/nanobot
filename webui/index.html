@@ -2,18 +2,23 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <meta name="color-scheme" content="light dark" />
     <meta
       name="description"
-      content="nanobot web UI — chat with your nanobot workspace."
+      content="Ziggy — chat with your private agent workspace."
       data-i18n-meta="description"
     />
     <meta name="theme-color" content="#fafaf9" media="(prefers-color-scheme: light)" />
     <meta name="theme-color" content="#161618" media="(prefers-color-scheme: dark)" />
-    <link rel="icon" type="image/png" sizes="32x32" href="/brand/nanobot_favicon_32.png" />
-    <link rel="icon" type="image/png" sizes="73x75" href="/brand/nanobot_icon.png" />
-    <link rel="apple-touch-icon" sizes="180x180" href="/brand/nanobot_apple_touch.png" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-title" content="Ziggy" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="icon" type="image/png" sizes="32x32" href="/brand/ziggy_favicon_32.png" />
+    <link rel="icon" type="image/png" sizes="96x96" href="/brand/ziggy_icon.png" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/brand/ziggy_apple_touch.png" />
     <style>
       html,
       body,
@@ -95,40 +100,40 @@
         var localeKey = "nanobot.locale";
         var copy = {
           en: {
-            boot: "Loading nanobot…",
-            description: "nanobot web UI — chat with your nanobot workspace."
+            boot: "Loading Ziggy…",
+            description: "Ziggy — chat with your private agent workspace."
           },
           "zh-CN": {
-            boot: "正在加载 nanobot…",
-            description: "nanobot Web UI —— 与你的 nanobot 工作区对话。"
+            boot: "正在加载 Ziggy…",
+            description: "Ziggy —— 与你的私有智能体工作区对话。"
           },
           "zh-TW": {
-            boot: "正在載入 nanobot…",
-            description: "nanobot Web UI —— 與你的 nanobot 工作區對話。"
+            boot: "正在載入 Ziggy…",
+            description: "Ziggy —— 與你的私有代理工作區對話。"
           },
           fr: {
-            boot: "Chargement de nanobot…",
-            description: "Interface web nanobot — discutez avec votre espace de travail nanobot."
+            boot: "Chargement de Ziggy…",
+            description: "Ziggy — discutez avec votre espace de travail d’agent privé."
           },
           ja: {
-            boot: "nanobot を読み込み中…",
-            description: "nanobot Web UI — nanobot ワークスペースと会話します。"
+            boot: "Ziggy を読み込み中…",
+            description: "Ziggy — プライベートエージェントのワークスペースと会話します。"
           },
           ko: {
-            boot: "nanobot 불러오는 중…",
-            description: "nanobot 웹 UI — nanobot 작업공간과 대화하세요."
+            boot: "Ziggy 불러오는 중…",
+            description: "Ziggy — 개인 에이전트 작업공간과 대화하세요."
           },
           es: {
-            boot: "Cargando nanobot…",
-            description: "Interfaz web de nanobot: conversa con tu espacio de trabajo de nanobot."
+            boot: "Cargando Ziggy…",
+            description: "Ziggy: conversa con tu espacio de agente privado."
           },
           vi: {
-            boot: "Đang tải nanobot…",
-            description: "Giao diện web nanobot — trò chuyện với workspace nanobot của bạn."
+            boot: "Đang tải Ziggy…",
+            description: "Ziggy — trò chuyện với workspace tác nhân riêng của bạn."
           },
           id: {
-            boot: "Memuat nanobot…",
-            description: "UI web nanobot — ngobrol dengan workspace nanobot Anda."
+            boot: "Memuat Ziggy…",
+            description: "Ziggy — ngobrol dengan workspace agen privat Anda."
           }
         };
 
@@ -170,14 +175,14 @@
         } catch {}
       })();
     </script>
-    <title>nanobot</title>
+    <title>Ziggy</title>
   </head>
   <body class="bg-background text-foreground antialiased">
     <div id="root">
       <div class="boot-splash">
         <div class="boot-splash-inner">
           <span class="boot-dot" aria-hidden="true"></span>
-          <span data-boot-copy>Loading nanobot…</span>
+          <span data-boot-copy>Loading Ziggy…</span>
         </div>
       </div>
     </div>
