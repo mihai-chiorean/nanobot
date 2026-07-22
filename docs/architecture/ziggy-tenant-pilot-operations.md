@@ -113,9 +113,11 @@ in `ziggy-multitenant-runtime.md`.
 
 After provisioning, copy the same bootstrap secret value to the matching
 tenant's `upstream_bootstrap_secret` in the Beelink `/etc/ziggy/tenants.json`.
-Every active tenant must have a unique value of at least 32 characters, and the
-manifest must remain mode `0600`. Transfer the value through the approved
-secret channel; do not paste it into logs, commands, or issue trackers.
+Every active tenant must have a unique value of at least 32 characters. Keep
+the manifest owned by `ziggy-control:ziggy-control` and mode `0600`; the
+unprivileged front-door process must be able to read it. Transfer the value
+through the approved secret channel; do not paste it into logs, commands, or
+issue trackers.
 
 After a reboot, verify the user manager and tenant unit before admitting the
 tenant:
@@ -138,10 +140,12 @@ systemctl --user is-active nanobot-tenant@<workspace-id>.service
    `StateDirectory` owns its parent.
 4. Confirm every active allocation has a unique `upstream_bootstrap_secret`
    matching the secret file used to provision its Spark runtime.
-5. Restart `ziggy-control`. Startup validates all IDs, emails, duplicate
+5. Set `/etc/ziggy/tenants.json` ownership to `ziggy-control:ziggy-control`
+   and mode `0600`.
+6. Restart `ziggy-control`. Startup validates all IDs, emails, duplicate
    workspaces, duplicate subjects, private upstream addresses, and bootstrap
    secret material before it accepts traffic.
-6. Have the tester sign in through Clerk. Control validates the public Clerk
+7. Have the tester sign in through Clerk. Control validates the public Clerk
    bearer, replaces it with `Authorization: Bearer <upstream_bootstrap_secret>`
    for the private tenant `/auth/token` call, and never forwards the Clerk
    bearer. `X-Nanobot-Auth` is stripped by the reverse proxy.
