@@ -236,6 +236,7 @@ async def test_list_shows_last_run_state(tmp_path) -> None:
     assert "ok" in result
     assert "(UTC)" in result
 
+
 @pytest.mark.asyncio
 async def test_list_shows_error_message(tmp_path) -> None:
     tool = _make_tool(tmp_path)
@@ -269,12 +270,14 @@ def test_list_shows_next_run(tmp_path) -> None:
 
 def test_list_includes_protected_dream_system_job_with_memory_purpose(tmp_path) -> None:
     tool = _make_tool(tmp_path)
-    tool._cron.register_system_job(CronJob(
-        id="dream",
-        name="dream",
-        schedule=CronSchedule(kind="cron", expr="0 */2 * * *", tz="UTC"),
-        payload=CronPayload(kind="system_event"),
-    ))
+    tool._cron.register_system_job(
+        CronJob(
+            id="dream",
+            name="dream",
+            schedule=CronSchedule(kind="cron", expr="0 */2 * * *", tz="UTC"),
+            payload=CronPayload(kind="system_event"),
+        )
+    )
 
     result = tool._list_jobs()
 
@@ -285,12 +288,14 @@ def test_list_includes_protected_dream_system_job_with_memory_purpose(tmp_path) 
 
 def test_remove_protected_dream_job_returns_clear_feedback(tmp_path) -> None:
     tool = _make_tool(tmp_path)
-    tool._cron.register_system_job(CronJob(
-        id="dream",
-        name="dream",
-        schedule=CronSchedule(kind="cron", expr="0 */2 * * *", tz="UTC"),
-        payload=CronPayload(kind="system_event"),
-    ))
+    tool._cron.register_system_job(
+        CronJob(
+            id="dream",
+            name="dream",
+            schedule=CronSchedule(kind="cron", expr="0 */2 * * *", tz="UTC"),
+            payload=CronPayload(kind="system_event"),
+        )
+    )
 
     result = tool._remove_job("dream")
 
@@ -343,6 +348,38 @@ def test_add_job_can_disable_delivery(tmp_path) -> None:
     assert result.startswith("Created job")
     job = tool._cron.list_jobs()[0]
     assert job.payload.deliver is False
+
+
+def test_add_job_can_schedule_work_task(tmp_path) -> None:
+    tool = _make_tool(tmp_path)
+    tool.set_context(
+        "websocket",
+        "chat-1",
+        metadata={"request_id": "request-1"},
+        session_key="websocket:chat-1",
+    )
+
+    result = tool._add_job(
+        "Research Digest",
+        "Read the AI newsletter and publish a ranked digest.",
+        60,
+        None,
+        None,
+        None,
+        as_work=True,
+        work_title="Daily research digest",
+    )
+
+    assert result.startswith("Created scheduled Work job")
+    job = tool._cron.list_jobs()[0]
+    assert job.payload.kind == "work_task"
+    assert job.payload.deliver is False
+    assert job.payload.channel == "websocket"
+    assert job.payload.to == "chat-1"
+    assert job.payload.session_key == "websocket:chat-1"
+    assert job.payload.channel_meta["request_id"] == "request-1"
+    assert job.payload.channel_meta["work_title"] == "Daily research digest"
+    assert job.payload.channel_meta["work_chat_id"] == "chat-1"
 
 
 def test_cron_schema_advertises_action_specific_requirements(tmp_path) -> None:

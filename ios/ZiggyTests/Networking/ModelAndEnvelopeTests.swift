@@ -41,6 +41,59 @@ final class ModelAndEnvelopeTests: XCTestCase {
         if case .unknown("future_state") = message.status {} else { XCTFail("status should preserve unknown value") }
     }
 
+    func testWorkStatusesMatchServerContractAndPreserveLegacyAliases() {
+        let serverStatuses: [ZiggyStatus] = [
+            .scheduled, .queued, .running, .waiting,
+            .succeeded, .failed, .cancelled, .interrupted
+        ]
+        XCTAssertEqual(serverStatuses.map(\.rawValue), [
+            "scheduled", "queued", "running", "waiting",
+            "succeeded", "failed", "cancelled", "interrupted"
+        ])
+        XCTAssertEqual(ZiggyStatus("pending"), .queued)
+        XCTAssertEqual(ZiggyStatus("completed"), .succeeded)
+        XCTAssertEqual(ZiggyStatus("canceled"), .cancelled)
+        XCTAssertEqual(ZiggyStatus("in-progress"), .running)
+    }
+
+    func testWorkStatusChangedPayloadDecodesTerminalStatus() throws {
+        let data = Data(#"{"event":"work.event","task_id":"task-1","seq":8,"type":"status.changed","payload":{"status":"succeeded","result_summary":"Done"}}"#.utf8)
+        let event = try JSONDecoder().decode(InboundWebSocketEvent.self, from: data)
+        guard case .workEvent(let workEvent) = event else { return XCTFail("expected work event") }
+
+        XCTAssertEqual(workEvent.status, .succeeded)
+        XCTAssertTrue(AppModel.shouldRefreshWork(for: workEvent))
+    }
+
+    func testOnlyTerminalStatusChangedEventsRefreshWork() {
+        for status in [ZiggyStatus.succeeded, .failed, .cancelled, .interrupted] {
+            XCTAssertTrue(status.isTerminal)
+            XCTAssertTrue(AppModel.shouldRefreshWork(for: WorkEvent(
+                taskID: "task-1", type: "status.changed", status: status
+            )))
+        }
+        for status in [ZiggyStatus.scheduled, .queued, .running, .waiting] {
+            XCTAssertFalse(status.isTerminal)
+        }
+        XCTAssertFalse(AppModel.shouldRefreshWork(for: WorkEvent(
+            taskID: "task-1", type: "status.changed", status: .running
+        )))
+        XCTAssertFalse(AppModel.shouldRefreshWork(for: WorkEvent(
+            taskID: "task-1", type: "progress", status: .succeeded
+        )))
+        XCTAssertTrue(AppModel.shouldRefreshWork(for: WorkEvent(
+            taskID: "task-1", type: "status.changed", status: .interrupted
+        )))
+    }
+
+    func testEveryServerStatusHasWorkPresentation() {
+        let statuses: [ZiggyStatus] = [
+            .scheduled, .queued, .running, .waiting,
+            .succeeded, .failed, .cancelled, .interrupted
+        ]
+        XCTAssertEqual(statuses.map(\.presentation.rawValue), statuses.map(\.rawValue))
+    }
+
     func testProductionHistoryMessageAllowsNoIDAndUTCWithoutSuffix() throws {
         let data = Data(#"{"role":"assistant","content":"IOS_NATIVE_OK","timestamp":"2026-07-17T16:14:57.836606"}"#.utf8)
         let message = try JSONDecoder().decode(ZiggyMessage.self, from: data)

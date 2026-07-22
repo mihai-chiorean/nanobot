@@ -112,7 +112,6 @@ export interface WorkStep {
 
 export interface WorkTask {
   task_id: string;
-  scope: string;
   session_key: string;
   chat_id: string;
   title: string;

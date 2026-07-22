@@ -129,6 +129,27 @@ def test_web_socket_config_allows_disabling_server_ping() -> None:
     assert config.ping_interval_s is None
 
 
+def test_web_socket_config_accepts_deployed_auth_aliases() -> None:
+    config = WebSocketConfig.model_validate(
+        {
+            "authJwksUrl": "https://clerk.test/.well-known/jwks.json",
+            "authIssuer": "https://clerk.test",
+            "authAudience": "ziggy-control",
+            "authAllowedEmails": ["tenant@example.com"],
+            "authAuthorizedParties": ["https://ziggy-control.example"],
+        }
+    )
+
+    assert config.auth_jwks_url.endswith("/jwks.json")
+    assert config.auth_issuer == "https://clerk.test"
+    assert config.auth_audience == "ziggy-control"
+    assert config.auth_allowed_emails == ["tenant@example.com"]
+    assert config.auth_authorized_parties == ["https://ziggy-control.example"]
+    dumped = config.model_dump(by_alias=True)
+    assert dumped["authAllowedEmails"] == ["tenant@example.com"]
+    assert "clerkAllowedEmail" not in dumped
+
+
 def test_ssl_context_requires_both_cert_and_key_files() -> None:
     bus = MagicMock()
     channel = WebSocketChannel(

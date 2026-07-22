@@ -4,8 +4,10 @@ import {
   deleteSession,
   fetchActivity,
   fetchSessionMessages,
+  fetchWorkArtifact,
   fetchWorkTask,
   fetchWorkTasks,
+  switchModel,
   updateSettings,
 } from "@/lib/api";
 
@@ -52,6 +54,40 @@ describe("webui API helpers", () => {
       "/api/settings/update?model=openrouter%2Ftest&provider=openrouter",
       expect.objectContaining({
         headers: { Authorization: "Bearer tok" },
+      }),
+    );
+  });
+
+  it("uses POST for model switch mutations", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ model_runtime: { status: "switching" } }),
+    } as Response);
+
+    await switchModel("tok", "qwen");
+
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/model/switch?target=qwen",
+      expect.objectContaining({
+        method: "POST",
+        headers: { Authorization: "Bearer tok" },
+      }),
+    );
+  });
+
+  it("downloads Work artifacts with the bearer token", async () => {
+    const blob = new Blob(["artifact"]);
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      blob: async () => blob,
+    } as Response);
+
+    await expect(fetchWorkArtifact("tok", "/api/work/artifacts/a1")).resolves.toBe(blob);
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/work/artifacts/a1",
+      expect.objectContaining({
+        headers: { Authorization: "Bearer tok" },
+        credentials: "same-origin",
       }),
     );
   });
@@ -109,7 +145,6 @@ describe("webui API helpers", () => {
         tasks: [
           {
             task_id: "work_1",
-            scope: "owner",
             session_key: "websocket:chat-1",
             chat_id: "chat-1",
             title: "Report",
@@ -144,7 +179,6 @@ describe("webui API helpers", () => {
       json: async () => ({
         task: {
           task_id: "work:encoded",
-          scope: "owner",
           session_key: "websocket:chat-1",
           chat_id: "chat-1",
           title: "Detail",

@@ -145,6 +145,46 @@ describe("NanobotClient", () => {
     );
   });
 
+  it("replays every active Work subscription from its last sequence after reconnect", async () => {
+    const client = new NanobotClient({
+      url: "ws://test",
+      reconnect: true,
+      maxBackoffMs: 10,
+      socketFactory: (url) => new FakeSocket(url) as unknown as WebSocket,
+    });
+    const firstHandler = vi.fn();
+    const secondHandler = vi.fn();
+    client.onWork("task-a", firstHandler);
+    client.onWork("task-b", secondHandler);
+    client.connect();
+    const firstSocket = lastSocket();
+    firstSocket.fakeOpen();
+    expect(firstSocket.sent).toContain(
+      JSON.stringify({ type: "work.subscribe", task_id: "task-a", after_seq: 0 }),
+    );
+    expect(firstSocket.sent).toContain(
+      JSON.stringify({ type: "work.subscribe", task_id: "task-b", after_seq: 0 }),
+    );
+
+    firstSocket.fakeMessage({
+      event: "work.event",
+      task_id: "task-a",
+      seq: 7,
+      type: "progress",
+    });
+    firstSocket.close();
+    await vi.advanceTimersByTimeAsync(20);
+    const reconnected = lastSocket();
+    reconnected.fakeOpen();
+
+    expect(reconnected.sent).toContain(
+      JSON.stringify({ type: "work.subscribe", task_id: "task-a", after_seq: 7 }),
+    );
+    expect(reconnected.sent).toContain(
+      JSON.stringify({ type: "work.subscribe", task_id: "task-b", after_seq: 0 }),
+    );
+  });
+
   it("reports status transitions through onStatus", () => {
     const client = new NanobotClient({
       url: "ws://test",

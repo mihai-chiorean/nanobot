@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Ziggy">
+  <rect width="512" height="512" rx="112" fill="#111315"/>
+  <path d="M154 140h210c18 0 28 21 16 35L226 350h138c17 0 31 14 31 31s-14 31-31 31H151c-18 0-28-21-16-35l154-175H154c-17 0-31-14-31-31s14-31 31-31Z" fill="#F8FAFC"/>
+  <path d="M331 80 284 210h58l-47 137 116-183h-61l50-84h-69Z" fill="#F6C35B"/>
+  <circle cx="159" cy="329" r="13" fill="#39C5BB"/>
+  <circle cx="203" cy="329" r="9" fill="#39C5BB"/>
+</svg>

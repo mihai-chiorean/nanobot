@@ -482,12 +482,17 @@ final class AppModel {
             if !workEventsByTaskID[taskID, default: []].contains(where: { $0.sequence == event.sequence }) {
                 workEventsByTaskID[taskID, default: []].append(event)
             }
-            if ["completed", "failed", "cancelled", "canceled"].contains(event.type.lowercased()) {
+            if Self.shouldRefreshWork(for: event)
+                || ["completed", "failed", "cancelled", "canceled"].contains(event.type.lowercased()) {
                 Task { await loadWork(showSpinner: false) }
             }
         case .unknown:
             break
         }
+    }
+
+    nonisolated static func shouldRefreshWork(for event: WorkEvent) -> Bool {
+        event.type.lowercased() == "status.changed" && event.status?.isTerminal == true
     }
 
     private func selectLocalChat(chatID: String) {

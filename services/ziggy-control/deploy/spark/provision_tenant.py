@@ -67,6 +67,20 @@ def tenant_config(source: dict, tenant_root: Path, email: str, gateway_port: int
 
     channels = config.setdefault("channels", {})
     websocket = copy.deepcopy(channels.get("websocket") or {})
+    auth_issuer = websocket.get("authIssuer") or websocket.get("auth_issuer")
+    auth_jwks_url = websocket.get("authJwksUrl") or websocket.get("auth_jwks_url")
+    authorized_parties = (
+        websocket.get("authAuthorizedParties")
+        or websocket.get("auth_authorized_parties")
+    )
+    if not isinstance(auth_issuer, str) or not auth_issuer.strip():
+        raise ValueError("source WebSocket config is missing authIssuer")
+    if not isinstance(auth_jwks_url, str) or not auth_jwks_url.strip():
+        raise ValueError("source WebSocket config is missing authJwksUrl")
+    if not isinstance(authorized_parties, list) or not all(
+        isinstance(party, str) and party.strip() for party in authorized_parties
+    ):
+        raise ValueError("source WebSocket config is missing authAuthorizedParties")
     for name in list(channels):
         if name not in {"sendProgress", "sendToolHints", "sendMaxRetries", "transcriptionProvider", "transcriptionLanguage"}:
             channels.pop(name, None)

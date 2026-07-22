@@ -11,6 +11,7 @@ import { useEffect, useMemo, useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import { useWork } from "@/hooks/useWork";
+import { fetchWorkArtifact } from "@/lib/api";
 import { relativeTime, shortChatId } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import type { InboundEvent, WorkStatus, WorkTask } from "@/lib/types";
@@ -132,7 +133,35 @@ function WorkDetail({
   onReply: (taskId: string, content: string) => void;
   onCancel: (taskId: string) => void;
 }) {
+  const { token } = useClient();
   const [reply, setReply] = useState("");
+  const [downloadingArtifactId, setDownloadingArtifactId] = useState<string | null>(null);
+  const [downloadError, setDownloadError] = useState<string | null>(null);
+
+  const downloadArtifact = async (artifactId: string, url: string, name: string) => {
+    if (downloadingArtifactId) return;
+    setDownloadingArtifactId(artifactId);
+    setDownloadError(null);
+    try {
+      const blob = await fetchWorkArtifact(token, url);
+      const objectUrl = URL.createObjectURL(blob);
+      try {
+        const anchor = document.createElement("a");
+        anchor.href = objectUrl;
+        anchor.download = name || "artifact";
+        anchor.style.display = "none";
+        document.body.appendChild(anchor);
+        anchor.click();
+        anchor.remove();
+      } finally {
+        URL.revokeObjectURL(objectUrl);
+      }
+    } catch {
+      setDownloadError(artifactId);
+    } finally {
+      setDownloadingArtifactId(null);
+    }
+  };
 
   if (!task) {
     return (
@@ -207,14 +236,41 @@ function WorkDetail({
         ) : (
           <div className="overflow-hidden rounded-md border border-border/60">
             {artifacts.map((artifact) => (
-              <a
+              <div
                 key={artifact.artifact_id}
-                href={artifact.url}
                 className="flex items-center justify-between gap-3 border-b border-border/50 px-3 py-3 text-sm hover:bg-accent/35 last:border-b-0"
               >
                 <span className="min-w-0 truncate">{artifact.name}</span>
-                <Download className="h-4 w-4 flex-none text-muted-foreground" />
-              </a>
+                {artifact.url ? (
+                  <button
+                    type="button"
+                    disabled={downloadingArtifactId !== null}
+                    onClick={() => void downloadArtifact(
+                      artifact.artifact_id,
+                      artifact.url as string,
+                      artifact.name,
+                    )}
+                    className="inline-flex h-8 w-8 flex-none items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground disabled:cursor-wait disabled:opacity-60"
+                    aria-label={
+                      downloadingArtifactId === artifact.artifact_id
+                        ? `Downloading ${artifact.name}`
+                        : `Download ${artifact.name}`
+                    }
+                    title="Download artifact"
+                  >
+                    {downloadingArtifactId === artifact.artifact_id ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <Download className="h-4 w-4" />
+                    )}
+                  </button>
+                ) : null}
+                {downloadError === artifact.artifact_id ? (
+                  <span role="alert" className="text-xs text-destructive">
+                    Download failed
+                  </span>
+                ) : null}
+              </div>
             ))}
           </div>
         )}

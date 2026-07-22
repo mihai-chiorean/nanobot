@@ -39,6 +39,8 @@ type BootState =
 
 const SIDEBAR_STORAGE_KEY = "nanobot-webui.sidebar";
 const SIDEBAR_WIDTH = 279;
+const BOOTSTRAP_REFRESH_LEEWAY_MS = 30_000;
+const BOOTSTRAP_REFRESH_RETRY_MS = 5_000;
 type ShellView = "chat" | "activity" | "settings";
 
 interface ErrorBoundaryState {
@@ -126,6 +128,64 @@ function AuthenticatedApp({
   useEffect(() => {
     let cancelled = false;
     let client: NanobotClient | undefined;
+    let refreshTimer: ReturnType<typeof setTimeout> | null = null;
+    let refreshInFlight: Promise<string | null> | null = null;
+    let scheduleRefresh: (expiresIn: number) => void = () => {};
+    let refreshBootstrap: () => Promise<string | null> = async () => null;
+
+    const scheduleRetry = () => {
+      if (cancelled) return;
+      if (refreshTimer) clearTimeout(refreshTimer);
+      refreshTimer = setTimeout(() => {
+        refreshTimer = null;
+        void refreshBootstrap();
+      }, BOOTSTRAP_REFRESH_RETRY_MS);
+    };
+
+    refreshBootstrap = async (): Promise<string | null> => {
+      if (refreshInFlight) return refreshInFlight;
+      refreshInFlight = (async () => {
+        try {
+          const refreshedIdentityToken = await getIdentityToken();
+          if (cancelled) return null;
+          if (!refreshedIdentityToken) throw new Error("Clerk session is unavailable.");
+          const refreshed = await fetchBootstrap(refreshedIdentityToken);
+          if (cancelled) return null;
+          const refreshedUrl = deriveWsUrl(refreshed.ws_path, refreshed.token);
+          // This updates REST credentials and the URL for a future socket;
+          // an already healthy WebSocket remains open.
+          client?.updateUrl(refreshedUrl);
+          setState((current) =>
+            current.status === "ready"
+              ? {
+                  ...current,
+                  token: refreshed.token,
+                  modelName: refreshed.model_name ?? current.modelName,
+                }
+              : current,
+          );
+          scheduleRefresh(refreshed.expires_in);
+          return refreshedUrl;
+        } catch {
+          scheduleRetry();
+          return null;
+        } finally {
+          refreshInFlight = null;
+        }
+      })();
+      return refreshInFlight;
+    };
+
+    scheduleRefresh = (expiresIn: number) => {
+      if (cancelled) return;
+      if (refreshTimer) clearTimeout(refreshTimer);
+      const lifetimeMs = Math.max(0, expiresIn * 1000);
+      const delay = Math.max(1_000, lifetimeMs - BOOTSTRAP_REFRESH_LEEWAY_MS);
+      refreshTimer = setTimeout(() => {
+        refreshTimer = null;
+        void refreshBootstrap();
+      }, delay);
+    };
     (async () => {
       try {
         const identityToken = await getIdentityToken();
@@ -136,27 +196,11 @@ function AuthenticatedApp({
         client = new NanobotClient({
           url,
           onReauth: async () => {
-            try {
-              const refreshedIdentityToken = await getIdentityToken();
-              if (!refreshedIdentityToken) return null;
-              const refreshed = await fetchBootstrap(refreshedIdentityToken);
-              if (cancelled) return null;
-              setState((current) =>
-                current.status === "ready"
-                  ? {
-                      ...current,
-                      token: refreshed.token,
-                      modelName: refreshed.model_name ?? current.modelName,
-                    }
-                  : current,
-              );
-              return deriveWsUrl(refreshed.ws_path, refreshed.token);
-            } catch {
-              return null;
-            }
+            return refreshBootstrap();
           },
         });
         client.connect();
+        scheduleRefresh(boot.expires_in);
         setState({
           status: "ready",
           client,
@@ -170,6 +214,7 @@ function AuthenticatedApp({
     })();
     return () => {
       cancelled = true;
+      if (refreshTimer) clearTimeout(refreshTimer);
       client?.close();
     };
   }, [getIdentityToken]);

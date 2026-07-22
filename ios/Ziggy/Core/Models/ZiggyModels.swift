@@ -58,30 +58,41 @@ private extension ISO8601DateFormatter {
 }
 
 public enum ZiggyStatus: Codable, Hashable, Sendable {
-    case queued, running, waiting, completed, failed, cancelled
+    case scheduled, queued, running, waiting, succeeded, failed, cancelled, interrupted
     case unknown(String)
 
     public init(_ rawValue: String) {
         switch rawValue.lowercased() {
+        case "scheduled": self = .scheduled
         case "queued", "pending": self = .queued
         case "running", "in_progress", "in-progress": self = .running
         case "waiting", "paused": self = .waiting
-        case "completed", "complete", "done": self = .completed
+        case "succeeded", "completed", "complete", "done": self = .succeeded
         case "failed", "error": self = .failed
         case "cancelled", "canceled": self = .cancelled
+        case "interrupted": self = .interrupted
         default: self = .unknown(rawValue)
         }
     }
 
     public var rawValue: String {
         switch self {
+        case .scheduled: "scheduled"
         case .queued: "queued"
         case .running: "running"
         case .waiting: "waiting"
-        case .completed: "completed"
+        case .succeeded: "succeeded"
         case .failed: "failed"
         case .cancelled: "cancelled"
+        case .interrupted: "interrupted"
         case .unknown(let value): value
+        }
+    }
+
+    public var isTerminal: Bool {
+        switch self {
+        case .succeeded, .failed, .cancelled, .interrupted: true
+        case .scheduled, .queued, .running, .waiting, .unknown: false
         }
     }
 
@@ -345,7 +356,9 @@ public struct WorkEvent: Codable, Hashable, Sendable {
                 actor: String? = nil, stepID: String? = nil,
                 createdAt: ZiggyTimestamp? = nil) {
         self.id = id; self.taskID = taskID; self.sequence = sequence; self.type = type
-        self.status = status; self.message = message; self.data = data; self.actor = actor
+        self.data = data
+        self.status = status ?? data?.objectString(for: ["status"]).map(ZiggyStatus.init)
+        self.message = message; self.actor = actor
         self.stepID = stepID; self.createdAt = createdAt
     }
 
@@ -355,9 +368,10 @@ public struct WorkEvent: Codable, Hashable, Sendable {
         taskID = try c.decodeIfPresent(String.self, forAny: ["task_id"])
         sequence = try c.decodeIfPresent(Int.self, forAny: ["seq", "sequence"])
         type = try c.decodeIfPresent(String.self, forAny: ["type", "event_type"]) ?? "event"
-        status = try c.decodeIfPresent(ZiggyStatus.self, forAny: ["status"])
         let payload = try c.decodeIfPresent(JSONValue.self, forAny: ["payload", "data"])
         data = payload
+        status = try c.decodeIfPresent(ZiggyStatus.self, forAny: ["status"])
+            ?? payload?.objectString(for: ["status"]).map(ZiggyStatus.init)
         message = try c.decodeIfPresent(String.self, forAny: ["message", "text", "detail"])
             ?? payload?.objectString(for: ["message", "text", "detail", "content"])
         actor = try c.decodeIfPresent(String.self, forAny: ["actor"])

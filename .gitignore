@@ -36,6 +36,8 @@ dmypy.json
 
 # Build & packaging
 dist/
+!nanobot/web/dist/
+!nanobot/web/dist/**
 build/
 *.manifest
 *.spec

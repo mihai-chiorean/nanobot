@@ -15,7 +15,12 @@ def test_tenant_config_isolates_state_and_scrubs_nonlocal_credentials(tmp_path: 
         "channels": {
             "sendProgress": True,
             "discord": {"enabled": True, "token": "owner-secret"},
-            "websocket": {"enabled": True, "authIssuer": "https://clerk.test"},
+            "websocket": {
+                "enabled": True,
+                "authIssuer": "https://clerk.test",
+                "authJwksUrl": "https://clerk.test/.well-known/jwks.json",
+                "authAuthorizedParties": ["https://chat.example.com"],
+            },
         },
         "tools": {"restrictToWorkspace": False, "mcpServers": {"owner": {"url": "http://owner"}}, "exec": {"enable": True}},
         "providers": {
@@ -38,3 +43,23 @@ def test_tenant_config_isolates_state_and_scrubs_nonlocal_credentials(tmp_path: 
     assert generated["providers"]["custom"]["apiKey"] == "local-placeholder"
     assert generated["providers"]["openai"] == {}
     assert source["channels"]["discord"]["token"] == "owner-secret"
+
+
+def test_tenant_config_rejects_incomplete_clerk_auth(tmp_path: Path):
+    source = {
+        "channels": {"websocket": {"enabled": True, "authIssuer": "https://clerk.test"}},
+    }
+
+    try:
+        MODULE.tenant_config(
+            source,
+            tmp_path / "tenant",
+            "tester@example.com",
+            18800,
+            "100.86.74.94",
+            18802,
+        )
+    except ValueError as exc:
+        assert "authJwksUrl" in str(exc)
+    else:
+        raise AssertionError("incomplete Clerk auth must be rejected")

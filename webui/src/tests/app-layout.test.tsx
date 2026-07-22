@@ -275,4 +275,35 @@ describe("App layout", () => {
       });
     });
   });
+
+  it("refreshes bootstrap credentials before expiry and retries without reconnecting", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.mocked(fetchBootstrap)
+        .mockResolvedValueOnce({ token: "initial", ws_path: "/", expires_in: 31 })
+        .mockRejectedValueOnce(new Error("temporary bootstrap failure"))
+        .mockResolvedValueOnce({ token: "renewed", ws_path: "/", expires_in: 300 });
+
+      render(<App />);
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(connectSpy).toHaveBeenCalledTimes(1);
+      expect(fetchBootstrap).toHaveBeenCalledTimes(1);
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1_000);
+      });
+      expect(fetchBootstrap).toHaveBeenCalledTimes(2);
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5_000);
+      });
+      expect(fetchBootstrap).toHaveBeenCalledTimes(3);
+      expect(connectSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

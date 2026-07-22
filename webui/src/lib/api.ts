@@ -40,6 +40,17 @@ async function request<T>(
   return (await res.json()) as T;
 }
 
+export async function fetchWorkArtifact(token: string, url: string): Promise<Blob> {
+  const res = await fetch(url, {
+    headers: { Authorization: `Bearer ${token}` },
+    credentials: "same-origin",
+  });
+  if (!res.ok) {
+    throw new ApiError(res.status, `HTTP ${res.status}`);
+  }
+  return res.blob();
+}
+
 function splitKey(key: string): { channel: string; chatId: string } {
   const idx = key.indexOf(":");
   if (idx === -1) return { channel: "", chatId: key };
@@ -174,7 +185,6 @@ function normalizeWorkStatus(value: string | undefined): WorkStatus {
 function normalizeWorkTask(raw: Record<string, unknown>): WorkTask {
   return {
     task_id: String(raw.task_id ?? ""),
-    scope: String(raw.scope ?? ""),
     session_key: String(raw.session_key ?? ""),
     chat_id: String(raw.chat_id ?? ""),
     title: String(raw.title ?? ""),
@@ -270,6 +280,7 @@ export async function switchModel(
   const body = await request<{ model_runtime: ModelRuntime }>(
     `${base}/api/model/switch?target=${encodeURIComponent(target)}`,
     token,
+    { method: "POST" },
   );
   return body.model_runtime;
 }
