@@ -92,6 +92,12 @@ events, and metric exemplars are dropped.
 
 ## Sampling and buffering
 
+The collector memory limiter leaves cgroup headroom below the systemd
+`MemoryMax`: Beelink uses a `320 MiB` limit plus a `32 MiB` spike allowance
+under `448M`, and Spark uses `128 MiB` plus `16 MiB` under `192M`. The remaining
+space covers collector runtime, exporter queues, and filesystem-storage
+overhead instead of allowing the limiter to consume the full cgroup budget.
+
 Beelink tail sampling waits 10 seconds and keeps all received error traces,
 traces slower than two seconds, and 2% of other traces. The tail sampler is
 bounded to 1,000 in-flight traces with bounded decision caches. To let it see
@@ -116,7 +122,8 @@ unbounded disk or blocking application work.
 
 ## Deploy and rollback
 
-Install `curl`, `openssl`, `apache2-utils`, `systemd`, and `journalctl`. Stage
+Install `curl`, `openssl`, `apache2-utils`, `util-linux` (`flock`), `systemd`,
+and `journalctl`. Stage
 the root-owned Grafana credential on each host and the local OTLP credential
 pair on Beelink. From a reviewed repository checkout, run:
 
@@ -140,14 +147,24 @@ The deploy command:
    incremented only after Grafana accepts a metric export.
 6. Automatically restores the saved deployment if startup fails.
 
+Deploy and rollback take a host-wide, nonblocking lock at
+`/run/lock/ziggy-otelcol-deploy.lock`; a concurrent operation fails clearly
+before changing collector state. The deployment backup state remains
+root-owned and mode `0700`, and candidate validation uses an isolated temporary
+directory before any live files are changed.
+
 Manual rollback restores the immediately preceding deployment:
 
 ```sh
 sudo services/observability/otelcol/ziggy-otelcol-deploy rollback
 ```
 
-Rollback changes collector code/config only. Persistent cursors and queued
-telemetry remain under the stable state directory and should not be deleted.
+Rollback changes collector code/config only. For an existing service it also
+requires the restored service to be active, expose collector self-telemetry,
+and show a positive successful-export counter. A service that was previously
+absent is stopped, disabled, and verified inactive. Persistent cursors and
+queued telemetry remain under the stable state directory and should not be
+deleted.
 If a new collector version changes the storage schema, test downgrade against
 a copied state directory before promotion.
 

@@ -67,6 +67,7 @@ jobs:
           PRIVACY_CANARY_OUTPUT: ${{ runner.temp }}/privacy-canary-output.json
           PRIVACY_CANARY_HTPASSWD_FILE: ${{ runner.temp }}/otel-local-users.htpasswd
           PRIVACY_CANARY_UNREACHABLE_ENDPOINT: http://127.0.0.1:24319
+          PRIVACY_CANARY_METRICS_PORT: 24320
         run: |
           collector=services/observability/otelcol/otelcol-contrib
           "${collector}" validate --config=services/observability/otelcol/beelink.yaml
