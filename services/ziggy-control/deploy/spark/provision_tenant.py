@@ -78,6 +78,7 @@ def tenant_config(source: dict, tenant_root: Path, email: str, gateway_port: int
         "token": "",
         "allowFrom": ["*"],
         "authAllowedEmails": [normalized_email],
+        "pingIntervalS": None,
     })
     channels["websocket"] = websocket
 

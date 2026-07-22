@@ -98,7 +98,8 @@ class WebSocketConfig(Base):
     # (base64 overhead) + envelope framing stays under 36 MB; the 40 MB ceiling
     # leaves a small margin for sender slop without opening a DoS avenue.
     max_message_bytes: int = Field(default=37_748_736, ge=1024, le=41_943_040)
-    ping_interval_s: float = Field(default=20.0, ge=5.0, le=300.0)
+    # Set to null when a client-owned heartbeat is responsible for liveness.
+    ping_interval_s: float | None = Field(default=20.0, ge=5.0, le=300.0)
     ping_timeout_s: float = Field(default=20.0, ge=5.0, le=300.0)
     ssl_certfile: str = ""
     ssl_keyfile: str = ""

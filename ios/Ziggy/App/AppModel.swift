@@ -117,6 +117,7 @@ final class AppModel {
     private var socketEventTask: Task<Void, Never>?
     private var configuredServerURL: URL?
     private var connectionAttempt = 0
+    private var needsForegroundReconnect = false
     private var pendingNewChat = false
     private var hasStarted = false
     private var chatReconciler = ChatStreamReconciler()
@@ -234,6 +235,21 @@ final class AppModel {
     }
 
     func retryConnection() async {
+        await connectAuthenticated()
+    }
+
+    func applicationDidEnterBackground() {
+        connectionAttempt += 1
+        needsForegroundReconnect = true
+        invalidateBootstrapRefresh()
+        let socketToStop = detachSocket()
+        Task { await socketToStop?.stop() }
+    }
+
+    func applicationDidBecomeActive() async {
+        guard needsForegroundReconnect else { return }
+        needsForegroundReconnect = false
+        guard hasStarted, authSession.isSignedIn else { return }
         await connectAuthenticated()
     }
 
@@ -619,11 +635,17 @@ final class AppModel {
     }
 
     private func stopSocket() async {
+        let socketToStop = detachSocket()
+        await socketToStop?.stop()
+    }
+
+    private func detachSocket() -> ZiggyWebSocketClient? {
         socketEventTask?.cancel()
         socketEventTask = nil
-        await socket?.stop()
+        let socketToStop = socket
         socket = nil
         connectionState = .idle
+        return socketToStop
     }
 
     private static func chatID(from sessionKey: String) -> String {

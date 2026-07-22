@@ -46,9 +46,30 @@ final class WebSocketLifecycleTests: XCTestCase {
         eventTask.cancel()
     }
 
-    private func makeClient(connection: TestWebSocketConnection) -> ZiggyWebSocketClient {
+    func testConnectedSocketSendsPeriodicHeartbeatPings() async throws {
+        let connection = TestWebSocketConnection()
+        let client = makeClient(connection: connection, heartbeatInterval: .milliseconds(10))
+        let collector = EventCollector()
+        let eventTask = collect(client.events, into: collector)
+
+        await client.start()
+        await connection.completePing()
+        try await Task.sleep(for: .milliseconds(45))
+
+        let pingCount = await connection.pingCount()
+        XCTAssertGreaterThanOrEqual(pingCount, 3)
+
+        await client.stop()
+        eventTask.cancel()
+    }
+
+    private func makeClient(
+        connection: TestWebSocketConnection,
+        heartbeatInterval: Duration = .seconds(10)
+    ) -> ZiggyWebSocketClient {
         ZiggyWebSocketClient(
             baseURL: URL(string: "https://ziggy.example.test")!,
+            heartbeatInterval: heartbeatInterval,
             credentialProvider: { WebSocketCredential(bearerToken: "test-token") },
             connectionFactory: { _ in connection }
         )
@@ -82,8 +103,10 @@ private final class TestWebSocketConnection: ZiggyWebSocketConnection, @unchecke
         var waiters: [CheckedContinuation<URLSessionWebSocketTask.Message, Error>] = []
         var pingResult: PingResult?
         var pingWaiter: CheckedContinuation<Void, Error>?
+        var pingCount = 0
 
         func waitForPing() async throws {
+            pingCount += 1
             if let pingResult {
                 switch pingResult {
                 case .success: return
@@ -129,6 +152,8 @@ private final class TestWebSocketConnection: ZiggyWebSocketConnection, @unchecke
             pingWaiter?.resume(throwing: CancellationError())
             pingWaiter = nil
         }
+
+        func currentPingCount() -> Int { pingCount }
     }
 
     private let state: State
@@ -170,6 +195,10 @@ private final class TestWebSocketConnection: ZiggyWebSocketConnection, @unchecke
 
     func completePing() async {
         await state.completePing(.success)
+    }
+
+    func pingCount() async -> Int {
+        await state.currentPingCount()
     }
 
     func failPing(with error: ZiggyWebSocketClientError) async {

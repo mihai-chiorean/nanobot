@@ -31,6 +31,7 @@ def test_tenant_config_isolates_state_and_scrubs_nonlocal_credentials(tmp_path: 
     assert generated["gateway"] == {"host": "127.0.0.1", "port": 18800, "heartbeat": {"enabled": False}}
     assert "discord" not in generated["channels"]
     assert generated["channels"]["websocket"]["authAllowedEmails"] == ["tester@example.com"]
+    assert generated["channels"]["websocket"]["pingIntervalS"] is None
     assert generated["tools"]["restrictToWorkspace"] is True
     assert generated["tools"]["exec"]["enable"] is False
     assert generated["tools"]["mcpServers"] == {}

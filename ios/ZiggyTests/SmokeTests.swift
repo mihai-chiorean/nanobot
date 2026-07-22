@@ -15,6 +15,18 @@ final class SmokeTests: XCTestCase {
     }
 
     @MainActor
+    func testBackgroundTransitionImmediatelyMarksSocketIdle() async {
+        let model = AppModel()
+        model.connectionState = .connected
+
+        model.applicationDidEnterBackground()
+
+        XCTAssertEqual(model.connectionState, .idle)
+        await model.applicationDidBecomeActive()
+        XCTAssertEqual(model.phase, .launching)
+    }
+
+    @MainActor
     func testSignOutClearsTenantDerivedStateBeforeProviderCompletes() async {
         let authSession = SmokeAuthSession()
         let model = AppModel(

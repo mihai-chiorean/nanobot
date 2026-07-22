@@ -4,6 +4,7 @@ import SwiftUI
 
 @main
 struct ZiggyApp: App {
+    @Environment(\.scenePhase) private var scenePhase
     private let clerk: Clerk?
     @State private var appModel: AppModel
 
@@ -49,6 +50,18 @@ struct ZiggyApp: App {
             }
             .environment(appModel)
             .preferredColorScheme(appModel.theme.colorScheme)
+            .onChange(of: scenePhase) { _, phase in
+                switch phase {
+                case .active:
+                    Task { await appModel.applicationDidBecomeActive() }
+                case .background:
+                    appModel.applicationDidEnterBackground()
+                case .inactive:
+                    break
+                @unknown default:
+                    break
+                }
+            }
         }
     }
 }

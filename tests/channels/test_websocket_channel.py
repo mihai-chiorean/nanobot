@@ -123,6 +123,12 @@ def test_web_socket_config_path_must_start_with_slash() -> None:
         WebSocketConfig(path="bad")
 
 
+def test_web_socket_config_allows_disabling_server_ping() -> None:
+    config = WebSocketConfig(ping_interval_s=None)
+
+    assert config.ping_interval_s is None
+
+
 def test_ssl_context_requires_both_cert_and_key_files() -> None:
     bus = MagicMock()
     channel = WebSocketChannel(
