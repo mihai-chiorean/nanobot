@@ -73,12 +73,12 @@ func TestHTTPReadinessCheckerCachesSuccessfulProbe(t *testing.T) {
 	}
 }
 
-func TestHTTPReadinessCheckerPreflightRequiresAuthenticatedBootstrap(t *testing.T) {
+func TestHTTPReadinessCheckerPreflightRequiresPrivateTokenIssuer(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/healthz":
 			w.WriteHeader(http.StatusNoContent)
-		case "/auth/bootstrap":
+		case "/auth/token":
 			w.WriteHeader(http.StatusUnauthorized)
 		default:
 			w.WriteHeader(http.StatusNotFound)
@@ -102,6 +102,6 @@ func TestHTTPReadinessCheckerPreflightRequiresAuthenticatedBootstrap(t *testing.
 	target, _ = url.Parse(serverWithMissingRoute.URL)
 	checker = NewHTTPReadinessChecker(target, "/healthz", time.Second, time.Second, nil)
 	if err := checker.Preflight(context.Background()); err == nil {
-		t.Fatal("Preflight() error = nil for missing authenticated bootstrap")
+		t.Fatal("Preflight() error = nil for missing private token issuer")
 	}
 }

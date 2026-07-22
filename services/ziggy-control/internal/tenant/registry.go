@@ -26,13 +26,14 @@ var (
 )
 
 type Allocation struct {
-	UserID        string `json:"user_id"`
-	WorkspaceID   string `json:"workspace_id"`
-	Email         string `json:"email"`
-	ClerkSubject  string `json:"clerk_subject,omitempty"`
-	UpstreamURL   string `json:"upstream_url"`
-	Status        string `json:"status"`
-	LegacyDefault bool   `json:"legacy_default,omitempty"`
+	UserID                  string `json:"user_id"`
+	WorkspaceID             string `json:"workspace_id"`
+	Email                   string `json:"email"`
+	ClerkSubject            string `json:"clerk_subject,omitempty"`
+	UpstreamURL             string `json:"upstream_url"`
+	UpstreamBootstrapSecret string `json:"upstream_bootstrap_secret"`
+	Status                  string `json:"status"`
+	LegacyDefault           bool   `json:"legacy_default,omitempty"`
 }
 
 type manifest struct {
@@ -203,6 +204,7 @@ func buildSnapshot(allocations []Allocation, bindings map[string]binding) (*snap
 		allocation.WorkspaceID = strings.TrimSpace(allocation.WorkspaceID)
 		allocation.ClerkSubject = strings.TrimSpace(allocation.ClerkSubject)
 		allocation.UpstreamURL = strings.TrimSpace(allocation.UpstreamURL)
+		allocation.UpstreamBootstrapSecret = strings.TrimSpace(allocation.UpstreamBootstrapSecret)
 		allocation.Status = strings.ToLower(strings.TrimSpace(allocation.Status))
 		email, err := canonicalEmail(allocation.Email)
 		if err != nil {

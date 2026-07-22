@@ -42,7 +42,7 @@ def _verifier(jwk: dict[str, object]) -> ClerkTokenVerifier:
     return verifier
 
 
-def _token(private_key: object, **overrides: object) -> str:
+def _token(private_key: object, *, omit_authorized_party: bool = False, **overrides: object) -> str:
     now = int(time.time())
     claims: dict[str, object] = {
         "iss": ISSUER,
@@ -54,6 +54,8 @@ def _token(private_key: object, **overrides: object) -> str:
         "email": "TENANT@example.com",
     }
     claims.update(overrides)
+    if omit_authorized_party:
+        claims.pop("azp", None)
     return jwt.encode(
         claims,
         private_key,
@@ -123,9 +125,7 @@ async def test_primary_email_lookup_uses_clerk_backend_api(
                 },
             )
 
-    monkeypatch.setattr(
-        "nanobot.security.clerk.httpx.AsyncClient", lambda **_kwargs: FakeClient()
-    )
+    monkeypatch.setattr("nanobot.security.clerk.httpx.AsyncClient", lambda **_kwargs: FakeClient())
 
     assert await verifier._fetch_primary_email("user/with/slash") == "tenant@example.com"
     assert str(request_seen["url"]).endswith("/user%2Fwith%2Fslash")
@@ -138,7 +138,7 @@ async def test_primary_email_lookup_uses_clerk_backend_api(
     [
         {"email": "other@example.com"},
         {"azp": "https://attacker.example"},
-        {"azp": None},
+        {"azp": 42},
     ],
 )
 async def test_forbidden_email_or_authorized_party(
@@ -148,6 +148,16 @@ async def test_forbidden_email_or_authorized_party(
 
     with pytest.raises(ClerkAuthorizationError):
         await _verifier(jwk).verify(_token(private_key, **overrides))
+
+
+@pytest.mark.asyncio
+async def test_native_token_without_authorized_party_is_accepted(signed_identity) -> None:
+    private_key, jwk = signed_identity
+    token = _token(private_key, omit_authorized_party=True)
+
+    claims = await _verifier(jwk).verify(token)
+
+    assert claims["sub"] == "user_test"
 
 
 @pytest.mark.asyncio

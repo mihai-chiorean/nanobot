@@ -1,0 +1,151 @@
+name: Ziggy client CI
+
+on:
+  pull_request:
+    branches:
+      - feat/ziggy-ios
+      - main
+      - ziggy-main
+    paths:
+      - ".github/workflows/ziggy-client.yml"
+      - "ios/**"
+      - "nanobot/web/dist/**"
+      - "pyproject.toml"
+      - "scripts/verify_ziggy_client_artifacts.py"
+      - "webui/**"
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  changes:
+    name: Detect client changes
+    runs-on: ubuntu-latest
+    outputs:
+      web: ${{ steps.filter.outputs.web }}
+      ios: ${{ steps.filter.outputs.ios }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Classify changed paths
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            web:
+              - '.github/workflows/ziggy-client.yml'
+              - 'nanobot/web/dist/**'
+              - 'pyproject.toml'
+              - 'scripts/verify_ziggy_client_artifacts.py'
+              - 'webui/**'
+            ios:
+              - '.github/workflows/ziggy-client.yml'
+              - 'ios/**'
+
+  web:
+    name: Web test, lint, build, and wheel
+    needs: changes
+    if: needs.changes.outputs.web == 'true'
+    runs-on: ubuntu-latest
+    env:
+      VITE_CLERK_PUBLISHABLE_KEY: pk_test_Y2lfemlnZ3lfY2xpZW50X3ZlcmlmaWNhdGlvbg
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: webui/package-lock.json
+
+      - name: Install web dependencies
+        working-directory: webui
+        run: npm ci
+
+      - name: Run web tests
+        working-directory: webui
+        run: npm test
+
+      - name: Lint web client
+        working-directory: webui
+        run: npm run lint
+
+      - name: Build PWA with explicit Clerk test key
+        working-directory: webui
+        run: npm run build
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: astral-sh/setup-uv@v4
+
+      - name: Build Python wheel containing the PWA
+        run: uv build --wheel --out-dir "$RUNNER_TEMP/ziggy-wheel"
+
+      - name: Verify PWA packaging and Clerk configuration
+        env:
+          PUBLISHABLE_KEY: ${{ env.VITE_CLERK_PUBLISHABLE_KEY }}
+        run: |
+          set -euo pipefail
+          wheel="$(find "$RUNNER_TEMP/ziggy-wheel" -maxdepth 1 -type f -name '*.whl' -print -quit)"
+          test -n "$wheel"
+          python scripts/verify_ziggy_client_artifacts.py \
+            --dist nanobot/web/dist \
+            --wheel "$wheel" \
+            --publishable-key "$PUBLISHABLE_KEY"
+
+  ios:
+    name: iOS simulator tests and build
+    needs: changes
+    if: needs.changes.outputs.ios == 'true'
+    runs-on: macos-26
+    env:
+      ZIGGY_CI_CLERK_PUBLISHABLE_KEY: pk_test_Y2lfemlnZ3lfY2xpZW50X2lvcw
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode 26.6
+        run: sudo xcode-select --switch /Applications/Xcode_26.6.app/Contents/Developer
+
+      - name: Select an available iPhone simulator
+        run: |
+          set -euo pipefail
+          device_id="$(xcrun simctl list devices available | awk -F '[()]' '/iPhone/ && $2 ~ /^[0-9A-F-]+$/ { print $2; exit }')"
+          test -n "$device_id"
+          echo "ZIGGY_SIMULATOR_DESTINATION=platform=iOS Simulator,id=$device_id" >> "$GITHUB_ENV"
+
+      - name: Resolve Swift packages
+        run: |
+          xcodebuild \
+            -project ios/Ziggy.xcodeproj \
+            -resolvePackageDependencies \
+            -clonedSourcePackagesDirPath "$RUNNER_TEMP/ziggy-source-packages"
+
+      - name: Build iOS app for simulator
+        run: |
+          xcodebuild \
+            -project ios/Ziggy.xcodeproj \
+            -scheme Ziggy \
+            -configuration Debug \
+            -destination "$ZIGGY_SIMULATOR_DESTINATION" \
+            -derivedDataPath "$RUNNER_TEMP/ziggy-derived-data" \
+            -clonedSourcePackagesDirPath "$RUNNER_TEMP/ziggy-source-packages" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CLERK_PUBLISHABLE_KEY="$ZIGGY_CI_CLERK_PUBLISHABLE_KEY" \
+            build
+
+      - name: Run iOS unit tests in simulator
+        run: |
+          xcodebuild \
+            -project ios/Ziggy.xcodeproj \
+            -scheme Ziggy \
+            -configuration Debug \
+            -destination "$ZIGGY_SIMULATOR_DESTINATION" \
+            -derivedDataPath "$RUNNER_TEMP/ziggy-derived-data" \
+            -clonedSourcePackagesDirPath "$RUNNER_TEMP/ziggy-source-packages" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CLERK_PUBLISHABLE_KEY="$ZIGGY_CI_CLERK_PUBLISHABLE_KEY" \
+            test

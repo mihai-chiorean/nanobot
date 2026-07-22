@@ -16,9 +16,10 @@ import (
 const maxBootstrapResponseBytes = 1 << 20
 
 type TenantRoute struct {
-	UserID      string
-	WorkspaceID string
-	Proxy       http.Handler
+	UserID                  string
+	WorkspaceID             string
+	UpstreamBootstrapSecret string
+	Proxy                   http.Handler
 }
 
 type TenantRouter interface {

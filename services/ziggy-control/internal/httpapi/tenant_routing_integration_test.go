@@ -26,9 +26,9 @@ func (alwaysReady) Check(context.Context) error { return nil }
 func TestTenantBootstrapPinsEveryCapabilityToOneRuntime(t *testing.T) {
 	ownerRequests := 0
 	testerRequests := 0
-	ownerRuntime := tenantRuntime(t, "owner-token", "owner", &ownerRequests)
+	ownerRuntime := tenantRuntime(t, "owner-token", "owner", "owner-bootstrap-secret-with-32-bytes", &ownerRequests)
 	defer ownerRuntime.Close()
-	testerRuntime := tenantRuntime(t, "tester-token", "tester", &testerRequests)
+	testerRuntime := tenantRuntime(t, "tester-token", "tester", "tester-bootstrap-secret-with-32-bytes", &testerRequests)
 	defer testerRuntime.Close()
 
 	registry := integrationRegistry(t, ownerRuntime.URL, testerRuntime.URL)
@@ -65,14 +65,17 @@ func TestTenantBootstrapPinsEveryCapabilityToOneRuntime(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	testerBootstrapRequest := httptest.NewRequest(http.MethodGet, "/auth/bootstrap", nil)
+	testerBootstrapRequest.Header.Set("Authorization", "Bearer public-clerk-token")
 	testerBootstrap := httptest.NewRecorder()
-	handler.ServeHTTP(testerBootstrap, httptest.NewRequest(http.MethodGet, "/auth/bootstrap", nil))
+	handler.ServeHTTP(testerBootstrap, testerBootstrapRequest)
 	if testerBootstrap.Code != http.StatusOK || !strings.Contains(testerBootstrap.Body.String(), "tester-token") {
 		t.Fatalf("tester bootstrap = %d %s", testerBootstrap.Code, testerBootstrap.Body.String())
 	}
 
 	ownerBootstrapRequest := httptest.NewRequest(http.MethodGet, "/auth/bootstrap", nil)
 	ownerBootstrapRequest.Header.Set("X-Test-User", "owner")
+	ownerBootstrapRequest.Header.Set("Authorization", "Bearer public-clerk-token")
 	ownerBootstrap := httptest.NewRecorder()
 	handler.ServeHTTP(ownerBootstrap, ownerBootstrapRequest)
 	if ownerBootstrap.Code != http.StatusOK || !strings.Contains(ownerBootstrap.Body.String(), "owner-token") {
@@ -107,12 +110,17 @@ func TestTenantBootstrapPinsEveryCapabilityToOneRuntime(t *testing.T) {
 	}
 }
 
-func tenantRuntime(t *testing.T, token, name string, requests *int) *httptest.Server {
+func tenantRuntime(t *testing.T, token, name, bootstrapSecret string, requests *int) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		(*requests)++
 		switch r.URL.Path {
-		case "/auth/bootstrap":
+		case "/auth/token":
+			if r.Header.Get("Authorization") != "Bearer "+bootstrapSecret || r.Header.Get("X-Nanobot-Auth") != "" {
+				t.Error("internal bootstrap did not replace the public Clerk credential")
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"token": token, "expires_in": 300, "ws_path": "/",
 			})
@@ -133,11 +141,13 @@ func integrationRegistry(t *testing.T, ownerURL, testerURL string) *tenant.Regis
 		"tenants": []map[string]any{
 			{
 				"user_id": "usr_owner", "workspace_id": "ws_owner", "email": "owner@example.com",
-				"clerk_subject": "clerk_owner", "upstream_url": ownerURL, "status": "active", "legacy_default": true,
+				"clerk_subject": "clerk_owner", "upstream_url": ownerURL,
+				"upstream_bootstrap_secret": "owner-bootstrap-secret-with-32-bytes", "status": "active", "legacy_default": true,
 			},
 			{
 				"user_id": "usr_tester", "workspace_id": "ws_tester", "email": "tester@example.com",
-				"clerk_subject": "clerk_tester", "upstream_url": testerURL, "status": "active",
+				"clerk_subject": "clerk_tester", "upstream_url": testerURL,
+				"upstream_bootstrap_secret": "tester-bootstrap-secret-with-32-bytes", "status": "active",
 			},
 		},
 	}

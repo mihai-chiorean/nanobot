@@ -71,12 +71,12 @@ func NewHTTPReadinessChecker(
 }
 
 // Preflight verifies the configured health path and the private runtime's
-// authenticated bootstrap contract before the front door starts accepting traffic.
+// internal token-issue contract before the front door starts accepting traffic.
 func (checker *HTTPReadinessChecker) Preflight(ctx context.Context) error {
 	if err := checker.check(ctx); err != nil {
 		return fmt.Errorf("configured readiness path: %w", err)
 	}
-	return checker.checkContractRoute(ctx, "/auth/bootstrap", http.StatusUnauthorized)
+	return checker.checkContractRoute(ctx, "/auth/token", http.StatusUnauthorized)
 }
 
 func (checker *HTTPReadinessChecker) checkContractRoute(ctx context.Context, route string, wantStatus int) error {

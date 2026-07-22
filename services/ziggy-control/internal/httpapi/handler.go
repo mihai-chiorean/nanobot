@@ -186,7 +186,7 @@ func New(config Config) (http.Handler, error) {
 	if api.telemetry == nil {
 		api.telemetry = telemetry.Noop()
 	}
-	for _, reserved := range []string{"/auth/bootstrap", "/webui/guest/bootstrap", "/api/guest", "/healthz", "/readyz", "/connectors"} {
+	for _, reserved := range []string{"/auth/bootstrap", "/auth/token", "/webui/guest/bootstrap", "/api/guest", "/healthz", "/readyz", "/connectors"} {
 		api.blockedPaths[reserved] = struct{}{}
 	}
 
@@ -395,11 +395,21 @@ func (api *API) forward(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *API) proxyTenantBootstrap(w http.ResponseWriter, r *http.Request, route TenantRoute) {
-	if route.Proxy == nil {
+	if route.Proxy == nil || len(route.UpstreamBootstrapSecret) < 32 {
 		writeError(w, http.StatusServiceUnavailable, "tenant runtime unavailable")
 		return
 	}
-	response, credentials, ttl, err := captureBootstrap(route.Proxy, r)
+	request := r.Clone(r.Context())
+	request.URL = cloneURL(r.URL)
+	request.URL.Path = "/auth/token"
+	request.URL.RawPath = ""
+	request.URL.RawQuery = ""
+	request.RequestURI = ""
+	request.Header = r.Header.Clone()
+	request.Header.Del("Authorization")
+	request.Header.Del("X-Nanobot-Auth")
+	request.Header.Set("Authorization", "Bearer "+route.UpstreamBootstrapSecret)
+	response, credentials, ttl, err := captureBootstrap(route.Proxy, request)
 	if err != nil {
 		api.logger.ErrorContext(r.Context(), "tenant bootstrap failed", "route", "bootstrap", "error_class", "invalid_upstream_response")
 		writeError(w, http.StatusBadGateway, "upstream bootstrap unavailable")

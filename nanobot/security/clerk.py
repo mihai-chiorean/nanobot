@@ -113,12 +113,13 @@ class ClerkTokenVerifier:
         except InvalidTokenError as exc:
             raise ClerkAuthenticationError("invalid bearer token") from exc
 
-        authorized_party = claims.get("azp")
-        if (
-            not isinstance(authorized_party, str)
-            or authorized_party not in self.authorized_parties
-        ):
-            raise ClerkAuthorizationError("authorized party is not allowed")
+        if "azp" in claims:
+            authorized_party = claims["azp"]
+            if (
+                not isinstance(authorized_party, str)
+                or authorized_party not in self.authorized_parties
+            ):
+                raise ClerkAuthorizationError("authorized party is not allowed")
 
         email = self._claim_email(claims)
         if email is None:

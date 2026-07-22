@@ -8,11 +8,11 @@ Type=simple
 User=ziggy-control
 Group=ziggy-control
 LoadCredential=clerk-secret-key:/etc/ziggy/secrets/clerk-secret-key
-LoadCredential=otel-local-auth:/etc/ziggy/secrets/otel-local-auth
-LoadCredential=connector-trust-key:/etc/ziggy/secrets/connector-trust-key
-Environment=CLERK_SECRET_KEY_FILE=%d/clerk-secret-key
-Environment=ZIGGY_OTEL_AUTH_FILE=%d/otel-local-auth
 EnvironmentFile=/etc/ziggy/ziggy-control.env
+Environment=CLERK_SECRET_KEY=
+Environment=CLERK_SECRET_KEY_FILE=%d/clerk-secret-key
+Environment=ZIGGY_OTEL_AUTH_FILE=
+Environment=ZIGGY_CONNECTORS_TRUST_KEY_FILE=
 StateDirectory=ziggy-control
 StateDirectoryMode=0700
 ExecStart=/usr/local/bin/ziggy-control

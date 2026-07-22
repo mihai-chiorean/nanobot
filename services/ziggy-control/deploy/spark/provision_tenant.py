@@ -24,6 +24,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gateway-port", type=int, required=True)
     parser.add_argument("--websocket-host", required=True)
     parser.add_argument("--websocket-port", type=int, required=True)
+    parser.add_argument("--bootstrap-secret-file", type=Path, required=True)
     parser.add_argument("--force", action="store_true")
     return parser.parse_args()
 
@@ -44,8 +45,47 @@ def local_provider(config: dict) -> bool:
         return False
 
 
-def tenant_config(source: dict, tenant_root: Path, email: str, gateway_port: int,
-                  websocket_host: str, websocket_port: int) -> dict:
+def read_bootstrap_secret(filename: Path) -> str:
+    try:
+        secret = filename.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise ValueError(f"cannot read bootstrap secret file: {filename}") from exc
+    if len(secret) < 32:
+        raise ValueError("bootstrap secret must contain at least 32 characters")
+    return secret
+
+
+def valid_websocket_bind_host(value: str) -> bool:
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    if address.is_unspecified or address.is_multicast or address.is_link_local:
+        return False
+    if address.is_loopback:
+        return True
+    if address.version == 4:
+        return any(
+            address in network
+            for network in (
+                ipaddress.ip_network("10.0.0.0/8"),
+                ipaddress.ip_network("172.16.0.0/12"),
+                ipaddress.ip_network("192.168.0.0/16"),
+                ipaddress.ip_network("100.64.0.0/10"),
+            )
+        )
+    return address in ipaddress.ip_network("fc00::/7")
+
+
+def tenant_config(
+    source: dict,
+    tenant_root: Path,
+    email: str,
+    gateway_port: int,
+    websocket_host: str,
+    websocket_port: int,
+    bootstrap_secret: str = "",
+) -> dict:
     normalized_email = email.strip().lower()
     if not EMAIL_RE.fullmatch(normalized_email):
         raise ValueError("invalid tenant email")
@@ -53,7 +93,11 @@ def tenant_config(source: dict, tenant_root: Path, email: str, gateway_port: int
         raise ValueError("ports must be between 1024 and 65535")
     if gateway_port == websocket_port:
         raise ValueError("gateway and WebSocket ports must differ")
-    ipaddress.ip_address(websocket_host)
+    if not valid_websocket_bind_host(websocket_host):
+        raise ValueError("WebSocket host must be loopback, RFC1918, IPv6 ULA, or Tailscale CGNAT")
+    bootstrap_secret = bootstrap_secret.strip()
+    if len(bootstrap_secret) < 32:
+        raise ValueError("bootstrap secret must contain at least 32 characters")
 
     config = copy.deepcopy(source)
     workspace = tenant_root / "workspace"
@@ -69,9 +113,8 @@ def tenant_config(source: dict, tenant_root: Path, email: str, gateway_port: int
     websocket = copy.deepcopy(channels.get("websocket") or {})
     auth_issuer = websocket.get("authIssuer") or websocket.get("auth_issuer")
     auth_jwks_url = websocket.get("authJwksUrl") or websocket.get("auth_jwks_url")
-    authorized_parties = (
-        websocket.get("authAuthorizedParties")
-        or websocket.get("auth_authorized_parties")
+    authorized_parties = websocket.get("authAuthorizedParties") or websocket.get(
+        "auth_authorized_parties"
     )
     if not isinstance(auth_issuer, str) or not auth_issuer.strip():
         raise ValueError("source WebSocket config is missing authIssuer")
@@ -82,18 +125,28 @@ def tenant_config(source: dict, tenant_root: Path, email: str, gateway_port: int
     ):
         raise ValueError("source WebSocket config is missing authAuthorizedParties")
     for name in list(channels):
-        if name not in {"sendProgress", "sendToolHints", "sendMaxRetries", "transcriptionProvider", "transcriptionLanguage"}:
+        if name not in {
+            "sendProgress",
+            "sendToolHints",
+            "sendMaxRetries",
+            "transcriptionProvider",
+            "transcriptionLanguage",
+        }:
             channels.pop(name, None)
-    websocket.update({
-        "enabled": True,
-        "host": websocket_host,
-        "port": websocket_port,
-        "path": "/",
-        "token": "",
-        "allowFrom": ["*"],
-        "authAllowedEmails": [normalized_email],
-        "pingIntervalS": None,
-    })
+    websocket.update(
+        {
+            "enabled": True,
+            "host": websocket_host,
+            "port": websocket_port,
+            "path": "/",
+            "token": "",
+            "tokenIssuePath": "/auth/token",
+            "tokenIssueSecret": bootstrap_secret,
+            "allowFrom": ["*"],
+            "authAllowedEmails": [normalized_email],
+            "pingIntervalS": None,
+        }
+    )
     channels["websocket"] = websocket
 
     tools = config.setdefault("tools", {})
@@ -147,6 +200,7 @@ def main() -> None:
         args.gateway_port,
         args.websocket_host,
         args.websocket_port,
+        read_bootstrap_secret(args.bootstrap_secret_file.expanduser().resolve()),
     )
     for directory in (tenant_root, tenant_root / "runtime", tenant_root / "workspace"):
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)

@@ -597,7 +597,11 @@ class WebSocketChannel(BaseChannel):
         self._issued_tokens[token_value] = time.monotonic() + float(self.config.token_ttl_s)
 
         return _http_json_response(
-            {"token": token_value, "expires_in": self.config.token_ttl_s}
+            {
+                "token": token_value,
+                "expires_in": self.config.token_ttl_s,
+                "ws_path": self._expected_path(),
+            }
         )
 
     # -- HTTP dispatch ------------------------------------------------------
