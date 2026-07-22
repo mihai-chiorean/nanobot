@@ -13,6 +13,7 @@ const WS_CLOSING = 2;
 type Unsubscribe = () => void;
 type EventHandler = (ev: InboundEvent) => void;
 type StatusHandler = (status: ConnectionStatus) => void;
+type WorkHandler = (ev: InboundEvent) => void;
 
 /** Structured connection-level errors surfaced to the UI.
  *
@@ -60,6 +61,7 @@ export class NanobotClient {
   private errorHandlers = new Set<ErrorHandler>();
   // chat_id -> handlers listening on it
   private chatHandlers = new Map<string, Set<EventHandler>>();
+  private workHandlers = new Map<string, Set<WorkHandler>>();
   // chat_ids we've attached to since connect; re-attached after reconnects
   private knownChats = new Set<string>();
   private pendingNewChat: PendingNewChat | null = null;
@@ -190,6 +192,43 @@ export class NanobotClient {
     this.queueSend(frame);
   }
 
+  createWork(chatId: string, content: string, media?: OutboundMedia[]): void {
+    this.knownChats.add(chatId);
+    this.queueSend(
+      media && media.length > 0
+        ? { type: "work.create", chat_id: chatId, content, mode: "background", media }
+        : { type: "work.create", chat_id: chatId, content, mode: "background" },
+    );
+  }
+
+  subscribeWork(taskId: string, afterSeq: number = 0): void {
+    this.queueSend({ type: "work.subscribe", task_id: taskId, after_seq: afterSeq });
+  }
+
+  cancelWork(taskId: string): void {
+    this.queueSend({ type: "work.cancel", task_id: taskId });
+  }
+
+  sendWorkMessage(taskId: string, content: string): void {
+    this.queueSend({ type: "work.message", task_id: taskId, content });
+  }
+
+  onWork(taskId: string, handler: WorkHandler): Unsubscribe {
+    let handlers = this.workHandlers.get(taskId);
+    if (!handlers) {
+      handlers = new Set();
+      this.workHandlers.set(taskId, handlers);
+    }
+    handlers.add(handler);
+    this.subscribeWork(taskId);
+    return () => {
+      const current = this.workHandlers.get(taskId);
+      if (!current) return;
+      current.delete(handler);
+      if (current.size === 0) this.workHandlers.delete(taskId);
+    };
+  }
+
   // -- internals ---------------------------------------------------------
 
   private setStatus(status: ConnectionStatus): void {
@@ -235,12 +274,28 @@ export class NanobotClient {
       return;
     }
 
+    if (parsed.event === "work.created") {
+      this.dispatchWork(parsed.task_id, parsed);
+      return;
+    }
+
+    if (parsed.event === "work.subscribed" || parsed.event === "work.event") {
+      this.dispatchWork(parsed.task_id, parsed);
+      return;
+    }
+
     const chatId = (parsed as { chat_id?: string }).chat_id;
     if (chatId) this.dispatch(chatId, parsed);
   }
 
   private dispatch(chatId: string, ev: InboundEvent): void {
     const handlers = this.chatHandlers.get(chatId);
+    if (!handlers) return;
+    for (const h of handlers) h(ev);
+  }
+
+  private dispatchWork(taskId: string, ev: InboundEvent): void {
+    const handlers = this.workHandlers.get(taskId);
     if (!handlers) return;
     for (const h of handlers) h(ev);
   }

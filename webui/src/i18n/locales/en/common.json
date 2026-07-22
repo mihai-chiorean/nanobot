@@ -1,20 +1,20 @@
 {
   "app": {
-    "brand": "nanobot",
+    "brand": "Ziggy",
     "loading": {
-      "connecting": "Connecting to nanobot…",
-      "boot": "Loading nanobot…"
+      "connecting": "Connecting to Ziggy…",
+      "boot": "Loading Ziggy…"
     },
     "error": {
-      "title": "Couldn't reach nanobot",
-      "gatewayHint": "Make sure the gateway is running (`nanobot gateway`) and that this page is open on the same machine."
+      "title": "Couldn't reach Ziggy",
+      "gatewayHint": "Ziggy is temporarily unavailable. Try again in a moment."
     },
     "documentTitle": {
-      "base": "nanobot",
-      "chat": "{{title}} · nanobot"
+      "base": "Ziggy",
+      "chat": "{{title}} · Ziggy"
     },
     "meta": {
-      "description": "nanobot web UI — chat with your nanobot workspace."
+      "description": "Ziggy web UI — chat with your Ziggy workspace."
     }
   },
   "sidebar": {
@@ -85,6 +85,8 @@
     "assistantTyping": "Assistant is typing",
     "toolSingle": "Using a tool",
     "toolMany": "Used {{count}} tools",
+    "progressSingle": "Thinking",
+    "progressMany": "{{count}} updates",
     "imageAttachment": "Image attachment"
   },
   "lightbox": {

@@ -1,4 +1,12 @@
-import { Moon, PanelLeftClose, RefreshCcw, Settings, SquarePen, Sun } from "lucide-react";
+import {
+  BriefcaseBusiness,
+  Moon,
+  PanelLeftClose,
+  RefreshCcw,
+  Settings,
+  SquarePen,
+  Sun,
+} from "lucide-react";
 import { UserButton } from "@clerk/react";
 import { useTranslation } from "react-i18next";
 
@@ -19,7 +27,8 @@ interface SidebarProps {
   onRefresh: () => void;
   onRequestDelete: (key: string, label: string) => void;
   onCollapse: () => void;
-  activeView?: "chat" | "settings";
+  activeView?: "chat" | "activity" | "settings";
+  onOpenActivity: () => void;
   onOpenSettings: () => void;
 }
 
@@ -28,15 +37,21 @@ export function Sidebar(props: SidebarProps) {
   return (
     <aside className="flex h-full w-full flex-col border-r border-sidebar-border/70 bg-sidebar text-sidebar-foreground">
       <div className="flex items-center justify-between px-3 pb-2 pt-3">
-        <picture className="block min-w-0">
-          <source srcSet="/brand/nanobot_logo.webp" type="image/webp" />
+        <div className="flex min-w-0 items-center gap-2">
           <img
-            src="/brand/nanobot_logo.png"
-            alt="nanobot"
-            className="h-7 w-auto select-none object-contain"
+            src="/brand/ziggy_icon.png"
+            alt=""
+            className="h-7 w-7 select-none rounded-lg object-contain"
+            aria-hidden
             draggable={false}
           />
-        </picture>
+          <div className="min-w-0 leading-none">
+            <div className="truncate text-[15px] font-semibold tracking-normal">Ziggy</div>
+            <div className="truncate text-[10.5px] font-medium text-muted-foreground">
+              private agent workspace
+            </div>
+          </div>
+        </div>
         <div className="flex items-center gap-0.5">
           <Button
             variant="ghost"
@@ -96,10 +111,18 @@ export function Sidebar(props: SidebarProps) {
       <Separator className="bg-sidebar-border/50" />
       <div className="flex items-center justify-between gap-2 px-2.5 py-2 text-xs">
         <ConnectionBadge />
-        <div className="flex items-center gap-1.5">
+        <div className="flex items-center gap-1">
+          <Button
+            onClick={props.onOpenActivity}
+            className="h-7 gap-1 rounded-md px-1.5 text-[11px] text-muted-foreground hover:bg-sidebar-accent hover:text-sidebar-foreground"
+            variant={props.activeView === "activity" ? "secondary" : "ghost"}
+          >
+            <BriefcaseBusiness className="h-3.5 w-3.5" />
+            Work
+          </Button>
           <Button
             onClick={props.onOpenSettings}
-            className="h-7 gap-1.5 rounded-md px-2 text-[11px] text-muted-foreground hover:bg-sidebar-accent hover:text-sidebar-foreground"
+            className="h-7 gap-1 rounded-md px-1.5 text-[11px] text-muted-foreground hover:bg-sidebar-accent hover:text-sidebar-foreground"
             variant={props.activeView === "settings" ? "secondary" : "ghost"}
           >
             <Settings className="h-3.5 w-3.5" />

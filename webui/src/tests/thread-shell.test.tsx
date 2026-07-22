@@ -36,6 +36,11 @@ function makeClient() {
       for (const h of chatHandlers.get(chatId) ?? []) h(ev);
     },
     sendMessage: vi.fn(),
+    createWork: vi.fn(),
+    subscribeWork: vi.fn(),
+    cancelWork: vi.fn(),
+    sendWorkMessage: vi.fn(),
+    onWork: vi.fn(() => () => {}),
     newChat: vi.fn(),
     attach: vi.fn(),
     connect: vi.fn(),
@@ -466,5 +471,63 @@ describe("ThreadShell", () => {
     await waitFor(() => {
       expect(screen.queryByRole("group", { name: "Question" })).not.toBeInTheDocument();
     });
+  });
+
+  it("creates a chat before launching welcome composer background work", async () => {
+    const client = makeClient();
+    const onNewChat = vi.fn().mockResolvedValue("chat-new");
+    const onSessionPreview = vi.fn();
+
+    const { rerender } = render(
+      wrap(
+        client,
+        <ThreadShell
+          session={null}
+          title="Ziggy"
+          onToggleSidebar={() => {}}
+          onGoHome={() => {}}
+          onNewChat={onNewChat}
+          onSessionPreview={onSessionPreview}
+        />,
+      ),
+    );
+
+    fireEvent.change(screen.getByLabelText("Message input"), {
+      target: { value: "build a launch plan" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Run in background" }));
+
+    await waitFor(() => expect(onNewChat).toHaveBeenCalledTimes(1));
+    expect(onSessionPreview).toHaveBeenCalledWith(
+      "websocket:chat-new",
+      "build a launch plan",
+    );
+    expect(client.createWork).not.toHaveBeenCalled();
+
+    await act(async () => {
+      rerender(
+        wrap(
+          client,
+          <ThreadShell
+            session={session("chat-new")}
+            title="Chat chat-new"
+            onToggleSidebar={() => {}}
+            onGoHome={() => {}}
+            onNewChat={onNewChat}
+            onSessionPreview={onSessionPreview}
+          />,
+        ),
+      );
+    });
+
+    await waitFor(() =>
+      expect(client.createWork).toHaveBeenCalledWith(
+        "chat-new",
+        "build a launch plan",
+        undefined,
+      ),
+    );
+    expect(screen.getByText("Started background work. Open Work to track progress."))
+      .toBeInTheDocument();
   });
 });

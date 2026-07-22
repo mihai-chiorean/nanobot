@@ -1,5 +1,14 @@
 import type { BootstrapResponse } from "./types";
 
+export class BootstrapError extends Error {
+  status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.status = status;
+    this.name = "BootstrapError";
+  }
+}
+
 /**
  * Exchange a Clerk session JWT for short-lived tenant REST and WebSocket
  * credentials at the Ziggy front door.
@@ -15,7 +24,7 @@ export async function fetchBootstrap(
     },
   });
   if (!res.ok) {
-    throw new Error(`bootstrap failed: HTTP ${res.status}`);
+    throw new BootstrapError(res.status, `bootstrap failed: HTTP ${res.status}`);
   }
   const body = (await res.json()) as BootstrapResponse;
   if (!body.token || !body.ws_path) {

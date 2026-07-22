@@ -35,6 +35,7 @@ vi.mock("@/hooks/useSessions", async (importOriginal) => {
         error: null,
         refresh: refreshSpy,
         createChat: createChatSpy,
+        updateSessionPreview: vi.fn(),
         deleteChat: async (key: string) => {
           await deleteChatSpy(key);
           setSessions((prev: ChatSummary[]) => prev.filter((s) => s.key !== key));
@@ -52,6 +53,13 @@ vi.mock("@/hooks/useTheme", () => ({
 }));
 
 vi.mock("@/lib/bootstrap", () => ({
+  BootstrapError: class BootstrapError extends Error {
+    status: number;
+    constructor(status: number, message: string) {
+      super(message);
+      this.status = status;
+    }
+  },
   fetchBootstrap: vi.fn().mockResolvedValue({
     token: "tok",
     ws_path: "/",
@@ -68,7 +76,10 @@ vi.mock("@/lib/nanobot-client", () => {
     onStatus = () => () => {};
     onError = () => () => {};
     onChat = () => () => {};
+    onWork = () => () => {};
     sendMessage = vi.fn();
+    sendWorkMessage = vi.fn();
+    cancelWork = vi.fn();
     newChat = vi.fn();
     attach = vi.fn();
     close = vi.fn();
@@ -82,6 +93,7 @@ import App from "@/App";
 
 describe("App layout", () => {
   beforeEach(() => {
+    window.history.replaceState(null, "", "/");
     mockSessions = [];
     mockSignedIn = true;
     connectSpy.mockClear();
@@ -207,7 +219,19 @@ describe("App layout", () => {
     fireEvent.click(screen.getByRole("button", { name: "Settings" }));
 
     expect(await screen.findByRole("heading", { name: "General" })).toBeInTheDocument();
-    expect(screen.getByText("AI")).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "AI" })).toBeInTheDocument();
     expect(screen.getByDisplayValue("openai/gpt-4o")).toBeInTheDocument();
+  });
+
+  it("opens tenant-scoped Work from the sidebar", async () => {
+    render(<App />);
+
+    await waitFor(() => expect(connectSpy).toHaveBeenCalled());
+    fireEvent.click(screen.getByRole("button", { name: "Work" }));
+
+    expect(
+      await screen.findByRole("heading", { name: "Work" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/background tasks/i)).toBeInTheDocument();
   });
 });

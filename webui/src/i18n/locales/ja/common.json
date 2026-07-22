@@ -1,20 +1,20 @@
 {
   "app": {
-    "brand": "nanobot",
+    "brand": "Ziggy",
     "loading": {
-      "connecting": "nanobot に接続中…",
-      "boot": "nanobot を読み込み中…"
+      "connecting": "Ziggy に接続中…",
+      "boot": "Ziggy を読み込み中…"
     },
     "error": {
-      "title": "nanobot に接続できませんでした",
-      "gatewayHint": "gateway（`nanobot gateway`）が起動しており、このページが同じマシン上で開かれていることを確認してください。"
+      "title": "Ziggy に接続できませんでした",
+      "gatewayHint": "Ziggy は一時的に利用できません。しばらくしてからもう一度お試しください。"
     },
     "documentTitle": {
-      "base": "nanobot",
-      "chat": "{{title}} · nanobot"
+      "base": "Ziggy",
+      "chat": "{{title}} · Ziggy"
     },
     "meta": {
-      "description": "nanobot Web UI — nanobot ワークスペースと会話します。"
+      "description": "Ziggy Web UI — Ziggy ワークスペースと会話します。"
     }
   },
   "sidebar": {

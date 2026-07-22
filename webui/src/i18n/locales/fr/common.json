@@ -1,20 +1,20 @@
 {
   "app": {
-    "brand": "nanobot",
+    "brand": "Ziggy",
     "loading": {
-      "connecting": "Connexion à nanobot…",
-      "boot": "Chargement de nanobot…"
+      "connecting": "Connexion à Ziggy…",
+      "boot": "Chargement de Ziggy…"
     },
     "error": {
-      "title": "Impossible de joindre nanobot",
-      "gatewayHint": "Assurez-vous que la gateway est en cours d’exécution (`nanobot gateway`) et que cette page est ouverte sur la même machine."
+      "title": "Impossible de joindre Ziggy",
+      "gatewayHint": "Ziggy est temporairement indisponible. Réessayez dans un instant."
     },
     "documentTitle": {
-      "base": "nanobot",
-      "chat": "{{title}} · nanobot"
+      "base": "Ziggy",
+      "chat": "{{title}} · Ziggy"
     },
     "meta": {
-      "description": "Interface web nanobot — discutez avec votre espace de travail nanobot."
+      "description": "Interface web Ziggy — discutez avec votre espace de travail Ziggy."
     }
   },
   "sidebar": {

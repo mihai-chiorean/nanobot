@@ -6,8 +6,9 @@ import { ThreadComposer } from "@/components/thread/ThreadComposer";
 import { ThreadHeader } from "@/components/thread/ThreadHeader";
 import { StreamErrorNotice } from "@/components/thread/StreamErrorNotice";
 import { ThreadViewport } from "@/components/thread/ThreadViewport";
-import { useNanobotStream } from "@/hooks/useNanobotStream";
+import { useNanobotStream, type SendImage } from "@/hooks/useNanobotStream";
 import { useSessionHistory } from "@/hooks/useSessions";
+import { randomId } from "@/lib/id";
 import type { ChatSummary, UIMessage } from "@/lib/types";
 import { useClient } from "@/providers/ClientProvider";
 
@@ -17,6 +18,7 @@ interface ThreadShellProps {
   onToggleSidebar: () => void;
   onGoHome: () => void;
   onNewChat: () => Promise<string | null>;
+  onSessionPreview?: (key: string, preview: string) => void;
   hideSidebarToggleOnDesktop?: boolean;
 }
 
@@ -34,6 +36,7 @@ export function ThreadShell({
   onToggleSidebar,
   onGoHome,
   onNewChat,
+  onSessionPreview = () => {},
   hideSidebarToggleOnDesktop = false,
 }: ThreadShellProps) {
   const { t } = useTranslation();
@@ -43,6 +46,10 @@ export function ThreadShell({
   const { client, modelName } = useClient();
   const [booting, setBooting] = useState(false);
   const pendingFirstRef = useRef<string | null>(null);
+  const pendingBackgroundRef = useRef<{
+    content: string;
+    images?: SendImage[];
+  } | null>(null);
   const messageCacheRef = useRef<Map<string, UIMessage[]>>(new Map());
 
   const initial = useMemo(() => {
@@ -99,18 +106,49 @@ export function ThreadShell({
     const pending = pendingFirstRef.current;
     if (!pending) return;
     pendingFirstRef.current = null;
+    if (session) {
+      onSessionPreview(session.key, pending);
+    }
     client.sendMessage(chatId, pending);
     setMessages((prev) => [
       ...prev,
       {
-        id: crypto.randomUUID(),
+        id: randomId(),
         role: "user",
         content: pending,
         createdAt: Date.now(),
       },
     ]);
     setBooting(false);
-  }, [chatId, client, setMessages]);
+  }, [chatId, client, onSessionPreview, session, setMessages]);
+
+  useEffect(() => {
+    if (!chatId) return;
+    const pending = pendingBackgroundRef.current;
+    if (!pending) return;
+    pendingBackgroundRef.current = null;
+    if (session) {
+      onSessionPreview(session.key, pending.content);
+    }
+    client.createWork(
+      chatId,
+      pending.content,
+      pending.images?.map((img) => img.media),
+    );
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: randomId(),
+        role: "tool",
+        kind: "trace",
+        traceKind: "progress",
+        content: "Started background work. Open Work to track progress.",
+        traces: ["Started background work. Open Work to track progress."],
+        createdAt: Date.now(),
+      },
+    ]);
+    setBooting(false);
+  }, [chatId, client, onSessionPreview, session, setMessages]);
 
   const handleWelcomeSend = useCallback(
     async (content: string) => {
@@ -121,9 +159,62 @@ export function ThreadShell({
       if (!newId) {
         pendingFirstRef.current = null;
         setBooting(false);
+      } else {
+        onSessionPreview(`websocket:${newId}`, content);
       }
     },
-    [booting, onNewChat],
+    [booting, onNewChat, onSessionPreview],
+  );
+
+  const handleWelcomeBackground = useCallback(
+    async (content: string, images?: SendImage[]) => {
+      if (booting) return;
+      setBooting(true);
+      pendingBackgroundRef.current = { content, images };
+      const newId = await onNewChat();
+      if (!newId) {
+        pendingBackgroundRef.current = null;
+        setBooting(false);
+      } else {
+        onSessionPreview(`websocket:${newId}`, content);
+      }
+    },
+    [booting, onNewChat, onSessionPreview],
+  );
+
+  const handleSend = useCallback(
+    (content: string, images?: SendImage[]) => {
+      if (session) {
+        onSessionPreview(session.key, content);
+      }
+      send(content, images);
+    },
+    [onSessionPreview, send, session],
+  );
+
+  const handleSendBackground = useCallback(
+    (content: string, images?: SendImage[]) => {
+      if (!session || !chatId) return;
+      onSessionPreview(session.key, content);
+      client.createWork(
+        chatId,
+        content,
+        images?.map((img) => img.media),
+      );
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: randomId(),
+          role: "tool",
+          kind: "trace",
+          traceKind: "progress",
+          content: "Started background work. Open Work to track progress.",
+          traces: ["Started background work. Open Work to track progress."],
+          createdAt: Date.now(),
+        },
+      ]);
+    },
+    [chatId, client, onSessionPreview, session, setMessages],
   );
 
   const emptyState = loading ? (
@@ -134,13 +225,13 @@ export function ThreadShell({
     <div className="flex w-full max-w-[40rem] flex-col gap-2 text-left animate-in fade-in-0 slide-in-from-bottom-2 duration-500">
       <div className="inline-flex items-center gap-2 text-[11px] font-medium text-muted-foreground">
         <img
-          src="/brand/nanobot_icon.png"
+          src="/brand/ziggy_icon.png"
           alt=""
           aria-hidden
           draggable={false}
           className="h-4 w-4 rounded-sm opacity-90"
         />
-        <span className="text-foreground/82">nanobot</span>
+        <span className="text-foreground/82">Ziggy</span>
       </div>
       <p className="max-w-[28rem] text-[13px] leading-6 text-muted-foreground">
         {t("thread.empty.description")}
@@ -172,12 +263,13 @@ export function ThreadShell({
               <AskUserPrompt
                 question={pendingAsk.question}
                 buttons={pendingAsk.buttons}
-                onAnswer={send}
+                onAnswer={handleSend}
               />
             ) : null}
             {session ? (
               <ThreadComposer
-                onSend={send}
+                onSend={handleSend}
+                onSendBackground={handleSendBackground}
                 disabled={!chatId}
                 placeholder={
                   showHeroComposer
@@ -190,6 +282,7 @@ export function ThreadShell({
             ) : (
               <ThreadComposer
                 onSend={handleWelcomeSend}
+                onSendBackground={handleWelcomeBackground}
                 disabled={booting}
                 placeholder={
                   booting

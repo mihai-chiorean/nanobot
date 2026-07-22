@@ -1,8 +1,18 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  Component,
+  type ErrorInfo,
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { SignInButton, SignUpButton, useAuth } from "@clerk/react";
 import { useTranslation } from "react-i18next";
 import { DeleteConfirm } from "@/components/DeleteConfirm";
 import { Sidebar } from "@/components/Sidebar";
+import { ActivityView } from "@/components/activity/ActivityView";
 import { SettingsView } from "@/components/settings/SettingsView";
 import { ThreadShell } from "@/components/thread/ThreadShell";
 import { Sheet, SheetContent } from "@/components/ui/sheet";
@@ -12,6 +22,7 @@ import { useSessions } from "@/hooks/useSessions";
 import { useTheme } from "@/hooks/useTheme";
 import { cn } from "@/lib/utils";
 import { deriveWsUrl, fetchBootstrap } from "@/lib/bootstrap";
+import { shortChatId } from "@/lib/format";
 import { NanobotClient } from "@/lib/nanobot-client";
 import { ClientProvider } from "@/providers/ClientProvider";
 import type { ChatSummary } from "@/lib/types";
@@ -28,7 +39,57 @@ type BootState =
 
 const SIDEBAR_STORAGE_KEY = "nanobot-webui.sidebar";
 const SIDEBAR_WIDTH = 279;
-type ShellView = "chat" | "settings";
+type ShellView = "chat" | "activity" | "settings";
+
+interface ErrorBoundaryState {
+  error: Error | null;
+}
+
+class ErrorBoundary extends Component<
+  { children: ReactNode },
+  ErrorBoundaryState
+> {
+  state: ErrorBoundaryState = { error: null };
+
+  static getDerivedStateFromError(error: Error): ErrorBoundaryState {
+    return { error };
+  }
+
+  componentDidCatch(error: Error, info: ErrorInfo) {
+    console.error("Ziggy Web render error", error, info);
+  }
+
+  render() {
+    if (this.state.error) {
+      return (
+        <div className="flex h-full w-full items-center justify-center px-4 text-center">
+          <div className="flex max-w-md flex-col items-center gap-3">
+            <img
+              src="/brand/ziggy_icon.png"
+              alt=""
+              className="h-10 w-10 opacity-60 grayscale select-none"
+              aria-hidden
+              draggable={false}
+            />
+            <p className="text-lg font-semibold">Something went wrong</p>
+            <p className="text-sm text-muted-foreground">
+              {this.state.error.message}
+            </p>
+            <button
+              type="button"
+              className="rounded-md border border-border px-3 py-1.5 text-sm hover:bg-muted"
+              onClick={() => this.setState({ error: null })}
+            >
+              Try again
+            </button>
+          </div>
+        </div>
+      );
+    }
+
+    return this.props.children;
+  }
+}
 
 function readSidebarOpen(): boolean {
   if (typeof window === "undefined") return true;
@@ -56,6 +117,11 @@ function AuthenticatedApp({
 }) {
   const { t } = useTranslation();
   const [state, setState] = useState<BootState>({ status: "loading" });
+  const handleModelNameChange = useCallback((modelName: string | null) => {
+    setState((current) =>
+      current.status === "ready" ? { ...current, modelName } : current,
+    );
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -121,7 +187,7 @@ function AuthenticatedApp({
       <div className="flex h-full w-full items-center justify-center px-4 text-center">
         <div className="flex max-w-md flex-col items-center gap-3">
           <img
-            src="/brand/nanobot_icon.png"
+            src="/brand/ziggy_icon.png"
             alt=""
             className="h-10 w-10 opacity-60 grayscale select-none"
             aria-hidden
@@ -136,20 +202,15 @@ function AuthenticatedApp({
       </div>
     );
   }
-
-  const handleModelNameChange = (modelName: string | null) => {
-    setState((current) =>
-      current.status === "ready" ? { ...current, modelName } : current,
-    );
-  };
-
   return (
     <ClientProvider
       client={state.client}
       token={state.token}
       modelName={state.modelName}
     >
-      <Shell onModelNameChange={handleModelNameChange} />
+      <ErrorBoundary>
+        <Shell onModelNameChange={handleModelNameChange} />
+      </ErrorBoundary>
     </ClientProvider>
   );
 }
@@ -160,7 +221,7 @@ function LoadingView() {
     <div className="flex h-full w-full items-center justify-center">
       <div className="flex flex-col items-center gap-3 animate-in fade-in-0 duration-300">
         <img
-          src="/brand/nanobot_icon.png"
+          src="/brand/ziggy_icon.png"
           alt=""
           className="h-10 w-10 animate-pulse select-none"
           aria-hidden
@@ -183,9 +244,9 @@ function SignedOutView() {
     <main className="flex h-full w-full items-center justify-center bg-background px-6">
       <div className="flex w-full max-w-xs flex-col items-center gap-6 text-center">
         <picture>
-          <source srcSet="/brand/nanobot_logo.webp" type="image/webp" />
+          <source srcSet="/brand/ziggy_wordmark.svg" type="image/svg+xml" />
           <img
-            src="/brand/nanobot_logo.png"
+            src="/brand/ziggy_wordmark.png"
             alt="Ziggy"
             className="h-10 w-auto select-none object-contain"
             draggable={false}
@@ -209,7 +270,14 @@ function SignedOutView() {
 function Shell({ onModelNameChange }: { onModelNameChange: (modelName: string | null) => void }) {
   const { t, i18n } = useTranslation();
   const { theme, toggle } = useTheme();
-  const { sessions, loading, refresh, createChat, deleteChat } = useSessions();
+  const {
+    sessions,
+    loading,
+    refresh,
+    createChat,
+    deleteChat,
+    updateSessionPreview,
+  } = useSessions();
   const [activeKey, setActiveKey] = useState<string | null>(null);
   const [view, setView] = useState<ShellView>("chat");
   const [desktopSidebarOpen, setDesktopSidebarOpen] =
@@ -306,7 +374,7 @@ function Shell({ onModelNameChange }: { onModelNameChange: (modelName: string | 
 
   const headerTitle = activeSession
     ? activeSession.preview ||
-      t("chat.fallbackTitle", { id: activeSession.chatId.slice(0, 6) })
+      t("chat.fallbackTitle", { id: shortChatId(activeSession.chatId) })
     : t("app.brand");
 
   useEffect(() => {
@@ -329,6 +397,10 @@ function Shell({ onModelNameChange }: { onModelNameChange: (modelName: string | 
     onRequestDelete: (key: string, label: string) =>
       setPendingDelete({ key, label }),
     activeView: view,
+    onOpenActivity: () => {
+      setView("activity" as const);
+      setMobileSidebarOpen(false);
+    },
     onOpenSettings: () => {
       setView("settings" as const);
       setMobileSidebarOpen(false);
@@ -370,7 +442,16 @@ function Shell({ onModelNameChange }: { onModelNameChange: (modelName: string | 
       </Sheet>
 
       <main className="flex h-full min-w-0 flex-1 flex-col">
-        {view === "settings" ? (
+        {view === "activity" ? (
+          <ActivityView
+            onBackToChat={() => setView("chat")}
+            onOpenChat={(key) => {
+              setActiveKey(key);
+              setView("chat");
+              setMobileSidebarOpen(false);
+            }}
+          />
+        ) : view === "settings" ? (
           <SettingsView
             theme={theme}
             onToggleTheme={toggle}
@@ -384,6 +465,7 @@ function Shell({ onModelNameChange }: { onModelNameChange: (modelName: string | 
             onToggleSidebar={toggleSidebar}
             onGoHome={() => setActiveKey(null)}
             onNewChat={onNewChat}
+            onSessionPreview={updateSessionPreview}
             hideSidebarToggleOnDesktop={desktopSidebarOpen}
           />
         )}

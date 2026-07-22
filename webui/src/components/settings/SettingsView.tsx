@@ -1,13 +1,13 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { ChevronLeft, Loader2 } from "lucide-react";
+import { ChevronLeft, Loader2, RefreshCw } from "lucide-react";
 
 import { LanguageSwitcher } from "@/components/LanguageSwitcher";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { fetchSettings, updateSettings } from "@/lib/api";
+import { fetchSettings, switchModel, updateSettings } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { useClient } from "@/providers/ClientProvider";
-import type { SettingsPayload } from "@/lib/types";
+import type { ModelSwitchTarget, SettingsPayload } from "@/lib/types";
 
 interface SettingsViewProps {
   theme: "light" | "dark";
@@ -24,6 +24,7 @@ export function SettingsView({
   const [settings, setSettings] = useState<SettingsPayload | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [switchingTarget, setSwitchingTarget] = useState<ModelSwitchTarget | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [form, setForm] = useState({
     model: "",
@@ -36,7 +37,8 @@ export function SettingsView({
       model: payload.agent.model,
       provider: payload.agent.provider,
     });
-  }, []);
+    onModelNameChange(payload.model_runtime?.active_model || payload.agent.model || null);
+  }, [onModelNameChange]);
 
   useEffect(() => {
     let cancelled = false;
@@ -59,6 +61,23 @@ export function SettingsView({
     };
   }, [applyPayload, token]);
 
+  useEffect(() => {
+    if (settings?.model_runtime?.status !== "switching") return;
+    const id = window.setInterval(() => {
+      fetchSettings(token)
+        .then((payload) => {
+          applyPayload(payload);
+          if (payload.model_runtime?.status !== "switching") {
+            setSwitchingTarget(null);
+          }
+        })
+        .catch(() => {
+          // The gateway restarts during a switch. Keep polling quietly.
+        });
+    }, 5_000);
+    return () => window.clearInterval(id);
+  }, [applyPayload, settings?.model_runtime?.status, token]);
+
   const dirty = useMemo(() => {
     if (!settings) return false;
     return (
@@ -73,12 +92,25 @@ export function SettingsView({
     try {
       const payload = await updateSettings(token, form);
       applyPayload(payload);
-      onModelNameChange(payload.agent.model || null);
       setError(null);
     } catch (err) {
       setError((err as Error).message);
     } finally {
       setSaving(false);
+    }
+  };
+
+  const switchRuntime = async (target: ModelSwitchTarget) => {
+    if (switchingTarget) return;
+    setSwitchingTarget(target);
+    try {
+      const runtime = await switchModel(token, target);
+      setSettings((prev) => prev ? { ...prev, model_runtime: runtime } : prev);
+      onModelNameChange(runtime.active_model ?? null);
+      setError(null);
+    } catch (err) {
+      setError((err as Error).message);
+      setSwitchingTarget(null);
     }
   };
 
@@ -114,7 +146,9 @@ export function SettingsView({
             settings={settings}
             dirty={dirty}
             saving={saving}
+            switchingTarget={switchingTarget}
             onSave={save}
+            onSwitchModel={switchRuntime}
           />
         ) : null}
       </main>
@@ -128,7 +162,9 @@ function SettingsSection({
   settings,
   dirty,
   saving,
+  switchingTarget,
   onSave,
+  onSwitchModel,
 }: {
   form: {
     model: string;
@@ -141,8 +177,13 @@ function SettingsSection({
   settings: SettingsPayload;
   dirty: boolean;
   saving: boolean;
+  switchingTarget: ModelSwitchTarget | null;
   onSave: () => void;
+  onSwitchModel: (target: ModelSwitchTarget) => void;
 }) {
+  const runtime = settings.model_runtime;
+  const isSwitching = runtime?.status === "switching" || switchingTarget !== null;
+  const active = runtime?.active_model || settings.agent.model;
   return (
     <div className="space-y-7">
       <section>
@@ -171,6 +212,51 @@ function SettingsSection({
               onChange={(event) => setForm((prev) => ({ ...prev, model: event.target.value }))}
               className="h-8 w-[280px]"
             />
+          </SettingsRow>
+
+          <SettingsRow title="Active backend">
+            <div className="flex flex-col items-end gap-2">
+              <div className="flex items-center gap-2 text-sm">
+                {isSwitching ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" />
+                ) : null}
+                <span className="font-medium">{active}</span>
+                {runtime?.engine ? (
+                  <span className="text-xs text-muted-foreground">{runtime.engine}</span>
+                ) : null}
+              </div>
+              {runtime?.error ? (
+                <div className="max-w-[360px] text-right text-xs text-destructive">
+                  {runtime.error}
+                </div>
+              ) : null}
+              <div className="flex gap-2">
+                <Button
+                  type="button"
+                  size="sm"
+                  variant={active === "qwen3.6-35b" ? "secondary" : "outline"}
+                  disabled={isSwitching}
+                  onClick={() => onSwitchModel("qwen")}
+                >
+                  {switchingTarget === "qwen" ? (
+                    <RefreshCw className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                  ) : null}
+                  Use Qwen
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant={active === "MiniMax-M2.5" ? "secondary" : "outline"}
+                  disabled={isSwitching}
+                  onClick={() => onSwitchModel("minimax")}
+                >
+                  {switchingTarget === "minimax" ? (
+                    <RefreshCw className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                  ) : null}
+                  Use MiniMax
+                </Button>
+              </div>
+            </div>
           </SettingsRow>
 
           {(dirty || saving || settings.requires_restart) ? (
@@ -235,7 +321,7 @@ function SettingsFooter({
   return (
     <div className="flex min-h-[52px] items-center justify-between gap-4 px-3 py-2.5">
       <div className="text-sm text-muted-foreground">
-        {saved ? "Saved. Restart nanobot to apply." : "Unsaved changes."}
+        {saved ? "Saved. Restart the agent runtime to apply." : "Unsaved changes."}
       </div>
       <Button size="sm" variant="outline" onClick={onSave} disabled={!dirty || saving}>
         {saving ? "Saving" : "Save"}

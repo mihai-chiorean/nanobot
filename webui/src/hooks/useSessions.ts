@@ -22,6 +22,7 @@ export function useSessions(): {
   refresh: () => Promise<void>;
   createChat: () => Promise<string>;
   deleteChat: (key: string) => Promise<void>;
+  updateSessionPreview: (key: string, preview: string) => void;
 } {
   const { client, token } = useClient();
   const [sessions, setSessions] = useState<ChatSummary[]>([]);
@@ -76,7 +77,27 @@ export function useSessions(): {
     [],
   );
 
-  return { sessions, loading, error, refresh, createChat, deleteChat };
+  const updateSessionPreview = useCallback((key: string, preview: string) => {
+    const clean = preview.replace(/\s+/g, " ").trim();
+    if (!clean) return;
+    setSessions((prev) =>
+      prev.map((s) =>
+        s.key === key
+          ? { ...s, preview: s.preview || clean, updatedAt: new Date().toISOString() }
+          : s,
+      ),
+    );
+  }, []);
+
+  return {
+    sessions,
+    loading,
+    error,
+    refresh,
+    createChat,
+    deleteChat,
+    updateSessionPreview,
+  };
 }
 
 /** Lazy-load a session's on-disk messages the first time the UI displays it. */

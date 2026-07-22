@@ -1,20 +1,20 @@
 {
   "app": {
-    "brand": "nanobot",
+    "brand": "Ziggy",
     "loading": {
-      "connecting": "Menghubungkan ke nanobot…",
-      "boot": "Memuat nanobot…"
+      "connecting": "Menghubungkan ke Ziggy…",
+      "boot": "Memuat Ziggy…"
     },
     "error": {
-      "title": "Tidak dapat menjangkau nanobot",
-      "gatewayHint": "Pastikan gateway sedang berjalan (`nanobot gateway`) dan halaman ini dibuka pada mesin yang sama."
+      "title": "Tidak dapat menjangkau Ziggy",
+      "gatewayHint": "Ziggy sementara tidak tersedia. Coba lagi sebentar lagi."
     },
     "documentTitle": {
-      "base": "nanobot",
-      "chat": "{{title}} · nanobot"
+      "base": "Ziggy",
+      "chat": "{{title}} · Ziggy"
     },
     "meta": {
-      "description": "UI web nanobot — ngobrol dengan workspace nanobot Anda."
+      "description": "UI web Ziggy — ngobrol dengan workspace Ziggy Anda."
     }
   },
   "sidebar": {
