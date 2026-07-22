@@ -41,8 +41,10 @@ class ReportProgressTool(Tool):
             return "No active Work task."
         previous = current_step_id.get()
         if previous:
-            store.finish_step(task_id, previous, summary=summary or None)
-        step_id = store.start_step(task_id, title)
+            await store.run_io(
+                store.finish_step, task_id, previous, summary=summary or None
+            )
+        step_id = await store.run_io(store.start_step, task_id, title)
         current_step_id.set(step_id)
         return f"Progress recorded: {title}"
 
@@ -103,7 +105,8 @@ class PublishArtifactTool(Tool):
             source_path = candidate
         if source_path is None and content is None:
             return "Error: provide either content or path."
-        artifact = store.add_artifact(
+        artifact = await store.run_io(
+            store.add_artifact,
             task_id,
             name=name,
             kind=kind,

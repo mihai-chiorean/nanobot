@@ -69,7 +69,7 @@ final class RichTransportTests: XCTestCase {
 
     func testWebSocketAuthorizationNeverUsesURLQuery() throws {
         let request = try ZiggyWebSocketClient.makeWebSocketRequest(
-            baseURL: try XCTUnwrap(URL(string: "https://example.test/ws")),
+            baseURL: try XCTUnwrap(URL(string: "https://chat.mihaichiorean.com/ws")),
             credential: WebSocketCredential(bearerToken: "secret")
         )
         XCTAssertEqual(request.url?.scheme, "wss")
@@ -80,7 +80,7 @@ final class RichTransportTests: XCTestCase {
 
     func testWebSocketRequestRejectsServerURLQuery() throws {
         XCTAssertThrowsError(try ZiggyWebSocketClient.makeWebSocketRequest(
-            baseURL: try XCTUnwrap(URL(string: "https://example.test/ws?client_id=ios")),
+            baseURL: try XCTUnwrap(URL(string: "https://chat.mihaichiorean.com/ws?client_id=ios")),
             credential: WebSocketCredential(bearerToken: "secret")
         )) { error in
             XCTAssertEqual(error as? ZiggyRESTError, .invalidURL)

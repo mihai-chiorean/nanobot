@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,26 @@ from loguru import logger
 
 class ModelSwitchUnavailableError(Exception):
     """The configured model switch executable isn't installed."""
+
+
+class ModelSwitchInProgressError(Exception):
+    """A model transition is already running in this appliance runtime."""
+
+
+_MAX_SWITCH_LOG_BYTES = 5 * 1024 * 1024
+_switch_guard = threading.Lock()
+_switch_process: subprocess.Popen[bytes] | None = None
+
+
+def _rotate_log(path: Path) -> None:
+    try:
+        if path.stat().st_size < _MAX_SWITCH_LOG_BYTES:
+            return
+    except FileNotFoundError:
+        return
+    rotated = path.with_name(f"{path.name}.1")
+    rotated.unlink(missing_ok=True)
+    path.replace(rotated)
 
 
 def state_path() -> Path:
@@ -53,6 +74,8 @@ def read_status() -> dict[str, Any]:
 
 
 def request_switch(target: str, *, force: bool = False) -> dict[str, Any]:
+    global _switch_process
+
     target = target.strip().lower()
     if target not in {"qwen", "minimax"}:
         raise ValueError("target must be qwen or minimax")
@@ -71,16 +94,20 @@ def request_switch(target: str, *, force: bool = False) -> dict[str, Any]:
         if configured_log
         else state_path().with_name("model-switch-http.log")
     )
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("ab", buffering=0) as log:
-        subprocess.Popen(
-            args,
-            stdin=subprocess.DEVNULL,
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-            close_fds=True,
-        )
+    with _switch_guard:
+        if _switch_process is not None and _switch_process.poll() is None:
+            raise ModelSwitchInProgressError("a model switch is already in progress")
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        _rotate_log(log_path)
+        with log_path.open("ab", buffering=0) as log:
+            _switch_process = subprocess.Popen(
+                args,
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                close_fds=True,
+            )
     status = read_status()
     status.update(
         {

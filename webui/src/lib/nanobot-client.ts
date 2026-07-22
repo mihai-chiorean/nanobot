@@ -80,6 +80,8 @@ export class NanobotClient {
   // Set by ``close()`` so the onclose handler knows the drop was intentional
   // and must not schedule a reconnect or flip status back to "reconnecting".
   private intentionallyClosed = false;
+  // Invalidates reconnect callbacks that are awaiting token refresh.
+  private reconnectGeneration = 0;
 
   constructor(private options: NanobotClientOptions) {
     this.shouldReconnect = options.reconnect ?? true;
@@ -149,9 +151,15 @@ export class NanobotClient {
 
   close(): void {
     this.intentionallyClosed = true;
+    this.reconnectGeneration += 1;
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
+    }
+    if (this.pendingNewChat) {
+      clearTimeout(this.pendingNewChat.timer);
+      this.pendingNewChat.reject(new Error("socket closed"));
+      this.pendingNewChat = null;
     }
     const sock = this.socket;
     this.socket = null;
@@ -355,18 +363,22 @@ export class NanobotClient {
   private scheduleReconnect(): void {
     this.setStatus("reconnecting");
     const attempt = this.reconnectAttempts++;
+    const generation = this.reconnectGeneration;
     // Exponential backoff: 0.5s, 1s, 2s, 4s, capped.
     const delay = Math.min(500 * 2 ** attempt, this.maxBackoffMs);
     this.reconnectTimer = setTimeout(async () => {
       this.reconnectTimer = null;
+      if (this.intentionallyClosed || generation !== this.reconnectGeneration) return;
       if (this.options.onReauth) {
         try {
           const refreshed = await this.options.onReauth();
+          if (this.intentionallyClosed || generation !== this.reconnectGeneration) return;
           if (refreshed) this.currentUrl = refreshed;
         } catch {
           // fall through to retry with current URL
         }
       }
+      if (this.intentionallyClosed || generation !== this.reconnectGeneration) return;
       this.connect();
     }, delay);
   }

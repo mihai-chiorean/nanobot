@@ -288,43 +288,49 @@ class _WorkHook(AgentHook):
 
     async def before_iteration(self, context: AgentHookContext) -> None:
         if context.iteration == 0:
-            await self._publish(self._loop.work_store.update_status(self._task_id, "running"))
+            event = await self._loop.work_store.run_io(
+                self._loop.work_store.update_status, self._task_id, "running"
+            )
+            await self._publish(event)
 
     async def before_execute_tools(self, context: AgentHookContext) -> None:
         for tool_call in context.tool_calls:
-            await self._publish(
-                self._loop.work_store.append_event(
-                    self._task_id,
-                    "tool.started",
-                    {"name": tool_call.name, "arguments": tool_call.arguments or {}},
-                    actor="main_agent",
-                )
+            event = await self._loop.work_store.run_io(
+                self._loop.work_store.append_event,
+                self._task_id,
+                "tool.started",
+                {"name": tool_call.name, "arguments": tool_call.arguments or {}},
+                actor="main_agent",
             )
+            await self._publish(event)
 
     async def after_iteration(self, context: AgentHookContext) -> None:
         # Work tools append step and artifact events synchronously. Replay any
         # events they added before emitting the generic tool completion rows.
-        for event in self._loop.work_store.list_events(
-            self._task_id, after_seq=self._last_published_seq
-        ):
+        events = await self._loop.work_store.run_io(
+            self._loop.work_store.list_events,
+            self._task_id,
+            after_seq=self._last_published_seq,
+        )
+        for event in events:
             await self._publish(event)
         for tool_event in context.tool_events or []:
-            await self._publish(
-                self._loop.work_store.append_event(
-                    self._task_id,
-                    "tool.finished",
-                    dict(tool_event),
-                    actor="main_agent",
-                )
+            event = await self._loop.work_store.run_io(
+                self._loop.work_store.append_event,
+                self._task_id,
+                "tool.finished",
+                dict(tool_event),
+                actor="main_agent",
             )
+            await self._publish(event)
         if context.stop_reason == "ask_user":
-            await self._publish(
-                self._loop.work_store.update_status(
-                    self._task_id,
-                    "waiting",
-                    result_summary=context.final_content,
-                )
+            event = await self._loop.work_store.run_io(
+                self._loop.work_store.update_status,
+                self._task_id,
+                "waiting",
+                result_summary=context.final_content,
             )
+            await self._publish(event)
 
 
 class AgentLoop:
@@ -724,7 +730,8 @@ class AgentLoop:
         task_id = self._work_task_id(msg.metadata)
         if task_id is None:
             return
-        event = self.work_store.update_status(
+        event = await self.work_store.run_io(
+            self.work_store.update_status,
             task_id,
             status,
             error=error,

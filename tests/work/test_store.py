@@ -1,3 +1,5 @@
+import asyncio
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Barrier
@@ -101,3 +103,43 @@ def test_terminal_status_update_is_idempotent(tmp_path: Path) -> None:
         "task.created",
         "status.changed",
     ]
+
+
+def test_event_retention_and_page_size_are_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(store_module, "MAX_EVENTS_PER_TASK", 3)
+    store = WorkStore(tmp_path)
+    task = _task(store)
+    for index in range(5):
+        store.append_event(task["task_id"], "progress", {"index": index})
+
+    events = store.list_events(task["task_id"], limit=2)
+    assert [event["seq"] for event in events] == [4, 5]
+    assert [event["seq"] for event in store.list_events(task["task_id"])] == [4, 5, 6]
+
+
+def test_artifact_count_and_tenant_storage_are_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(store_module, "MAX_ARTIFACTS_PER_TASK", 1)
+    monkeypatch.setattr(store_module, "MAX_TENANT_ARTIFACT_BYTES", 5)
+    store = WorkStore(tmp_path)
+    first_task = _task(store)
+    second_task = _task(store)
+    store.add_artifact(first_task["task_id"], name="one.txt", kind="file", content="123")
+
+    with pytest.raises(ValueError, match="count limit"):
+        store.add_artifact(first_task["task_id"], name="two.txt", kind="file", content="1")
+    with pytest.raises(ValueError, match="Tenant Work artifact storage"):
+        store.add_artifact(second_task["task_id"], name="three.txt", kind="file", content="456")
+
+
+def test_run_io_executes_store_work_off_event_loop(tmp_path: Path) -> None:
+    store = WorkStore(tmp_path)
+    event_loop_thread = threading.get_ident()
+
+    async def run() -> int:
+        return await store.run_io(threading.get_ident)
+
+    assert asyncio.run(run()) != event_loop_thread

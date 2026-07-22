@@ -73,7 +73,12 @@ class ClerkTokenVerifier:
 
     @property
     def configured(self) -> bool:
-        return bool(self.issuer and self.jwks_url and self.allowed_emails)
+        return bool(
+            self.issuer
+            and self.jwks_url
+            and self.allowed_emails
+            and self.authorized_parties
+        )
 
     async def verify(self, token: str) -> dict[str, Any]:
         if not token:
@@ -109,7 +114,7 @@ class ClerkTokenVerifier:
             raise ClerkAuthenticationError("invalid bearer token") from exc
 
         authorized_party = claims.get("azp")
-        if authorized_party is not None and (
+        if (
             not isinstance(authorized_party, str)
             or authorized_party not in self.authorized_parties
         ):

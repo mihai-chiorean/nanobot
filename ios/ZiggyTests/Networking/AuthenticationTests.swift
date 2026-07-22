@@ -19,10 +19,28 @@ final class AuthenticationTests: XCTestCase {
         }
 
         let result = try await ZiggyRESTClient(
-            baseURL: try XCTUnwrap(URL(string: "https://example.test")),
+            baseURL: try XCTUnwrap(URL(string: "https://chat.mihaichiorean.com")),
             session: session
         ).bootstrapAuthenticated(identityToken: "clerk-session-token")
         XCTAssertEqual(result.restToken, "short")
+    }
+
+    func testAuthenticatedBootstrapRejectsAnUntrustedConfiguredHostBeforeNetworking() async throws {
+        let session = makeSession()
+        URLProtocolStub.handler = { _ in
+            XCTFail("an identity token request must not reach an untrusted host")
+            throw URLError(.badServerResponse)
+        }
+
+        do {
+            _ = try await ZiggyRESTClient(
+                baseURL: try XCTUnwrap(URL(string: "https://attacker.example")),
+                session: session
+            ).bootstrapAuthenticated(identityToken: "clerk-session-token")
+            XCTFail("expected untrusted host rejection")
+        } catch {
+            XCTAssertEqual(error as? ZiggyRESTError, .invalidURL)
+        }
     }
 
     func testClerkCallbackValidationAcceptsOnlyTheRegisteredCallback() throws {
@@ -40,16 +58,35 @@ final class AuthenticationTests: XCTestCase {
         )))
     }
 
-    func testRESTResponseLimitAppliesBeforeDecode() async throws {
+    func testRESTResponseLimitUsesContentLengthPrecheck() async throws {
         let session = makeSession()
         URLProtocolStub.handler = { request in
             Self.response(for: request, body: String(repeating: "x", count: 65))
         }
         let client = ZiggyRESTClient(
-            baseURL: try XCTUnwrap(URL(string: "https://example.test")),
+            baseURL: try XCTUnwrap(URL(string: "https://chat.mihaichiorean.com")),
             session: session,
             maxResponseBytes: 64
         )
+        do {
+            _ = try await client.fetchSessions()
+            XCTFail("expected response limit")
+        } catch {
+            XCTAssertEqual(error as? ZiggyRESTError, .responseTooLarge(limit: 64))
+        }
+    }
+
+    func testRESTResponseLimitAppliesWhileReadingChunkedBody() async throws {
+        let session = makeSession()
+        URLProtocolStub.handler = { request in
+            Self.response(for: request, body: String(repeating: "x", count: 65), includeContentLength: false)
+        }
+        let client = ZiggyRESTClient(
+            baseURL: try XCTUnwrap(URL(string: "https://chat.mihaichiorean.com")),
+            session: session,
+            maxResponseBytes: 64
+        )
+
         do {
             _ = try await client.fetchSessions()
             XCTFail("expected response limit")
@@ -80,12 +117,17 @@ final class AuthenticationTests: XCTestCase {
         return URLSession(configuration: configuration)
     }
 
-    private static func response(for request: URLRequest, body: String) -> (HTTPURLResponse, Data) {
+    private static func response(for request: URLRequest, body: String,
+                                 includeContentLength: Bool = true) -> (HTTPURLResponse, Data) {
+        var headers = ["Content-Type": "application/json"]
+        if includeContentLength {
+            headers["Content-Length"] = String(Data(body.utf8).count)
+        }
         let response = HTTPURLResponse(
             url: request.url!,
             statusCode: 200,
             httpVersion: nil,
-            headerFields: ["Content-Type": "application/json"]
+            headerFields: headers
         )!
         return (response, Data(body.utf8))
     }

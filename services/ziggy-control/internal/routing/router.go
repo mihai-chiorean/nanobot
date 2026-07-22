@@ -144,6 +144,10 @@ func (router *Router) Default() httpapi.TenantRoute {
 	return router.fallback
 }
 
+func (router *Router) TenantCount() int {
+	return len(router.byUserID)
+}
+
 func (router *Router) cleanupExpired() {
 	now := router.now()
 	router.entries.Range(func(key, value any) bool {

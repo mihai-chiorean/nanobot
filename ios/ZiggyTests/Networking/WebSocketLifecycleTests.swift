@@ -70,7 +70,7 @@ final class WebSocketLifecycleTests: XCTestCase {
         heartbeatInterval: Duration = .seconds(10)
     ) -> ZiggyWebSocketClient {
         ZiggyWebSocketClient(
-            baseURL: URL(string: "https://ziggy.example.test")!,
+            baseURL: URL(string: "https://chat.mihaichiorean.com")!,
             heartbeatInterval: heartbeatInterval,
             credentialProvider: { WebSocketCredential(bearerToken: "test-token") },
             connectionFactory: { _ in connection }
@@ -179,7 +179,7 @@ private final class TestWebSocketConnection: ZiggyWebSocketConnection, @unchecke
         self.state = State()
         if let statusCode {
             response = HTTPURLResponse(
-                url: URL(string: "https://ziggy.example.test")!,
+                url: URL(string: "https://chat.mihaichiorean.com")!,
                 statusCode: statusCode,
                 httpVersion: nil,
                 headerFields: nil

@@ -1,6 +1,7 @@
 """Message tool for sending messages to users."""
 
 import os
+import stat
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -8,7 +9,66 @@ from typing import Any, Awaitable, Callable
 from nanobot.agent.tools.base import Tool, tool_parameters
 from nanobot.agent.tools.schema import ArraySchema, StringSchema, tool_parameters_schema
 from nanobot.bus.events import OutboundMessage
-from nanobot.config.paths import get_workspace_path
+from nanobot.config.paths import get_media_dir, get_workspace_path
+
+_MEDIA_REJECTED = (
+    "Error: attachment must be an existing regular file inside the workspace "
+    "or approved media directory"
+)
+
+
+def _is_under(path: Path, directory: Path) -> bool:
+    try:
+        path.relative_to(directory)
+    except ValueError:
+        return False
+    return True
+
+
+def _contains_symlink(path: Path) -> bool:
+    """Return whether any component of *path* is a symlink.
+
+    The path is checked before resolving it so a symlink cannot be used to
+    make an otherwise allowed-looking attachment point at another file.
+    """
+    current = Path(path.anchor)
+    for part in path.parts:
+        if part == path.anchor:
+            continue
+        current /= part
+        try:
+            if current.is_symlink():
+                return True
+        except OSError:
+            return True
+    return False
+
+
+def _resolve_attachment(path: str, workspace: Path) -> Path | None:
+    """Resolve and validate a local attachment against the allowed roots."""
+    try:
+        candidate = Path(path).expanduser()
+        if not candidate.is_absolute():
+            candidate = workspace / candidate
+        if _contains_symlink(candidate):
+            return None
+        resolved = candidate.resolve(strict=True)
+        roots = (workspace.resolve(strict=False), get_media_dir().resolve(strict=False))
+        if not any(_is_under(resolved, root) for root in roots):
+            return None
+
+        # Validate the file at the point of acceptance. O_NOFOLLOW prevents a
+        # final-component symlink from being accepted during this check.
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(resolved, flags)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return None
+        finally:
+            os.close(fd)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return resolved
 
 
 @tool_parameters(
@@ -39,7 +99,9 @@ class MessageTool(Tool):
         workspace: str | Path | None = None,
     ):
         self._send_callback = send_callback
-        self._workspace = Path(workspace).expanduser() if workspace is not None else get_workspace_path()
+        self._workspace = (
+            Path(workspace).expanduser() if workspace is not None else get_workspace_path()
+        ).resolve(strict=False)
         self._default_channel: ContextVar[str] = ContextVar("message_default_channel", default=default_channel)
         self._default_chat_id: ContextVar[str] = ContextVar("message_default_chat_id", default=default_chat_id)
         self._default_message_id: ContextVar[str | None] = ContextVar(
@@ -147,13 +209,18 @@ class MessageTool(Tool):
             return "Error: Message sending not configured"
 
         if media:
-            resolved = []
+            resolved_media: list[str] = []
             for p in media:
-                if p.startswith(("http://", "https://")) or os.path.isabs(p):
-                    resolved.append(p)
-                else:
-                    resolved.append(str(self._workspace / p))
-            media = resolved
+                if not isinstance(p, str):
+                    return _MEDIA_REJECTED
+                if p.lower().startswith(("http://", "https://")):
+                    resolved_media.append(p)
+                    continue
+                resolved_path = _resolve_attachment(p, self._workspace)
+                if resolved_path is None:
+                    return _MEDIA_REJECTED
+                resolved_media.append(str(resolved_path))
+            media = resolved_media
 
         metadata = dict(self._default_metadata.get()) if same_target else {}
         if message_id:

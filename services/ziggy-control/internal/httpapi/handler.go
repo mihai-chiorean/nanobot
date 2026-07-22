@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"path"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -37,6 +38,7 @@ type Config struct {
 	HTTPInFlight      int64
 	SSEInFlight       int64
 	WebSocketInFlight int64
+	TenantCount       int
 	Version           string
 }
 
@@ -62,9 +64,14 @@ const (
 	defaultHTTPInFlight      = int64(64)
 	defaultSSEInFlight       = int64(8)
 	defaultWebSocketInFlight = int64(8)
+	anonymousTenant          = "<anonymous>"
 )
 
 type admissionClass uint8
+
+type tenantCountProvider interface {
+	TenantCount() int
+}
 
 const (
 	admissionHTTP admissionClass = iota
@@ -95,12 +102,20 @@ func (gate *admissionGate) tryAcquire() (func(), bool) {
 }
 
 type inboundAdmission struct {
-	http      admissionGate
-	sse       admissionGate
-	webSocket admissionGate
+	http             admissionGate
+	sse              admissionGate
+	webSocket        admissionGate
+	tenantCount      int64
+	httpTenants      sync.Map
+	sseTenants       sync.Map
+	webSocketTenants sync.Map
 }
 
 func newInboundAdmission(httpLimit, sseLimit, webSocketLimit int64) *inboundAdmission {
+	return newInboundAdmissionWithTenantCount(httpLimit, sseLimit, webSocketLimit, 1)
+}
+
+func newInboundAdmissionWithTenantCount(httpLimit, sseLimit, webSocketLimit int64, tenantCount int) *inboundAdmission {
 	if httpLimit <= 0 {
 		httpLimit = defaultHTTPInFlight
 	}
@@ -110,10 +125,14 @@ func newInboundAdmission(httpLimit, sseLimit, webSocketLimit int64) *inboundAdmi
 	if webSocketLimit <= 0 {
 		webSocketLimit = defaultWebSocketInFlight
 	}
+	if tenantCount <= 0 {
+		tenantCount = 1
+	}
 	return &inboundAdmission{
-		http:      admissionGate{limit: httpLimit},
-		sse:       admissionGate{limit: sseLimit},
-		webSocket: admissionGate{limit: webSocketLimit},
+		http:        admissionGate{limit: httpLimit},
+		sse:         admissionGate{limit: sseLimit},
+		webSocket:   admissionGate{limit: webSocketLimit},
+		tenantCount: int64(tenantCount),
 	}
 }
 
@@ -142,6 +161,12 @@ func New(config Config) (http.Handler, error) {
 	if config.MaxRequestBody <= 0 {
 		return nil, errors.New("maximum request body must be positive")
 	}
+	tenantCount := config.TenantCount
+	if tenantCount <= 0 {
+		if provider, ok := config.TenantRouter.(tenantCountProvider); ok {
+			tenantCount = provider.TenantCount()
+		}
+	}
 
 	api := &API{
 		proxy:           config.Proxy,
@@ -155,7 +180,7 @@ func New(config Config) (http.Handler, error) {
 		ownerSubject:    strings.TrimSpace(config.OwnerSubject),
 		blockedPaths:    cloneBlockedPaths(config.BlockedPaths),
 		maxRequestBody:  config.MaxRequestBody,
-		admission:       newInboundAdmission(config.HTTPInFlight, config.SSEInFlight, config.WebSocketInFlight),
+		admission:       newInboundAdmissionWithTenantCount(config.HTTPInFlight, config.SSEInFlight, config.WebSocketInFlight, tenantCount),
 		version:         config.Version,
 	}
 	if api.telemetry == nil {
@@ -168,11 +193,11 @@ func New(config Config) (http.Handler, error) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", api.health)
 	mux.HandleFunc("/readyz", api.ready)
-	mux.Handle("/auth/bootstrap", config.Authenticate(http.HandlerFunc(api.bootstrap)))
-	mux.HandleFunc("/connectors/oauth/google/callback", api.connectorCallback)
-	mux.Handle("/connectors/", config.Authenticate(http.HandlerFunc(api.connectors)))
-	mux.HandleFunc("/", api.forward)
-	return api.assignRequestID(api.observe(api.admit(mux))), nil
+	mux.Handle("/auth/bootstrap", config.Authenticate(api.admit(http.HandlerFunc(api.bootstrap))))
+	mux.Handle("/connectors/oauth/google/callback", api.admit(http.HandlerFunc(api.connectorCallback)))
+	mux.Handle("/connectors/", config.Authenticate(api.admit(http.HandlerFunc(api.connectors))))
+	mux.Handle("/", api.admit(http.HandlerFunc(api.forward)))
+	return api.assignRequestID(api.observe(mux)), nil
 }
 
 func (api *API) admit(next http.Handler) http.Handler {
@@ -182,14 +207,14 @@ func (api *API) admit(next http.Handler) http.Handler {
 			return
 		}
 
-		gate := &api.admission.http
+		class := admissionHTTP
 		switch {
 		case isWebSocketUpgrade(r):
-			gate = &api.admission.webSocket
+			class = admissionWebSocket
 		case acceptsSSE(r):
-			gate = &api.admission.sse
+			class = admissionSSE
 		}
-		release, acquired := gate.tryAcquire()
+		release, acquired := api.admission.tryAcquire(class, api.admissionTenant(r))
 		if !acquired {
 			w.Header().Set("Retry-After", "1")
 			writeError(w, http.StatusServiceUnavailable, "inbound capacity unavailable")
@@ -198,6 +223,78 @@ func (api *API) admit(next http.Handler) http.Handler {
 		defer release()
 		next.ServeHTTP(w, r)
 	})
+}
+
+func (admission *inboundAdmission) tryAcquire(class admissionClass, tenant string) (func(), bool) {
+	global, tenants := admission.gates(class)
+	globalRelease, acquired := global.tryAcquire()
+	if !acquired {
+		return nil, false
+	}
+
+	if strings.TrimSpace(tenant) == "" {
+		tenant = anonymousTenant
+	}
+	tenantCount := admission.tenantCount
+	if tenant == anonymousTenant {
+		tenantCount++
+	}
+	tenantLimit := admission.share(global.limit, tenantCount)
+	entry := &admissionGate{limit: tenantLimit}
+	actual, _ := tenants.LoadOrStore(tenant, entry)
+	tenantRelease, acquired := actual.(*admissionGate).tryAcquire()
+	if !acquired {
+		globalRelease()
+		return nil, false
+	}
+	return func() {
+		tenantRelease()
+		globalRelease()
+	}, true
+}
+
+func (admission *inboundAdmission) gates(class admissionClass) (*admissionGate, *sync.Map) {
+	switch class {
+	case admissionSSE:
+		return &admission.sse, &admission.sseTenants
+	case admissionWebSocket:
+		return &admission.webSocket, &admission.webSocketTenants
+	default:
+		return &admission.http, &admission.httpTenants
+	}
+}
+
+func (admission *inboundAdmission) share(limit, tenantCount int64) int64 {
+	if tenantCount <= 0 {
+		tenantCount = 1
+	}
+	share := (limit + tenantCount - 1) / tenantCount
+	if share < 1 {
+		return 1
+	}
+	return share
+}
+
+func (api *API) admissionTenant(r *http.Request) string {
+	if principal, ok := identity.FromContext(r.Context()); ok {
+		if api.tenantRouter != nil {
+			route, err := api.tenantRouter.ResolvePrincipal(r.Context(), principal)
+			if err == nil && strings.TrimSpace(route.UserID) != "" {
+				return route.UserID
+			}
+			return anonymousTenant
+		}
+		if api.isOwner(principal) {
+			return "owner"
+		}
+		return anonymousTenant
+	}
+	if api.tenantRouter != nil {
+		if route, ok := api.tenantRouter.ResolveCredential(requestCredential(r)); ok && strings.TrimSpace(route.UserID) != "" {
+			return route.UserID
+		}
+	}
+	return anonymousTenant
 }
 
 func acceptsSSE(r *http.Request) bool {

@@ -16,6 +16,7 @@ import re
 import secrets
 import shutil
 import ssl
+import stat
 import time
 import uuid
 from collections.abc import Callable
@@ -33,7 +34,7 @@ from websockets.http11 import Response
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
-from nanobot.config.paths import get_media_dir
+from nanobot.config.paths import get_media_dir, get_workspace_path
 from nanobot.config.schema import Base
 from nanobot.security.clerk import (
     ClerkAuthenticationError,
@@ -46,7 +47,7 @@ from nanobot.utils.media_decode import (
     FileSizeExceeded,
     save_base64_data_url,
 )
-from nanobot.work.store import ACTIVE_STATUSES, WorkStore
+from nanobot.work.store import ACTIVE_STATUSES, MAX_EVENT_PAGE, WorkStore
 
 if TYPE_CHECKING:
     from nanobot.session.manager import SessionManager
@@ -60,6 +61,21 @@ def _strip_trailing_slash(path: str) -> str:
 
 def _normalize_config_path(path: str) -> str:
     return _strip_trailing_slash(path)
+
+
+def _contains_symlink_component(path: Path) -> bool:
+    """Return whether *path* contains a symlink component."""
+    current = Path(path.anchor)
+    for part in path.parts:
+        if part == path.anchor:
+            continue
+        current /= part
+        try:
+            if current.is_symlink():
+                return True
+        except OSError:
+            return True
+    return False
 
 
 def _append_buttons_as_text(text: str, buttons: list[list[str]]) -> str:
@@ -623,7 +639,7 @@ class WebSocketChannel(BaseChannel):
 
         if got == "/api/work":
             if method == "GET":
-                return self._handle_work_list(request)
+                return await self._handle_work_list(request)
             if method == "POST":
                 return await self._handle_work_create(request)
             return _http_error(405, "Method Not Allowed")
@@ -632,13 +648,13 @@ class WebSocketChannel(BaseChannel):
         if match:
             if method != "GET":
                 return _http_error(405, "Method Not Allowed")
-            return self._handle_work_artifact(request, match.group(1))
+            return await self._handle_work_artifact(request, match.group(1))
 
         match = re.match(r"^/api/work/([^/]+)/events$", got)
         if match:
             if method != "GET":
                 return _http_error(405, "Method Not Allowed")
-            return self._handle_work_events(request, match.group(1))
+            return await self._handle_work_events(request, match.group(1))
 
         match = re.match(r"^/api/work/([^/]+)/cancel$", got)
         if match:
@@ -656,7 +672,7 @@ class WebSocketChannel(BaseChannel):
         if match:
             if method != "GET":
                 return _http_error(405, "Method Not Allowed")
-            return self._handle_work_detail(request, match.group(1))
+            return await self._handle_work_detail(request, match.group(1))
 
         if got == "/api/model/status":
             if method != "GET":
@@ -728,9 +744,7 @@ class WebSocketChannel(BaseChannel):
     def _check_api_token(self, request: WsRequest) -> bool:
         """Validate a request against the API token pool (multi-use, TTL-bound)."""
         self._purge_expired_api_tokens()
-        token = _bearer_token(request.headers) or _query_first(
-            _parse_query(request.path), "token"
-        )
+        token = _bearer_token(request.headers)
         if not token:
             return False
         expiry = self._api_tokens.get(token)
@@ -891,7 +905,7 @@ class WebSocketChannel(BaseChannel):
             )
         return _http_json_response({"activity": items})
 
-    def _handle_work_list(self, request: WsRequest) -> Response:
+    async def _handle_work_list(self, request: WsRequest) -> Response:
         if not self._check_api_token(request):
             return _http_error(401, "Unauthorized")
         if self._work_store is None:
@@ -902,9 +916,10 @@ class WebSocketChannel(BaseChannel):
             limit = int(_query_first(query, "limit") or "50")
         except ValueError:
             limit = 50
-        return _http_json_response(
-            {"tasks": self._work_store.list_tasks(status=status, limit=limit)}
+        tasks = await self._work_store.run_io(
+            self._work_store.list_tasks, status=status, limit=limit
         )
+        return _http_json_response({"tasks": tasks})
 
     async def _handle_work_create(self, request: WsRequest) -> Response:
         if not self._check_api_token(request):
@@ -923,7 +938,8 @@ class WebSocketChannel(BaseChannel):
         media_paths, media_error = self._work_media(body.get("media"))
         if media_error is not None:
             return _http_error(400, f"media rejected: {media_error}")
-        task = self._work_store.create_task(
+        task = await self._work_store.run_io(
+            self._work_store.create_task,
             chat_id=chat_id,
             content=content,
             mode="background",
@@ -944,7 +960,9 @@ class WebSocketChannel(BaseChannel):
             return _http_error(503, "failed to enqueue work")
         return _http_json_response({"task": task}, status=201)
 
-    def _handle_work_detail(self, request: WsRequest, raw_task_id: str) -> Response:
+    async def _handle_work_detail(
+        self, request: WsRequest, raw_task_id: str
+    ) -> Response:
         if not self._check_api_token(request):
             return _http_error(401, "Unauthorized")
         if self._work_store is None:
@@ -952,13 +970,15 @@ class WebSocketChannel(BaseChannel):
         task_id = _decode_id(raw_task_id, _WORK_ID_RE)
         if task_id is None:
             return _http_error(400, "invalid task id")
-        task = self._work_store.task_snapshot(task_id)
+        task = await self._work_store.run_io(self._work_store.task_snapshot, task_id)
         if task is None:
             return _http_error(404, "task not found")
         self._augment_work_artifact_urls(task)
         return _http_json_response({"task": task})
 
-    def _handle_work_events(self, request: WsRequest, raw_task_id: str) -> Response:
+    async def _handle_work_events(
+        self, request: WsRequest, raw_task_id: str
+    ) -> Response:
         if not self._check_api_token(request):
             return _http_error(401, "Unauthorized")
         if self._work_store is None:
@@ -966,7 +986,7 @@ class WebSocketChannel(BaseChannel):
         task_id = _decode_id(raw_task_id, _WORK_ID_RE)
         if task_id is None:
             return _http_error(400, "invalid task id")
-        if self._work_store.get_task(task_id) is None:
+        if await self._work_store.run_io(self._work_store.get_task, task_id) is None:
             return _http_error(404, "task not found")
         query = _parse_query(request.path)
         after_raw = _query_first(query, "after") or _query_first(query, "after_seq") or "0"
@@ -974,8 +994,26 @@ class WebSocketChannel(BaseChannel):
             after_seq = max(0, int(after_raw))
         except ValueError:
             return _http_error(400, "after must be an integer")
+        try:
+            limit = max(
+                1,
+                min(MAX_EVENT_PAGE, int(_query_first(query, "limit") or MAX_EVENT_PAGE)),
+            )
+        except ValueError:
+            return _http_error(400, "limit must be an integer")
+        events = await self._work_store.run_io(
+            self._work_store.list_events,
+            task_id,
+            after_seq=after_seq,
+            limit=limit,
+        )
+        next_after_seq = events[-1]["seq"] if events else after_seq
         return _http_json_response(
-            {"events": self._work_store.list_events(task_id, after_seq=after_seq)}
+            {
+                "events": events,
+                "has_more": len(events) == limit,
+                "next_after_seq": next_after_seq,
+            }
         )
 
     async def _handle_work_cancel(
@@ -988,7 +1026,7 @@ class WebSocketChannel(BaseChannel):
         task_id = _decode_id(raw_task_id, _WORK_ID_RE)
         if task_id is None:
             return _http_error(400, "invalid task id")
-        task = self._work_store.get_task(task_id)
+        task = await self._work_store.run_io(self._work_store.get_task, task_id)
         if task is None:
             return _http_error(404, "task not found")
         error = await self._cancel_work_task(task, sender_id="rest")
@@ -996,7 +1034,8 @@ class WebSocketChannel(BaseChannel):
             return _http_error(409, "task is already complete")
         if error is not None:
             return _http_error(503, "failed to signal cancellation")
-        return _http_json_response({"task": self._work_store.get_task(task_id)})
+        current = await self._work_store.run_io(self._work_store.get_task, task_id)
+        return _http_json_response({"task": current})
 
     async def _handle_work_message(
         self, request: WsRequest, raw_task_id: str
@@ -1008,7 +1047,7 @@ class WebSocketChannel(BaseChannel):
         task_id = _decode_id(raw_task_id, _WORK_ID_RE)
         if task_id is None:
             return _http_error(400, "invalid task id")
-        task = self._work_store.get_task(task_id)
+        task = await self._work_store.run_io(self._work_store.get_task, task_id)
         if task is None:
             return _http_error(404, "task not found")
         if task.get("status") not in ACTIVE_STATUSES:
@@ -1067,7 +1106,8 @@ class WebSocketChannel(BaseChannel):
 
     async def _fail_work_enqueue(self, task_id: str) -> None:
         assert self._work_store is not None
-        event = self._work_store.update_status(
+        event = await self._work_store.run_io(
+            self._work_store.update_status,
             task_id,
             "failed",
             error="Failed to enqueue Work task.",
@@ -1077,7 +1117,8 @@ class WebSocketChannel(BaseChannel):
 
     async def _record_work_message(self, task_id: str, content: str) -> None:
         assert self._work_store is not None
-        event = self._work_store.append_event(
+        event = await self._work_store.run_io(
+            self._work_store.append_event,
             task_id,
             "message.received",
             {"content": content},
@@ -1101,16 +1142,19 @@ class WebSocketChannel(BaseChannel):
         except Exception:
             logger.exception("failed to signal cancellation for Work task {}", task["task_id"])
             return "publish_failed"
-        event = self._work_store.update_status(str(task["task_id"]), "cancelled")
+        task_id = str(task["task_id"])
+        event = await self._work_store.run_io(
+            self._work_store.update_status, task_id, "cancelled"
+        )
         if event is None:
-            current = self._work_store.get_task(str(task["task_id"]))
+            current = await self._work_store.run_io(self._work_store.get_task, task_id)
             if current is not None and current.get("status") == "cancelled":
                 return None
             return "terminal"
         await self._broadcast_work_event(event)
         return None
 
-    def _handle_work_artifact(
+    async def _handle_work_artifact(
         self, request: WsRequest, raw_artifact_id: str
     ) -> Any:
         if not self._check_api_token(request):
@@ -1120,7 +1164,9 @@ class WebSocketChannel(BaseChannel):
         artifact_id = _decode_id(raw_artifact_id, _ARTIFACT_ID_RE)
         if artifact_id is None:
             return _http_error(400, "invalid artifact id")
-        item = self._work_store.artifact_path(artifact_id)
+        item = await self._work_store.run_io(
+            self._work_store.artifact_path, artifact_id
+        )
         if item is None:
             return _http_error(404, "artifact not found")
         path, metadata = item
@@ -1233,7 +1279,11 @@ class WebSocketChannel(BaseChannel):
     def _handle_model_switch(self, request: WsRequest) -> Response:
         if not self._check_api_token(request):
             return _http_error(401, "Unauthorized")
-        from nanobot.model_runtime import ModelSwitchUnavailableError, request_switch
+        from nanobot.model_runtime import (
+            ModelSwitchInProgressError,
+            ModelSwitchUnavailableError,
+            request_switch,
+        )
 
         query = _parse_query(request.path)
         body = _request_json(request)
@@ -1251,6 +1301,8 @@ class WebSocketChannel(BaseChannel):
         }
         try:
             status = request_switch(target, force=force)
+        except ModelSwitchInProgressError as exc:
+            return _http_error(409, str(exc))
         except ModelSwitchUnavailableError as exc:
             return _http_error(503, str(exc))
         except Exception:
@@ -1359,6 +1411,8 @@ class WebSocketChannel(BaseChannel):
         client joins it against the existing webui base.
         """
         try:
+            if _contains_symlink_component(abs_path):
+                return None
             media_root = get_media_dir().resolve()
             rel = abs_path.resolve().relative_to(media_root)
         except (OSError, ValueError):
@@ -1369,32 +1423,70 @@ class WebSocketChannel(BaseChannel):
         ).digest()[:16]
         return f"/api/media/{_b64url_encode(mac)}/{payload}"
 
+    def _allowed_outbound_media(self, path: Path) -> Path | None:
+        """Resolve an outbound source under this tenant's allowed roots."""
+        if _contains_symlink_component(path):
+            return None
+        workspace = (
+            self._session_manager.workspace
+            if self._session_manager is not None
+            else get_workspace_path()
+        )
+        try:
+            resolved = path.resolve(strict=True)
+            roots = (Path(workspace).resolve(strict=False), get_media_dir().resolve(strict=False))
+            if not any(resolved == root or root in resolved.parents for root in roots):
+                return None
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(resolved, flags)
+            try:
+                if not stat.S_ISREG(os.fstat(fd).st_mode):
+                    return None
+            finally:
+                os.close(fd)
+        except (OSError, ValueError):
+            return None
+        return resolved
+
     def _sign_or_stage_media_path(self, path: Path) -> dict[str, str] | None:
         """Return a signed media URL payload for *path*.
 
         Persisted inbound media already lives under ``get_media_dir`` and can
-        be signed directly. Outbound bot-generated files may live anywhere on
-        disk; copy those into the websocket media bucket first so the browser
-        can fetch them through the existing signed media route without
-        exposing arbitrary filesystem paths.
+        be signed directly. Workspace files are copied into the websocket
+        media bucket first so the browser can fetch them through the existing
+        signed media route without exposing arbitrary filesystem paths.
         """
-        signed = self._sign_media_path(path)
+        resolved = self._allowed_outbound_media(path)
+        if resolved is None:
+            return None
+        signed = self._sign_media_path(resolved)
         if signed is not None:
-            return {"url": signed, "name": path.name}
+            return {"url": signed, "name": resolved.name}
         try:
-            if not path.is_file():
-                return None
             media_dir = get_media_dir("websocket")
-            safe_name = safe_filename(path.name) or "attachment"
+            safe_name = safe_filename(resolved.name) or "attachment"
             staged = media_dir / f"{uuid.uuid4().hex[:12]}-{safe_name}"
-            shutil.copyfile(path, staged)
+            source_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            source_fd = os.open(resolved, source_flags)
+            try:
+                staged_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+                staged_fd = os.open(staged, staged_flags, 0o600)
+                try:
+                    with os.fdopen(source_fd, "rb", closefd=False) as source, os.fdopen(
+                        staged_fd, "wb", closefd=False
+                    ) as destination:
+                        shutil.copyfileobj(source, destination)
+                finally:
+                    os.close(staged_fd)
+            finally:
+                os.close(source_fd)
         except OSError as exc:
-            logger.warning("websocket: failed to stage outbound media {}: {}", path, exc)
+            logger.warning("websocket: failed to stage outbound media {}: {}", resolved, exc)
             return None
         signed = self._sign_media_path(staged)
         if signed is None:
             return None
-        return {"url": signed, "name": path.name}
+        return {"url": signed, "name": resolved.name}
 
     def _handle_media_fetch(self, sig: str, payload: str) -> Response:
         """Serve a single media file previously signed via
@@ -1420,6 +1512,8 @@ class WebSocketChannel(BaseChannel):
         # the resolved path to escape the media root; guard defensively.
         try:
             media_root = get_media_dir().resolve()
+            if _contains_symlink_component(media_root / rel_str):
+                return _http_error(404, "not found")
             candidate = (media_root / rel_str).resolve()
             candidate.relative_to(media_root)
         except (OSError, ValueError):
@@ -1791,7 +1885,8 @@ class WebSocketChannel(BaseChannel):
                 reason=media_error,
             )
             return
-        task = self._work_store.create_task(
+        task = await self._work_store.run_io(
+            self._work_store.create_task,
             chat_id=chat_id,
             content=content,
             mode="background",
@@ -1836,11 +1931,10 @@ class WebSocketChannel(BaseChannel):
             await self._send_event(connection, "error", detail="work unavailable")
             return
         task_id = envelope.get("task_id")
-        if (
-            not isinstance(task_id, str)
-            or _WORK_ID_RE.fullmatch(task_id) is None
-            or self._work_store.get_task(task_id) is None
-        ):
+        if not isinstance(task_id, str) or _WORK_ID_RE.fullmatch(task_id) is None:
+            await self._send_event(connection, "error", detail="task not found")
+            return
+        if await self._work_store.run_io(self._work_store.get_task, task_id) is None:
             await self._send_event(connection, "error", detail="task not found")
             return
         try:
@@ -1850,8 +1944,20 @@ class WebSocketChannel(BaseChannel):
             return
         self._attach_work(connection, task_id)
         await self._send_event(connection, "work.subscribed", task_id=task_id)
-        for event in self._work_store.list_events(task_id, after_seq=after_seq):
-            await self._send_work_event(connection, event)
+        cursor = after_seq
+        while True:
+            events = await self._work_store.run_io(
+                self._work_store.list_events,
+                task_id,
+                after_seq=cursor,
+                limit=MAX_EVENT_PAGE,
+            )
+            for event in events:
+                await self._send_work_event(connection, event)
+            if len(events) < MAX_EVENT_PAGE:
+                break
+            cursor = int(events[-1]["seq"])
+            await asyncio.sleep(0)
 
     async def _handle_work_cancel_envelope(
         self, connection: Any, envelope: dict[str, Any]
@@ -1860,14 +1966,13 @@ class WebSocketChannel(BaseChannel):
             await self._send_event(connection, "error", detail="work unavailable")
             return
         task_id = envelope.get("task_id")
-        if (
-            not isinstance(task_id, str)
-            or _WORK_ID_RE.fullmatch(task_id) is None
-            or self._work_store.get_task(task_id) is None
-        ):
+        if not isinstance(task_id, str) or _WORK_ID_RE.fullmatch(task_id) is None:
             await self._send_event(connection, "error", detail="task not found")
             return
-        task = self._work_store.get_task(task_id)
+        task = await self._work_store.run_io(self._work_store.get_task, task_id)
+        if task is None:
+            await self._send_event(connection, "error", detail="task not found")
+            return
         assert task is not None
         self._attach_work(connection, task_id)
         error = await self._cancel_work_task(task, sender_id="websocket")
@@ -1893,7 +1998,7 @@ class WebSocketChannel(BaseChannel):
         if not isinstance(task_id, str) or _WORK_ID_RE.fullmatch(task_id) is None:
             await self._send_event(connection, "error", detail="task not found")
             return
-        task = self._work_store.get_task(task_id)
+        task = await self._work_store.run_io(self._work_store.get_task, task_id)
         if task is None:
             await self._send_event(connection, "error", detail="task not found")
             return
@@ -2010,12 +2115,18 @@ class WebSocketChannel(BaseChannel):
             payload["buttons"] = msg.buttons
             payload["button_prompt"] = msg.content
         if msg.media:
-            payload["media"] = msg.media
+            accepted_media: list[str] = []
             urls: list[dict[str, str]] = []
             for entry in msg.media:
+                if isinstance(entry, str) and entry.lower().startswith(("http://", "https://")):
+                    accepted_media.append(entry)
+                    continue
                 signed = self._sign_or_stage_media_path(Path(entry))
                 if signed is not None:
+                    accepted_media.append(entry)
                     urls.append(signed)
+            if accepted_media:
+                payload["media"] = accepted_media
             if urls:
                 payload["media_urls"] = urls
         artifact_urls = self._work_artifact_media_urls(

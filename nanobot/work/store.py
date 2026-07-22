@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import mimetypes
@@ -21,6 +22,11 @@ TERMINAL_STATUSES = frozenset({"succeeded", "failed", "cancelled", "interrupted"
 ACTIVE_STATUSES = frozenset({"queued", "running", "waiting"})
 VALID_STATUSES = frozenset({"scheduled", *ACTIVE_STATUSES, *TERMINAL_STATUSES})
 MAX_ARTIFACT_BYTES = 100 * 1024 * 1024
+MAX_ARTIFACTS_PER_TASK = 64
+MAX_TASK_ARTIFACT_BYTES = 256 * 1024 * 1024
+MAX_TENANT_ARTIFACT_BYTES = 1024 * 1024 * 1024
+MAX_EVENTS_PER_TASK = 10_000
+MAX_EVENT_PAGE = 500
 
 
 def utc_now() -> str:
@@ -57,9 +63,15 @@ class WorkStore:
         self.root = ensure_dir(workspace / "work")
         self.artifacts_root = ensure_dir(self.root / "artifacts")
         self.db_path = self.root / "work.sqlite3"
+        self._io_lock = asyncio.Lock()
         self._init_db()
         self._has_compat_scope = self._column_exists("work_tasks", "scope")
         self.reconcile_interrupted()
+
+    async def run_io(self, operation: Any, /, *args: Any, **kwargs: Any) -> Any:
+        """Run one store operation off the event loop, preserving tenant-local order."""
+        async with self._io_lock:
+            return await asyncio.to_thread(operation, *args, **kwargs)
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.db_path, timeout=5.0)
@@ -305,6 +317,10 @@ class WorkStore:
             "UPDATE work_tasks SET last_seq = ?, updated_at = ? WHERE task_id = ?",
             (seq, created_at, task_id),
         )
+        connection.execute(
+            "DELETE FROM work_events WHERE task_id = ? AND seq <= ?",
+            (task_id, seq - MAX_EVENTS_PER_TASK),
+        )
         return WorkEvent(task_id, seq, event_type, payload, actor, step_id, created_at)
 
     def update_status(
@@ -421,15 +437,23 @@ class WorkStore:
                     created_at=now,
                 )
 
-    def list_events(self, task_id: str, *, after_seq: int = 0) -> list[dict[str, Any]]:
+    def list_events(
+        self,
+        task_id: str,
+        *,
+        after_seq: int = 0,
+        limit: int = MAX_EVENT_PAGE,
+    ) -> list[dict[str, Any]]:
+        limit = max(1, min(limit, MAX_EVENT_PAGE))
         with self._connect() as connection:
             rows = connection.execute(
                 """
                 SELECT * FROM work_events
                 WHERE task_id = ? AND seq > ?
                 ORDER BY seq ASC
+                LIMIT ?
                 """,
-                (task_id, after_seq),
+                (task_id, after_seq, limit),
             ).fetchall()
         events: list[dict[str, Any]] = []
         for row in rows:
@@ -519,6 +543,23 @@ class WorkStore:
         try:
             with self._connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
+                task_usage = connection.execute(
+                    """
+                    SELECT COUNT(*) AS artifact_count,
+                           COALESCE(SUM(size_bytes), 0) AS size_bytes
+                    FROM work_artifacts WHERE task_id = ?
+                    """,
+                    (task_id,),
+                ).fetchone()
+                tenant_usage = connection.execute(
+                    "SELECT COALESCE(SUM(size_bytes), 0) AS size_bytes FROM work_artifacts"
+                ).fetchone()
+                if int(task_usage["artifact_count"]) >= MAX_ARTIFACTS_PER_TASK:
+                    raise ValueError("Work task artifact count limit reached")
+                if int(task_usage["size_bytes"]) + size_bytes > MAX_TASK_ARTIFACT_BYTES:
+                    raise ValueError("Work task artifact storage limit reached")
+                if int(tenant_usage["size_bytes"]) + size_bytes > MAX_TENANT_ARTIFACT_BYTES:
+                    raise ValueError("Tenant Work artifact storage limit reached")
                 connection.execute(
                     """
                     INSERT INTO work_artifacts (

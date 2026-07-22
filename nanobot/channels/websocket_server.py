@@ -7,6 +7,7 @@ embedded REST surface to expose real POST endpoints on the same port.
 
 from __future__ import annotations
 
+import asyncio
 import email.utils
 import http
 from dataclasses import dataclass
@@ -124,9 +125,24 @@ async def run_channel_server(
             method=request.method,
             path=request.path_qs,
             headers=request.headers,
-            body=await request.read(),
         )
         connection = AiohttpConnection(request, transport_request)
+        if request.can_read_body and request.method in {"POST", "PUT", "PATCH"}:
+            # Every mutation in the embedded /api surface requires the short-lived
+            # REST bearer. Reject before buffering a body so unauthenticated clients
+            # cannot multiply max_message_bytes across all front-door slots.
+            if request.path.startswith("/api/") and not channel._check_api_token(
+                transport_request
+            ):
+                return _to_aiohttp_response(connection.respond(401, "Unauthorized"))
+            try:
+                transport_request.body = await asyncio.wait_for(
+                    request.read(), timeout=10.0
+                )
+            except TimeoutError:
+                return _to_aiohttp_response(connection.respond(408, "Request Timeout"))
+            except web.HTTPRequestEntityTooLarge:
+                return _to_aiohttp_response(connection.respond(413, "Payload Too Large"))
         response = await channel._dispatch_http(connection, transport_request)
         if isinstance(response, TransportFileResponse):
             file_response = web.FileResponse(response.path, headers=response.headers)

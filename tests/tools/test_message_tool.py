@@ -1,10 +1,9 @@
-import os
+from pathlib import Path
 
 import pytest
 
 from nanobot.agent.tools.message import MessageTool
 from nanobot.bus.events import OutboundMessage
-from nanobot.config.paths import get_workspace_path
 
 
 @pytest.mark.asyncio
@@ -91,13 +90,17 @@ async def test_message_tool_does_not_inherit_metadata_for_cross_target() -> None
 
 
 @pytest.mark.asyncio
-async def test_message_tool_resolves_relative_media_paths() -> None:
+async def test_message_tool_resolves_relative_media_paths(tmp_path: Path) -> None:
     sent: list[OutboundMessage] = []
 
     async def _send(msg: OutboundMessage) -> None:
         sent.append(msg)
 
-    tool = MessageTool(send_callback=_send)
+    workspace = tmp_path / "workspace"
+    attachment = workspace / "output" / "image.png"
+    attachment.parent.mkdir(parents=True)
+    attachment.write_bytes(b"image")
+    tool = MessageTool(send_callback=_send, workspace=workspace)
 
     await tool.execute(
         content="see attached",
@@ -106,7 +109,7 @@ async def test_message_tool_resolves_relative_media_paths() -> None:
         media=["output/image.png"],
     )
 
-    expected = str(get_workspace_path() / "output/image.png")
+    expected = str(attachment.resolve())
     assert sent[0].media == [expected]
 
 
@@ -118,6 +121,9 @@ async def test_message_tool_resolves_relative_media_paths_from_active_workspace(
         sent.append(msg)
 
     workspace = tmp_path / "workspace"
+    attachment = workspace / "output" / "image.png"
+    attachment.parent.mkdir(parents=True)
+    attachment.write_bytes(b"image")
     tool = MessageTool(send_callback=_send, workspace=workspace)
 
     await tool.execute(
@@ -127,28 +133,30 @@ async def test_message_tool_resolves_relative_media_paths_from_active_workspace(
         media=["output/image.png"],
     )
 
-    assert sent[0].media == [str(workspace / "output/image.png")]
+    assert sent[0].media == [str(attachment.resolve())]
 
 
 @pytest.mark.asyncio
-async def test_message_tool_passes_through_absolute_media_paths() -> None:
+async def test_message_tool_rejects_absolute_media_paths_outside_workspace(tmp_path: Path) -> None:
     sent: list[OutboundMessage] = []
 
     async def _send(msg: OutboundMessage) -> None:
         sent.append(msg)
 
-    tool = MessageTool(send_callback=_send)
+    tool = MessageTool(send_callback=_send, workspace=tmp_path / "workspace")
 
-    abs_path = os.path.abspath(os.path.join(os.sep, "tmp", "abs_image.png"))
+    abs_path = tmp_path / "outside.png"
+    abs_path.write_bytes(b"not allowed")
 
-    await tool.execute(
+    result = await tool.execute(
         content="see attached",
         channel="telegram",
         chat_id="1",
-        media=[abs_path],
+        media=[str(abs_path)],
     )
 
-    assert sent[0].media == [abs_path]
+    assert result.startswith("Error: attachment must be")
+    assert sent == []
 
 
 @pytest.mark.asyncio
@@ -173,15 +181,22 @@ async def test_message_tool_passes_through_url_media_paths() -> None:
 
 
 @pytest.mark.asyncio
-async def test_message_tool_resolves_mixed_media_paths() -> None:
+async def test_message_tool_resolves_mixed_allowed_media_paths(tmp_path: Path, monkeypatch) -> None:
     sent: list[OutboundMessage] = []
 
     async def _send(msg: OutboundMessage) -> None:
         sent.append(msg)
 
-    tool = MessageTool(send_callback=_send)
-
-    abs_path = os.path.abspath(os.path.join(os.sep, "tmp", "absolute.png"))
+    workspace = tmp_path / "workspace"
+    workspace_attachment = workspace / "output" / "relative.png"
+    workspace_attachment.parent.mkdir(parents=True)
+    workspace_attachment.write_bytes(b"workspace")
+    media_root = tmp_path / "media"
+    media_root.mkdir()
+    media_attachment = media_root / "media.png"
+    media_attachment.write_bytes(b"media")
+    monkeypatch.setattr("nanobot.agent.tools.message.get_media_dir", lambda: media_root)
+    tool = MessageTool(send_callback=_send, workspace=workspace)
 
     await tool.execute(
         content="see attached",
@@ -189,16 +204,64 @@ async def test_message_tool_resolves_mixed_media_paths() -> None:
         chat_id="1",
         media=[
             "output/relative.png",
-            abs_path,
+            str(media_attachment),
             "https://example.com/url.png",
             "http://example.com/http.png",
         ],
     )
 
-    expected_relative = str(get_workspace_path() / "output/relative.png")
+    expected_relative = str(workspace_attachment.resolve())
     assert sent[0].media == [
         expected_relative,
-        abs_path,
+        str(media_attachment.resolve()),
         "https://example.com/url.png",
         "http://example.com/http.png",
     ]
+
+
+@pytest.mark.asyncio
+async def test_message_tool_rejects_proc_environ(tmp_path: Path) -> None:
+    sent: list[OutboundMessage] = []
+
+    async def _send(msg: OutboundMessage) -> None:
+        sent.append(msg)
+
+    tool = MessageTool(send_callback=_send, workspace=tmp_path / "workspace")
+    result = await tool.execute(
+        content="do not attach host secrets",
+        channel="telegram",
+        chat_id="1",
+        media=["/proc/self/environ"],
+    )
+
+    assert result.startswith("Error: attachment must be")
+    assert sent == []
+
+
+@pytest.mark.asyncio
+async def test_message_tool_rejects_traversal_and_symlink_media(tmp_path: Path) -> None:
+    sent: list[OutboundMessage] = []
+
+    async def _send(msg: OutboundMessage) -> None:
+        sent.append(msg)
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    secret = tmp_path / "secret.txt"
+    secret.write_text("secret")
+    link = workspace / "link.txt"
+    try:
+        link.symlink_to(secret)
+    except OSError:
+        pytest.skip("symlinks are unavailable")
+
+    tool = MessageTool(send_callback=_send, workspace=workspace)
+    for path in ("../secret.txt", str(link)):
+        result = await tool.execute(
+            content="blocked",
+            channel="telegram",
+            chat_id="1",
+            media=[path],
+        )
+        assert result.startswith("Error: attachment must be")
+    assert sent == []

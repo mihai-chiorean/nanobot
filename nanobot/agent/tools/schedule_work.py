@@ -181,7 +181,8 @@ class ScheduleWorkTool(Tool):
             "risk_notes": risk_notes,
             "confirmed": bool(confirmed),
         }
-        plan_task = self._work_store.create_task(
+        plan_task = await self._work_store.run_io(
+            self._work_store.create_task,
             session_key=session_key,
             chat_id=chat_id,
             content=instructions,
@@ -191,8 +192,15 @@ class ScheduleWorkTool(Tool):
             status="scheduled",
         )
         plan_task_id = str(plan_task["task_id"])
-        self._work_store.append_event(plan_task_id, "plan.created", {"plan": plan}, actor="planner")
-        self._work_store.add_artifact(
+        await self._work_store.run_io(
+            self._work_store.append_event,
+            plan_task_id,
+            "plan.created",
+            {"plan": plan},
+            actor="planner",
+        )
+        await self._work_store.run_io(
+            self._work_store.add_artifact,
             plan_task_id,
             name="work-plan.md",
             kind="markdown",
@@ -223,19 +231,22 @@ class ScheduleWorkTool(Tool):
             )
         except Exception as exc:
             logger.exception("Failed to schedule Work plan {}", plan_task_id)
-            self._work_store.update_status(
+            await self._work_store.run_io(
+                self._work_store.update_status,
                 plan_task_id,
                 "failed",
                 error=f"Scheduling failed: {type(exc).__name__}",
             )
             return "Error: failed to create the scheduled Work job."
-        self._work_store.append_event(
+        await self._work_store.run_io(
+            self._work_store.append_event,
             plan_task_id,
             "schedule.created",
             {"cron_job_id": job.id, "schedule": plan["schedule"]},
             actor="planner",
         )
-        self._work_store.update_status(
+        await self._work_store.run_io(
+            self._work_store.update_status,
             plan_task_id,
             "scheduled",
             result_summary=f"Scheduled: {label}. Deliverable: {deliverable}.",

@@ -303,6 +303,49 @@ func TestInboundAdmissionIsBoundedByTrafficClassAndReleasesOnCancellation(t *tes
 	}
 }
 
+func TestInboundAdmissionIsTenantFairWithinGlobalCap(t *testing.T) {
+	admission := newInboundAdmissionWithTenantCount(4, 4, 4, 2)
+
+	releases := make([]func(), 0, 4)
+	for _, tenant := range []string{"tenant-a", "tenant-a", "tenant-b", "tenant-b"} {
+		release, acquired := admission.tryAcquire(admissionHTTP, tenant)
+		if !acquired {
+			t.Fatalf("tenant %q was rejected before its share was full", tenant)
+		}
+		releases = append(releases, release)
+	}
+	if release, acquired := admission.tryAcquire(admissionHTTP, "tenant-a"); acquired {
+		release()
+		t.Fatal("tenant exceeded its fair share")
+	}
+	if release, acquired := admission.tryAcquire(admissionHTTP, "tenant-c"); acquired {
+		release()
+		t.Fatal("global cap was exceeded")
+	}
+	for _, release := range releases {
+		release()
+	}
+}
+
+func TestInboundAdmissionLimitsAnonymousTrafficSeparately(t *testing.T) {
+	admission := newInboundAdmissionWithTenantCount(4, 4, 4, 1)
+
+	first, acquired := admission.tryAcquire(admissionHTTP, anonymousTenant)
+	if !acquired {
+		t.Fatal("first anonymous request was rejected")
+	}
+	second, acquired := admission.tryAcquire(admissionHTTP, anonymousTenant)
+	if !acquired {
+		t.Fatal("second anonymous request was rejected")
+	}
+	defer first()
+	defer second()
+	if release, acquired := admission.tryAcquire(admissionHTTP, anonymousTenant); acquired {
+		release()
+		t.Fatal("anonymous traffic consumed the whole global budget")
+	}
+}
+
 func TestHealthAndReadinessBypassInboundAdmission(t *testing.T) {
 	admission := newInboundAdmission(1, 1, 1)
 	handler := (&API{admission: admission}).admit(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

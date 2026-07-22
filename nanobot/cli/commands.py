@@ -714,7 +714,8 @@ def _run_gateway(
             session_key = f"cron:{job.id}"
             title = str(meta.get("work_title") or job.name or "Scheduled work")
             plan_task_id = meta.get("work_plan_task_id")
-            task = agent.work_store.create_task(
+            task = await agent.work_store.run_io(
+                agent.work_store.create_task,
                 session_key=session_key,
                 chat_id=chat_id,
                 content=job.payload.message,
@@ -730,7 +731,8 @@ def _run_gateway(
                 job.id,
             )
             if isinstance(plan_task_id, str) and plan_task_id.startswith("work_"):
-                agent.work_store.append_event(
+                await agent.work_store.run_io(
+                    agent.work_store.append_event,
                     plan_task_id,
                     "scheduled_run.created",
                     {"cron_job_id": job.id, "run_task_id": task_id, "title": title},
@@ -750,13 +752,15 @@ def _run_gateway(
                     on_progress=_silent,
                 )
             except asyncio.CancelledError:
-                agent.work_store.update_status(
+                await agent.work_store.run_io(
+                    agent.work_store.update_status,
                     task_id,
                     "interrupted",
                     error="Scheduled work was interrupted.",
                 )
                 if isinstance(plan_task_id, str) and plan_task_id.startswith("work_"):
-                    agent.work_store.append_event(
+                    await agent.work_store.run_io(
+                        agent.work_store.append_event,
                         plan_task_id,
                         "scheduled_run.interrupted",
                         {"cron_job_id": job.id, "run_task_id": task_id},
@@ -765,13 +769,15 @@ def _run_gateway(
                 raise
             except Exception as exc:
                 logger.exception("Scheduled Work task {} failed", task_id)
-                agent.work_store.update_status(
+                await agent.work_store.run_io(
+                    agent.work_store.update_status,
                     task_id,
                     "failed",
                     error=f"Scheduled work failed: {type(exc).__name__}",
                 )
                 if isinstance(plan_task_id, str) and plan_task_id.startswith("work_"):
-                    agent.work_store.append_event(
+                    await agent.work_store.run_io(
+                        agent.work_store.append_event,
                         plan_task_id,
                         "scheduled_run.failed",
                         {
@@ -782,7 +788,8 @@ def _run_gateway(
                         actor="scheduler",
                     )
                     if job.delete_after_run:
-                        agent.work_store.update_status(
+                        await agent.work_store.run_io(
+                            agent.work_store.update_status,
                             plan_task_id,
                             "failed",
                             error=f"Scheduled run failed: {type(exc).__name__}",
@@ -791,14 +798,16 @@ def _run_gateway(
             if response is not None and channel == "websocket":
                 await bus.publish_outbound(response)
             if isinstance(plan_task_id, str) and plan_task_id.startswith("work_"):
-                agent.work_store.append_event(
+                await agent.work_store.run_io(
+                    agent.work_store.append_event,
                     plan_task_id,
                     "scheduled_run.completed",
                     {"cron_job_id": job.id, "run_task_id": task_id},
                     actor="scheduler",
                 )
                 if job.delete_after_run:
-                    agent.work_store.update_status(
+                    await agent.work_store.run_io(
+                        agent.work_store.update_status,
                         plan_task_id,
                         "succeeded",
                         result_summary=f"One-time scheduled work ran as {task_id}.",
@@ -868,7 +877,7 @@ def _run_gateway(
         config,
         bus,
         session_manager=session_manager,
-        active_session_keys=agent.active_session_keys,
+        active_session_keys=getattr(agent, "active_session_keys", None),
     )
 
     def _pick_heartbeat_target() -> tuple[str, str]:

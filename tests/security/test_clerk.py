@@ -138,6 +138,7 @@ async def test_primary_email_lookup_uses_clerk_backend_api(
     [
         {"email": "other@example.com"},
         {"azp": "https://attacker.example"},
+        {"azp": None},
     ],
 )
 async def test_forbidden_email_or_authorized_party(

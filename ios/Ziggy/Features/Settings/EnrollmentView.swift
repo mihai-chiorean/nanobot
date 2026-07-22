@@ -52,6 +52,10 @@ struct EnrollmentView: View {
                     }
 
                     Button {
+                        guard appModel.isServerURLAllowed else {
+                            appModel.bannerMessage = "Use the production Ziggy server or a localhost URL for development."
+                            return
+                        }
                         if clerk.user == nil {
                             showsAuthentication = true
                         } else {
@@ -70,6 +74,8 @@ struct EnrollmentView: View {
                             .clipShape(RoundedRectangle(cornerRadius: 8))
                     }
                     .buttonStyle(.plain)
+                    .disabled(!appModel.isServerURLAllowed)
+                    .opacity(appModel.isServerURLAllowed ? 1 : 0.55)
 
                     if clerk.user != nil {
                         Button {
@@ -102,6 +108,13 @@ struct EnrollmentView: View {
                     .background(ZiggyPalette.card)
                     .clipShape(RoundedRectangle(cornerRadius: 8))
                     .overlay(RoundedRectangle(cornerRadius: 8).stroke(ZiggyPalette.border.opacity(0.75)))
+
+                    if !appModel.serverURLText.isEmpty && !appModel.isServerURLAllowed {
+                        Label("Use the production host or localhost for development.", systemImage: "exclamationmark.circle")
+                            .font(.caption)
+                            .foregroundStyle(ZiggyPalette.destructive)
+                            .padding(.horizontal, 3)
+                    }
                 }
                 .frame(maxWidth: 440)
 

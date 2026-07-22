@@ -195,8 +195,13 @@ def test_issue_route_secret_matches_empty_secret() -> None:
 
 
 @pytest.mark.asyncio
-async def test_send_delivers_json_message_with_media_and_reply() -> None:
+async def test_send_delivers_json_message_with_media_and_reply(tmp_path, monkeypatch) -> None:
     bus = MagicMock()
+    media_root = tmp_path / "media"
+    media_root.mkdir()
+    attachment = media_root / "a.png"
+    attachment.write_bytes(b"image")
+    monkeypatch.setattr("nanobot.channels.websocket.get_media_dir", lambda channel=None: media_root)
     channel = WebSocketChannel({"enabled": True, "allowFrom": ["*"]}, bus)
     mock_ws = AsyncMock()
     channel._attach(mock_ws, "chat-1")
@@ -206,7 +211,7 @@ async def test_send_delivers_json_message_with_media_and_reply() -> None:
         chat_id="chat-1",
         content="hello",
         reply_to="m1",
-        media=["/tmp/a.png"],
+        media=[str(attachment)],
         buttons=[["Yes", "No"]],
     )
     await channel.send(msg)
@@ -218,23 +223,27 @@ async def test_send_delivers_json_message_with_media_and_reply() -> None:
     assert payload["text"] == "hello\n\n1. Yes\n2. No"
     assert payload["button_prompt"] == "hello"
     assert payload["reply_to"] == "m1"
-    assert payload["media"] == ["/tmp/a.png"]
+    assert payload["media"] == [str(attachment)]
+    assert payload["media_urls"][0]["name"] == "a.png"
     assert payload["buttons"] == [["Yes", "No"]]
 
 
 @pytest.mark.asyncio
-async def test_send_stages_external_media_as_signed_url(monkeypatch, tmp_path) -> None:
+async def test_send_stages_workspace_media_as_signed_url(monkeypatch, tmp_path) -> None:
     bus = MagicMock()
     media_root = tmp_path / "media"
     ws_media = media_root / "websocket"
     ws_media.mkdir(parents=True)
-    external = tmp_path / "clip.mp4"
-    external.write_bytes(b"video")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    attachment = workspace / "clip.mp4"
+    attachment.write_bytes(b"video")
 
     def fake_media_dir(channel: str | None = None):
         return ws_media if channel == "websocket" else media_root
 
     monkeypatch.setattr("nanobot.channels.websocket.get_media_dir", fake_media_dir)
+    monkeypatch.setattr("nanobot.channels.websocket.get_workspace_path", lambda: workspace)
     channel = WebSocketChannel({"enabled": True, "allowFrom": ["*"]}, bus)
     mock_ws = AsyncMock()
     channel._attach(mock_ws, "chat-1")
@@ -244,15 +253,45 @@ async def test_send_stages_external_media_as_signed_url(monkeypatch, tmp_path) -
             channel="websocket",
             chat_id="chat-1",
             content="video",
+            media=[str(attachment)],
+        )
+    )
+
+    payload = json.loads(mock_ws.send.call_args[0][0])
+    assert payload["media"] == [str(attachment)]
+    assert payload["media_urls"][0]["name"] == "clip.mp4"
+    assert payload["media_urls"][0]["url"].startswith("/api/media/")
+    assert any(p.name.endswith("-clip.mp4") for p in ws_media.iterdir())
+
+
+@pytest.mark.asyncio
+async def test_send_drops_external_media_paths(monkeypatch, tmp_path) -> None:
+    bus = MagicMock()
+    media_root = tmp_path / "media"
+    media_root.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    external = tmp_path / "outside.txt"
+    external.write_text("host data")
+    monkeypatch.setattr("nanobot.channels.websocket.get_media_dir", lambda channel=None: media_root)
+    monkeypatch.setattr("nanobot.channels.websocket.get_workspace_path", lambda: workspace)
+    channel = WebSocketChannel({"enabled": True, "allowFrom": ["*"]}, bus)
+    mock_ws = AsyncMock()
+    channel._attach(mock_ws, "chat-1")
+
+    await channel.send(
+        OutboundMessage(
+            channel="websocket",
+            chat_id="chat-1",
+            content="blocked",
             media=[str(external)],
         )
     )
 
     payload = json.loads(mock_ws.send.call_args[0][0])
-    assert payload["media"] == [str(external)]
-    assert payload["media_urls"][0]["name"] == "clip.mp4"
-    assert payload["media_urls"][0]["url"].startswith("/api/media/")
-    assert any(p.name.endswith("-clip.mp4") for p in ws_media.iterdir())
+    assert "media" not in payload
+    assert "media_urls" not in payload
+    assert list(media_root.iterdir()) == []
 
 
 @pytest.mark.asyncio

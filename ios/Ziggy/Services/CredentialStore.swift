@@ -37,7 +37,7 @@ enum CredentialStoreError: Error, Equatable, LocalizedError, Sendable {
             case .empty:
                 "The \(key.displayName) cannot be empty."
             case .invalidServerURL:
-                "The server URL must use HTTPS, or HTTP on localhost, 127.0.0.1, or ::1, with no user info, query, or fragment."
+                "Use https://chat.mihaichiorean.com, or an HTTP/HTTPS localhost URL for development, without user info, query, or fragment."
             case .leadingOrTrailingWhitespace:
                 "The \(key.displayName) contains leading or trailing whitespace."
             }

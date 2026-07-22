@@ -82,6 +82,7 @@ func run() error {
 	}
 
 	var tenantRouter httpapi.TenantRouter
+	tenantCount := 1
 	if cfg.TenantManifest != "" {
 		registry, err := tenant.Load(cfg.TenantManifest, cfg.TenantBindings)
 		if err != nil {
@@ -98,6 +99,7 @@ func run() error {
 		if err != nil {
 			return err
 		}
+		tenantCount = len(registry.Allocations())
 		logger.Info("tenant routing enabled", "tenant_count", len(registry.Allocations()))
 	}
 	var connectorProxy http.Handler
@@ -140,6 +142,7 @@ func run() error {
 		HTTPInFlight:      cfg.HTTPInFlight,
 		SSEInFlight:       cfg.SSEInFlight,
 		WebSocketInFlight: cfg.WebSocketInFlight,
+		TenantCount:       tenantCount,
 		Version:           version,
 	})
 	if err != nil {
@@ -150,10 +153,11 @@ func run() error {
 		Addr:              cfg.ListenAddr,
 		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
 		IdleTimeout:       90 * time.Second,
 		MaxHeaderBytes:    1 << 20,
-		// WriteTimeout and ReadTimeout remain zero because this endpoint carries
-		// long-lived WebSocket/SSE traffic. Request bodies are size-bounded in the handler.
+		// ReadTimeout only covers reading the request headers and body. SSE and
+		// WebSocket response lifetimes remain unbounded because WriteTimeout is zero.
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

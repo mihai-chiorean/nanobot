@@ -39,7 +39,7 @@ iOS / web -> Cloudflare -> ziggy-control -> private Nanobot -> Spark models
   credential, query, request ID, or session ID.
 - Optionally emit content-free OpenTelemetry metrics and traces to a loopback
   OTLP/HTTP collector.
-- Admit bounded tenant HTTP, SSE, and WebSocket traffic without waiting;
+- Admit bounded tenant-fair HTTP, SSE, and WebSocket traffic without waiting;
   health and readiness remain available when a traffic class is full.
 
 Configuration is immutable after startup. Admission uses atomic try-acquire
@@ -96,8 +96,10 @@ private-network validation as Nanobot. The systemd unit discovers the shared
 `ZIGGY_CONNECTORS_TRUST_KEY_FILE`. The key is shared only with
 `ziggy-connectors`.
 
-The default admission limits are 64 ordinary HTTP requests, 8 SSE
-streams, and 8 WebSocket connections. Override them with
+The default global admission limits are 64 ordinary HTTP requests, 8 SSE
+streams, and 8 WebSocket connections. Each configured tenant receives an
+equal share of each class, while anonymous traffic receives a separate share;
+the global limits remain hard caps. Override the global limits with
 `ZIGGY_MAX_HTTP_IN_FLIGHT`, `ZIGGY_MAX_SSE_IN_FLIGHT`, and
 `ZIGGY_MAX_WEBSOCKET_IN_FLIGHT`. `/healthz` and `/readyz` bypass these limits.
 

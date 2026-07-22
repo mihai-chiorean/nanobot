@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 import websockets
 from websockets.exceptions import ConnectionClosedError
@@ -58,3 +59,35 @@ async def test_message_size_enforcement_and_clean_shutdown(tmp_path: Path) -> No
     rebound = await asyncio.start_server(lambda _r, _w: None, "127.0.0.1", port)
     rebound.close()
     await rebound.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_unauthenticated_api_body_is_rejected_before_buffering() -> None:
+    port = 29938
+    bus = MagicMock(publish_inbound=AsyncMock())
+    channel = WebSocketChannel(
+        {
+            "enabled": True,
+            "allowFrom": ["*"],
+            "host": "127.0.0.1",
+            "port": port,
+            "path": "/",
+            "websocketRequiresToken": False,
+            "maxMessageBytes": 1024,
+            "pingIntervalS": None,
+        },
+        bus,
+    )
+    server = asyncio.create_task(channel.start())
+    await asyncio.sleep(0.2)
+    try:
+        response = await asyncio.to_thread(
+            httpx.post,
+            f"http://127.0.0.1:{port}/api/work",
+            content=b"x" * 4096,
+            timeout=5.0,
+        )
+        assert response.status_code == 401
+    finally:
+        await channel.stop()
+        await server

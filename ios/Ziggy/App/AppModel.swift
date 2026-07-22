@@ -89,6 +89,10 @@ final class AppModel {
         return false
     }
 
+    var isServerURLAllowed: Bool {
+        ZiggyServerURLValidation.url(from: serverURLText) != nil
+    }
+
     var selectedChatID: String? {
         selectedSessionKey.map(Self.chatID(from:))
     }
@@ -139,8 +143,9 @@ final class AppModel {
         if let rawTheme = environment["ZIGGY_THEME"], let theme = ZiggyTheme(rawValue: rawTheme) {
             self.theme = theme
         }
-        if let server = environment["ZIGGY_SERVER_URL"], !server.isEmpty {
-            serverURLText = server
+        if let server = environment["ZIGGY_SERVER_URL"],
+           let configuredURL = ZiggyServerURLValidation.url(from: server) {
+            serverURLText = configuredURL.absoluteString
         }
         do {
             if let savedURL = try await credentialStore.serverURL() {
@@ -150,6 +155,15 @@ final class AppModel {
                 await connectAuthenticated()
             } else {
                 phase = .needsEnrollment
+            }
+        } catch CredentialStoreError.invalidStoredValue(key: .serverURL) {
+            do {
+                try await credentialStore.removeServerURL()
+                serverURLText = ZiggyServerURLValidation.productionURL.absoluteString
+                bannerMessage = "The saved server URL was rejected and has been reset."
+                phase = .needsEnrollment
+            } catch {
+                phase = .failed(Self.message(for: error))
             }
         } catch {
             phase = .failed(Self.message(for: error))

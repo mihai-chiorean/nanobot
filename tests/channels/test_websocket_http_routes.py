@@ -429,6 +429,12 @@ async def test_api_token_pool_purges_expired(bus: MagicMock, tmp_path: Path) -> 
 
     assert channel._check_api_token(_LiveReq()) is True
 
+    class _QueryReq:
+        path = "/api/sessions?token=live"
+        headers = {}
+
+    assert channel._check_api_token(_QueryReq()) is False
+
 
 @pytest.mark.asyncio
 async def test_clerk_bootstrap_token_serves_rest_and_one_websocket(
