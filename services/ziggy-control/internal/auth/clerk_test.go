@@ -253,3 +253,35 @@ func TestCacheEmailResolverCachesSuccessesOnly(t *testing.T) {
 		t.Errorf("resolver calls = %d, want 3", calls.Load())
 	}
 }
+
+func TestCacheEmailResolverEvictsExpiredAndOldEntries(t *testing.T) {
+	var calls atomic.Int32
+	resolver := cacheEmailResolverWithLimit(func(_ context.Context, subject string) (string, error) {
+		calls.Add(1)
+		return subject + "@example.com", nil
+	}, 10*time.Millisecond, 2)
+
+	if _, err := resolver(context.Background(), "user_1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolver(context.Background(), "user_2"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolver(context.Background(), "user_3"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolver(context.Background(), "user_1"); err != nil {
+		t.Fatal(err)
+	}
+	if got := calls.Load(); got != 4 {
+		t.Errorf("bounded cache calls = %d, want 4", got)
+	}
+
+	time.Sleep(15 * time.Millisecond)
+	if _, err := resolver(context.Background(), "user_3"); err != nil {
+		t.Fatal(err)
+	}
+	if got := calls.Load(); got != 5 {
+		t.Errorf("expired cache calls = %d, want 5", got)
+	}
+}

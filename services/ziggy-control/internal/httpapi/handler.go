@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"path"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/mihai-chiorean/nanobot/services/ziggy-control/internal/identity"
@@ -24,16 +25,19 @@ import (
 type Middleware func(http.Handler) http.Handler
 
 type Config struct {
-	Authenticate   Middleware
-	Proxy          http.Handler
-	Readiness      ReadinessChecker
-	Logger         *slog.Logger
-	Telemetry      *telemetry.Recorder
-	OwnerEmail     string
-	OwnerSubject   string
-	BlockedPaths   map[string]struct{}
-	MaxRequestBody int64
-	Version        string
+	Authenticate      Middleware
+	Proxy             http.Handler
+	Readiness         ReadinessChecker
+	Logger            *slog.Logger
+	Telemetry         *telemetry.Recorder
+	OwnerEmail        string
+	OwnerSubject      string
+	BlockedPaths      map[string]struct{}
+	MaxRequestBody    int64
+	HTTPInFlight      int64
+	SSEInFlight       int64
+	WebSocketInFlight int64
+	Version           string
 }
 
 type API struct {
@@ -45,12 +49,72 @@ type API struct {
 	ownerSubject   string
 	blockedPaths   map[string]struct{}
 	maxRequestBody int64
+	admission      *inboundAdmission
 	version        string
 }
 
 type requestIDKey struct{}
 
 const maxEnrollmentBody = 4 << 10
+
+const (
+	defaultHTTPInFlight      = int64(64)
+	defaultSSEInFlight       = int64(8)
+	defaultWebSocketInFlight = int64(8)
+)
+
+type admissionClass uint8
+
+const (
+	admissionHTTP admissionClass = iota
+	admissionSSE
+	admissionWebSocket
+)
+
+type admissionGate struct {
+	limit  int64
+	active atomic.Int64
+}
+
+func (gate *admissionGate) tryAcquire() (func(), bool) {
+	for {
+		current := gate.active.Load()
+		if current >= gate.limit {
+			return nil, false
+		}
+		if gate.active.CompareAndSwap(current, current+1) {
+			var released atomic.Bool
+			return func() {
+				if released.CompareAndSwap(false, true) {
+					gate.active.Add(-1)
+				}
+			}, true
+		}
+	}
+}
+
+type inboundAdmission struct {
+	http      admissionGate
+	sse       admissionGate
+	webSocket admissionGate
+}
+
+func newInboundAdmission(httpLimit, sseLimit, webSocketLimit int64) *inboundAdmission {
+	if httpLimit <= 0 {
+		httpLimit = defaultHTTPInFlight
+	}
+	if sseLimit <= 0 {
+		sseLimit = defaultSSEInFlight
+	}
+	if webSocketLimit <= 0 {
+		webSocketLimit = defaultWebSocketInFlight
+	}
+	return &inboundAdmission{
+		http:      admissionGate{limit: httpLimit},
+		sse:       admissionGate{limit: sseLimit},
+		webSocket: admissionGate{limit: webSocketLimit},
+	}
+}
 
 func New(config Config) (http.Handler, error) {
 	if config.Authenticate == nil {
@@ -81,6 +145,7 @@ func New(config Config) (http.Handler, error) {
 		ownerSubject:   strings.TrimSpace(config.OwnerSubject),
 		blockedPaths:   cloneBlockedPaths(config.BlockedPaths),
 		maxRequestBody: config.MaxRequestBody,
+		admission:      newInboundAdmission(config.HTTPInFlight, config.SSEInFlight, config.WebSocketInFlight),
 		version:        config.Version,
 	}
 	if api.telemetry == nil {
@@ -96,7 +161,36 @@ func New(config Config) (http.Handler, error) {
 	mux.Handle("/auth/bootstrap", config.Authenticate(http.HandlerFunc(api.bootstrap)))
 	mux.HandleFunc("/webui/guest/bootstrap", api.enroll)
 	mux.HandleFunc("/", api.forward)
-	return api.assignRequestID(api.observe(mux)), nil
+	return api.assignRequestID(api.observe(api.admit(mux))), nil
+}
+
+func (api *API) admit(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" || r.URL.Path == "/readyz" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		gate := &api.admission.http
+		switch {
+		case isWebSocketUpgrade(r):
+			gate = &api.admission.webSocket
+		case acceptsSSE(r):
+			gate = &api.admission.sse
+		}
+		release, acquired := gate.tryAcquire()
+		if !acquired {
+			w.Header().Set("Retry-After", "1")
+			writeError(w, http.StatusServiceUnavailable, "inbound capacity unavailable")
+			return
+		}
+		defer release()
+		next.ServeHTTP(w, r)
+	})
+}
+
+func acceptsSSE(r *http.Request) bool {
+	return strings.Contains(strings.ToLower(r.Header.Get("Accept")), "text/event-stream")
 }
 
 func (api *API) health(w http.ResponseWriter, r *http.Request) {

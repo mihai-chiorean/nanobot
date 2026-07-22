@@ -231,6 +231,17 @@ func TestOrdinaryRequestsAreProxiedWithNewRequestID(t *testing.T) {
 		if got := r.Header.Get("X-Nanobot-Auth"); got != "" {
 			t.Errorf("X-Nanobot-Auth was forwarded: %q", got)
 		}
+		for _, header := range []string{"Cookie", "Proxy-Authorization", "Forwarded", "X-Clerk-User", "X-Ziggy-Subject", "X-Ziggy-Email"} {
+			if got := r.Header.Get(header); got != "" {
+				t.Errorf("%s was forwarded: %q", header, got)
+			}
+		}
+		if got := r.Header.Get("X-Forwarded-Host"); got == "evil.example" {
+			t.Errorf("client X-Forwarded-Host was forwarded: %q", got)
+		}
+		if got := r.Header.Get("X-Forwarded-Proto"); got == "https" {
+			t.Errorf("client X-Forwarded-Proto was forwarded: %q", got)
+		}
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer upstream.Close()
@@ -241,6 +252,14 @@ func TestOrdinaryRequestsAreProxiedWithNewRequestID(t *testing.T) {
 	request.Header.Set("X-Request-ID", "untrusted")
 	request.Header.Set("X-Nanobot-Auth", "spoofed")
 	request.Header.Set("X-Forwarded-For", "203.0.113.99")
+	request.Header.Set("X-Forwarded-Host", "evil.example")
+	request.Header.Set("X-Forwarded-Proto", "https")
+	request.Header.Set("Cookie", "session=secret")
+	request.Header.Set("Proxy-Authorization", "Basic c2VjcmV0")
+	request.Header.Set("Forwarded", "for=203.0.113.99")
+	request.Header.Set("X-Clerk-User", "user-canary")
+	request.Header.Set("X-Ziggy-Subject", "subject-canary")
+	request.Header.Set("X-Ziggy-Email", "email-canary")
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 
@@ -256,6 +275,90 @@ func TestOrdinaryRequestsAreProxiedWithNewRequestID(t *testing.T) {
 	}
 	if strings.Contains(forwardedFor, "203.0.113.99") {
 		t.Errorf("spoofed X-Forwarded-For was forwarded: %q", forwardedFor)
+	}
+}
+
+func TestInboundAdmissionIsBoundedByTrafficClassAndReleasesOnCancellation(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		setup func(*http.Request)
+		limit func(*inboundAdmission) *admissionGate
+	}{
+		{name: "http", limit: func(admission *inboundAdmission) *admissionGate { return &admission.http }},
+		{name: "sse", setup: func(request *http.Request) { request.Header.Set("Accept", "text/event-stream") }, limit: func(admission *inboundAdmission) *admissionGate { return &admission.sse }},
+		{name: "websocket", setup: func(request *http.Request) { request.Header.Set("Upgrade", "websocket") }, limit: func(admission *inboundAdmission) *admissionGate { return &admission.webSocket }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			admission := newInboundAdmission(1, 1, 1)
+			var calls atomic.Int32
+			handler := (&API{admission: admission}).admit(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if calls.Add(1) == 1 {
+					<-r.Context().Done()
+				}
+				w.WriteHeader(http.StatusNoContent)
+			}))
+
+			ctx, cancel := context.WithCancel(context.Background())
+			first := httptest.NewRequest(http.MethodGet, "/api", nil).WithContext(ctx)
+			if test.setup != nil {
+				test.setup(first)
+			}
+			done := make(chan struct{})
+			go func() {
+				handler.ServeHTTP(httptest.NewRecorder(), first)
+				close(done)
+			}()
+			deadline := time.After(time.Second)
+			for test.limit(admission).active.Load() != 1 {
+				select {
+				case <-deadline:
+					t.Fatal("first request was not admitted")
+				default:
+					time.Sleep(time.Millisecond)
+				}
+			}
+
+			second := httptest.NewRecorder()
+			secondRequest := httptest.NewRequest(http.MethodGet, "/api", nil)
+			if test.setup != nil {
+				test.setup(secondRequest)
+			}
+			handler.ServeHTTP(second, secondRequest)
+			if second.Code != http.StatusServiceUnavailable || second.Header().Get("Retry-After") != "1" {
+				t.Fatalf("second request = %d, Retry-After %q", second.Code, second.Header().Get("Retry-After"))
+			}
+
+			cancel()
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatal("canceled request did not release")
+			}
+			third := httptest.NewRecorder()
+			thirdRequest := httptest.NewRequest(http.MethodGet, "/api", nil)
+			if test.setup != nil {
+				test.setup(thirdRequest)
+			}
+			handler.ServeHTTP(third, thirdRequest)
+			if third.Code != http.StatusNoContent {
+				t.Errorf("third request = %d, want 204", third.Code)
+			}
+		})
+	}
+}
+
+func TestHealthAndReadinessBypassInboundAdmission(t *testing.T) {
+	admission := newInboundAdmission(1, 1, 1)
+	handler := (&API{admission: admission}).admit(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	admission.http.active.Store(1)
+	for _, route := range []string{"/healthz", "/readyz"} {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, route, nil))
+		if response.Code != http.StatusNoContent {
+			t.Errorf("%s status = %d, want 204", route, response.Code)
+		}
 	}
 }
 

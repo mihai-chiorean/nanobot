@@ -72,3 +72,38 @@ func TestHTTPReadinessCheckerCachesSuccessfulProbe(t *testing.T) {
 		t.Errorf("upstream requests = %d, want 1", got)
 	}
 }
+
+func TestHTTPReadinessCheckerPreflightRequiresOwnerLegacyRoutes(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/healthz":
+			w.WriteHeader(http.StatusNoContent)
+		case "/auth/bootstrap":
+			w.WriteHeader(http.StatusUnauthorized)
+		case "/webui/guest/bootstrap":
+			w.WriteHeader(http.StatusBadRequest)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	target, _ := url.Parse(server.URL)
+	checker := NewHTTPReadinessChecker(target, "/healthz", time.Second, time.Second, nil)
+	if err := checker.Preflight(context.Background()); err != nil {
+		t.Fatalf("Preflight() error = %v", err)
+	}
+
+	serverWithMissingRoute := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer serverWithMissingRoute.Close()
+	target, _ = url.Parse(serverWithMissingRoute.URL)
+	checker = NewHTTPReadinessChecker(target, "/healthz", time.Second, time.Second, nil)
+	if err := checker.Preflight(context.Background()); err == nil {
+		t.Fatal("Preflight() error = nil for missing legacy route")
+	}
+}

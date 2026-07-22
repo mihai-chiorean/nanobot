@@ -32,11 +32,13 @@ iOS / web -> Cloudflare -> ziggy-control -> private Nanobot -> Spark models
   credential, query, request ID, or session ID.
 - Optionally emit content-free OpenTelemetry metrics and traces to a loopback
   OTLP/HTTP collector.
+- Admit bounded owner-only HTTP, SSE, and WebSocket traffic without waiting;
+  health and readiness remain available when a traffic class is full.
 
-Configuration is immutable after startup. Request handling uses no global
-mutable state or application locks. The standard HTTP transport provides
-concurrency-safe connection pooling, and each request carries a fresh
-cryptographic correlation ID.
+Configuration is immutable after startup. Admission uses atomic try-acquire
+and release counters and returns `503 Retry-After: 1` when a class is full.
+The standard HTTP transport provides concurrency-safe connection pooling, and
+each request carries a fresh cryptographic correlation ID.
 
 ## Compatibility bridge
 
@@ -59,14 +61,27 @@ Required variables:
 |---|---|
 | `CLERK_SECRET_KEY` or `CLERK_SECRET_KEY_FILE` | Backend key, supplied inline for development or through a credential file. Set exactly one. |
 | `ZIGGY_OWNER_EMAIL` | Only account admitted to the shared phase-one workspace. |
-| `ZIGGY_UPSTREAM_URL` | Private Nanobot origin, such as `http://127.0.0.1:8765`. |
+| `ZIGGY_UPSTREAM_URL` | Private Nanobot origin. It must use an explicit loopback, RFC1918 IPv4, IPv6 ULA/link-local, or Tailscale `100.64.0.0/10` address. Userinfo, query, fragment, and public hostnames are rejected. |
 
-Optional variables are documented in [`.env.example`](.env.example). Pin
-`ZIGGY_OWNER_SUBJECT` after the first successful login so an email change or
-account replacement cannot transfer access. Configure
-`ZIGGY_AUTHORIZED_PARTIES` when the Clerk clients emit a stable `azp` claim.
-Startup emits explicit warnings while either the subject pin or authorized-party
-check is absent.
+Optional variables are documented in [`.env.example`](.env.example). In
+production, `ZIGGY_OWNER_SUBJECT` and at least one
+`ZIGGY_AUTHORIZED_PARTIES` value are mandatory: an email match alone is not an
+identity boundary. Development, local, staging, and test environments retain
+the explicit escape hatch for clients that do not yet emit `azp` or use a
+subject pin.
+
+The default owner-only admission limits are 64 ordinary HTTP requests, 8 SSE
+streams, and 8 WebSocket connections. Override them with
+`ZIGGY_MAX_HTTP_IN_FLIGHT`, `ZIGGY_MAX_SSE_IN_FLIGHT`, and
+`ZIGGY_MAX_WEBSOCKET_IN_FLIGHT`. `/healthz` and `/readyz` bypass these limits.
+
+Startup first requires the configured readiness path to return 2xx, then
+requires the owner-only legacy Nanobot contract: unauthenticated `GET
+/auth/bootstrap` must return `401`, and credential-less `GET
+/webui/guest/bootstrap` must return `400`. A missing or incompatible upstream
+blocks deployment before the listener starts. `ZIGGY_LEGACY_UPSTREAM_PREFLIGHT`
+may be disabled only outside production when deliberately testing against the
+checked-in Nanobot source, which does not contain these vendor routes.
 
 Set `ZIGGY_OTEL_ENDPOINT=http://127.0.0.1:4318` and
 `ZIGGY_OTEL_AUTH_FILE` to enable application metrics and traces through the
@@ -165,6 +180,11 @@ Nanobot and model upstream.
 health polling into upstream load. Neither endpoint proves that a user can
 authenticate; deployment smoke tests must also exercise `/auth/bootstrap`.
 
+The application and telemetry exporters share the configured
+`ZIGGY_SHUTDOWN_TIMEOUT` budget (10 seconds by default). The systemd unit keeps
+`TimeoutStopSec=15s`, leaving a stop cushion after HTTP draining and telemetry
+flush. Do not configure a shutdown timeout longer than the unit's stop budget.
+
 ## Lab workflow
 
 The `lab-control` repository remains the source of truth for host topology and
@@ -184,7 +204,11 @@ orchestrator.
 ## Scope boundary
 
 This phase intentionally has no PostgreSQL dependency, no workspace scheduler,
-and no second-user support. Admitting another email to this binary would place
-that user in the owner's Nanobot workspace. The next milestone replaces the
-owner policy with a durable identity/workspace resolver and routes two test
+and no second-user support. It is owner-only and does not implement
+multi-tenancy. Current internal query-token compatibility is retained for the
+owner-only legacy protocol: WebSocket `Authorization: Bearer ...` is translated
+to the upstream `token` query parameter, and legacy GET/query guest enrollment
+remains available with `Deprecation: true`. Do not treat those query-token
+paths as a new public authentication mechanism. The next milestone replaces
+the owner policy with a durable identity/workspace resolver and routes test
 users to separate private runtimes.
