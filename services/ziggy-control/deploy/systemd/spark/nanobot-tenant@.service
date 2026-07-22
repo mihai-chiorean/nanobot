@@ -19,12 +19,9 @@ TimeoutStartSec=120s
 TimeoutStopSec=30s
 
 NoNewPrivileges=true
-PrivateDevices=true
 PrivateTmp=true
 ProtectControlGroups=true
 ProtectHome=read-only
-ProtectKernelLogs=true
-ProtectKernelModules=true
 ProtectKernelTunables=true
 ProtectSystem=strict
 ReadWritePaths=/home/mihai/.local/share/ziggy/tenants/%i
