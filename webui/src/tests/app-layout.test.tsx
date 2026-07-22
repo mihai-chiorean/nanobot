@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { ChatSummary } from "@/lib/types";
@@ -10,6 +10,7 @@ const deleteChatSpy = vi.fn();
 const getTokenSpy = vi.fn().mockResolvedValue("clerk-token");
 let mockSessions: ChatSummary[] = [];
 let mockSignedIn = true;
+let clientOptions: { onReauth?: () => Promise<string | null> } | null = null;
 
 vi.mock("@clerk/react", () => ({
   useAuth: () => ({
@@ -84,12 +85,17 @@ vi.mock("@/lib/nanobot-client", () => {
     attach = vi.fn();
     close = vi.fn();
     updateUrl = vi.fn();
+
+    constructor(options: { onReauth?: () => Promise<string | null> }) {
+      clientOptions = options;
+    }
   }
 
   return { NanobotClient: MockClient };
 });
 
 import App from "@/App";
+import { fetchBootstrap } from "@/lib/bootstrap";
 
 describe("App layout", () => {
   beforeEach(() => {
@@ -100,6 +106,12 @@ describe("App layout", () => {
     refreshSpy.mockReset();
     createChatSpy.mockClear();
     deleteChatSpy.mockReset();
+    clientOptions = null;
+    vi.mocked(fetchBootstrap).mockReset().mockResolvedValue({
+      token: "tok",
+      ws_path: "/",
+      expires_in: 300,
+    });
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValue({
@@ -233,5 +245,34 @@ describe("App layout", () => {
       await screen.findByRole("heading", { name: "Work" }),
     ).toBeInTheDocument();
     expect(screen.getByText(/background tasks/i)).toBeInTheDocument();
+  });
+
+  it("uses a refreshed bootstrap token for later REST requests", async () => {
+    const fetchSpy = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ tasks: [] }),
+    });
+    vi.stubGlobal("fetch", fetchSpy);
+    vi.mocked(fetchBootstrap)
+      .mockResolvedValueOnce({ token: "initial", ws_path: "/", expires_in: 300 })
+      .mockResolvedValueOnce({ token: "refreshed", ws_path: "/", expires_in: 300 });
+
+    render(<App />);
+    await waitFor(() => expect(connectSpy).toHaveBeenCalled());
+
+    await act(async () => {
+      await clientOptions?.onReauth?.();
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Work" }));
+
+    await waitFor(() => {
+      const workRequest = fetchSpy.mock.calls.find(([input]) =>
+        String(input).endsWith("/api/work"),
+      );
+      expect(workRequest?.[1]?.headers).toMatchObject({
+        Authorization: "Bearer refreshed",
+      });
+    });
   });
 });

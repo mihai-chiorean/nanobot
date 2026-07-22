@@ -140,6 +140,16 @@ function AuthenticatedApp({
               const refreshedIdentityToken = await getIdentityToken();
               if (!refreshedIdentityToken) return null;
               const refreshed = await fetchBootstrap(refreshedIdentityToken);
+              if (cancelled) return null;
+              setState((current) =>
+                current.status === "ready"
+                  ? {
+                      ...current,
+                      token: refreshed.token,
+                      modelName: refreshed.model_name ?? current.modelName,
+                    }
+                  : current,
+              );
               return deriveWsUrl(refreshed.ws_path, refreshed.token);
             } catch {
               return null;
