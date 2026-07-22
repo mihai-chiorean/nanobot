@@ -98,8 +98,6 @@ public struct BootstrapResponse: Codable, Hashable, Sendable {
     public let serverName: String?
     public let model: String?
     public let access: String?
-    public let guestCode: String?
-    public let isOwner: Bool?
     public let capabilities: [String: JSONValue]?
 
     /// Compatibility alias for callers that do not distinguish the two transport credentials yet.
@@ -118,7 +116,6 @@ public struct BootstrapResponse: Codable, Hashable, Sendable {
     public init(restToken: String, webSocketToken: String? = nil, webSocketPath: String = "/",
                 expiresIn: Int? = nil, expiresAt: ZiggyTimestamp? = nil,
                 serverName: String? = nil, model: String? = nil, access: String? = nil,
-                guestCode: String? = nil, isOwner: Bool? = nil,
                 capabilities: [String: JSONValue]? = nil) {
         self.restToken = restToken
         self.webSocketToken = webSocketToken
@@ -128,8 +125,6 @@ public struct BootstrapResponse: Codable, Hashable, Sendable {
         self.serverName = serverName
         self.model = model
         self.access = access
-        self.guestCode = guestCode
-        self.isOwner = isOwner ?? access.map { $0 == "owner" }
         self.capabilities = capabilities
     }
 
@@ -143,8 +138,6 @@ public struct BootstrapResponse: Codable, Hashable, Sendable {
         serverName = try c.decodeIfPresent(String.self, forAny: ["server", "server_name", "name"])
         model = try c.decodeIfPresent(String.self, forAny: ["model", "model_name"])
         access = try c.decodeIfPresent(String.self, forAny: ["access", "access_level"])
-        guestCode = try c.decodeIfPresent(String.self, forAny: ["guest_code"])
-        isOwner = try c.decodeIfPresent(Bool.self, forAny: ["owner", "is_owner"]) ?? access.map { $0 == "owner" }
         if let values = try? c.decode([String: JSONValue].self, forAny: ["capabilities", "features"]) {
             capabilities = values
         } else if let names = try? c.decode([String].self, forAny: ["capabilities", "features"]) {
@@ -389,16 +382,14 @@ public struct WorkEvent: Codable, Hashable, Sendable {
 
 public struct SettingsSnapshot: Codable, Hashable, Sendable {
     public let model: String?
-    public let isOwner: Bool?
     public let values: [String: JSONValue]
-    public init(model: String? = nil, isOwner: Bool? = nil, values: [String: JSONValue] = [:]) {
-        self.model = model; self.isOwner = isOwner; self.values = values
+    public init(model: String? = nil, values: [String: JSONValue] = [:]) {
+        self.model = model; self.values = values
     }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: AnyCodingKey.self)
         model = try c.decodeIfPresent(String.self, forAny: ["model", "model_name"])
-        isOwner = try c.decodeIfPresent(Bool.self, forAny: ["owner", "is_owner"])
         values = try c.decodeIfPresent([String: JSONValue].self, forAny: ["values", "settings"]) ?? [:]
     }
 }

@@ -3,15 +3,14 @@ import XCTest
 
 final class ModelAndEnvelopeTests: XCTestCase {
     func testProductionBootstrapShape() throws {
-        let data = Data(#"{"token":"nbwt_short-lived","ws_path":"/","expires_in":299,"model_name":"qwen3.6-35b","access":"guest","guest_code":"enrolled"}"#.utf8)
+        let data = Data(#"{"token":"nbwt_short-lived","ws_path":"/","expires_in":299,"model_name":"qwen3.6-35b","access":"tenant"}"#.utf8)
         let response = try JSONDecoder().decode(BootstrapResponse.self, from: data)
         XCTAssertEqual(response.restToken, "nbwt_short-lived")
         XCTAssertNil(response.webSocketToken)
         XCTAssertEqual(response.webSocketPath, "/")
         XCTAssertEqual(response.expiresIn, 299)
         XCTAssertEqual(response.model, "qwen3.6-35b")
-        XCTAssertEqual(response.access, "guest")
-        XCTAssertEqual(response.isOwner, false)
+        XCTAssertEqual(response.access, "tenant")
     }
 
     func testCapabilitiesRemainIndependent() {
