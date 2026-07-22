@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "tenants": [
+    {
+      "user_id": "usr_replace_with_stable_id",
+      "workspace_id": "ws_replace_with_stable_id",
+      "email": "owner@example.com",
+      "clerk_subject": "user_replace_with_clerk_subject",
+      "upstream_url": "http://100.64.0.10:18792",
+      "status": "active",
+      "legacy_default": true
+    },
+    {
+      "user_id": "usr_replace_with_stable_id_2",
+      "workspace_id": "ws_replace_with_stable_id_2",
+      "email": "tester@example.com",
+      "upstream_url": "http://100.64.0.10:18802",
+      "status": "active"
+    }
+  ]
+}

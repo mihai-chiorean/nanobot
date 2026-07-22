@@ -25,6 +25,12 @@ def _make_full_loop(tmp_path: Path) -> AgentLoop:
     return AgentLoop(bus=MessageBus(), provider=provider, workspace=tmp_path, model="test-model")
 
 
+def test_agent_loop_scopes_audit_log_to_workspace(tmp_path: Path) -> None:
+    loop = _make_full_loop(tmp_path)
+
+    assert loop._audit_logger._log_path == tmp_path / "audit.jsonl"
+
+
 def test_save_turn_skips_multimodal_user_when_only_runtime_context() -> None:
     loop = _mk_loop()
     session = Session(key="test:runtime-only")

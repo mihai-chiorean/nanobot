@@ -336,7 +336,7 @@ class AgentLoop:
         self.context = ContextBuilder(workspace, timezone=timezone, disabled_skills=disabled_skills)
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()
-        self._audit_logger = AuditLogger()
+        self._audit_logger = AuditLogger(self.workspace / "audit.jsonl")
         self.tools.set_audit_logger(self._audit_logger)
         # One file-read/write tracker per logical session. The tool registry is
         # shared by this loop, so tools resolve the active state via contextvars.

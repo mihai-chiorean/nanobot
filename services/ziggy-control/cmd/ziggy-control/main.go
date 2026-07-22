@@ -14,7 +14,9 @@ import (
 	"github.com/mihai-chiorean/nanobot/services/ziggy-control/internal/auth"
 	"github.com/mihai-chiorean/nanobot/services/ziggy-control/internal/config"
 	"github.com/mihai-chiorean/nanobot/services/ziggy-control/internal/httpapi"
+	"github.com/mihai-chiorean/nanobot/services/ziggy-control/internal/routing"
 	"github.com/mihai-chiorean/nanobot/services/ziggy-control/internal/telemetry"
+	"github.com/mihai-chiorean/nanobot/services/ziggy-control/internal/tenant"
 )
 
 var version = "dev"
@@ -79,6 +81,39 @@ func run() error {
 		return err
 	}
 
+	var tenantRouter httpapi.TenantRouter
+	if cfg.TenantManifest != "" {
+		registry, err := tenant.Load(cfg.TenantManifest, cfg.TenantBindings)
+		if err != nil {
+			return err
+		}
+		defaultUpstream, err := config.ParsePrivateUpstream(registry.Default().UpstreamURL)
+		if err != nil {
+			return fmt.Errorf("default tenant upstream: %w", err)
+		}
+		if defaultUpstream.String() != cfg.UpstreamURL.String() {
+			return fmt.Errorf("default tenant upstream must match ZIGGY_UPSTREAM_URL")
+		}
+		tenantRouter, err = routing.New(registry, logger, observability)
+		if err != nil {
+			return err
+		}
+		logger.Info("tenant routing enabled", "tenant_count", len(registry.Allocations()))
+	}
+	var connectorProxy http.Handler
+	var connectorSigner *httpapi.ConnectorSigner
+	if cfg.ConnectorsURL != nil {
+		if tenantRouter == nil {
+			return fmt.Errorf("connector proxy requires tenant routing")
+		}
+		connectorSigner, err = httpapi.NewConnectorSigner(cfg.ConnectorTrustKey)
+		if err != nil {
+			return err
+		}
+		connectorProxy = httpapi.NewConnectorReverseProxy(cfg.ConnectorsURL, logger, observability)
+		logger.Info("connector routing enabled")
+	}
+
 	readiness := httpapi.NewHTTPReadinessChecker(cfg.UpstreamURL, cfg.UpstreamReadyPath, cfg.ReadinessTimeout, cfg.ReadinessCacheTTL, observability)
 	if cfg.LegacyPreflight {
 		preflightCtx, cancel := context.WithTimeout(context.Background(), cfg.ReadinessTimeout)
@@ -92,6 +127,9 @@ func run() error {
 	handler, err := httpapi.New(httpapi.Config{
 		Authenticate:      httpapi.Middleware(authenticate),
 		Proxy:             httpapi.NewReverseProxy(cfg.UpstreamURL, logger, observability),
+		TenantRouter:      tenantRouter,
+		ConnectorProxy:    connectorProxy,
+		ConnectorSigner:   connectorSigner,
 		Readiness:         readiness,
 		Logger:            logger,
 		Telemetry:         observability,

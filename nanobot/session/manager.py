@@ -11,7 +11,7 @@ from typing import Any
 
 from loguru import logger
 
-from nanobot.config.paths import get_legacy_sessions_dir
+from nanobot.config.paths import get_legacy_sessions_dir, is_default_workspace
 from nanobot.utils.helpers import (
     ensure_dir,
     estimate_message_tokens,
@@ -246,7 +246,9 @@ class SessionManager:
     def __init__(self, workspace: Path):
         self.workspace = workspace
         self.sessions_dir = ensure_dir(self.workspace / "sessions")
-        self.legacy_sessions_dir = get_legacy_sessions_dir()
+        self.legacy_sessions_dir = (
+            get_legacy_sessions_dir() if is_default_workspace(self.workspace) else None
+        )
         self._cache: dict[str, Session] = {}
 
     @staticmethod
@@ -260,6 +262,8 @@ class SessionManager:
 
     def _get_legacy_session_path(self, key: str) -> Path:
         """Legacy global session path (~/.nanobot/sessions/)."""
+        if self.legacy_sessions_dir is None:
+            raise RuntimeError("legacy session migration is disabled for custom workspaces")
         return self.legacy_sessions_dir / f"{self.safe_key(key)}.jsonl"
 
     def get_or_create(self, key: str) -> Session:
@@ -285,7 +289,7 @@ class SessionManager:
     def _load(self, key: str) -> Session | None:
         """Load a session from disk."""
         path = self._get_session_path(key)
-        if not path.exists():
+        if not path.exists() and self.legacy_sessions_dir is not None:
             legacy_path = self._get_legacy_session_path(key)
             if legacy_path.exists():
                 try:

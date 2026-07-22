@@ -1,6 +1,8 @@
 package config
 
 import (
+	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"net"
@@ -39,6 +41,10 @@ type Config struct {
 	OwnerSubject      string
 	ClerkSecretKey    string
 	AuthorizedParties []string
+	TenantManifest    string
+	TenantBindings    string
+	ConnectorsURL     *url.URL
+	ConnectorTrustKey []byte
 	BlockedPaths      map[string]struct{}
 	ShutdownTimeout   time.Duration
 	ReadinessTimeout  time.Duration
@@ -143,6 +149,15 @@ func loadFrom(lookup LookupEnv, readFile ReadFile) (Config, error) {
 	}
 	authorizedParties := commaSeparated(lookup, "ZIGGY_AUTHORIZED_PARTIES", "")
 	ownerSubject := optional(lookup, "ZIGGY_OWNER_SUBJECT")
+	tenantManifest := optional(lookup, "ZIGGY_TENANTS_FILE")
+	tenantBindings := optional(lookup, "ZIGGY_TENANT_BINDINGS_FILE")
+	if (tenantManifest == "") != (tenantBindings == "") {
+		return Config{}, fmt.Errorf("ZIGGY_TENANTS_FILE and ZIGGY_TENANT_BINDINGS_FILE must be set together")
+	}
+	connectorsURL, connectorTrustKey, err := connectorConfig(lookup, readFile)
+	if err != nil {
+		return Config{}, err
+	}
 	legacyPreflight, err := boolean(lookup, "ZIGGY_LEGACY_UPSTREAM_PREFLIGHT", defaultLegacyPreflight)
 	if err != nil {
 		return Config{}, err
@@ -153,6 +168,9 @@ func loadFrom(lookup LookupEnv, readFile ReadFile) (Config, error) {
 		}
 		if ownerSubject == "" {
 			return Config{}, fmt.Errorf("ZIGGY_OWNER_SUBJECT is required in production")
+		}
+		if tenantManifest == "" {
+			return Config{}, fmt.Errorf("ZIGGY_TENANTS_FILE and ZIGGY_TENANT_BINDINGS_FILE are required in production")
 		}
 		if !legacyPreflight {
 			return Config{}, fmt.Errorf("ZIGGY_LEGACY_UPSTREAM_PREFLIGHT cannot be disabled in production")
@@ -166,6 +184,10 @@ func loadFrom(lookup LookupEnv, readFile ReadFile) (Config, error) {
 		OwnerSubject:      ownerSubject,
 		ClerkSecretKey:    secret,
 		AuthorizedParties: authorizedParties,
+		TenantManifest:    tenantManifest,
+		TenantBindings:    tenantBindings,
+		ConnectorsURL:     connectorsURL,
+		ConnectorTrustKey: connectorTrustKey,
 		BlockedPaths:      blockedPaths(lookup),
 		ShutdownTimeout:   shutdownTimeout,
 		ReadinessTimeout:  readinessTimeout,
@@ -182,6 +204,44 @@ func loadFrom(lookup LookupEnv, readFile ReadFile) (Config, error) {
 		OTelTraceSample:   otelTraceSample,
 		DeploymentEnv:     deploymentEnv,
 	}, nil
+}
+
+func connectorConfig(lookup LookupEnv, readFile ReadFile) (*url.URL, []byte, error) {
+	rawURL := optional(lookup, "ZIGGY_CONNECTORS_URL")
+	keyFile := optional(lookup, "ZIGGY_CONNECTORS_TRUST_KEY_FILE")
+	if (rawURL == "") != (keyFile == "") {
+		return nil, nil, fmt.Errorf("ZIGGY_CONNECTORS_URL and ZIGGY_CONNECTORS_TRUST_KEY_FILE must be set together")
+	}
+	if rawURL == "" {
+		return nil, nil, nil
+	}
+	parsed, err := parseUpstream(rawURL)
+	if err != nil {
+		return nil, nil, fmt.Errorf("ZIGGY_CONNECTORS_URL: %w", err)
+	}
+	contents, err := readFile(keyFile)
+	if err != nil {
+		return nil, nil, fmt.Errorf("ZIGGY_CONNECTORS_TRUST_KEY_FILE: %w", err)
+	}
+	key := decodeKeyMaterial(contents)
+	if len(key) < 32 {
+		return nil, nil, fmt.Errorf("ZIGGY_CONNECTORS_TRUST_KEY_FILE must contain at least 32 bytes")
+	}
+	return parsed, key, nil
+}
+
+func decodeKeyMaterial(contents []byte) []byte {
+	trimmed := strings.TrimSpace(string(contents))
+	for _, decode := range []func(string) ([]byte, error){
+		base64.StdEncoding.DecodeString,
+		base64.RawStdEncoding.DecodeString,
+		hex.DecodeString,
+	} {
+		if decoded, err := decode(trimmed); err == nil && len(decoded) >= 32 {
+			return decoded
+		}
+	}
+	return contents
 }
 
 func absolutePath(lookup LookupEnv, key, fallback string) (string, error) {
@@ -302,6 +362,12 @@ func parseUpstream(value string) (*url.URL, error) {
 	}
 	parsed.Path = strings.TrimSuffix(parsed.Path, "/")
 	return parsed, nil
+}
+
+// ParsePrivateUpstream validates a tenant runtime origin with the same private
+// network policy as the primary upstream.
+func ParsePrivateUpstream(value string) (*url.URL, error) {
+	return parseUpstream(value)
 }
 
 func trustedUpstreamHost(host string) bool {
