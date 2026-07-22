@@ -6,7 +6,7 @@ Requires=anti-sycophancy-proxy.service
 
 [Service]
 Type=simple
-WorkingDirectory=/home/mihai/workspace/ziggy
+WorkingDirectory=/home/mihai/workspace/ziggy/current-nanobot
 ExecStartPre=/usr/bin/curl --fail --silent --show-error http://127.0.0.1:8001/health
 ExecStart=/home/mihai/workspace/ziggy/.venv/bin/python3 -m nanobot gateway --config /home/mihai/.local/share/ziggy/tenants/%i/runtime/config.json
 Environment=PYTHONUNBUFFERED=1

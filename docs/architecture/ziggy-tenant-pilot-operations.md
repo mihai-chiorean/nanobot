@@ -38,6 +38,24 @@ state file. A different subject cannot later claim the same allocation.
 
 ## Spark runtime provisioning
 
+Deploy Nanobot source as an immutable release tree and switch the stable
+working-directory symlink atomically. Do not overwrite the historical dirty
+vendor checkout that was used to establish the pilot:
+
+```sh
+release=/home/mihai/workspace/ziggy/releases/nanobot-<git-sha>
+mkdir -p "$release"
+# Extract the reviewed source artifact into $release, then verify its commit manifest.
+ln -sfn "$release" /home/mihai/workspace/ziggy/current-nanobot.next
+mv -Tf /home/mihai/workspace/ziggy/current-nanobot.next \
+  /home/mihai/workspace/ziggy/current-nanobot
+```
+
+Both owner and tenant units must use `current-nanobot` as `WorkingDirectory`
+and execute `python3 -m nanobot gateway` directly. Rollback repoints the symlink
+to the prior immutable release and restarts the units; workspace, session,
+memory, Work, cron, and media state live outside the release tree.
+
 Install the user unit from
 `services/ziggy-control/deploy/systemd/spark/nanobot-tenant@.service`, then
 enable user-manager lingering before logout or reboot. Run this once as root
