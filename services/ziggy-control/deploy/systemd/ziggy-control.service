@@ -8,11 +8,15 @@ Type=simple
 User=ziggy-control
 Group=ziggy-control
 LoadCredential=clerk-secret-key:/etc/ziggy/secrets/clerk-secret-key
+LoadCredential=otel-local-auth:/etc/ziggy/secrets/otel-local-auth
 Environment=CLERK_SECRET_KEY_FILE=%d/clerk-secret-key
+Environment=ZIGGY_OTEL_AUTH_FILE=%d/otel-local-auth
 EnvironmentFile=/etc/ziggy/ziggy-control.env
 ExecStart=/usr/local/bin/ziggy-control
 Restart=on-failure
 RestartSec=2s
+# The process shares its 10s application shutdown budget between HTTP drain
+# and telemetry flush; keep a 5s cushion before systemd force-kills it.
 TimeoutStopSec=15s
 
 NoNewPrivileges=true

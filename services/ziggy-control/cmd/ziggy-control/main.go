@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"github.com/mihai-chiorean/nanobot/services/ziggy-control/internal/auth"
 	"github.com/mihai-chiorean/nanobot/services/ziggy-control/internal/config"
 	"github.com/mihai-chiorean/nanobot/services/ziggy-control/internal/httpapi"
+	"github.com/mihai-chiorean/nanobot/services/ziggy-control/internal/telemetry"
 )
 
 var version = "dev"
@@ -35,31 +37,72 @@ func run() error {
 		"version", version,
 	)
 	slog.SetDefault(logger)
-	if cfg.OwnerSubject == "" {
+	if cfg.DeploymentEnv != "production" && cfg.OwnerSubject == "" {
 		logger.Warn("owner subject is not pinned")
 	}
-	if len(cfg.AuthorizedParties) == 0 {
+	if cfg.DeploymentEnv != "production" && len(cfg.AuthorizedParties) == 0 {
 		logger.Warn("Clerk authorized-party validation is disabled")
 	}
+
+	observability, err := telemetry.New(context.Background(), telemetry.Config{
+		Endpoint:              cfg.OTelEndpoint,
+		AuthorizationFile:     cfg.OTelAuthFile,
+		ServiceVersion:        version,
+		DeploymentEnvironment: cfg.DeploymentEnv,
+		TraceSampleRatio:      cfg.OTelTraceSample,
+	})
+	if err != nil {
+		logger.Warn("OpenTelemetry disabled", "error_class", "initialization")
+		observability = telemetry.Noop()
+	}
+	if observability.Enabled() {
+		logger.Info("OpenTelemetry enabled", "export", "loopback_otlp_http")
+	}
+	telemetryShutdownComplete := false
+	defer func() {
+		if telemetryShutdownComplete {
+			return
+		}
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
+		defer cancel()
+		if err := observability.Shutdown(shutdownCtx); err != nil {
+			logger.Warn("OpenTelemetry shutdown incomplete", "error_class", "export")
+		}
+	}()
 
 	authenticate, err := auth.New(auth.Config{
 		SecretKey:         cfg.ClerkSecretKey,
 		AuthorizedParties: cfg.AuthorizedParties,
+		Telemetry:         observability,
 	})
 	if err != nil {
 		return err
 	}
 
+	readiness := httpapi.NewHTTPReadinessChecker(cfg.UpstreamURL, cfg.UpstreamReadyPath, cfg.ReadinessTimeout, cfg.ReadinessCacheTTL, observability)
+	if cfg.LegacyPreflight {
+		preflightCtx, cancel := context.WithTimeout(context.Background(), cfg.ReadinessTimeout)
+		err := readiness.Preflight(preflightCtx)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("upstream compatibility preflight failed: %w", err)
+		}
+	}
+
 	handler, err := httpapi.New(httpapi.Config{
-		Authenticate:   httpapi.Middleware(authenticate),
-		Proxy:          httpapi.NewReverseProxy(cfg.UpstreamURL, logger),
-		Readiness:      httpapi.NewHTTPReadinessChecker(cfg.UpstreamURL, cfg.UpstreamReadyPath, cfg.ReadinessTimeout, cfg.ReadinessCacheTTL),
-		Logger:         logger,
-		OwnerEmail:     cfg.OwnerEmail,
-		OwnerSubject:   cfg.OwnerSubject,
-		BlockedPaths:   cfg.BlockedPaths,
-		MaxRequestBody: cfg.MaxRequestBody,
-		Version:        version,
+		Authenticate:      httpapi.Middleware(authenticate),
+		Proxy:             httpapi.NewReverseProxy(cfg.UpstreamURL, logger, observability),
+		Readiness:         readiness,
+		Logger:            logger,
+		Telemetry:         observability,
+		OwnerEmail:        cfg.OwnerEmail,
+		OwnerSubject:      cfg.OwnerSubject,
+		BlockedPaths:      cfg.BlockedPaths,
+		MaxRequestBody:    cfg.MaxRequestBody,
+		HTTPInFlight:      cfg.HTTPInFlight,
+		SSEInFlight:       cfg.SSEInFlight,
+		WebSocketInFlight: cfg.WebSocketInFlight,
+		Version:           version,
 	})
 	if err != nil {
 		return err
@@ -99,14 +142,26 @@ func run() error {
 	logger.Info("shutting down")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancel()
-	if err := server.Shutdown(shutdownCtx); err != nil {
-		logger.Warn("graceful shutdown deadline reached", "error", err)
-		if closeErr := server.Close(); closeErr != nil {
-			return closeErr
+	shutdownErr := server.Shutdown(shutdownCtx)
+	var closeErr error
+	if shutdownErr != nil {
+		logger.Warn("graceful shutdown deadline reached", "error", shutdownErr)
+		if closeErr = server.Close(); closeErr != nil {
+			logger.Warn("server close failed", "error_class", "shutdown")
 		}
 	}
+	if err := observability.Shutdown(shutdownCtx); err != nil {
+		logger.Warn("OpenTelemetry shutdown incomplete", "error_class", "export")
+	}
+	telemetryShutdownComplete = true
 	if err := <-serveErr; !errors.Is(err, http.ErrServerClosed) {
 		return err
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	if shutdownErr != nil {
+		return shutdownErr
 	}
 	return nil
 }

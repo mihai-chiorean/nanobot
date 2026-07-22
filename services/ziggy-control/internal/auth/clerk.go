@@ -15,12 +15,14 @@ import (
 	"github.com/clerk/clerk-sdk-go/v2/jwks"
 	"github.com/clerk/clerk-sdk-go/v2/user"
 	"github.com/mihai-chiorean/nanobot/services/ziggy-control/internal/identity"
+	"github.com/mihai-chiorean/nanobot/services/ziggy-control/internal/telemetry"
 )
 
 type Config struct {
 	SecretKey         string
 	AuthorizedParties []string
 	HTTPClient        *http.Client
+	Telemetry         *telemetry.Recorder
 }
 
 type emailResolver func(context.Context, string) (string, error)
@@ -35,6 +37,8 @@ type cachedEmail struct {
 	expiresAt time.Time
 }
 
+const defaultEmailCacheEntries = 1024
+
 func New(config Config) (func(http.Handler) http.Handler, error) {
 	if strings.TrimSpace(config.SecretKey) == "" {
 		return nil, errors.New("Clerk secret key is required")
@@ -46,7 +50,14 @@ func New(config Config) (func(http.Handler) http.Handler, error) {
 		transport.MaxIdleConns = 32
 		transport.MaxIdleConnsPerHost = 16
 		transport.IdleConnTimeout = 90 * time.Second
-		httpClient = &http.Client{Timeout: 5 * time.Second, Transport: transport}
+		observability := config.Telemetry
+		if observability == nil {
+			observability = telemetry.Noop()
+		}
+		httpClient = &http.Client{
+			Timeout:   5 * time.Second,
+			Transport: observability.WrapTransport(transport, "identity"),
+		}
 	}
 	clientConfig := &clerk.ClientConfig{BackendConfig: clerk.BackendConfig{
 		HTTPClient: httpClient,
@@ -84,21 +95,51 @@ func New(config Config) (func(http.Handler) http.Handler, error) {
 }
 
 func cacheEmailResolver(resolve emailResolver, ttl time.Duration) emailResolver {
-	var cache sync.Map
+	return cacheEmailResolverWithLimit(resolve, ttl, defaultEmailCacheEntries)
+}
+
+func cacheEmailResolverWithLimit(resolve emailResolver, ttl time.Duration, maxEntries int) emailResolver {
+	if maxEntries <= 0 {
+		maxEntries = 1
+	}
+	cache := make(map[string]cachedEmail, maxEntries)
+	var mutex sync.Mutex
+
 	return func(ctx context.Context, subject string) (string, error) {
-		if cached, ok := cache.Load(subject); ok {
-			entry := cached.(cachedEmail)
-			if time.Now().Before(entry.expiresAt) {
-				return entry.value, nil
+		now := time.Now()
+		mutex.Lock()
+		for key, entry := range cache {
+			if !now.Before(entry.expiresAt) {
+				delete(cache, key)
 			}
-			cache.Delete(subject)
 		}
+		if entry, ok := cache[subject]; ok {
+			mutex.Unlock()
+			return entry.value, nil
+		}
+		mutex.Unlock()
 
 		email, err := resolve(ctx, subject)
 		if err != nil {
 			return "", err
 		}
-		cache.Store(subject, cachedEmail{value: email, expiresAt: time.Now().Add(ttl)})
+
+		mutex.Lock()
+		defer mutex.Unlock()
+		if len(cache) >= maxEntries {
+			oldestKey := ""
+			var oldest time.Time
+			for key, entry := range cache {
+				if oldestKey == "" || entry.expiresAt.Before(oldest) {
+					oldestKey = key
+					oldest = entry.expiresAt
+				}
+			}
+			if oldestKey != "" {
+				delete(cache, oldestKey)
+			}
+		}
+		cache[subject] = cachedEmail{value: email, expiresAt: time.Now().Add(ttl)}
 		return email, nil
 	}
 }

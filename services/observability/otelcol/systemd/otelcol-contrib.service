@@ -1,0 +1,41 @@
+[Unit]
+Description=Ziggy OpenTelemetry Collector
+Documentation=https://opentelemetry.io/docs/collector/
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=otelcol-contrib
+Group=otelcol-contrib
+SupplementaryGroups=systemd-journal
+ExecStart=/usr/local/libexec/ziggy-otelcol-start --config=/etc/otelcol-contrib/config.yaml
+Restart=on-failure
+RestartSec=10s
+TimeoutStopSec=30s
+StateDirectory=ziggy-otelcol
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectHostname=true
+ProtectClock=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

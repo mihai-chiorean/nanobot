@@ -1,272 +1,247 @@
 # Ziggy Observability Architecture
 
-Status: proposed
+Status: proposed; collector configuration is implemented but host rollout is a
+separate promotion
 
 ## Decision
 
 Use OpenTelemetry and Prometheus formats as the instrumentation boundary and
-send a deliberately small, content-free telemetry set to Grafana Cloud. Run the
-official `otelcol-contrib` distribution on Beelink as the gateway. Run one
-resource-capped collector on Spark only for local journal access, host/model
-metrics, and forwarding selected Prometheus targets. Keep Langfuse local for
-LLM-specific traces, prompts, token use, cost, and evaluation.
+send a small, content-free operational telemetry set to Grafana Cloud. Run one
+resource-capped `otelcol-contrib` process on each host because journald and host
+metrics are node-local. Keep Langfuse local for prompts, model inputs/outputs,
+token use, cost, and evaluation.
 
-This gives the system an off-site control plane that remains available when
-Spark, Beelink, the home network, or their storage is down. The collector is
-vendor-neutral and supports Prometheus and generic OTLP inputs, so changing the
-storage backend does not require replacing application instrumentation.
+Grafana Cloud is an off-site alerting and incident index, not the forensic log
+store. Full journals and private AI observability remain local.
 
-References:
+## Privacy boundary
 
-- [OpenTelemetry Collector](https://opentelemetry.io/docs/collector/)
-- [Grafana Cloud pricing and free retention](https://grafana.com/pricing/)
+No prompt, transcript, email/document content, request or response body,
+credential, authorization/cookie/header value, raw URL, query string, request
+ID, user ID, workspace ID, session ID, or other tenant identity may leave the
+private network.
 
-Use the ordinary Grafana Cloud Metrics, Logs, and Traces products. Do not enable
-the separately billed Application Observability product or emit its
-`traces_host_info` billing signal during the initial rollout.
+The export boundary is allowlist-first:
 
-## Requirements
+1. Beelink accepts OTLP/HTTP only on loopback, only with local Basic auth, and
+   only for `service.name=ziggy-control`.
+2. Application metric names, span names, resource keys, span/datapoint keys,
+   and bounded enum values are explicit allowlists. Unknown telemetry is
+   dropped, not merely redacted.
+3. All span events are dropped. Spans containing links and metric datapoints
+   containing exemplars are dropped because `v0.147.0` cannot safely clear
+   their nested attributes in place.
+4. Filesystem mountpoint attributes are dropped because they can contain user
+   or workspace paths. Prometheus metric names are allowlisted at scrape time.
+   Identity and high-cardinality labels are dropped, followed by a short label
+   allowlist.
+5. Health-probe URLs are mapped from exact configured URLs to fixed target
+   names, then the URL and error-message attributes are discarded.
+6. Journald messages are used only to classify an allowlisted lifecycle or
+   host-health event. The raw body and all journal fields are erased before
+   export; the output contains a fixed `event.name`, timestamp/severity, and
+   stable service/host resources only.
 
-- The cloud view must remain available when Spark, Beelink, or the home network
-  is unavailable.
-- An alert must identify the failed component and link to the preceding service
-  events or error logs when they exist.
-- No prompts, transcripts, email or document content, request bodies,
-  credentials, authorization headers, cookies, or URL query strings may leave
-  the private network.
-- Collection must use no GPU memory and have a hard CPU and memory ceiling on
-  Spark. Losing optional telemetry is preferable to contending with inference.
-- Configuration, dashboards, recording rules, and alerts live in source control
-  and are deployed through Lab.
+There is no cloud export of ziggy-control, Cloudflared, Docker, Qwen, Nanobot,
+or user-session warning bodies. Redaction is defense in depth and never grants
+permission to ingest a broad log source.
 
-## Current state
+The CI privacy canary sends legacy and current URL, query, header, body,
+identity, workspace, session, and request attributes through authenticated
+OTLP. It also sends a span event, span link, status message, metric exemplar,
+and unapproved metric. CI fails if authentication does not reject an anonymous
+request, approved telemetry disappears, or any canary value reaches the file
+exporter.
 
-- Spark runs `nanobot-prometheus` and `nanobot-grafana` in Docker.
-- Spark Prometheus currently scrapes only Nanobot and the Qwen-facing proxy. It
-  does not expose host, GPU, systemd state, or restart information.
-- Prometheus retains up to 90 days or 20 GB on Spark-local storage.
-- Beelink has separate CVAT Grafana and Langfuse/ClickHouse deployments.
-- `ziggy-control`, `ziggy-cloudflared`, and Spark user services log to journald.
-- `ziggy-control` emits structured request logs with service, version, request
-  ID, route, status, response bytes, duration, and Cloudflare Ray ID.
-- `ziggy-cloudflared` exposes local Prometheus metrics on port 20241.
+## Credentials
 
-The Spark Prometheus/Grafana pair is useful for development but cannot be the
-production source of truth: it disappears during the most important failure,
-an unavailable Spark host.
+Grafana write tokens are one per host, scoped only for the required telemetry
+write APIs, and loaded by systemd from
+`/etc/ziggy/secrets/grafana-cloud-otel-token`. The collector Basic auth client
+uses `password_file`; no cloud token is copied into process environment.
 
-## Data flow
+The Beelink local OTLP credential is a paired secret generated from one random
+password:
 
 ```text
-public /healthz and /readyz <---------- Grafana synthetic probes
+/etc/ziggy/secrets/otel-local-users.htpasswd
+  -> collector systemd credential: otel-local-users
 
-ziggy-control -- OTLP metadata only ---+
-cloudflared ---- Prometheus -----------+      +---------------------------+
-Beelink journal allowlist ------------+----->| OTel gateway on Beelink   |
-Docker service state -----------------+      +------------+--------------+
-                                                               |
-Spark endpoint probes over Tailscale --------------------------+
-                                                               | TLS
-Spark selected journal events ----------+                      |
-Spark host/model health metrics ---------+  +-------------------v---+
-Qwen Prometheus metrics -----------------+->| OTel collector on Spark|
-                                            | MemoryMax/CPUQuota     |
-                                            +-----------+------------+
-                                                        |
-                           +----------------------------+-----------+
-                           | metrics / selected logs / sampled spans|
-                           v                                        v
-                    Grafana Cloud                          local Langfuse
-                    operational view                      private AI data
+/etc/ziggy/secrets/otel-local-auth
+  -> ziggy-control systemd credential: otel-local-auth
+  -> ZIGGY_OTEL_AUTH_FILE=%d/otel-local-auth
 ```
 
-The collector enriches every signal with stable `service.name`, `service.version`,
-`deployment.environment`, and `host.name` attributes. The Spark service has a
-systemd memory limit and CPU quota and does no trace processing, secret
-scanning, or broad journal ingestion.
+The second file contains `ziggy-control:<plain random password>`; the Go client
+normalizes it to a Basic Authorization value internally. Secret source files
+are root-owned mode `0400`; credential paths, not values, are placed in process
+environments. Rotation restarts the collector and ziggy-control.
 
-## Collected surface
+## Implemented data flow
 
-### Metrics and probes
+```text
+ziggy-control -- authenticated loopback OTLP metrics/traces --+
+Cloudflared -- allowlisted Prometheus metrics ---------------+--> Beelink collector
+Beelink host/probes/system units -----------------------------+        |
+content-free system lifecycle/kernel events -----------------+        |
+                                                                      | TLS
+Spark host/model probes --------------------------------------+        |
+Qwen allowlisted Prometheus metrics --------------------------+--> Spark collector
+content-free kernel OOM/GPU/storage events -------------------+        |
+                                                                      v
+                                                                Grafana Cloud
 
-- Host availability, boot ID, uptime, load, CPU, RAM, disk, filesystem, network,
-  and OOM counters.
-- GPU utilization, memory used/free, temperature, power, and exporter health.
-- Active/failed state and restart events for Qwen, the anti-sycophancy proxy,
-  Nanobot gateway, Whisper, Ziggy ingest, `ziggy-control`, Cloudflare tunnel,
-  Redis, and the backend containers.
-- Process RSS/CPU and health for the inference and gateway processes. Alert if
-  the retired Minimax process or unit becomes active.
-- Black-box probes from Beelink to Spark ports `8012`, `8001`, and `18792`, and
-  cloud probes to public `/healthz` and `/readyz`.
-- Qwen queue depth, first-token latency, generation rate, and failures when the
-  upstream exporter exposes them.
+private prompts/model content ---------------------------------> local Langfuse only
+```
 
-### Logs
+Each pipeline sets only stable resources: `service.name`,
+`service.namespace`, `deployment.environment`, `host.name`,
+`ziggy.host.role`, and application `service.version` where applicable.
 
-Only ship warning/error events and lifecycle messages from the named services
-above, plus kernel OOM and NVIDIA driver failures. Do not ship general Nanobot,
-application, access, Docker, or user-session logs. Retain full journals locally
-for deeper investigation. Filtering is allowlist-first; redaction is a second
-line of defense, not permission to export arbitrary logs.
+## Current collected surface
 
-### Traces
+### Beelink
 
-Instrument `ziggy-control` first. Export service/operation names, timestamps,
-status, latency, retry count, and a generated trace ID. Strip headers, cookies,
-request and response bodies, user identifiers, raw URLs, and query strings
-before export. Keep all errors and slow requests and sample only 1-5% of normal
-requests. Propagate W3C trace context to Nanobot as support is added.
+- Host uptime, load, CPU, memory, disk, filesystem, network, and paging metrics
+  from explicitly enabled host scrapers and a final metric/attribute allowlist.
+- Named checks for local health/readiness and public health. The checked-in
+  collector does not create the independent external synthetic monitor; that
+  remains a Grafana-side rollout action.
+- A reviewed subset of Cloudflared connection/request/error metrics.
+- `systemd.unit.state` for the four system units `ziggy-control.service`,
+  `ziggy-cloudflared.service`, `docker.service`, and
+  `otelcol-contrib.service`.
+- Fixed service started/stopped/failed/restart-scheduled events for
+  ziggy-control, Cloudflared, and Docker, plus fixed host OOM/storage-error
+  events. No message body is exported.
+- The nine named ziggy-control RED/uptime metrics currently emitted by the Go
+  service.
+- Content-free ziggy-control spans with bounded operation/route/method/status
+  attributes.
+- An allowlisted subset of collector process heartbeat, queue,
+  exporter-failure, receiver/processor refusal, and tail-sampler self-metrics
+  scraped from an explicit loopback Prometheus pull reader.
 
-## Incident workflow
+### Spark
 
-The fleet dashboard is organized for a single question: what changed before the
-service stopped working?
+- The same bounded host metric classes.
+- Named health checks for Qwen, the anti-sycophancy proxy, and Nanobot gateway.
+- A reviewed subset of Qwen/vLLM queue, cache, latency, token, and outcome
+  metrics when those exact names exist at the deployed endpoint.
+- Fixed kernel OOM, GPU-driver, and storage-error events with no message body.
+- An allowlisted subset of collector process heartbeat, queue,
+  exporter-failure, and receiver/processor refusal self-metrics from the same
+  explicit loopback pull reader.
 
-1. A cloud probe detects that public readiness failed even if both local hosts
-   are unreachable.
-2. The incident timeline overlays host boot IDs, deploy annotations, systemd
-   state transitions, restart events, GPU-memory headroom, OOM counters, and
-   endpoint probe results.
-3. Selecting a failed service opens only its allowlisted warning/error events
-   for the five minutes before and after the transition.
-4. A related sampled trace shows which request boundary failed or timed out,
-   without request content or identity attributes.
-5. A runbook link provides the local `lab` commands for retrieving complete
-   journals when the cloud metadata is insufficient.
+Spark has no OTLP receiver, trace pipeline, application journal pipeline, or
+systemd metrics receiver. In particular, this design does **not** claim current
+state metrics for Spark user services. Lifecycle text in the user journal is
+not a trustworthy state source. Lab should eventually publish desired/deployed
+version and health state, and the future runtime manager should publish actual
+runtime desired/current state, lease generation, start outcome, and restart
+counts as bounded metrics. Until then, endpoint probes, Qwen metrics, kernel
+events, and local `systemctl --user` investigation are the available signals.
 
-Grafana Cloud is therefore not the forensic data store. It is the durable
-incident index and alerting surface that points to a narrow cause and the local
-evidence needed to confirm it.
+GPU utilization, memory, temperature, and power metrics are also not currently
+implemented. Add them only after selecting and pinning a GPU exporter with an
+exact metric/label allowlist and measuring its Spark resource cost.
 
-## Rollout
+## Trace sampling
 
-### Phase 1: host and ingress visibility
+The Beelink collector performs bounded tail sampling:
 
-1. Create one Grafana Cloud Free stack with separate least-privilege write
-   credentials for metrics, logs, and traces. Disable Application
-   Observability.
-2. Install the full OTel gateway on Beelink and resource-capped collector on
-   Spark through Lab.
-3. Collect host/GPU/service-state metrics, only the selected journald events,
-   Cloudflare metrics, and the existing Spark Prometheus targets.
-4. Add an external synthetic check for `https://chat.mihaichiorean.com/healthz`
-   and an internal readiness check for `/readyz`.
-5. Alert on public unavailability, readiness failure, tunnel disconnects,
-   sustained 5xx rates, disk pressure, memory pressure, Spark GPU failure,
-   service restart/failure, Qwen health, and unexpected Minimax activation.
-6. Build one fleet dashboard whose service rows link directly to filtered logs
-   for the selected host, service, and incident window.
+- retain all received traces with OpenTelemetry `ERROR` status;
+- retain all received traces whose end-to-end duration exceeds two seconds;
+- retain 2% of remaining traces probabilistically;
+- hold at most 1,000 in-flight traces with bounded sampled/non-sampled decision
+  caches and a 10-second decision window.
 
-### Phase 2: application telemetry
+ziggy-control must set `ZIGGY_OTEL_TRACE_SAMPLE_RATIO=1.0` in production so the
+collector sees error and latency outcomes before sampling. Any smaller SDK head
+sample ratio means the collector cannot promise complete error/slow retention.
+Sampling is a cost control, not a privacy control; sanitization runs before the
+tail sampler.
 
-1. Add OpenTelemetry HTTP server/client spans and RED metrics to
-   `ziggy-control` on a separate loopback telemetry listener.
-2. Propagate W3C trace context to Nanobot and all Go services.
-3. Instrument Nanobot, Whisper, Ziggy ingest, and model calls around queueing,
-   first-token latency, tool execution, and completion.
-4. Correlate operational trace IDs with Langfuse trace IDs without exporting
-   prompt content into general-purpose logs.
+## Queues and failure behavior
 
-### Phase 3: service objectives
+Exporter queues and journald cursors use the `file_storage` extension under the
+systemd-managed `/var/lib/ziggy-otelcol` state directory. The queue byte sizer
+caps payloads at 64 MiB on Beelink and 32 MiB on Spark. BoltDB pages and
+compaction can temporarily consume additional bounded operational overhead, so
+host disk alerts must leave headroom beyond those payload numbers.
 
-- Public availability and bootstrap success rate.
-- Chat request success rate and end-to-end latency.
-- Time to first token and tokens per second.
-- Tool-call failure and timeout rate.
-- Whisper queue time, transcription latency, and rejected audio.
-- GPU saturation, model queue depth, OOM events, and restarts.
+Writes are fsynced, online/startup compaction is enabled, and exporter retry
+continues for up to 30 minutes. Journald receivers persist cursors and retry
+downstream backpressure for up to 30 minutes. Queue overflow, disk exhaustion,
+or prolonged cloud failure drops optional telemetry; it must not block Ziggy or
+grow disk use without a configured ceiling.
 
-## Alternatives
+The collector self-metric allowlist provides process uptime as a heartbeat,
+queue size/capacity, successful sends, enqueue/send failures, and
+receiver/processor refusal counters. Full collector diagnostics remain in its
+local journal.
 
-### Managed product fit
+## Resource isolation
 
-Grafana Cloud Free is the initial production choice. Its ordinary free stack
-currently includes 10,000 active metric series, 50 GB each of logs and traces,
-14-day retention, and three users. The existing Spark Prometheus head has about
-549 series, so the first rollout has substantial headroom if journal collection
-remains allowlisted.
+The shared systemd unit runs as an unprivileged account with a private state
+directory, empty capability set, strict filesystem/home/device protection,
+restricted namespaces/address families, `NoNewPrivileges`, and other systemd
+sandboxing. It retains journal read access through the `systemd-journal` group.
 
-Do not enable Grafana Cloud Application Observability initially. Its current
-new-customer pricing adds $0.025 per host-hour plus telemetry charges, which is
-about $36.50 per month for two continuously connected physical hosts before
-telemetry. Plain Cloud Metrics, Logs, Traces, dashboards, and alerting provide
-the capabilities required here without that product.
+Beelink is limited to 448 MiB and 15% CPU. Spark is limited to 192 MiB and 5%
+CPU. The collector has no GPU dependency. Losing telemetry is preferable to
+contending with inference.
 
-References:
+## Reproducible rollout
 
-- [Grafana Cloud deployment and free allowances](https://grafana.com/grafana/deployment-options/)
-- [Grafana Cloud pricing](https://grafana.com/pricing/)
-- [Application Observability host-hour pricing](https://grafana.com/docs/grafana-cloud/monitor-applications/application-observability/pricing/)
+Production pins `otelcol-contrib v0.147.0` and checked-in SHA-256 values for
+Linux AMD64 and ARM64 archives. CI runs the native artifact on both
+architectures, parses all YAML, validates all profiles, checks shell syntax,
+and executes the privacy/auth canary.
 
-Better Stack is the simplest runner-up for external probes and incident UX. Its
-free plan currently includes 10 monitors/heartbeats, 30 GB of metrics, and 3 GB
-each of logs and traces retained for three days. That history is short for
-intermittent home-lab failures, and using it would split the current Prometheus
-and Grafana workflow across products. Reconsider it if operational simplicity
-matters more than retention and ecosystem continuity.
+The host deploy command downloads and verifies the architecture-specific
+artifact, validates the candidate config with the candidate binary and
+credential-file paths, snapshots the current binary link/config/unit/drop-in/
+launcher, installs the candidate, enables and starts the service, and verifies
+that it remains active. Promotion additionally requires the local process
+uptime heartbeat, exporter queue-capacity metric, and a positive
+`otelcol_exporter_sent_metric_points_total` counter, which records an accepted
+Grafana metrics export. A startup or export-readiness failure automatically
+restores the snapshot. The same snapshot is available through an explicit
+rollback command.
 
-SigNoz Cloud provides an integrated OpenTelemetry APM experience but currently
-starts at $49 per month. Chronosphere targets enterprise-scale telemetry control
-and has no public self-service price. Neither is justified at the current scale.
+Rollout order:
 
-References:
+1. Create one least-privilege Grafana write token per host and the paired local
+   OTLP credential on Beelink.
+2. Deploy Spark first and verify host/probe/Qwen/collector metrics plus only
+   content-free kernel events.
+3. Deploy Beelink with ziggy-control telemetry disabled and verify host/probe/
+   Cloudflared/systemd/collector signals and content-free events.
+4. Configure ziggy-control's loopback endpoint, `otel-local-auth` credential,
+   and head sample ratio `1.0`; restart it and verify authenticated metric/trace
+   arrival.
+5. Run synthetic failure checks and inspect cloud output for only documented
+   resources, names, labels, and event fields.
+6. Add dashboards and alerts only for signals observed at the deployed version;
+   absent allowlisted Qwen/Cloudflared names are a rollout finding, not a reason
+   to broaden the regex.
 
-- [Better Stack pricing](https://betterstack.com/pricing)
-- [SigNoz pricing](https://signoz.io/pricing/)
-- [Chronosphere distributed tracing](https://chronosphere.io/platform/distributed-tracing/)
-
-### Self-hosted Grafana LGTM
-
-Best fit if telemetry must stay local. It preserves Grafana, Prometheus, Loki,
-and Tempo conventions, but introduces log and trace storage plus backup and
-upgrade work. Tempo expects durable object storage for production traces. It
-also needs to run outside Spark if it is expected to report Spark outages.
-
-References: [Loki architecture](https://grafana.com/docs/loki/latest/get-started/architecture/),
-[Tempo architecture](https://grafana.com/docs/tempo/latest/introduction/architecture/)
-
-### SigNoz
-
-Good integrated OpenTelemetry UI and self-hosting story. Its backend is another
-ClickHouse deployment, duplicating the database and operational footprint
-already present for Langfuse. Adopt it only if its integrated APM workflow is
-more valuable than retaining the existing Grafana ecosystem.
-
-Reference: [SigNoz architecture](https://signoz.io/docs/architecture/)
-
-### OpenObserve
-
-Strong compact self-hosted candidate with one product for logs, metrics, and
-traces and OTLP ingestion. It is worth a later evaluation if Grafana Cloud cost
-or data locality becomes a problem. Choosing it now would add a second query
-and dashboard model while the current Prometheus/Grafana deployment is still
-useful.
-
-Reference: [OpenObserve documentation](https://openobserve.ai/docs/)
+Rollback restores collector artifacts/configuration but preserves persistent
+queues and cursors. Storage-format downgrade compatibility must be tested on a
+copy before changing the pinned collector version.
 
 ## Guardrails
 
-- Do not use telemetry labels for user IDs, conversation IDs, request IDs, or
-  other unbounded values; keep high-cardinality identifiers in logs and traces.
-- Do not export Clerk tokens, Nanobot tokens, WebSocket query strings, prompts,
-  email bodies, transcripts, or tool credentials.
-- Drop `http.request.header.*`, `http.response.header.*`, `url.full`,
-  `url.query`, cookies, and request/response body attributes in the collector,
-  even when an SDK is believed not to emit them.
-- Use an allowlist for journal units and priorities. Never rely on automatic PII
-  or secret detection as the primary privacy control.
-- Put Grafana Cloud credentials in systemd credentials, not environment files,
-  and give each host write-only scopes. The dashboard account has MFA.
-- Cap the Spark collector with systemd `MemoryMax` and `CPUQuota`; do not run eBPF
-  auto-instrumentation or local Loki/Tempo databases on Spark.
-- Start the Spark collector with `MemoryMax=192M` and `CPUQuota=5%`. Treat those as hard
-  ceilings to validate under load, not resource reservations; lower them only
-  after measuring collection gaps and queue behavior.
-- Pin container and collector versions instead of deploying `latest` tags.
-- Keep collection configuration and dashboards in source control and deploy
-  them through Lab.
-- Set retention and ingestion budgets before enabling verbose application
-  traces. Grafana Cloud's current free allowances list 50 GB per month each for
-  logs and traces with 14-day retention; metrics use a separate active-series
-  allowance. That is sufficient for a measured first rollout.
+- Do not enable OTLP on Spark until a named, reviewed SDK needs it and can use a
+  dedicated authenticated credential and signal allowlist.
+- Do not enable broad application, Docker, access, user-journal, or warning-log
+  ingestion. Retrieve full logs locally during an incident.
+- Do not add labels for user, workspace, conversation, session, request, URL,
+  prompt, model input, or unbounded runtime IDs.
+- Treat new metric names and attribute keys as denied until code review updates
+  the relevant allowlist and privacy canary.
+- Do not enable eBPF auto-instrumentation, Application Observability, or a local
+  Loki/Tempo database on Spark during this rollout.
+- Keep telemetry credentials write-only, host-specific, file-backed, and out of
+  source control and process environments.

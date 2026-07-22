@@ -63,7 +63,7 @@ enum CredentialStoreError: Error, Equatable, LocalizedError, Sendable {
             case .empty:
                 "The \(key.displayName) cannot be empty."
             case .invalidServerURL:
-                "The server URL must use http or https and include a host."
+                "The server URL must use HTTPS, or HTTP on localhost, 127.0.0.1, or ::1, with no user info, query, or fragment."
             case .leadingOrTrailingWhitespace:
                 "The \(key.displayName) contains leading or trailing whitespace."
             case .ephemeralToken:
@@ -102,14 +102,14 @@ extension CredentialStoring {
             return nil
         }
 
-        guard let url = URL(string: value), Self.isValidServerURL(url) else {
+        guard let url = ZiggyServerURLValidation.url(from: value) else {
             throw CredentialStoreError.invalidStoredValue(key: .serverURL)
         }
         return url
     }
 
     func save(serverURL: URL) async throws {
-        guard Self.isValidServerURL(serverURL) else {
+        guard ZiggyServerURLValidation.isValid(serverURL) else {
             throw CredentialStoreError.invalidValue(key: .serverURL, reason: .invalidServerURL)
         }
         try await setValue(serverURL.absoluteString, for: .serverURL)
@@ -155,15 +155,6 @@ extension CredentialStoring {
         try await removeEnrollmentCredential(for: .ownerAccessCode)
     }
 
-    private static func isValidServerURL(_ url: URL) -> Bool {
-        guard let scheme = url.scheme?.lowercased(),
-              scheme == "http" || scheme == "https",
-              let host = url.host,
-              !host.isEmpty else {
-            return false
-        }
-        return true
-    }
 }
 
 enum CredentialStoreValidation {
@@ -180,10 +171,7 @@ enum CredentialStoreValidation {
         }
 
         if case .serverURL = key {
-            guard let url = URL(string: value),
-                  let scheme = url.scheme?.lowercased(),
-                  (scheme == "http" || scheme == "https"),
-                  url.host?.isEmpty == false else {
+            guard ZiggyServerURLValidation.url(from: value) != nil else {
                 throw CredentialStoreError.invalidValue(key: key, reason: .invalidServerURL)
             }
         }

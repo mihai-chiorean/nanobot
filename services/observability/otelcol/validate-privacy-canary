@@ -1,0 +1,204 @@
+#!/bin/sh
+set -eu
+
+collector=${1:-otelcol-contrib}
+script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+tmp="$(mktemp -d)"
+pid=
+cleanup() {
+  if [ -n "${pid}" ]; then
+    kill -TERM "${pid}" >/dev/null 2>&1 || true
+    wait "${pid}" >/dev/null 2>&1 || true
+  fi
+  rm -rf "${tmp}"
+}
+trap cleanup EXIT HUP INT TERM
+
+port=$((20000 + ($$ % 20000)))
+endpoint="127.0.0.1:${port}"
+unreachable_endpoint="http://127.0.0.1:$((port + 1))"
+metrics_port=$((port + 2))
+password=privacy-canary-password
+hash="$(openssl passwd -apr1 "${password}")"
+printf 'ziggy-control:%s\n' "${hash}" > "${tmp}/users.htpasswd"
+authorization="Basic $(printf 'ziggy-control:%s' "${password}" | base64 | tr -d '\r\n')"
+
+cat > "${tmp}/traces.json" <<'JSON'
+{
+  "resourceSpans": [{
+    "resource": {"attributes": [
+      {"key": "service.name", "value": {"stringValue": "ziggy-control"}},
+      {"key": "service.version", "value": {"stringValue": "canary-version"}},
+      {"key": "user.id", "value": {"stringValue": "privacy-canary-secret"}},
+      {"key": "workspace.id", "value": {"stringValue": "privacy-canary-secret"}},
+      {"key": "session.id", "value": {"stringValue": "privacy-canary-secret"}},
+      {"key": "url.full", "value": {"stringValue": "https://example.invalid/?privacy-canary-secret"}},
+      {"key": "http.request.header.authorization", "value": {"stringValue": "privacy-canary-secret"}}
+    ]},
+    "scopeSpans": [{
+      "scope": {"name": "github.com/mihai-chiorean/nanobot/services/ziggy-control", "version": "privacy-canary-secret", "attributes": [{"key": "request.id", "value": {"stringValue": "privacy-canary-secret"}}]},
+      "spans": [{
+        "traceId": "11111111111111111111111111111111",
+        "spanId": "2222222222222222",
+        "traceState": "canary=privacy-canary-secret",
+        "name": "HTTP bootstrap",
+        "kind": 2,
+        "startTimeUnixNano": "1000000000",
+        "endTimeUnixNano": "4000000000",
+        "attributes": [
+          {"key": "ziggy.route", "value": {"stringValue": "bootstrap"}},
+          {"key": "ziggy.operation", "value": {"stringValue": "privacy-canary-secret"}},
+          {"key": "http.request.method", "value": {"stringValue": "GET"}},
+          {"key": "http.request.body", "value": {"stringValue": "privacy-canary-secret"}},
+          {"key": "http.request.headers.authorization", "value": {"stringValue": "privacy-canary-secret"}},
+          {"key": "http.target", "value": {"stringValue": "/?privacy-canary-secret"}},
+          {"key": "enduser.id", "value": {"stringValue": "privacy-canary-secret"}},
+          {"key": "request.id", "value": {"stringValue": "privacy-canary-secret"}}
+        ],
+        "events": [{"name": "privacy-canary-event", "timeUnixNano": "2000000000", "attributes": [{"key": "body", "value": {"stringValue": "privacy-canary-secret"}}]}],
+        "status": {"message": "privacy-canary-secret", "code": 2}
+      }, {
+        "traceId": "11111111111111111111111111111111",
+        "spanId": "5555555555555555",
+        "name": "HTTP health",
+        "kind": 2,
+        "startTimeUnixNano": "1000000000",
+        "endTimeUnixNano": "2000000000",
+        "links": [{"traceId": "33333333333333333333333333333333", "spanId": "4444444444444444", "attributes": [{"key": "session.id", "value": {"stringValue": "privacy-canary-secret"}}]}],
+        "status": {"code": 2}
+      }]
+    }]
+  }]
+}
+JSON
+
+cat > "${tmp}/metrics.json" <<'JSON'
+{
+  "resourceMetrics": [{
+    "resource": {"attributes": [
+      {"key": "service.name", "value": {"stringValue": "ziggy-control"}},
+      {"key": "service.version", "value": {"stringValue": "canary-version"}},
+      {"key": "user.id", "value": {"stringValue": "privacy-canary-secret"}}
+    ]},
+    "scopeMetrics": [{
+      "scope": {"name": "github.com/mihai-chiorean/nanobot/services/ziggy-control", "version": "privacy-canary-secret", "attributes": [{"key": "workspace.id", "value": {"stringValue": "privacy-canary-secret"}}]},
+      "metrics": [
+        {"name": "ziggy.control.service.uptime", "gauge": {"dataPoints": [
+          {"timeUnixNano": "1000000000", "asDouble": 1, "attributes": [
+            {"key": "ziggy.route", "value": {"stringValue": "health"}},
+            {"key": "ziggy.outcome", "value": {"stringValue": "privacy-canary-secret"}},
+            {"key": "session.id", "value": {"stringValue": "privacy-canary-secret"}},
+            {"key": "url.query", "value": {"stringValue": "privacy-canary-secret"}}
+          ]},
+          {"timeUnixNano": "2000000000", "asDouble": 2, "exemplars": [{
+            "timeUnixNano": "2000000000", "asDouble": 2,
+            "traceId": "11111111111111111111111111111111", "spanId": "2222222222222222",
+            "filteredAttributes": [{"key": "request.id", "value": {"stringValue": "privacy-canary-secret"}}]
+          }]}
+        ]}},
+        {"name": "privacy.canary.unapproved.metric", "gauge": {"dataPoints": [{"timeUnixNano": "1000000000", "asDouble": 1}]}}
+      ]
+    }]
+  }]
+}
+JSON
+
+PRIVACY_CANARY_ENDPOINT="${endpoint}" \
+PRIVACY_CANARY_OUTPUT="${tmp}/output.json" \
+PRIVACY_CANARY_HTPASSWD_FILE="${tmp}/users.htpasswd" \
+PRIVACY_CANARY_UNREACHABLE_ENDPOINT="${unreachable_endpoint}" \
+PRIVACY_CANARY_METRICS_PORT="${metrics_port}" \
+  "${collector}" --config="${script_dir}/privacy-canary.yaml" >"${tmp}/collector.log" 2>&1 &
+pid=$!
+
+ready=false
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  code="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+    --header 'Content-Type: application/json' --data-binary @"${tmp}/traces.json" \
+    "http://${endpoint}/v1/traces" || true)"
+  if [ "${code}" = 401 ]; then
+    ready=true
+    break
+  fi
+  if ! kill -0 "${pid}" >/dev/null 2>&1; then
+    cat "${tmp}/collector.log" >&2
+    exit 1
+  fi
+  sleep 1
+done
+if [ "${ready}" != true ]; then
+  echo "collector did not reject the unauthenticated canary with HTTP 401" >&2
+  cat "${tmp}/collector.log" >&2
+  exit 1
+fi
+
+for signal in traces metrics; do
+  code="$(curl --silent --show-error --output "${tmp}/${signal}.response" --write-out '%{http_code}' \
+    --header 'Content-Type: application/json' \
+    --header "Authorization: ${authorization}" \
+    --data-binary @"${tmp}/${signal}.json" "http://${endpoint}/v1/${signal}")"
+  if [ "${code}" != 200 ]; then
+    echo "authenticated ${signal} canary returned HTTP ${code}" >&2
+    cat "${tmp}/${signal}.response" >&2
+    exit 1
+  fi
+done
+
+sleep 3
+self_metrics="$(curl --fail --silent --show-error "http://127.0.0.1:${metrics_port}/metrics")"
+if ! printf '%s\n' "${self_metrics}" | grep -q '^otelcol_process_uptime_seconds_total{'; then
+  echo "collector self-telemetry heartbeat is absent" >&2
+  exit 1
+fi
+for metric in \
+  otelcol_exporter_queue_capacity \
+  otelcol_exporter_send_failed_metric_points_total \
+  otelcol_receiver_failed_metric_points_total \
+  otelcol_receiver_refused_metric_points_total; do
+  if ! printf '%s\n' "${self_metrics}" | grep -q "^${metric}{"; then
+    echo "collector self-telemetry metric is absent: ${metric}" >&2
+    exit 1
+  fi
+done
+printf '%s\n' "${self_metrics}" | awk '
+  $1 ~ /^otelcol_exporter_sent_metric_points_total[{]/ && $NF + 0 > 0 { found = 1 }
+  END { exit(found ? 0 : 1) }
+'
+kill -TERM "${pid}"
+wait "${pid}"
+pid=
+
+test -s "${tmp}/output.json"
+grep -q 'ziggy.control.service.uptime' "${tmp}/output.json"
+grep -q 'HTTP bootstrap' "${tmp}/output.json"
+if grep -q 'privacy-canary-secret\|privacy-canary-event\|privacy.canary.unapproved.metric' "${tmp}/output.json"; then
+  echo "privacy canary escaped the collector allowlist" >&2
+  grep -o 'privacy-canary-secret\|privacy-canary-event\|privacy.canary.unapproved.metric' \
+    "${tmp}/output.json" | sort -u >&2
+  grep 'privacy-canary-secret\|privacy-canary-event\|privacy.canary.unapproved.metric' \
+    "${tmp}/output.json" | cut -c 1-4000 >&2
+  exit 1
+fi
+
+for profile in beelink.yaml spark.yaml; do
+  grep -q 'storage: file_storage' "${script_dir}/${profile}"
+  grep -q 'set(log.body, nil)' "${script_dir}/${profile}"
+  grep -q 'uptime_seconds_total' "${script_dir}/${profile}"
+  grep -q 'queue_(capacity|size)' "${script_dir}/${profile}"
+  grep -q 'receiver_(failed|refused)' "${script_dir}/${profile}"
+done
+if grep -q 'journald/ziggy_errors\|set(log.body, log.body\["MESSAGE"\])' \
+  "${script_dir}/beelink.yaml" "${script_dir}/spark.yaml"; then
+  echo "a broad or raw journald export path is configured" >&2
+  exit 1
+fi
+if grep -q '^  otlp:' "${script_dir}/spark.yaml"; then
+  echo "Spark must not expose an OTLP receiver" >&2
+  exit 1
+fi
+if grep -q '"mountpoint"' "${script_dir}/beelink.yaml" "${script_dir}/spark.yaml"; then
+  echo "filesystem mountpoint attributes must not cross the export boundary" >&2
+  exit 1
+fi
+
+echo "privacy canary passed"

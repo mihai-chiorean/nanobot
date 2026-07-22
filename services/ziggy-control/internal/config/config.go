@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net"
 	"net/mail"
+	"net/netip"
 	"net/url"
 	"os"
 	"path"
@@ -21,7 +22,15 @@ const (
 	defaultReadinessCacheTTL   = 2 * time.Second
 	defaultUpstreamReadyPath   = "/"
 	defaultMaxRequestBodyBytes = int64(64 << 20)
+	defaultHTTPInFlight        = int64(64)
+	defaultSSEInFlight         = int64(8)
+	defaultWebSocketInFlight   = int64(8)
+	defaultOTelTraceSampleRate = 1.0
+	defaultDeploymentEnv       = "production"
+	defaultLegacyPreflight     = true
 )
+
+var tailscaleCGNATPrefix = netip.MustParsePrefix("100.64.0.0/10")
 
 type Config struct {
 	ListenAddr        string
@@ -36,7 +45,15 @@ type Config struct {
 	ReadinessCacheTTL time.Duration
 	UpstreamReadyPath string
 	MaxRequestBody    int64
+	HTTPInFlight      int64
+	SSEInFlight       int64
+	WebSocketInFlight int64
+	LegacyPreflight   bool
 	LogLevel          slog.Level
+	OTelEndpoint      string
+	OTelAuthFile      string
+	OTelTraceSample   float64
+	DeploymentEnv     string
 }
 
 type LookupEnv func(string) (string, bool)
@@ -100,25 +117,70 @@ func loadFrom(lookup LookupEnv, readFile ReadFile) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	httpInFlight, err := positiveInt64(lookup, "ZIGGY_MAX_HTTP_IN_FLIGHT", defaultHTTPInFlight)
+	if err != nil {
+		return Config{}, err
+	}
+	sseInFlight, err := positiveInt64(lookup, "ZIGGY_MAX_SSE_IN_FLIGHT", defaultSSEInFlight)
+	if err != nil {
+		return Config{}, err
+	}
+	webSocketInFlight, err := positiveInt64(lookup, "ZIGGY_MAX_WEBSOCKET_IN_FLIGHT", defaultWebSocketInFlight)
+	if err != nil {
+		return Config{}, err
+	}
 	logLevel, err := parseLogLevel(valueOrDefault(lookup, "ZIGGY_LOG_LEVEL", "info"))
 	if err != nil {
 		return Config{}, err
+	}
+	otelTraceSample, err := fraction(lookup, "ZIGGY_OTEL_TRACE_SAMPLE_RATIO", defaultOTelTraceSampleRate)
+	if err != nil {
+		return Config{}, err
+	}
+	deploymentEnv, err := deploymentEnvironment(valueOrDefault(lookup, "ZIGGY_DEPLOYMENT_ENVIRONMENT", defaultDeploymentEnv))
+	if err != nil {
+		return Config{}, err
+	}
+	authorizedParties := commaSeparated(lookup, "ZIGGY_AUTHORIZED_PARTIES", "")
+	ownerSubject := optional(lookup, "ZIGGY_OWNER_SUBJECT")
+	legacyPreflight, err := boolean(lookup, "ZIGGY_LEGACY_UPSTREAM_PREFLIGHT", defaultLegacyPreflight)
+	if err != nil {
+		return Config{}, err
+	}
+	if deploymentEnv == "production" {
+		if len(authorizedParties) == 0 {
+			return Config{}, fmt.Errorf("ZIGGY_AUTHORIZED_PARTIES is required in production")
+		}
+		if ownerSubject == "" {
+			return Config{}, fmt.Errorf("ZIGGY_OWNER_SUBJECT is required in production")
+		}
+		if !legacyPreflight {
+			return Config{}, fmt.Errorf("ZIGGY_LEGACY_UPSTREAM_PREFLIGHT cannot be disabled in production")
+		}
 	}
 
 	return Config{
 		ListenAddr:        listenAddr,
 		UpstreamURL:       upstream,
 		OwnerEmail:        ownerEmail,
-		OwnerSubject:      optional(lookup, "ZIGGY_OWNER_SUBJECT"),
+		OwnerSubject:      ownerSubject,
 		ClerkSecretKey:    secret,
-		AuthorizedParties: commaSeparated(lookup, "ZIGGY_AUTHORIZED_PARTIES", ""),
+		AuthorizedParties: authorizedParties,
 		BlockedPaths:      blockedPaths(lookup),
 		ShutdownTimeout:   shutdownTimeout,
 		ReadinessTimeout:  readinessTimeout,
 		ReadinessCacheTTL: readinessCacheTTL,
 		UpstreamReadyPath: readyPath,
 		MaxRequestBody:    maxRequestBody,
+		HTTPInFlight:      httpInFlight,
+		SSEInFlight:       sseInFlight,
+		WebSocketInFlight: webSocketInFlight,
+		LegacyPreflight:   legacyPreflight,
 		LogLevel:          logLevel,
+		OTelEndpoint:      optional(lookup, "ZIGGY_OTEL_ENDPOINT"),
+		OTelAuthFile:      optional(lookup, "ZIGGY_OTEL_AUTH_FILE"),
+		OTelTraceSample:   otelTraceSample,
+		DeploymentEnv:     deploymentEnv,
 	}, nil
 }
 
@@ -137,6 +199,25 @@ func positiveInt64(lookup LookupEnv, key string, fallback int64) (int64, error) 
 		return 0, fmt.Errorf("%s must be a positive integer", key)
 	}
 	return parsed, nil
+}
+
+func fraction(lookup LookupEnv, key string, fallback float64) (float64, error) {
+	value := valueOrDefault(lookup, key, strconv.FormatFloat(fallback, 'f', -1, 64))
+	parsed, err := strconv.ParseFloat(value, 64)
+	if err != nil || parsed < 0 || parsed > 1 {
+		return 0, fmt.Errorf("%s must be between 0 and 1", key)
+	}
+	return parsed, nil
+}
+
+func deploymentEnvironment(value string) (string, error) {
+	value = strings.ToLower(strings.TrimSpace(value))
+	switch value {
+	case "development", "local", "staging", "production", "test":
+		return value, nil
+	default:
+		return "", fmt.Errorf("ZIGGY_DEPLOYMENT_ENVIRONMENT: unsupported environment")
+	}
 }
 
 func clerkSecret(lookup LookupEnv, readFile ReadFile) (string, error) {
@@ -192,6 +273,15 @@ func duration(lookup LookupEnv, key string, fallback time.Duration) (time.Durati
 	return parsed, nil
 }
 
+func boolean(lookup LookupEnv, key string, fallback bool) (bool, error) {
+	value := valueOrDefault(lookup, key, strconv.FormatBool(fallback))
+	parsed, err := strconv.ParseBool(value)
+	if err != nil {
+		return false, fmt.Errorf("%s must be true or false", key)
+	}
+	return parsed, nil
+}
+
 func parseUpstream(value string) (*url.URL, error) {
 	parsed, err := url.Parse(value)
 	if err != nil {
@@ -203,11 +293,37 @@ func parseUpstream(value string) (*url.URL, error) {
 	if parsed.Host == "" {
 		return nil, fmt.Errorf("host is required")
 	}
-	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+	if parsed.User != nil || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" || parsed.RawFragment != "" {
 		return nil, fmt.Errorf("userinfo, query, and fragment are not allowed")
+	}
+	host := parsed.Hostname()
+	if !trustedUpstreamHost(host) {
+		return nil, fmt.Errorf("host must be an explicit loopback, RFC1918, IPv6 ULA/link-local, or Tailscale CGNAT address")
 	}
 	parsed.Path = strings.TrimSuffix(parsed.Path, "/")
 	return parsed, nil
+}
+
+func trustedUpstreamHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	addressText := host
+	if address, zone, found := strings.Cut(host, "%"); found {
+		if zone == "" {
+			return false
+		}
+		addressText = address
+	}
+	address, err := netip.ParseAddr(addressText)
+	if err != nil {
+		return false
+	}
+	address = address.Unmap()
+	if address.IsLoopback() || address.IsPrivate() || address.IsLinkLocalUnicast() {
+		return true
+	}
+	return tailscaleCGNATPrefix.Contains(address)
 }
 
 func commaSeparated(lookup LookupEnv, key, fallback string) []string {

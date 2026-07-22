@@ -116,23 +116,29 @@ private struct RichTableBlock: View {
                 Grid(alignment: .leading, horizontalSpacing: 0, verticalSpacing: 0) {
                     GridRow {
                         ForEach(Array(value.columns.enumerated()), id: \.offset) { _, column in
-                            cell(column, isHeader: true)
+                            cell(column, isHeader: true, accessibilityLabel: "Column \(column)")
                         }
                     }
-                    ForEach(Array(value.rows.enumerated()), id: \.offset) { _, row in
+                    ForEach(Array(value.rows.enumerated()), id: \.offset) { rowIndex, row in
                         GridRow {
                             ForEach(0..<value.columns.count, id: \.self) { index in
-                                cell(index < row.count ? row[index] : "", isHeader: false)
+                                let text = index < row.count ? row[index] : ""
+                                cell(
+                                    text,
+                                    isHeader: false,
+                                    accessibilityLabel: "Row \(rowIndex + 1), \(value.columns[index]): \(text)"
+                                )
                             }
                         }
                     }
                 }
             }
             .textSelection(.enabled)
+            .accessibilityElement(children: .contain)
         }
     }
 
-    private func cell(_ text: String, isHeader: Bool) -> some View {
+    private func cell(_ text: String, isHeader: Bool, accessibilityLabel: String) -> some View {
         Text(text)
             .font(isHeader ? .caption.weight(.semibold) : .caption)
             .foregroundStyle(ZiggyPalette.foreground)
@@ -142,6 +148,7 @@ private struct RichTableBlock: View {
             .background(isHeader ? ZiggyPalette.accent : ZiggyPalette.card)
             .overlay(alignment: .trailing) { Rectangle().fill(ZiggyPalette.border).frame(width: 1) }
             .overlay(alignment: .bottom) { Rectangle().fill(ZiggyPalette.border).frame(height: 1) }
+            .accessibilityLabel(accessibilityLabel)
     }
 }
 
@@ -213,17 +220,19 @@ private struct RichChartBlock: View {
                 }
                 .frame(minHeight: 210)
                 .chartLegend(position: .bottom, alignment: .leading)
-                .accessibilityElement(children: .ignore)
-                .accessibilityLabel(chartSummary)
+                .accessibilityRepresentation {
+                    VStack(alignment: .leading) {
+                        Text(value.title ?? "Chart")
+                        ForEach(value.accessibilityRows) { row in
+                            Text(row.spokenValue)
+                        }
+                    }
+                }
             }
         }
         .foregroundStyle(ZiggyPalette.foreground)
     }
 
-    private var chartSummary: String {
-        let pointCount = value.series.reduce(0) { $0 + $1.points.count }
-        return "\(value.title ?? "Chart"); \(value.series.count) series; \(pointCount) points"
-    }
 }
 
 private struct RichTimelineBlock: View {

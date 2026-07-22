@@ -67,6 +67,82 @@ func TestBootstrapAuthenticatesOwnerAndPreservesAuthorization(t *testing.T) {
 	}
 }
 
+func TestEnrollmentBootstrapAcceptsPostFormAndAuthorization(t *testing.T) {
+	requests := make(chan *http.Request, 2)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests <- r.Clone(context.Background())
+		w.Header().Set("Cache-Control", "public, max-age=3600")
+		_, _ = io.WriteString(w, `{"token":"nanobot-token"}`)
+	}))
+	defer upstream.Close()
+	handler := newTestHandler(t, upstream.URL, principalMiddleware(identity.Principal{}))
+
+	tests := []struct {
+		name     string
+		body     string
+		header   string
+		wantCode string
+	}{
+		{name: "form", body: "join_code=form-canary", wantCode: "form-canary"},
+		{name: "authorization", header: "Bearer header-canary", wantCode: "header-canary"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, "/webui/guest/bootstrap", strings.NewReader(test.body))
+			request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			if test.header != "" {
+				request.Header.Set("Authorization", test.header)
+			}
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+
+			if response.Code != http.StatusOK {
+				t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+			}
+			if got := response.Header().Get("Cache-Control"); got != "no-store" {
+				t.Errorf("Cache-Control = %q, want no-store", got)
+			}
+			upstreamRequest := <-requests
+			if upstreamRequest.Method != http.MethodGet || upstreamRequest.URL.Path != "/webui/guest/bootstrap" {
+				t.Errorf("upstream request = %s %s", upstreamRequest.Method, upstreamRequest.URL.Path)
+			}
+			if got := upstreamRequest.URL.Query().Get("code"); got != test.wantCode {
+				t.Errorf("upstream code = %q, want %q", got, test.wantCode)
+			}
+			if got := upstreamRequest.Header.Get("Authorization"); got != "" {
+				t.Errorf("upstream Authorization = %q, want empty", got)
+			}
+		})
+	}
+}
+
+func TestEnrollmentBootstrapKeepsDeprecatedGetCompatibility(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Query().Get("code"); got != "legacy-canary" {
+			t.Errorf("upstream code = %q", got)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+	handler := newTestHandler(t, upstream.URL, principalMiddleware(identity.Principal{}))
+
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(
+		http.MethodGet,
+		"/webui/guest/bootstrap?code=legacy-canary&ignored=query-canary",
+		nil,
+	))
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("status = %d", response.Code)
+	}
+	if got := response.Header().Get("Deprecation"); got != "true" {
+		t.Errorf("Deprecation = %q, want true", got)
+	}
+	if got := response.Header().Get("Cache-Control"); got != "no-store" {
+		t.Errorf("Cache-Control = %q, want no-store", got)
+	}
+}
+
 func TestBootstrapRejectsUnauthorizedAndNonOwner(t *testing.T) {
 	var requests atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
@@ -155,6 +231,17 @@ func TestOrdinaryRequestsAreProxiedWithNewRequestID(t *testing.T) {
 		if got := r.Header.Get("X-Nanobot-Auth"); got != "" {
 			t.Errorf("X-Nanobot-Auth was forwarded: %q", got)
 		}
+		for _, header := range []string{"Cookie", "Proxy-Authorization", "Forwarded", "X-Clerk-User", "X-Ziggy-Subject", "X-Ziggy-Email"} {
+			if got := r.Header.Get(header); got != "" {
+				t.Errorf("%s was forwarded: %q", header, got)
+			}
+		}
+		if got := r.Header.Get("X-Forwarded-Host"); got == "evil.example" {
+			t.Errorf("client X-Forwarded-Host was forwarded: %q", got)
+		}
+		if got := r.Header.Get("X-Forwarded-Proto"); got == "https" {
+			t.Errorf("client X-Forwarded-Proto was forwarded: %q", got)
+		}
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer upstream.Close()
@@ -165,6 +252,14 @@ func TestOrdinaryRequestsAreProxiedWithNewRequestID(t *testing.T) {
 	request.Header.Set("X-Request-ID", "untrusted")
 	request.Header.Set("X-Nanobot-Auth", "spoofed")
 	request.Header.Set("X-Forwarded-For", "203.0.113.99")
+	request.Header.Set("X-Forwarded-Host", "evil.example")
+	request.Header.Set("X-Forwarded-Proto", "https")
+	request.Header.Set("Cookie", "session=secret")
+	request.Header.Set("Proxy-Authorization", "Basic c2VjcmV0")
+	request.Header.Set("Forwarded", "for=203.0.113.99")
+	request.Header.Set("X-Clerk-User", "user-canary")
+	request.Header.Set("X-Ziggy-Subject", "subject-canary")
+	request.Header.Set("X-Ziggy-Email", "email-canary")
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 
@@ -180,6 +275,90 @@ func TestOrdinaryRequestsAreProxiedWithNewRequestID(t *testing.T) {
 	}
 	if strings.Contains(forwardedFor, "203.0.113.99") {
 		t.Errorf("spoofed X-Forwarded-For was forwarded: %q", forwardedFor)
+	}
+}
+
+func TestInboundAdmissionIsBoundedByTrafficClassAndReleasesOnCancellation(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		setup func(*http.Request)
+		limit func(*inboundAdmission) *admissionGate
+	}{
+		{name: "http", limit: func(admission *inboundAdmission) *admissionGate { return &admission.http }},
+		{name: "sse", setup: func(request *http.Request) { request.Header.Set("Accept", "text/event-stream") }, limit: func(admission *inboundAdmission) *admissionGate { return &admission.sse }},
+		{name: "websocket", setup: func(request *http.Request) { request.Header.Set("Upgrade", "websocket") }, limit: func(admission *inboundAdmission) *admissionGate { return &admission.webSocket }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			admission := newInboundAdmission(1, 1, 1)
+			var calls atomic.Int32
+			handler := (&API{admission: admission}).admit(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if calls.Add(1) == 1 {
+					<-r.Context().Done()
+				}
+				w.WriteHeader(http.StatusNoContent)
+			}))
+
+			ctx, cancel := context.WithCancel(context.Background())
+			first := httptest.NewRequest(http.MethodGet, "/api", nil).WithContext(ctx)
+			if test.setup != nil {
+				test.setup(first)
+			}
+			done := make(chan struct{})
+			go func() {
+				handler.ServeHTTP(httptest.NewRecorder(), first)
+				close(done)
+			}()
+			deadline := time.After(time.Second)
+			for test.limit(admission).active.Load() != 1 {
+				select {
+				case <-deadline:
+					t.Fatal("first request was not admitted")
+				default:
+					time.Sleep(time.Millisecond)
+				}
+			}
+
+			second := httptest.NewRecorder()
+			secondRequest := httptest.NewRequest(http.MethodGet, "/api", nil)
+			if test.setup != nil {
+				test.setup(secondRequest)
+			}
+			handler.ServeHTTP(second, secondRequest)
+			if second.Code != http.StatusServiceUnavailable || second.Header().Get("Retry-After") != "1" {
+				t.Fatalf("second request = %d, Retry-After %q", second.Code, second.Header().Get("Retry-After"))
+			}
+
+			cancel()
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatal("canceled request did not release")
+			}
+			third := httptest.NewRecorder()
+			thirdRequest := httptest.NewRequest(http.MethodGet, "/api", nil)
+			if test.setup != nil {
+				test.setup(thirdRequest)
+			}
+			handler.ServeHTTP(third, thirdRequest)
+			if third.Code != http.StatusNoContent {
+				t.Errorf("third request = %d, want 204", third.Code)
+			}
+		})
+	}
+}
+
+func TestHealthAndReadinessBypassInboundAdmission(t *testing.T) {
+	admission := newInboundAdmission(1, 1, 1)
+	handler := (&API{admission: admission}).admit(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	admission.http.active.Store(1)
+	for _, route := range []string{"/healthz", "/readyz"} {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, route, nil))
+		if response.Code != http.StatusNoContent {
+			t.Errorf("%s status = %d, want 204", route, response.Code)
+		}
 	}
 }
 
@@ -232,11 +411,94 @@ func TestAccessLogIncludesRequestOutcome(t *testing.T) {
 	if err := json.Unmarshal(logs.Bytes(), &event); err != nil {
 		t.Fatalf("decode access log: %v; log = %s", err, logs.String())
 	}
-	if event["request_id"] == "" || event["status"] != float64(http.StatusTeapot) {
-		t.Errorf("access log identity/outcome = %+v", event)
+	if event["status"] != float64(http.StatusTeapot) {
+		t.Errorf("access log outcome = %+v", event)
 	}
 	if event["bytes"] != float64(len("short and stout")) || event["route"] != "proxy" {
 		t.Errorf("access log response fields = %+v", event)
+	}
+	for _, forbidden := range []string{"request_id", "trace_id", "path", "cf_ray"} {
+		if _, ok := event[forbidden]; ok {
+			t.Errorf("access log contains forbidden field %q: %+v", forbidden, event)
+		}
+	}
+}
+
+func TestRequestFailureLogsExcludeCredentialsAndIdentifiers(t *testing.T) {
+	tests := []struct {
+		name    string
+		handler func(*testing.T, *slog.Logger) http.Handler
+		request func() *http.Request
+	}{
+		{
+			name: "authorization denial",
+			handler: func(t *testing.T, logger *slog.Logger) http.Handler {
+				upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+					t.Fatal("denied request reached upstream")
+				}))
+				t.Cleanup(upstream.Close)
+				return newTestHandlerWithLogger(t, upstream.URL, principalMiddleware(identity.Principal{
+					Subject: "user-canary",
+					Email:   "email-canary@example.com",
+				}), logger, 64<<20)
+			},
+			request: func() *http.Request {
+				request := httptest.NewRequest(http.MethodGet, "/auth/bootstrap?token=query-canary", nil)
+				request.Header.Set("Authorization", "Bearer token-canary")
+				return request
+			},
+		},
+		{
+			name: "proxy failure",
+			handler: func(t *testing.T, logger *slog.Logger) http.Handler {
+				upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+				upstreamURL := upstream.URL
+				upstream.Close()
+				return newTestHandlerWithLogger(t, upstreamURL, principalMiddleware(identity.Principal{}), logger, 64<<20)
+			},
+			request: func() *http.Request {
+				request := httptest.NewRequest(http.MethodGet, "/api/sessions/session-canary/messages?token=query-canary", nil)
+				request.Header.Set("Authorization", "Bearer token-canary")
+				return request
+			},
+		},
+		{
+			name: "enrollment rejection",
+			handler: func(t *testing.T, logger *slog.Logger) http.Handler {
+				upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+					t.Fatal("rejected enrollment reached upstream")
+				}))
+				t.Cleanup(upstream.Close)
+				return newTestHandlerWithLogger(t, upstream.URL, principalMiddleware(identity.Principal{}), logger, 64<<20)
+			},
+			request: func() *http.Request {
+				request := httptest.NewRequest(http.MethodPost, "/webui/guest/bootstrap?ignored=query-canary", strings.NewReader("code=enrollment-canary&join_code=conflict-canary"))
+				request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+				request.Header.Set("Authorization", "Bearer token-canary")
+				return request
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			logger := slog.New(slog.NewJSONHandler(&logs, nil))
+			handler := test.handler(t, logger)
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, test.request())
+
+			serialized := logs.String()
+			for _, forbidden := range []string{
+				"user-canary", "email-canary@example.com", "session-canary",
+				"token-canary", "query-canary", "enrollment-canary", "conflict-canary",
+				"request_id", "trace_id", "127.0.0.1:",
+			} {
+				if strings.Contains(serialized, forbidden) {
+					t.Errorf("logs contain forbidden value %q: %s", forbidden, serialized)
+				}
+			}
+		})
 	}
 }
 
@@ -277,6 +539,12 @@ func TestWebSocketUpgradePassesThrough(t *testing.T) {
 		if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
 			t.Errorf("Upgrade = %q", r.Header.Get("Upgrade"))
 		}
+		if got := r.URL.Query().Get("token"); got != "nanobot-token" {
+			t.Errorf("upstream WebSocket token = %q", got)
+		}
+		if got := r.Header.Get("Authorization"); got != "" {
+			t.Errorf("upstream Authorization = %q, want empty", got)
+		}
 		connection, buffer, err := w.(http.Hijacker).Hijack()
 		if err != nil {
 			t.Errorf("hijack: %v", err)
@@ -314,7 +582,7 @@ func TestWebSocketUpgradePassesThrough(t *testing.T) {
 	defer connection.Close()
 	_ = connection.SetDeadline(time.Now().Add(2 * time.Second))
 	_, _ = fmt.Fprintf(connection,
-		"GET /?token=nanobot-token HTTP/1.1\r\nHost: %s\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+		"GET / HTTP/1.1\r\nHost: %s\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nAuthorization: Bearer nanobot-token\r\n\r\n",
 		frontURL.Host,
 	)
 
@@ -380,7 +648,7 @@ func newTestHandlerWithLogger(
 	}
 	handler, err := New(Config{
 		Authenticate:   authenticate,
-		Proxy:          NewReverseProxy(target, logger),
+		Proxy:          NewReverseProxy(target, logger, nil),
 		Readiness:      checkerFunc(func(context.Context) error { return nil }),
 		Logger:         logger,
 		OwnerEmail:     "owner@example.com",

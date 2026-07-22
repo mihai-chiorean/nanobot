@@ -2,6 +2,7 @@ import Foundation
 
 public enum AssistantStreamEvent: Sendable, Hashable {
     case connected(ConnectionInfo?)
+    case message(RichContentMessage)
     case delta(AssistantDelta)
     case completed(AssistantCompletion)
     case failed(AssistantStreamFailure)

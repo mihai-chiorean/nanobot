@@ -105,6 +105,16 @@ public struct BootstrapResponse: Codable, Hashable, Sendable {
     /// Compatibility alias for callers that do not distinguish the two transport credentials yet.
     public var token: String { restToken }
 
+    public func expirationDate(relativeTo now: Date = Date()) -> Date? {
+        let relative = expiresIn.map { now.addingTimeInterval(TimeInterval(max(0, $0))) }
+        switch (expiresAt?.date, relative) {
+        case (.some(let absolute), .some(let relative)): return min(absolute, relative)
+        case (.some(let absolute), .none): return absolute
+        case (.none, .some(let relative)): return relative
+        case (.none, .none): return nil
+        }
+    }
+
     public init(restToken: String, webSocketToken: String? = nil, webSocketPath: String = "/",
                 expiresIn: Int? = nil, expiresAt: ZiggyTimestamp? = nil,
                 serverName: String? = nil, model: String? = nil, access: String? = nil,
@@ -135,7 +145,13 @@ public struct BootstrapResponse: Codable, Hashable, Sendable {
         access = try c.decodeIfPresent(String.self, forAny: ["access", "access_level"])
         guestCode = try c.decodeIfPresent(String.self, forAny: ["guest_code"])
         isOwner = try c.decodeIfPresent(Bool.self, forAny: ["owner", "is_owner"]) ?? access.map { $0 == "owner" }
-        capabilities = try c.decodeIfPresent([String: JSONValue].self, forAny: ["capabilities", "features"])
+        if let values = try? c.decode([String: JSONValue].self, forAny: ["capabilities", "features"]) {
+            capabilities = values
+        } else if let names = try? c.decode([String].self, forAny: ["capabilities", "features"]) {
+            capabilities = Dictionary(uniqueKeysWithValues: names.map { ($0, .boolean(true)) })
+        } else {
+            capabilities = nil
+        }
     }
 }
 
@@ -210,8 +226,18 @@ public enum MessageContent: Codable, Hashable, Sendable {
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.singleValueContainer()
-        if let text = try? c.decode(String.self) { self = .text(text) }
-        else { self = .structured(try c.decode(JSONValue.self)) }
+        if let text = try? c.decode(String.self) {
+            guard text.utf8.count <= ZiggyProtocolLimits.maxLegacyTextBytes else {
+                throw RichContentDecodingError.limit("legacy message text")
+            }
+            self = .text(text)
+        } else {
+            let value = try c.decode(JSONValue.self)
+            guard value.aggregateStringBytes <= RichContentLimits.maxMessageContentBytes else {
+                throw RichContentDecodingError.limit("legacy message content")
+            }
+            self = .structured(value)
+        }
     }
     public func encode(to encoder: Encoder) throws {
         switch self { case .text(let value): try value.encode(to: encoder); case .structured(let value): try value.encode(to: encoder) }
@@ -228,16 +254,32 @@ public struct ZiggyMessage: Codable, Hashable, Sendable {
     public let status: ZiggyStatus?
     public let sequence: Int?
     public let metadata: [String: JSONValue]?
+    public let richContent: RichContentMessage?
 
     public init(id: String, sessionKey: String? = nil, role: MessageRole, content: MessageContent,
                 createdAt: ZiggyTimestamp? = nil, status: ZiggyStatus? = nil, sequence: Int? = nil,
-                metadata: [String: JSONValue]? = nil) {
+                metadata: [String: JSONValue]? = nil, richContent: RichContentMessage? = nil) {
         self.id = id; self.sessionKey = sessionKey; self.role = role; self.content = content
         self.createdAt = createdAt; self.status = status; self.sequence = sequence; self.metadata = metadata
+        self.richContent = richContent
     }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: AnyCodingKey.self)
+        if c.contains(AnyCodingKey("version")), c.contains(AnyCodingKey("blocks")) {
+            let rich = try RichContentMessage(from: decoder)
+            id = rich.id
+            sessionKey = rich.chatID
+            role = rich.role
+            content = .text(LegacyContentAdapter.plainText(for: rich.blocks))
+            createdAt = rich.createdAt
+            status = nil
+            sequence = nil
+            metadata = nil
+            richContent = rich
+            return
+        }
+
         sessionKey = try c.decodeIfPresent(String.self, forAny: ["session_key", "sessionKey", "chat_key"])
         role = try c.decode(MessageRole.self, forAny: ["role", "author_role"])
         content = try c.decodeIfPresent(MessageContent.self, forAny: ["content", "text", "body"]) ?? .text("")
@@ -247,6 +289,11 @@ public struct ZiggyMessage: Codable, Hashable, Sendable {
         metadata = try c.decodeIfPresent([String: JSONValue].self, forAny: ["metadata", "meta"])
         id = try c.decodeIfPresent(String.self, forAny: ["id", "message_id", "uuid"])
             ?? "message-\(sequence.map(String.init) ?? UUID().uuidString)"
+        richContent = nil
+        guard id.utf8.count <= RichContentLimits.maxMessageIDBytes,
+              (sessionKey ?? "").utf8.count <= RichContentLimits.maxChatIDBytes else {
+            throw RichContentDecodingError.limit("legacy message identity")
+        }
     }
 }
 

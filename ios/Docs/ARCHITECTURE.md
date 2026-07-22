@@ -25,7 +25,10 @@ local persistence arrives.
 not import SwiftUI. UI-specific formatting stays in feature modules. The
 versioned `RichContentMessage` model preserves unknown blocks as placeholders;
 `LegacyContentAdapter` maps current string/JSON messages and progress/tool
-metadata without interpreting HTML.
+metadata without interpreting HTML. The current production Nanobot path uses
+that legacy adapter for markdown, progress, and media presentation; it does not
+assume that the backend emits typed blocks. `rich_content_v1` remains disabled
+unless the bootstrap response explicitly advertises it.
 
 ### Networking
 
@@ -45,11 +48,12 @@ endpoint and future stateless completion surfaces.
 ### Security
 
 - `CredentialStore` stores the long-lived guest enrollment code in Keychain.
+- Enrollment credentials use `WhenUnlockedThisDeviceOnly` Keychain
+  accessibility.
 - Short-lived `nbwt_` tokens remain in memory and are refreshed for reconnects.
 - REST sends tokens in the `Authorization` header.
-- The current server requires the token as a WebSocket query item. The client
-  constructs that URL only at connection time and never logs it. A future
-  server revision should accept an authorization header or initial auth frame.
+- WebSocket handshakes send short-lived credentials in the `Authorization`
+  header. Credentials are never placed in WebSocket URLs.
 
 ### Features
 
@@ -68,7 +72,7 @@ emit `AsyncStream` values that are reduced into stable view state.
 
 ### Bootstrap and REST
 
-- `GET /webui/guest/bootstrap?code=...`
+- `POST /webui/guest/bootstrap` with a JSON enrollment body
 - `GET /api/sessions`
 - `GET /api/sessions/{key}/messages`
 - `GET /api/work`
@@ -77,6 +81,7 @@ emit `AsyncStream` values that are reduced into stable view state.
 - `GET /api/settings` for owner scope
 
 REST requests use `Authorization: Bearer <short-lived token>`.
+Enrollment codes are sent only in request bodies or headers and never in URLs.
 
 ### WebSocket client frames
 
@@ -104,7 +109,8 @@ The optional OpenAI-compatible endpoint uses `POST /v1/chat/completions` with
 
 - UI state is main-actor isolated.
 - A socket drop moves the app to reconnecting and retains unsent frames.
-- Exponential reconnect backoff is bounded and reset after a successful open.
+- Exponential reconnect backoff is bounded and reset after a successful
+  ping/pong confirms the WebSocket upgrade.
 - REST credentials refresh shortly before their advertised expiry.
 - A malformed additive event surfaces a diagnostic without dropping the
   otherwise healthy WebSocket.

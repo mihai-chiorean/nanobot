@@ -1,0 +1,53 @@
+#!/bin/sh
+set -eu
+
+version=0.147.0
+release_base="https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v${version}"
+script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+checksum_file="${script_dir}/otelcol-contrib-${version}-linux.sha256"
+
+case "$(uname -m)" in
+  x86_64|amd64) arch=amd64 ;;
+  aarch64|arm64) arch=arm64 ;;
+  *)
+    echo "unsupported architecture: $(uname -m)" >&2
+    exit 1
+    ;;
+esac
+
+archive="otelcol-contrib_${version}_linux_${arch}.tar.gz"
+expected="$(awk -v archive="${archive}" '$2 == archive { print $1 }' "${checksum_file}")"
+if [ -z "${expected}" ]; then
+  echo "no pinned checksum for ${archive}" >&2
+  exit 1
+fi
+
+destination="/opt/ziggy/otelcol-contrib/${version}/${arch}"
+if [ -x "${destination}/otelcol-contrib" ]; then
+  printf '%s\n' "${destination}/otelcol-contrib"
+  exit 0
+fi
+
+tmp="$(mktemp -d)"
+trap 'rm -rf "${tmp}"' EXIT HUP INT TERM
+curl --fail --show-error --silent --location \
+  --proto '=https' --tlsv1.2 \
+  --output "${tmp}/${archive}" "${release_base}/${archive}"
+
+if command -v sha256sum >/dev/null 2>&1; then
+  actual="$(sha256sum "${tmp}/${archive}" | awk '{ print $1 }')"
+else
+  actual="$(shasum -a 256 "${tmp}/${archive}" | awk '{ print $1 }')"
+fi
+if [ "${actual}" != "${expected}" ]; then
+  echo "checksum mismatch for ${archive}" >&2
+  exit 1
+fi
+
+mkdir -p "${tmp}/unpack"
+tar -xzf "${tmp}/${archive}" -C "${tmp}/unpack"
+test -x "${tmp}/unpack/otelcol-contrib"
+install -o root -g root -m 0755 -d "${destination}"
+install -o root -g root -m 0755 \
+  "${tmp}/unpack/otelcol-contrib" "${destination}/otelcol-contrib"
+printf '%s\n' "${destination}/otelcol-contrib"

@@ -1,0 +1,198 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "description": "Version 1 fleet and ziggy-control operational dashboard. Every panel uses signals configured or emitted on the current branch.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "datasource": null,
+      "description": "Current sources: configured OTel httpcheck/hostmetrics receivers and optional ziggy-control OTLP metrics. Empty application panels mean ZIGGY_OTEL_ENDPOINT plus ZIGGY_OTEL_AUTH_FILE is not enabled or the signal has not arrived.",
+      "gridPos": {"h": 4, "w": 24, "x": 0, "y": 0},
+      "id": 1,
+      "options": {
+        "content": "## Current fleet view\nAll dimensions are bounded fleet attributes. No tenant, user, workspace, conversation, session, request, path, URL query, or credential is a metric label. Runtime supervisor and tenant inventory metrics do not exist yet and are intentionally absent. Trace panels are not included; the SDK defaults to 100% head acceptance and Beelink retains errors, slow traces, and 2% of normal traces.",
+        "mode": "markdown"
+      },
+      "title": "Data contract",
+      "type": "text"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "$metrics_ds"},
+      "description": "Current Beelink httpcheck target for the public health endpoint.",
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [{"options": {"0": {"color": "red", "text": "DOWN"}, "1": {"color": "green", "text": "UP"}}, "type": "value"}],
+          "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 1}]}
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 4},
+      "id": 2,
+      "options": {"colorMode": "background", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "wideLayout": true},
+      "targets": [{"editorMode": "code", "expr": "max(httpcheck_status{ziggy_probe_target=\"public-health\"})", "instant": true, "legendFormat": "public health", "range": false, "refId": "A"}],
+      "title": "Public health",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "$metrics_ds"},
+      "description": "Current Beelink readiness probe. This includes the cached private Nanobot readiness result.",
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [{"options": {"0": {"color": "red", "text": "NOT READY"}, "1": {"color": "green", "text": "READY"}}, "type": "value"}],
+          "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 1}]}
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 4, "w": 6, "x": 6, "y": 4},
+      "id": 3,
+      "options": {"colorMode": "background", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "wideLayout": true},
+      "targets": [{"editorMode": "code", "expr": "max(httpcheck_status{ziggy_probe_target=\"control-readiness\"})", "instant": true, "legendFormat": "local readiness", "range": false, "refId": "A"}],
+      "title": "Control readiness",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "$metrics_ds"},
+      "description": "Current application uptime gauge. No data is honest when application OTLP is disabled.",
+      "fieldConfig": {"defaults": {"unit": "s", "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}}, "overrides": []},
+      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 4},
+      "id": 4,
+      "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "wideLayout": true},
+      "targets": [{"editorMode": "code", "expr": "max(ziggy_control_service_uptime_seconds{service_name=\"ziggy-control\"})", "instant": true, "legendFormat": "ziggy-control", "range": false, "refId": "A"}],
+      "title": "Control process uptime",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "$metrics_ds"},
+      "description": "Current hostmetrics uptime for the two collector hosts.",
+      "fieldConfig": {"defaults": {"unit": "s", "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}}, "overrides": []},
+      "gridPos": {"h": 4, "w": 6, "x": 18, "y": 4},
+      "id": 5,
+      "options": {"colorMode": "value", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "wideLayout": true},
+      "targets": [{"editorMode": "code", "expr": "max by (host_name) (system_uptime_seconds)", "instant": true, "legendFormat": "{{host_name}}", "range": false, "refId": "A"}],
+      "title": "Host uptime",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "$metrics_ds"},
+      "description": "Completed request rate by bounded route template.",
+      "fieldConfig": {"defaults": {"unit": "reqps"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+      "id": 6,
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [{"editorMode": "code", "expr": "sum by (ziggy_route) (rate(ziggy_control_http_server_requests_total{service_name=\"ziggy-control\"}[$__rate_interval]))", "legendFormat": "{{ziggy_route}}", "range": true, "refId": "A"}],
+      "title": "Control request rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "$metrics_ds"},
+      "description": "Server request duration p95. Long-lived SSE and WebSocket requests are measured until they close.",
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+      "id": 7,
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [{"editorMode": "code", "expr": "histogram_quantile(0.95, sum by (le, ziggy_route) (rate(ziggy_control_http_server_duration_seconds_bucket{service_name=\"ziggy-control\"}[$__rate_interval])))", "legendFormat": "{{ziggy_route}}", "range": true, "refId": "A"}],
+      "title": "Control latency p95",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "$metrics_ds"},
+      "description": "Percentage of completed control requests returning 5xx.",
+      "fieldConfig": {"defaults": {"min": 0, "max": 100, "unit": "percent", "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 1}, {"color": "red", "value": 5}]}}, "overrides": []},
+      "gridPos": {"h": 7, "w": 8, "x": 0, "y": 16},
+      "id": 8,
+      "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "single", "sort": "none"}},
+      "targets": [{"editorMode": "code", "expr": "100 * sum(rate(ziggy_control_http_server_requests_total{service_name=\"ziggy-control\",http_response_status_class=\"5xx\"}[$__rate_interval])) / clamp_min(sum(rate(ziggy_control_http_server_requests_total{service_name=\"ziggy-control\"}[$__rate_interval])), 0.000001)", "legendFormat": "5xx %", "range": true, "refId": "A"}],
+      "title": "Control 5xx rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "$metrics_ds"},
+      "description": "Current upstream outcomes. Operations are bounded classes and never targets or URLs.",
+      "fieldConfig": {"defaults": {"unit": "reqps"}, "overrides": []},
+      "gridPos": {"h": 7, "w": 8, "x": 8, "y": 16},
+      "id": 9,
+      "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [{"editorMode": "code", "expr": "sum by (ziggy_operation, ziggy_outcome) (rate(ziggy_control_upstream_requests_total{service_name=\"ziggy-control\"}[$__rate_interval]))", "legendFormat": "{{ziggy_operation}} / {{ziggy_outcome}}", "range": true, "refId": "A"}],
+      "title": "Upstream outcomes",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "$metrics_ds"},
+      "description": "Bootstrap outcomes are aggregate authorization operations, never users.",
+      "fieldConfig": {"defaults": {"unit": "reqps"}, "overrides": []},
+      "gridPos": {"h": 7, "w": 8, "x": 16, "y": 16},
+      "id": 10,
+      "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [{"editorMode": "code", "expr": "sum by (ziggy_outcome) (rate(ziggy_control_auth_bootstrap_attempts_total{service_name=\"ziggy-control\"}[$__rate_interval]))", "legendFormat": "{{ziggy_outcome}}", "range": true, "refId": "A"}],
+      "title": "Owner bootstrap outcomes",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "$metrics_ds"},
+      "description": "Current host CPU utilization from hostmetrics.",
+      "fieldConfig": {"defaults": {"min": 0, "max": 100, "unit": "percent"}, "overrides": []},
+      "gridPos": {"h": 7, "w": 8, "x": 0, "y": 23},
+      "id": 11,
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [{"editorMode": "code", "expr": "100 * (1 - avg by (host_name) (system_cpu_utilization_ratio{state=\"idle\"}))", "legendFormat": "{{host_name}}", "range": true, "refId": "A"}],
+      "title": "Host CPU used",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "$metrics_ds"},
+      "description": "Current host used-memory ratio from hostmetrics.",
+      "fieldConfig": {"defaults": {"min": 0, "max": 100, "unit": "percent"}, "overrides": []},
+      "gridPos": {"h": 7, "w": 8, "x": 8, "y": 23},
+      "id": 12,
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [{"editorMode": "code", "expr": "100 * max by (host_name) (system_memory_utilization_ratio{state=\"used\"})", "legendFormat": "{{host_name}}", "range": true, "refId": "A"}],
+      "title": "Host memory used",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "$metrics_ds"},
+      "description": "Configured current HTTP probe latency. OTel unit milliseconds becomes a Prometheus milliseconds suffix.",
+      "fieldConfig": {"defaults": {"unit": "ms"}, "overrides": []},
+      "gridPos": {"h": 7, "w": 8, "x": 16, "y": 23},
+      "id": 13,
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [{"editorMode": "code", "expr": "max by (ziggy_probe_target) (httpcheck_duration_milliseconds)", "legendFormat": "{{ziggy_probe_target}}", "range": true, "refId": "A"}],
+      "title": "Probe duration",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 41,
+  "tags": ["ziggy", "fleet", "control-plane", "contract-v1"],
+  "templating": {
+    "list": [
+      {
+        "current": {},
+        "hide": 0,
+        "includeAll": false,
+        "label": "Metrics data source",
+        "multi": false,
+        "name": "metrics_ds",
+        "options": [],
+        "query": "prometheus",
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "type": "datasource"
+      }
+    ]
+  },
+  "time": {"from": "now-6h", "to": "now"},
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Ziggy Fleet and Control Plane v1",
+  "uid": "ziggy-fleet-v1",
+  "version": 1,
+  "weekStart": ""
+}

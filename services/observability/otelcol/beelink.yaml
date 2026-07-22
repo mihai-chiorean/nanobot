@@ -1,10 +1,10 @@
 receivers:
-  otlp:
+  otlp/ziggy_control:
     protocols:
-      grpc:
-        endpoint: 127.0.0.1:4317
       http:
         endpoint: 127.0.0.1:4318
+        auth:
+          authenticator: basicauth/ziggy_otlp
 
   hostmetrics:
     collection_interval: 60s
@@ -77,6 +77,30 @@ receivers:
           scrape_interval: 30s
           static_configs:
             - targets: [127.0.0.1:20241]
+          metric_relabel_configs:
+            - source_labels: [__name__]
+              regex: '(cloudflared_tunnel_ha_connections|cloudflared_tunnel_total_requests|cloudflared_tunnel_request_errors|cloudflared_tunnel_response_by_code|cloudflared_tunnel_concurrent_requests_per_tunnel|cloudflared_tunnel_timer_retries|cloudflared_tunnel_register_success|cloudflared_tunnel_register_fail)'
+              action: keep
+            - regex: '(user|user_id|workspace|workspace_id|session|session_id|request|request_id|client|client_id|url|uri|path|query|header|cookie|email|token|subject|cf_ray|ray_id)'
+              action: labeldrop
+            - regex: '(__name__|job|instance|protocol|status_code|le|quantile)'
+              action: labelkeep
+
+  prometheus/otelcol:
+    config:
+      scrape_configs:
+        - job_name: ziggy-otelcol
+          scrape_interval: 30s
+          static_configs:
+            - targets: [127.0.0.1:8888]
+          metric_relabel_configs:
+            - source_labels: [__name__]
+              regex: '(otelcol_process_(cpu_seconds_total|memory_rss_bytes|uptime_seconds_total)|otelcol_exporter_(queue_(capacity|size)|enqueue_failed_.*_total|send_failed_.*_total|sent_.*_total)|otelcol_receiver_(failed|refused)_.*_total|otelcol_processor_(refused_.*_total|tail_sampling_(sampling_traces_on_memory|sampling_trace_dropped_too_early_total|sampling_policy_evaluation_error_total)))'
+              action: keep
+            - regex: '(service_instance_id|service\.instance\.id)'
+              action: labeldrop
+            - regex: '(__name__|job|instance|exporter|receiver|processor|transport|signal|policy|service_name|service_version)'
+              action: labelkeep
 
   systemd/ziggy:
     scope: system
@@ -84,50 +108,51 @@ receivers:
       - ziggy-control.service
       - ziggy-cloudflared.service
       - docker.service
-
-  journald/ziggy_errors:
-    start_at: end
-    priority: warning
-    units:
-      - ziggy-control.service
-      - ziggy-cloudflared.service
-      - docker.service
-    retry_on_failure:
-      enabled: true
-      max_elapsed_time: 1m
+      - otelcol-contrib.service
 
   journald/ziggy_lifecycle:
     start_at: end
+    storage: file_storage
     priority: info
     identifiers: [systemd]
     grep: '(?i)(((ziggy-control|ziggy-cloudflared|docker).*(started|stopped|starting|stopping|failed|main process exited|scheduled restart))|((started|stopped|starting|stopping|failed|main process exited|scheduled restart).*(ziggy-control|ziggy-cloudflared|docker)))'
+    retry_on_failure:
+      enabled: true
+      initial_interval: 1s
+      max_interval: 30s
+      max_elapsed_time: 30m
 
   journald/kernel:
     start_at: end
+    storage: file_storage
     priority: warning
     dmesg: true
     grep: '(?i)(out of memory|oom-kill|killed process|nvme|i/o error|filesystem)'
+    retry_on_failure:
+      enabled: true
+      initial_interval: 1s
+      max_interval: 30s
+      max_elapsed_time: 30m
 
 processors:
   memory_limiter:
     check_interval: 5s
-    limit_mib: 384
-    spike_limit_mib: 64
+    limit_mib: 320
+    spike_limit_mib: 32
 
   batch:
-    send_batch_size: 512
+    send_batch_size: 256
+    send_batch_max_size: 512
     timeout: 10s
 
   resourcedetection:
     detectors: [env, system]
     system:
       resource_attributes:
-        host.id:
-          enabled: true
         host.name:
           enabled: true
 
-  resource/ziggy:
+  resource/common:
     attributes:
       - key: deployment.environment
         value: production
@@ -139,46 +164,240 @@ processors:
         value: beelink
         action: upsert
 
-  transform/promote_host:
+  resource/host:
+    attributes:
+      - key: service.name
+        value: ziggy-host
+        action: upsert
+
+  resource/probes:
+    attributes:
+      - key: service.name
+        value: ziggy-health-probe
+        action: upsert
+
+  resource/cloudflared:
+    attributes:
+      - key: service.name
+        value: ziggy-cloudflared
+        action: upsert
+
+  resource/systemd:
+    attributes:
+      - key: service.name
+        value: ziggy-systemd
+        action: upsert
+
+  resource/otelcol:
+    attributes:
+      - key: service.name
+        value: ziggy-otelcol
+        action: upsert
+
+  resource/kernel:
+    attributes:
+      - key: service.name
+        value: kernel
+        action: upsert
+
+  filter/otlp_traces:
+    error_mode: propagate
+    trace_conditions:
+      - context: resource
+        conditions:
+          - resource.attributes["service.name"] != "ziggy-control"
+      - context: scope
+        conditions:
+          - scope.name != "github.com/mihai-chiorean/nanobot/services/ziggy-control"
+      - context: span
+        conditions:
+          - not IsMatch(span.name, "^(HTTP (health|readiness|bootstrap|enrollment|proxy|other)|upstream (identity|readiness|nanobot_bootstrap|nanobot_enrollment|nanobot_proxy|other))$")
+          - Len(span.links) > 0
+          - span.kind != SPAN_KIND_SERVER and span.kind != SPAN_KIND_CLIENT
+      - context: spanevent
+        conditions:
+          - spanevent.name != nil
+
+  transform/otlp_traces:
+    error_mode: propagate
+    trace_statements:
+      - context: resource
+        statements:
+          - keep_keys(resource.attributes, ["service.name", "service.namespace", "service.version", "deployment.environment", "host.name", "ziggy.host.role"])
+          - set(resource.attributes["service.version"], "unknown") where resource.attributes["service.version"] != nil and not IsMatch(resource.attributes["service.version"], "^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$")
+          - truncate_all(resource.attributes, 128)
+      - context: scope
+        statements:
+          - keep_keys(scope.attributes, [])
+          - set(scope.version, "")
+      - context: span
+        statements:
+          - keep_keys(span.attributes, ["ziggy.route", "ziggy.operation", "http.request.method", "http.response.status_code"])
+          - set(span.attributes["ziggy.route"], "other") where span.attributes["ziggy.route"] != nil and not IsMatch(span.attributes["ziggy.route"], "^(health|readiness|bootstrap|enrollment|proxy|other)$")
+          - set(span.attributes["ziggy.operation"], "other") where span.attributes["ziggy.operation"] != nil and not IsMatch(span.attributes["ziggy.operation"], "^(identity|readiness|nanobot_bootstrap|nanobot_enrollment|nanobot_proxy|other)$")
+          - set(span.attributes["http.request.method"], "OTHER") where span.attributes["http.request.method"] != nil and not IsMatch(span.attributes["http.request.method"], "^(GET|HEAD|POST|PUT|PATCH|DELETE|OPTIONS|CONNECT|TRACE|OTHER)$")
+          - set(span.attributes["http.response.status_code"], 0) where span.attributes["http.response.status_code"] != nil and (span.attributes["http.response.status_code"] < 100 or span.attributes["http.response.status_code"] > 599)
+          - truncate_all(span.attributes, 32)
+          - set(span.trace_state, "")
+          - set(span.status.message, "")
+
+  tail_sampling/ziggy:
+    decision_wait: 10s
+    num_traces: 1000
+    expected_new_traces_per_sec: 20
+    decision_cache:
+      sampled_cache_size: 2000
+      non_sampled_cache_size: 10000
+    policies:
+      - name: errors
+        type: status_code
+        status_code:
+          status_codes: [ERROR]
+      - name: slow
+        type: latency
+        latency:
+          threshold_ms: 2000
+      - name: normal
+        type: probabilistic
+        probabilistic:
+          sampling_percentage: 2
+
+  filter/otlp_metrics:
+    error_mode: propagate
+    metric_conditions:
+      - resource.attributes["service.name"] != "ziggy-control"
+      - scope.name != "github.com/mihai-chiorean/nanobot/services/ziggy-control"
+      - not IsMatch(metric.name, "^ziggy\\.control\\.(http\\.server\\.(requests|duration|response\\.size|active_requests)|auth\\.bootstrap\\.attempts|upstream\\.(requests|duration|active_requests)|service\\.uptime)$")
+      - Len(datapoint.exemplars) > 0
+
+  transform/otlp_metrics:
+    error_mode: propagate
     metric_statements:
-      - set(datapoint.attributes["host.name"], resource.attributes["host.name"])
+      - context: resource
+        statements:
+          - keep_keys(resource.attributes, ["service.name", "service.namespace", "service.version", "deployment.environment", "host.name", "ziggy.host.role"])
+          - set(resource.attributes["service.version"], "unknown") where resource.attributes["service.version"] != nil and not IsMatch(resource.attributes["service.version"], "^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$")
+          - truncate_all(resource.attributes, 128)
+      - context: scope
+        statements:
+          - keep_keys(scope.attributes, [])
+          - set(scope.version, "")
+      - context: datapoint
+        statements:
+          - keep_keys(datapoint.attributes, ["ziggy.route", "ziggy.operation", "ziggy.outcome", "http.request.method", "http.response.status_class"])
+          - set(datapoint.attributes["ziggy.route"], "other") where datapoint.attributes["ziggy.route"] != nil and not IsMatch(datapoint.attributes["ziggy.route"], "^(health|readiness|bootstrap|enrollment|proxy|other)$")
+          - set(datapoint.attributes["ziggy.operation"], "other") where datapoint.attributes["ziggy.operation"] != nil and not IsMatch(datapoint.attributes["ziggy.operation"], "^(identity|readiness|nanobot_bootstrap|nanobot_enrollment|nanobot_proxy|other)$")
+          - set(datapoint.attributes["ziggy.outcome"], "other") where datapoint.attributes["ziggy.outcome"] != nil and not IsMatch(datapoint.attributes["ziggy.outcome"], "^(authorized|unauthenticated|denied|invalid_method|unavailable|rejected|canceled|timeout|network_error|success|http_4xx|http_5xx|invalid_response|other)$")
+          - set(datapoint.attributes["http.request.method"], "OTHER") where datapoint.attributes["http.request.method"] != nil and not IsMatch(datapoint.attributes["http.request.method"], "^(GET|HEAD|POST|PUT|PATCH|DELETE|OPTIONS|CONNECT|TRACE|OTHER)$")
+          - set(datapoint.attributes["http.response.status_class"], "unset") where datapoint.attributes["http.response.status_class"] != nil and not IsMatch(datapoint.attributes["http.response.status_class"], "^(1xx|2xx|3xx|4xx|5xx|unset)$")
+          - truncate_all(datapoint.attributes, 32)
 
-  transform/journald:
-    error_mode: ignore
+  filter/host_metrics:
+    error_mode: propagate
+    metric_conditions:
+      - not IsMatch(metric.name, "^system\\.(cpu\\.(logical\\.count|time|utilization|load_average\\.(1m|5m|15m))|disk\\.(io|operations|io_time|operation_time|pending_operations|weighted_io_time|merged)|filesystem\\.(usage|utilization|inodes\\.(usage|utilization))|memory\\.(usage|utilization|limit)|network\\.(dropped|errors|io|packets|connections)|paging\\.(usage|operations|faults|utilization)|uptime)$")
+
+  transform/host_metrics:
+    error_mode: propagate
+    metric_statements:
+      - context: resource
+        statements:
+          - keep_keys(resource.attributes, ["service.name", "service.namespace", "deployment.environment", "host.name", "ziggy.host.role"])
+      - context: datapoint
+        statements:
+          - keep_keys(datapoint.attributes, ["cpu", "state", "device", "direction", "type", "mode", "interface"])
+          - truncate_all(datapoint.attributes, 128)
+
+  filter/probe_metrics:
+    error_mode: propagate
+    metric_conditions:
+      - not IsMatch(metric.name, "^httpcheck\\.(status|duration|error|tls\\.cert_remaining)$")
+
+  transform/probe_metrics:
+    error_mode: propagate
+    metric_statements:
+      - context: resource
+        statements:
+          - keep_keys(resource.attributes, ["service.name", "service.namespace", "deployment.environment", "host.name", "ziggy.host.role"])
+      - context: datapoint
+        statements:
+          - set(datapoint.attributes["ziggy.probe.target"], "control-health") where datapoint.attributes["http.url"] == "http://127.0.0.1:8787/healthz"
+          - set(datapoint.attributes["ziggy.probe.target"], "control-readiness") where datapoint.attributes["http.url"] == "http://127.0.0.1:8787/readyz"
+          - set(datapoint.attributes["ziggy.probe.target"], "public-health") where datapoint.attributes["http.url"] == "https://chat.mihaichiorean.com/healthz"
+          - keep_keys(datapoint.attributes, ["ziggy.probe.target", "http.status_code", "http.status_class", "http.method", "network.transport"])
+
+  transform/cloudflared_metrics:
+    error_mode: propagate
+    metric_statements:
+      - context: resource
+        statements:
+          - keep_keys(resource.attributes, ["service.name", "service.namespace", "deployment.environment", "host.name", "ziggy.host.role"])
+      - context: datapoint
+        statements:
+          - keep_keys(datapoint.attributes, ["job", "instance", "protocol", "status_code", "le", "quantile"])
+          - truncate_all(datapoint.attributes, 64)
+
+  transform/systemd_metrics:
+    error_mode: propagate
+    metric_statements:
+      - context: resource
+        statements:
+          - keep_keys(resource.attributes, ["service.name", "service.namespace", "deployment.environment", "host.name", "ziggy.host.role"])
+      - context: datapoint
+        statements:
+          - keep_keys(datapoint.attributes, ["systemd.unit.name", "systemd.unit.active_state"])
+          - truncate_all(datapoint.attributes, 64)
+
+  transform/otelcol_metrics:
+    error_mode: propagate
+    metric_statements:
+      - context: resource
+        statements:
+          - keep_keys(resource.attributes, ["service.name", "service.namespace", "deployment.environment", "host.name", "ziggy.host.role"])
+      - context: datapoint
+        statements:
+          - keep_keys(datapoint.attributes, ["job", "instance", "exporter", "receiver", "processor", "transport", "signal", "policy", "service_name", "service_version"])
+          - truncate_all(datapoint.attributes, 64)
+
+  transform/lifecycle_logs:
+    error_mode: propagate
     log_statements:
-      - set(log.attributes, log.body)
-      - set(log.body, log.body["MESSAGE"])
-      - set(resource.attributes["service.name"], log.attributes["_SYSTEMD_UNIT"]) where log.attributes["_SYSTEMD_UNIT"] != nil
-      - set(resource.attributes["service.name"], log.attributes["SYSLOG_IDENTIFIER"]) where resource.attributes["service.name"] == nil
-      - keep_keys(log.attributes, ["PRIORITY", "_SYSTEMD_UNIT", "SYSLOG_IDENTIFIER", "_BOOT_ID"])
+      - context: log
+        statements:
+          - set(resource.attributes["service.name"], "ziggy-control") where IsMatch(log.body["MESSAGE"], "(?i)ziggy-control")
+          - set(resource.attributes["service.name"], "ziggy-cloudflared") where IsMatch(log.body["MESSAGE"], "(?i)ziggy-cloudflared")
+          - set(resource.attributes["service.name"], "docker") where IsMatch(log.body["MESSAGE"], "(?i)docker")
+          - set(log.attributes["event.name"], "service.starting") where IsMatch(log.body["MESSAGE"], "(?i)(^|[^a-z])starting([^a-z]|$)")
+          - set(log.attributes["event.name"], "service.started") where IsMatch(log.body["MESSAGE"], "(?i)(^|[^a-z])started([^a-z]|$)")
+          - set(log.attributes["event.name"], "service.stopping") where IsMatch(log.body["MESSAGE"], "(?i)(^|[^a-z])stopping([^a-z]|$)")
+          - set(log.attributes["event.name"], "service.stopped") where IsMatch(log.body["MESSAGE"], "(?i)(^|[^a-z])stopped([^a-z]|$)")
+          - set(log.attributes["event.name"], "service.failed") where IsMatch(log.body["MESSAGE"], "(?i)(failed|main process exited)")
+          - set(log.attributes["event.name"], "service.restart_scheduled") where IsMatch(log.body["MESSAGE"], "(?i)scheduled restart")
+          - set(log.body, nil)
+          - keep_keys(log.attributes, ["event.name"])
+          - keep_keys(resource.attributes, ["service.name", "service.namespace", "deployment.environment", "host.name", "ziggy.host.role"])
 
-  attributes/trace_privacy:
-    actions:
-      - key: http.request.header.authorization
-        action: delete
-      - key: http.request.header.cookie
-        action: delete
-      - key: http.response.header.set-cookie
-        action: delete
-      - key: http.request.body
-        action: delete
-      - key: http.response.body
-        action: delete
-      - key: url.full
-        action: delete
-      - key: url.query
-        action: delete
-      - key: enduser.id
-        action: delete
-      - key: user.id
-        action: delete
+  filter/lifecycle_logs:
+    error_mode: propagate
+    log_conditions:
+      - log.attributes["event.name"] == nil
+      - not IsMatch(resource.attributes["service.name"], "^(ziggy-control|ziggy-cloudflared|docker)$")
 
-  filter/ziggy_traces:
-    error_mode: ignore
-    traces:
-      span:
-        - resource.attributes["service.name"] == nil
-        - resource.attributes["service.name"] != "ziggy-control"
+  transform/kernel_logs:
+    error_mode: propagate
+    log_statements:
+      - context: log
+        statements:
+          - set(log.attributes["event.name"], "host.oom") where IsMatch(log.body["MESSAGE"], "(?i)(out of memory|oom-kill|killed process)")
+          - set(log.attributes["event.name"], "host.storage_error") where IsMatch(log.body["MESSAGE"], "(?i)(nvme|i/o error|filesystem)")
+          - set(log.body, nil)
+          - keep_keys(log.attributes, ["event.name"])
+          - keep_keys(resource.attributes, ["service.name", "service.namespace", "deployment.environment", "host.name", "ziggy.host.role"])
+
+  filter/kernel_logs:
+    error_mode: propagate
+    log_conditions:
+      - log.attributes["event.name"] == nil
 
 exporters:
   otlphttp/grafana_cloud:
@@ -187,32 +406,78 @@ exporters:
       authenticator: basicauth/grafana_cloud
     sending_queue:
       enabled: true
+      storage: file_storage
+      sizer: bytes
+      queue_size: 67108864
       num_consumers: 2
-      queue_size: 128
     retry_on_failure:
       enabled: true
-      max_elapsed_time: 5m
+      initial_interval: 5s
+      max_interval: 60s
+      max_elapsed_time: 30m
 
 extensions:
   basicauth/grafana_cloud:
     client_auth:
       username: ${env:GRAFANA_CLOUD_INSTANCE_ID}
-      password: ${env:GRAFANA_CLOUD_API_KEY}
+      password_file: ${env:GRAFANA_CLOUD_API_KEY_FILE}
+
+  basicauth/ziggy_otlp:
+    htpasswd:
+      file: ${env:ZIGGY_OTLP_HTPASSWD_FILE}
+
+  file_storage:
+    directory: /var/lib/ziggy-otelcol/storage
+    create_directory: true
+    directory_permissions: "0700"
+    timeout: 1s
+    fsync: true
+    compaction:
+      on_start: true
+      on_rebound: true
+      cleanup_on_start: true
+      directory: /var/lib/ziggy-otelcol/compaction
+      rebound_needed_threshold_mib: 64
+      rebound_trigger_threshold_mib: 16
 
 service:
-  extensions: [basicauth/grafana_cloud]
+  extensions: [basicauth/grafana_cloud, basicauth/ziggy_otlp, file_storage]
   pipelines:
-    traces:
-      receivers: [otlp]
-      processors: [memory_limiter, filter/ziggy_traces, attributes/trace_privacy, resourcedetection, resource/ziggy, batch]
+    traces/ziggy_control:
+      receivers: [otlp/ziggy_control]
+      processors: [memory_limiter, filter/otlp_traces, resourcedetection, resource/common, transform/otlp_traces, tail_sampling/ziggy, batch]
       exporters: [otlphttp/grafana_cloud]
-    metrics:
-      receivers: [otlp, hostmetrics, httpcheck/ziggy, prometheus/cloudflared, systemd/ziggy]
-      processors: [memory_limiter, resourcedetection, resource/ziggy, transform/promote_host, batch]
+    metrics/ziggy_control:
+      receivers: [otlp/ziggy_control]
+      processors: [memory_limiter, filter/otlp_metrics, resourcedetection, resource/common, transform/otlp_metrics, batch]
       exporters: [otlphttp/grafana_cloud]
-    logs:
-      receivers: [journald/ziggy_errors, journald/ziggy_lifecycle, journald/kernel]
-      processors: [memory_limiter, transform/journald, resourcedetection, resource/ziggy, batch]
+    metrics/host:
+      receivers: [hostmetrics]
+      processors: [memory_limiter, filter/host_metrics, resourcedetection, resource/common, resource/host, transform/host_metrics, batch]
+      exporters: [otlphttp/grafana_cloud]
+    metrics/probes:
+      receivers: [httpcheck/ziggy]
+      processors: [memory_limiter, filter/probe_metrics, resourcedetection, resource/common, resource/probes, transform/probe_metrics, batch]
+      exporters: [otlphttp/grafana_cloud]
+    metrics/cloudflared:
+      receivers: [prometheus/cloudflared]
+      processors: [memory_limiter, resourcedetection, resource/common, resource/cloudflared, transform/cloudflared_metrics, batch]
+      exporters: [otlphttp/grafana_cloud]
+    metrics/systemd:
+      receivers: [systemd/ziggy]
+      processors: [memory_limiter, resourcedetection, resource/common, resource/systemd, transform/systemd_metrics, batch]
+      exporters: [otlphttp/grafana_cloud]
+    metrics/otelcol:
+      receivers: [prometheus/otelcol]
+      processors: [memory_limiter, resourcedetection, resource/common, resource/otelcol, transform/otelcol_metrics, batch]
+      exporters: [otlphttp/grafana_cloud]
+    logs/lifecycle:
+      receivers: [journald/ziggy_lifecycle]
+      processors: [memory_limiter, resourcedetection, resource/common, transform/lifecycle_logs, filter/lifecycle_logs, batch]
+      exporters: [otlphttp/grafana_cloud]
+    logs/kernel:
+      receivers: [journald/kernel]
+      processors: [memory_limiter, resourcedetection, resource/common, resource/kernel, transform/kernel_logs, filter/kernel_logs, batch]
       exporters: [otlphttp/grafana_cloud]
   telemetry:
     resource:
@@ -220,11 +485,8 @@ service:
       host.name: ${env:HOSTNAME}
     metrics:
       readers:
-        - periodic:
+        - pull:
             exporter:
-              otlp:
-                protocol: http/protobuf
-                endpoint: ${env:GRAFANA_CLOUD_OTLP_ENDPOINT}/v1/metrics
-                headers:
-                  - name: authorization
-                    value: ${env:GRAFANA_CLOUD_BASIC_AUTH_HEADER}
+              prometheus:
+                host: 127.0.0.1
+                port: 8888

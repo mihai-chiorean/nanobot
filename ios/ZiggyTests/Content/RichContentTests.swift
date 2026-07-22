@@ -77,7 +77,10 @@ final class RichContentTests: XCTestCase {
             ])
         ])
         let legacy = ZiggyMessage(id: "legacy", role: .assistant, content: .structured(structured))
-        let adapted = LegacyContentAdapter.content(for: legacy)
+        let adapted = LegacyContentAdapter.content(
+            for: legacy,
+            capabilities: RichContentCapabilities(richContentV1: true)
+        )
         guard case .unsupported(let adaptedType, _) = adapted[0] else {
             return XCTFail("legacy rich payload should use envelope isolation")
         }
@@ -151,5 +154,39 @@ final class RichContentTests: XCTestCase {
             return XCTFail("streaming content should remain markdown")
         }
         XCTAssertEqual(markdown.text, "Hello")
+    }
+
+    func testAggregateContentAndMediaStructureAreBounded() throws {
+        let half = String(repeating: "x", count: RichContentLimits.maxMessageContentBytes / 2 + 1)
+        let aggregate = #"{"version":"1","id":"m","chat_id":"c","role":"assistant","blocks":[{"type":"markdown","text":"\#(half)"},{"type":"markdown","text":"\#(half)"}]}"#
+        XCTAssertThrowsError(try JSONDecoder().decode(RichContentMessage.self, from: Data(aggregate.utf8)))
+
+        let badMedia = #"{"type":"media","source":{"type":"allowlisted_url","url":"https://user:secret@example.test/a"},"media_type":"image/png","width":40000,"height":1}"#
+        XCTAssertThrowsError(try JSONDecoder().decode(RichBlock.self, from: Data(badMedia.utf8)))
+
+        let badFile = #"{"type":"file","id":"f","name":"x","size_bytes":-1}"#
+        XCTAssertThrowsError(try JSONDecoder().decode(RichBlock.self, from: Data(badFile.utf8)))
+    }
+
+    func testUnsupportedPayloadIsTruncated() throws {
+        let payload = String(repeating: "x", count: ZiggyProtocolLimits.maxUnsupportedPayloadBytes * 2)
+        let data = Data("{\"type\":\"future\",\"payload\":\"\(payload)\"}".utf8)
+        let block = try JSONDecoder().decode(RichBlock.self, from: data)
+        guard case .unsupported(_, let bounded) = block else { return XCTFail("expected placeholder") }
+        XCTAssertLessThanOrEqual(bounded.aggregateStringBytes, ZiggyProtocolLimits.maxUnsupportedPayloadBytes)
+    }
+
+    func testAccessibilityModelsExposeTableAndChartValues() throws {
+        let table = try TableBlock(columns: ["Region", "Count"], rows: [["West", "7"]])
+        XCTAssertEqual(table.accessibilityRows, ["Row 1, Region: West, Count: 7"])
+
+        let chart = try ChartBlock(
+            chartType: .bar,
+            title: "Requests",
+            series: [ChartSeries(name: "Success", points: [try ChartPoint(label: "Monday", value: 42)])]
+        )
+        XCTAssertEqual(chart.accessibilityRows.first?.series, "Success")
+        XCTAssertTrue(chart.accessibilitySummary.contains("Monday"))
+        XCTAssertTrue(chart.accessibilitySummary.contains("42"))
     }
 }

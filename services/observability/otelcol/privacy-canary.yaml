@@ -1,0 +1,139 @@
+receivers:
+  otlp/canary:
+    protocols:
+      http:
+        endpoint: ${env:PRIVACY_CANARY_ENDPOINT}
+        auth:
+          authenticator: basicauth/canary
+
+processors:
+  filter/traces:
+    error_mode: propagate
+    trace_conditions:
+      - context: resource
+        conditions:
+          - resource.attributes["service.name"] != "ziggy-control"
+      - context: scope
+        conditions:
+          - scope.name != "github.com/mihai-chiorean/nanobot/services/ziggy-control"
+      - context: span
+        conditions:
+          - not IsMatch(span.name, "^(HTTP (health|readiness|bootstrap|enrollment|proxy|other)|upstream (identity|readiness|nanobot_bootstrap|nanobot_enrollment|nanobot_proxy|other))$")
+          - Len(span.links) > 0
+          - span.kind != SPAN_KIND_SERVER and span.kind != SPAN_KIND_CLIENT
+      - context: spanevent
+        conditions:
+          - spanevent.name != nil
+
+  transform/traces:
+    error_mode: propagate
+    trace_statements:
+      - context: resource
+        statements:
+          - keep_keys(resource.attributes, ["service.name", "service.namespace", "service.version", "deployment.environment", "host.name", "ziggy.host.role"])
+          - set(resource.attributes["service.version"], "unknown") where resource.attributes["service.version"] != nil and not IsMatch(resource.attributes["service.version"], "^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$")
+          - truncate_all(resource.attributes, 128)
+      - context: scope
+        statements:
+          - keep_keys(scope.attributes, [])
+          - set(scope.version, "")
+      - context: span
+        statements:
+          - keep_keys(span.attributes, ["ziggy.route", "ziggy.operation", "http.request.method", "http.response.status_code"])
+          - set(span.attributes["ziggy.route"], "other") where span.attributes["ziggy.route"] != nil and not IsMatch(span.attributes["ziggy.route"], "^(health|readiness|bootstrap|enrollment|proxy|other)$")
+          - set(span.attributes["ziggy.operation"], "other") where span.attributes["ziggy.operation"] != nil and not IsMatch(span.attributes["ziggy.operation"], "^(identity|readiness|nanobot_bootstrap|nanobot_enrollment|nanobot_proxy|other)$")
+          - set(span.attributes["http.request.method"], "OTHER") where span.attributes["http.request.method"] != nil and not IsMatch(span.attributes["http.request.method"], "^(GET|HEAD|POST|PUT|PATCH|DELETE|OPTIONS|CONNECT|TRACE|OTHER)$")
+          - set(span.attributes["http.response.status_code"], 0) where span.attributes["http.response.status_code"] != nil and (span.attributes["http.response.status_code"] < 100 or span.attributes["http.response.status_code"] > 599)
+          - truncate_all(span.attributes, 32)
+          - set(span.trace_state, "")
+          - set(span.status.message, "")
+
+  tail_sampling:
+    decision_wait: 1s
+    num_traces: 10
+    expected_new_traces_per_sec: 2
+    decision_cache:
+      sampled_cache_size: 20
+      non_sampled_cache_size: 20
+    policies:
+      - name: errors
+        type: status_code
+        status_code:
+          status_codes: [ERROR]
+      - name: slow
+        type: latency
+        latency:
+          threshold_ms: 2000
+      - name: normal
+        type: probabilistic
+        probabilistic:
+          sampling_percentage: 2
+
+  filter/metrics:
+    error_mode: propagate
+    metric_conditions:
+      - resource.attributes["service.name"] != "ziggy-control"
+      - scope.name != "github.com/mihai-chiorean/nanobot/services/ziggy-control"
+      - not IsMatch(metric.name, "^ziggy\\.control\\.(http\\.server\\.(requests|duration|response\\.size|active_requests)|auth\\.bootstrap\\.attempts|upstream\\.(requests|duration|active_requests)|service\\.uptime)$")
+      - Len(datapoint.exemplars) > 0
+
+  transform/metrics:
+    error_mode: propagate
+    metric_statements:
+      - context: resource
+        statements:
+          - keep_keys(resource.attributes, ["service.name", "service.namespace", "service.version", "deployment.environment", "host.name", "ziggy.host.role"])
+          - set(resource.attributes["service.version"], "unknown") where resource.attributes["service.version"] != nil and not IsMatch(resource.attributes["service.version"], "^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$")
+          - truncate_all(resource.attributes, 128)
+      - context: scope
+        statements:
+          - keep_keys(scope.attributes, [])
+          - set(scope.version, "")
+      - context: datapoint
+        statements:
+          - keep_keys(datapoint.attributes, ["ziggy.route", "ziggy.operation", "ziggy.outcome", "http.request.method", "http.response.status_class"])
+          - set(datapoint.attributes["ziggy.route"], "other") where datapoint.attributes["ziggy.route"] != nil and not IsMatch(datapoint.attributes["ziggy.route"], "^(health|readiness|bootstrap|enrollment|proxy|other)$")
+          - set(datapoint.attributes["ziggy.operation"], "other") where datapoint.attributes["ziggy.operation"] != nil and not IsMatch(datapoint.attributes["ziggy.operation"], "^(identity|readiness|nanobot_bootstrap|nanobot_enrollment|nanobot_proxy|other)$")
+          - set(datapoint.attributes["ziggy.outcome"], "other") where datapoint.attributes["ziggy.outcome"] != nil and not IsMatch(datapoint.attributes["ziggy.outcome"], "^(authorized|unauthenticated|denied|invalid_method|unavailable|rejected|canceled|timeout|network_error|success|http_4xx|http_5xx|invalid_response|other)$")
+          - set(datapoint.attributes["http.request.method"], "OTHER") where datapoint.attributes["http.request.method"] != nil and not IsMatch(datapoint.attributes["http.request.method"], "^(GET|HEAD|POST|PUT|PATCH|DELETE|OPTIONS|CONNECT|TRACE|OTHER)$")
+          - set(datapoint.attributes["http.response.status_class"], "unset") where datapoint.attributes["http.response.status_class"] != nil and not IsMatch(datapoint.attributes["http.response.status_class"], "^(1xx|2xx|3xx|4xx|5xx|unset)$")
+          - truncate_all(datapoint.attributes, 32)
+
+exporters:
+  file/canary:
+    path: ${env:PRIVACY_CANARY_OUTPUT}
+
+  otlphttp/queue_canary:
+    endpoint: ${env:PRIVACY_CANARY_UNREACHABLE_ENDPOINT}
+    timeout: 1s
+    sending_queue:
+      enabled: true
+      queue_size: 10
+      num_consumers: 1
+    retry_on_failure:
+      enabled: false
+
+extensions:
+  basicauth/canary:
+    htpasswd:
+      file: ${env:PRIVACY_CANARY_HTPASSWD_FILE}
+
+service:
+  extensions: [basicauth/canary]
+  pipelines:
+    traces:
+      receivers: [otlp/canary]
+      processors: [filter/traces, transform/traces, tail_sampling]
+      exporters: [file/canary, otlphttp/queue_canary]
+    metrics:
+      receivers: [otlp/canary]
+      processors: [filter/metrics, transform/metrics]
+      exporters: [file/canary, otlphttp/queue_canary]
+  telemetry:
+    metrics:
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 127.0.0.1
+                port: ${env:PRIVACY_CANARY_METRICS_PORT}

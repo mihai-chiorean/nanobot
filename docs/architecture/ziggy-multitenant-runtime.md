@@ -51,6 +51,7 @@ state, integration authorization, and cross-service auditability.
 | Memory is a Go MCP service with a replaceable backend | The memory policy can evolve independently of Nanobot and Chroma. |
 | Workspace IDs come from server-side identity resolution | A client cannot select another tenant by changing an ID. |
 | Product state is durable outside runtime processes | A runtime can be killed and recreated without losing account or Work state. |
+| PostgreSQL is the only authoritative coordination store | Runtime ownership, fencing, leases, capacity reservations, and recovery survive every manager process and never depend on Redis. |
 
 ## 4. System Context
 
@@ -112,7 +113,7 @@ flowchart TB
         CONN[ziggy-connectors / MCP]
         MEMORY[ziggy-memory / MCP]
         PG[(PostgreSQL)]
-        REDIS[(Redis - locks and cache only)]
+        REDIS[(Redis - disposable cache only)]
         VAULT[Credential encryption service]
 
         subgraph ActiveRuntimes[Active per-workspace runtimes]
@@ -155,7 +156,6 @@ flowchart TB
     CONN --> PG
     MEMORY --> PG
     API --> REDIS
-    SUP --> REDIS
 ```
 
 Nanobot processes should run on the Beelink rather than consume Spark's model
@@ -258,12 +258,12 @@ flowchart TB
 | Cloudflare connector and Go gateway | Stateless | Beelink | Any healthy CPU node | Change deployment placement; public origin remains unchanged. |
 | Runtime supervisor | Node-local control | Beelink | One per runtime-capable node | Add the target node and drain runtimes before removing the old supervisor. |
 | Nanobot runtime | Ephemeral process plus workspace files | Beelink | CPU node with workspace access | Stop writes, snapshot/copy and verify workspace, then start exactly one owner. Later, hydrate ephemeral runtime state from canonical services. |
-| Model gateway | Stateless admission state backed by Redis/DB | Beelink | Any CPU node near the model network | Preserve logical URL and shared admission state. |
+| Model gateway | Stateless; durable quota decisions in PostgreSQL, optional disposable queue cache in Redis | Beelink | Any CPU node near the model network | Preserve logical URL and authoritative PostgreSQL admission state. |
 | LLM, Whisper, embedding, reranker | Model cache and GPU process state | Spark | Node with required GPU/runtime labels | Pre-pull model weights, validate GPU runtime, drain requests, then switch endpoint. |
 | Work and connector MCP | Durable state in PostgreSQL; credentials external | Beelink | Any CPU node | Confirm DB/credential connectivity and drain active jobs. |
 | Memory MCP | Stateless service; backend undecided | Deferred | Any CPU node | Memory backend remains separately placed and authoritative. |
 | PostgreSQL | Authoritative durable state | Beelink | Explicit state-home node | Planned backup/restore or replication cutover; never ordinary scheduler eviction. |
-| Redis | Disposable coordination state | Beelink | Any CPU node | Restart is acceptable only when leases and jobs recover from PostgreSQL. |
+| Redis | Disposable cache only | Beelink | Any CPU node | Runtime ownership, leases, slots, fences, and durable jobs must not depend on it. |
 
 The hard distinction is **workload mobility versus data mobility**. A stateless
 binary or container can move by changing deployment configuration. A PostgreSQL
@@ -317,17 +317,23 @@ scheduler churn:
 1. Verify Spark has CPU RAM, disk, ports, Docker/systemd prerequisites, and
    enough headroom beyond the loaded models.
 2. Install the same service artifacts and configuration while they remain
-   stopped; pre-pull images and model assets.
-3. Back up PostgreSQL, Redis recovery inputs, Nanobot workspaces, integration
-   metadata, and encrypted credential material.
+   stopped; pre-pull images and model assets. Any workspace compatibility probe
+   uses a disposable snapshot, never the live writable volume.
+3. Back up PostgreSQL, Nanobot workspaces, integration metadata, and encrypted
+   credential material. Redis is disposable and has no recovery input required
+   for ownership, leases, slots, or durable jobs.
 4. Stop writes at the Go front door and drain active Nanobot and Work jobs.
 5. Stop authoritative services on Beelink, copy state, verify checksums, and
-   start PostgreSQL plus internal services on Spark.
+   verify every old writable database/workspace process and mount is stopped or
+   detached before starting PostgreSQL plus internal services on Spark.
 6. Run isolation, conversation, tool, transcription, Ziggy, and Work smoke
    tests against an internal address.
 7. Move the Cloudflare Tunnel origin to the Spark front door and reopen writes.
 8. Keep Beelink services stopped but intact for the rollback window. Never run
-   two writable copies of a workspace or database.
+   two writable copies of a workspace or database. Rollback repeats the same
+   sequence in reverse: close writes, stop and detach Spark's writable copies,
+   verify state transfer, then start Beelink. A failed stop/detach leaves the
+   service unavailable rather than starting a second writer.
 
 Revisit a scheduler only if Ziggy later owns at least three interchangeable
 hosts and automatic placement becomes a demonstrated operational need. It is
@@ -358,7 +364,8 @@ Operational rules:
    previous application version, and complete before incompatible code ships.
 5. Services emit structured logs, OpenTelemetry trace IDs, Prometheus metrics,
    build SHA, and dependency health. Every request carries the same correlation
-   ID through gateway, Nanobot, MCP, and model calls.
+   ID internally through gateway, Nanobot, MCP, and model calls; the cloud
+   export boundary strips request and tenant identifiers.
 6. Back up PostgreSQL and workspace data independently of containers, and test
    restoration. A volume existing is not a backup.
 7. Rollback restores an artifact version. Data rollback requires a separately
@@ -689,40 +696,150 @@ permanently running container per registered user.
 
 ### Supervisor contract
 
-The runtime manager reconciles durable desired state instead of treating the
-Docker daemon as authoritative:
+The runtime manager reconciles PostgreSQL desired state instead of treating its
+process memory, Docker, or Redis as authoritative. `ziggy-control` resolves the
+workspace before calling it; client workspace IDs never reach the driver as
+authorization. An in-memory keyed queue may serialize work already assigned to
+one manager process, but it grants no ownership and is rebuilt by
+reconciliation.
 
-1. `ziggy-control` verifies the user and resolves a workspace before requesting
-   a runtime. Client workspace IDs never reach the driver as authorization.
-2. The manager serializes operations per workspace through a keyed work queue;
-   unrelated workspaces start and stop concurrently without a global lock.
-3. `EnsureRunning` creates or validates the volume, writes generated config,
-   records a new runtime generation, creates the labeled container, starts it,
-   and waits for the private health check before publishing its endpoint.
-4. Requests increment an active-turn lease. Idle eviction marks the runtime
-   draining, rejects new turns, waits for active work or its deadline, stops and
-   removes the container, and preserves the workspace volume.
-5. A crash uses bounded exponential restart backoff. After the retry budget,
-   the runtime is failed, routing stops, and observability links the state
-   transition to its selected logs. It never silently routes to another
-   workspace or stale generation.
-6. On manager restart, reconciliation lists containers by Ziggy labels and
-   compares workspace, runtime ID, generation, image digest, and desired state.
-   It adopts only an exact live match, removes orphaned containers, and prevents
-   duplicate owners of one workspace.
-7. Disable and deletion revoke sessions first, drain and remove the runtime,
-   inventory and remove tenant data, and preserve only the configured audit
-   record. Removing a TestFlight tester is not runtime revocation.
-8. Upgrades drain the old generation, start the pinned replacement, run its
-   compatibility/health probe, then atomically publish the new endpoint. A
-   failed replacement leaves the workspace stopped or restores the previous
-   compatible image; two generations never serve writes concurrently.
+### PostgreSQL ownership, lease, and fence
+
+PostgreSQL is the single coordination store. Redis must not participate in
+runtime ownership, leases, fencing, capacity, or abandoned-start recovery.
+Database time (`clock_timestamp()`), not manager host clocks, determines lease
+expiry.
+
+The logical `workspace_runtime_owner` table has exactly one durable row per
+workspace:
+
+```text
+workspace_id                 primary key
+runtime_id                   unique, nullable while cold
+generation                   bigint, monotonic fencing token
+manager_id                   manager instance identity
+manager_lease_id             unique random UUID
+manager_lease_expires_at     database timestamp
+desired_state                cold | running | draining | deleted
+observed_state               cold | starting | warm | busy | stopping | failed
+image_digest
+endpoint
+workspace_mount_id
+updated_at
+```
+
+The row is never deleted and recreated during ordinary lifecycle operations.
+`generation` starts at zero, increments in the same transaction that grants a
+new runtime ownership epoch, never decreases, and is never reused, including
+rollback. Workspace deletion retains a tombstone/final generation for at least
+the capability and audit retention window.
+
+Ownership operations are compare-and-swap transactions:
+
+1. **Acquire:** lock the workspace row. Succeed only for the current unexpired
+   `manager_lease_id` (idempotent renewal by its owner) or after the prior lease
+   is expired. A new owner writes a new random lease ID, increments generation,
+   records the proposed runtime ID/manager/expiry, and commits atomically.
+2. **Renew:** `UPDATE ... WHERE workspace_id = ? AND generation = ? AND
+   manager_lease_id = ? AND manager_lease_expires_at > clock_timestamp()`.
+   Extend the lease and its capacity reservations in one transaction. Zero
+   updated rows means ownership is lost.
+3. **Release:** only after the owned container is stopped and its writable
+   mount is detached, CAS the same workspace/generation/lease ID, clear the
+   endpoint/runtime fields, set observed state cold, and release its slots.
+   Release never decrements generation.
+4. **Takeover:** an expired lease permits a new generation, not immediate reuse
+   of its workspace or slot. The new owner first fences routing, finds and
+   stops the old labeled container, and verifies process exit plus writable
+   mount detachment. If that cannot be verified, the workspace and slot remain
+   quarantined and no replacement starts.
+
+A manager that cannot renew before expiry immediately rejects new operations,
+stops routing, and asks its node-local driver to stop owned runtimes. Every
+runtime capability contains `workspace_id`, `runtime_id`, `generation`, and
+expiry. The gateway, model gateway, and MCP services compare the generation to
+the current PostgreSQL owner before accepting work; a stale process therefore
+loses network-side write authority even while shutdown completes. PostgreSQL
+unavailability fails closed for acquire, renew, route publication, and new
+turns.
+
+Turn admission uses its own short-lived `turn_lease_id` rows keyed by
+workspace/runtime/generation. `AcquireTurn` inserts with an idempotency key only
+while the manager lease is current and desired state is running;
+`ReleaseTurn` CAS-deletes or completes the same turn lease ID. Expired turn
+leases are recoverable, but a missing release never authorizes a second
+workspace owner.
+
+### Global slots and start permits
+
+PostgreSQL also owns two fixed slot pools:
+
+- **warm runtime slots:** 10 rows, held from cold-start admission until the
+  runtime is stopped and unmounted;
+- **concurrent start permits:** 2 rows, held only while creating, starting, and
+  health-checking a runtime.
+
+Each reservation records pool/slot number, workspace, runtime ID, generation,
+manager lease ID, reservation ID, state, and database expiry. Acquisition locks
+one free row with `FOR UPDATE SKIP LOCKED` and CAS-writes the reservation. A
+cold start must hold both a warm slot and a distinct start permit before the
+driver creates a container. A warm runtime releases its start permit after the
+health decision but retains its warm slot. This is separate from model request
+concurrency and prevents many cold users from exhausting CPU/disk through
+simultaneous Python/container startup.
+
+Expiry alone does not make an abandoned reservation reusable. Reconciliation
+must prove that no matching create/start operation or container remains, stop
+and unmount any stale runtime, then CAS-clear the reservation using its old
+reservation ID/generation. An unreachable node leaves the slot quarantined.
+This can reduce availability but cannot exceed the global caps or create two
+writable owners. Renewal updates owner lease and held reservations together;
+partial renewal is rolled back.
+
+### Start, replacement, and rollback
+
+`EnsureRunning` follows this order:
+
+1. Acquire or renew the PostgreSQL owner epoch and reserve a warm slot plus a
+   start permit.
+2. Reconcile all labeled containers for the workspace. Before creating a new
+   runtime, stop every old process/container and verify the old read-write
+   workspace mount is detached.
+3. Validate the volume/config and create the container labeled with workspace,
+   runtime ID, generation, lease ID, image digest, and reservation IDs.
+4. Start it with the one writable workspace mount, wait for private health, and
+   CAS-publish the endpoint only if owner generation/lease and reservations are
+   still current.
+5. Release the start permit. On failure, stop/unmount the candidate, record the
+   bounded retry result, and retain or release the warm slot according to the
+   desired state.
+
+Upgrade compatibility probes never mount the live workspace read-write. They
+run a disposable candidate container against a disposable snapshot/copy with
+no externally routable endpoint, then destroy both. Promotion drains the old
+generation, rejects new turns, waits for current turn leases or the deadline,
+stops the old container, and verifies its writable mount is detached **before**
+starting the replacement on the live workspace.
+
+Rollback is symmetric. Stop and unmount the failed/new generation first, then
+increment generation again and start the previous pinned image as a new owner
+epoch with new runtime and lease IDs. Probe it first on a fresh disposable
+snapshot; never restart the old container with its stale generation and never
+run old and new images against the same writable mount. If stop/unmount cannot
+be proven, rollback leaves the workspace unavailable and quarantined.
+
+On manager restart, reconciliation compares PostgreSQL owner/slot records with
+container labels and mount state. It adopts only an exact current
+workspace/runtime/generation/lease/image match. Everything else is fenced,
+stopped, unmounted, and then removed. Disable/deletion revoke sessions first,
+drain and stop the runtime, inventory/remove tenant data, and preserve only the
+configured audit record. Removing a TestFlight tester is not runtime
+revocation.
 
 The minimum manager API is `EnsureRunning`, `AcquireTurn`, `ReleaseTurn`,
 `Drain`, `Stop`, `Delete`, `Status`, and `Reconcile`. Calls carry an internal
-workspace capability and idempotency key. Runtime status and lease metadata are
-stored in PostgreSQL; an in-memory keyed queue coordinates only work executing
-inside one manager process and is rebuilt by reconciliation.
+workspace capability and idempotency key. A crash uses bounded exponential
+restart backoff; after the budget, routing stops and the runtime becomes failed.
 
 ```mermaid
 stateDiagram-v2
@@ -745,6 +862,8 @@ Initial policy:
 |---|---:|---|
 | Registered workspaces | 50 | Product admission cap |
 | Maximum warm runtimes | 10 | Bound Beelink RAM |
+| Concurrent runtime starts | 2 | Bound container/Python startup CPU, RAM, and I/O |
+| Manager lease TTL / renewal | 30s / 10s | Fast fencing with room for transient database latency |
 | Idle timeout | 20 minutes | Preserve recent responsiveness |
 | Active turn per user | 1 | Protect session ordering |
 | Interactive model concurrency | 4 | Protect first-token latency |
@@ -779,7 +898,8 @@ their context/KV-cache sizes.
 | Work tasks and approvals | Work service/PostgreSQL | `workspace_id` | Survives runtime restarts |
 | OAuth connections | Connector service/PostgreSQL | `workspace_id`, `integration_id` | Tokens encrypted separately |
 | OAuth/API secrets | Credential encryption service | Credential reference | Never returned to Nanobot |
-| Runtime lease/state | Supervisor/PostgreSQL plus Redis lease | `workspace_id`, `runtime_id` | Redis is not authoritative |
+| Runtime owner/lease/fence/state | Supervisor/PostgreSQL only | `workspace_id`, `runtime_id`, `generation` | One durable current-owner row; CAS lease and monotonic fence |
+| Runtime capacity/start reservations | Supervisor/PostgreSQL only | pool slot, `workspace_id`, `generation` | Fixed global slots; abandoned reservations require verified stop/unmount before reuse |
 | Model usage | Model gateway | `workspace_id` | Quotas and performance only |
 | Audit events | Append-only audit store | `workspace_id`, actor | Secret-redacted |
 
@@ -878,6 +998,9 @@ Read and write tools have separate capabilities and approval policies.
 |---|---|
 | Clerk unavailable | Existing valid Ziggy session may continue within TTL; new bootstrap fails closed. |
 | Runtime cold start fails | Bounded retry, clear unavailable event, no route to another workspace. |
+| Manager lease renewal fails | Reject new turns, withdraw the endpoint, stop the owned runtime before lease expiry, and require a new fenced generation. |
+| Manager dies during start | Reservation stays unavailable until reconciliation proves the create/start operation and container are stopped, then CAS-recovers it. |
+| Old writable mount cannot be detached | Quarantine the workspace and warm slot; do not start replacement or rollback generation. |
 | Nanobot crashes mid-turn | Mark turn interrupted, restart runtime, preserve durable product events. |
 | Model queue full | Return explicit busy/queued state; do not start unlimited generations. |
 | Spark unavailable | Keep workspace state intact; Work remains retryable; chat reports inference unavailable. |
@@ -889,7 +1012,8 @@ Read and write tools have separate capabilities and approval policies.
 
 ## 16. Observability and Tests
 
-Every request and event should carry:
+Authorization and audit context may carry the following values inside trusted
+service boundaries:
 
 ```text
 trace_id
@@ -900,8 +1024,17 @@ session_id or work_id
 tool_call_id when applicable
 ```
 
+They must not automatically become log fields, metric labels, span attributes,
+or cloud resources. Cloud operational telemetry is limited to stable service,
+host role, bounded operation/route/outcome, status class, latency, and capacity
+state. The collector strips user, workspace, runtime, session, work, tool-call,
+request, URL/query/header/body, and other identity/content attributes. Local
+audit records may retain the minimum identifiers required for authorization and
+investigation under a separate access and retention policy.
+
 Logs must not contain Clerk JWTs, runtime capabilities, OAuth credentials,
-email bodies by default, or full model prompts by default.
+email bodies, model prompts, transcripts, or tool results. Full content is
+never a default log or trace field.
 
 Required automated suites:
 
@@ -910,6 +1043,13 @@ Required automated suites:
 - Cross-tenant session, file, media, memory, Work, and integration attempts.
 - MCP capability expiry, replay, tool mismatch, and workspace mismatch.
 - Runtime start, crash, idle eviction, and reconnect behavior.
+- Concurrent manager acquire/renew/release races proving one current owner,
+  monotonic generation, stale-fence rejection, and database-time expiry.
+- Warm-slot and start-permit exhaustion, fairness, lease renewal, abandoned
+  reservation recovery, and unreachable-node quarantine.
+- Upgrade and rollback tests proving the old writable container/mount is gone
+  before replacement starts and every compatibility probe uses a disposable
+  snapshot.
 - Model admission fairness and cancellation.
 - Upstream Nanobot contract tests against the pinned version.
 - Scheduled compatibility tests against current upstream `main`.
@@ -965,14 +1105,18 @@ rolled back without changing the mobile app or rebuilding unrelated services.
 
 ### Phase 2: provision isolated users
 
-- Add users, workspaces, membership, runtime lease, and admission tables.
+- Add users, workspaces, membership, the single-row PostgreSQL runtime owner
+  with CAS lease/fence, turn leases, and fixed warm/start slot tables.
 - Generate one workspace/config per admitted user.
 - Start one private Nanobot runtime per active workspace.
-- Add cross-tenant adversarial tests before inviting a second user.
+- Add cross-tenant and concurrent-manager ownership/fencing tests before
+  inviting a second user.
 
 ### Phase 3: control resources
 
 - Add idle shutdown, warm-runtime cap, crash recovery, and LRU eviction.
+- Enforce the separate global warm-slot and concurrent-start pools, including
+  abandoned reservation quarantine/recovery.
 - Route all Nanobot inference through the model gateway.
 - Add per-user and global concurrency limits.
 
@@ -1022,6 +1166,12 @@ The architecture is successfully realized when:
 - stopping every Nanobot process leaves all durable product state intact;
 - a cold user can start, reconnect, and continue their own session;
 - ten warm users stay within the measured Beelink RAM budget;
+- concurrent managers cannot publish two owners for one workspace, generation
+  never decreases, and stale lease/fence tokens fail closed;
+- at most ten warm runtimes and two runtime starts are admitted globally, and
+  abandoned reservations are not reused before stop/unmount verification;
+- upgrade and rollback never overlap writable containers/mounts and probe only
+  disposable workspace snapshots before cutover;
 - model admission keeps interactive latency bounded under mixed chat and Work
   load;
 - integration tokens never appear in Nanobot files, prompts, logs, or tool

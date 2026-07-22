@@ -29,7 +29,7 @@ enum ZiggyTheme: String, CaseIterable, Identifiable, Sendable {
 }
 
 struct ChatItem: Identifiable, Hashable, Sendable {
-    let id: String
+    var id: String
     let chatID: String
     let role: MessageRole
     var text: String
@@ -46,9 +46,16 @@ struct ChatItem: Identifiable, Hashable, Sendable {
         self.isStreaming = isStreaming
     }
 
-    mutating func append(delta: String) {
+    @discardableResult
+    mutating func append(delta: String) -> Bool {
+        guard delta.utf8.count <= ZiggyProtocolLimits.maxDeltaTextBytes,
+              text.utf8.count + delta.utf8.count <= ZiggyProtocolLimits.maxStreamTextBytes else {
+            isStreaming = false
+            return false
+        }
         text += delta
         blocks = [.markdown(MarkdownBlock(text: text))]
+        return true
     }
 }
 
@@ -111,12 +118,17 @@ final class AppModel {
     private let credentialStore: any CredentialStoring
     private var restClient: ZiggyRESTClient?
     private var restTokenExpiresAt: Date?
+    private var currentBootstrap: BootstrapResponse?
+    private var bootstrapRefreshTask: Task<BootstrapResponse, Error>?
+    private var credentialGeneration = 0
+    private var contentCapabilities = RichContentCapabilities.legacyOnly
     private var socket: ZiggyWebSocketClient?
     private var socketEventTask: Task<Void, Never>?
     private var configuredServerURL: URL?
     private var configuredAccessCode: String?
     private var pendingNewChat = false
     private var hasStarted = false
+    private var chatReconciler = ChatStreamReconciler()
 
     init(credentialStore: any CredentialStoring = KeychainCredentialStore()) {
         self.credentialStore = credentialStore
@@ -165,9 +177,7 @@ final class AppModel {
 
     func connect(persist: Bool = true) async {
         let trimmedCode = accessCode.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let serverURL = URL(string: serverURLText),
-              ["http", "https"].contains(serverURL.scheme?.lowercased() ?? ""),
-              serverURL.host?.isEmpty == false else {
+        guard let serverURL = ZiggyServerURLValidation.url(from: serverURLText) else {
             phase = .failed("Enter a valid Ziggy server URL.")
             return
         }
@@ -179,6 +189,12 @@ final class AppModel {
         phase = .connecting
         bannerMessage = nil
         await stopSocket()
+        bootstrapRefreshTask?.cancel()
+        bootstrapRefreshTask = nil
+        restClient = nil
+        currentBootstrap = nil
+        restTokenExpiresAt = nil
+        contentCapabilities = .legacyOnly
 
         do {
             let bootstrapClient = ZiggyRESTClient(baseURL: serverURL)
@@ -194,9 +210,9 @@ final class AppModel {
             }
 
             let webSocketURL = Self.webSocketURL(baseURL: serverURL, path: bootstrap.webSocketPath)
-            let socket = ZiggyWebSocketClient(baseURL: webSocketURL) {
-                let fresh = try await bootstrapClient.bootstrapGuest(code: trimmedCode)
-                return fresh.webSocketToken ?? fresh.restToken
+            let socket = ZiggyWebSocketClient(baseURL: webSocketURL) { [weak self] in
+                guard let self else { throw ZiggyRESTError.invalidResponse }
+                return try await self.webSocketCredential()
             }
             self.socket = socket
             observe(socket)
@@ -220,6 +236,13 @@ final class AppModel {
         try? await credentialStore.removeServerURL()
         try? await credentialStore.removeGuestEnrollmentCode()
         restClient = nil
+        currentBootstrap = nil
+        bootstrapRefreshTask?.cancel()
+        bootstrapRefreshTask = nil
+        restTokenExpiresAt = nil
+        contentCapabilities = .legacyOnly
+        credentialGeneration = 0
+        chatReconciler = ChatStreamReconciler()
         configuredServerURL = nil
         configuredAccessCode = nil
         accessCode = ""
@@ -243,7 +266,7 @@ final class AppModel {
         if showSpinner { isRefreshing = true }
         defer { if showSpinner { isRefreshing = false } }
         do {
-            let response = try await authenticatedRESTClient().fetchSessions()
+            let response = try await performAuthenticatedREST { try await $0.fetchSessions() }
             var refreshed = response.items.sorted { lhs, rhs in
                 (lhs.updatedAt?.date ?? .distantPast) > (rhs.updatedAt?.date ?? .distantPast)
             }
@@ -267,10 +290,10 @@ final class AppModel {
 
     func loadMessages(sessionKey: String) async {
         do {
-            let response = try await authenticatedRESTClient().fetchMessages(sessionKey: sessionKey)
+            let response = try await performAuthenticatedREST { try await $0.fetchMessages(sessionKey: sessionKey) }
             let chatID = Self.chatID(from: sessionKey)
             messagesByChatID[chatID] = response.items.map { message in
-                let blocks = LegacyContentAdapter.content(for: message)
+                let blocks = LegacyContentAdapter.content(for: message, capabilities: contentCapabilities)
                 return ChatItem(
                     id: message.id,
                     chatID: chatID,
@@ -313,7 +336,7 @@ final class AppModel {
         if showSpinner { isRefreshing = true }
         defer { if showSpinner { isRefreshing = false } }
         do {
-            let response = try await authenticatedRESTClient().fetchWork()
+            let response = try await performAuthenticatedREST { try await $0.fetchWork() }
             workTasks = response.items.sorted { lhs, rhs in
                 (lhs.updatedAt?.date ?? lhs.createdAt?.date ?? .distantPast)
                     > (rhs.updatedAt?.date ?? rhs.createdAt?.date ?? .distantPast)
@@ -325,7 +348,7 @@ final class AppModel {
 
     func subscribe(to task: WorkTask) async {
         do {
-            let response = try await authenticatedRESTClient().fetchWorkEvents(taskID: task.id)
+            let response = try await performAuthenticatedREST { try await $0.fetchWorkEvents(taskID: task.id) }
             workEventsByTaskID[task.id] = response.items.sorted { ($0.sequence ?? 0) < ($1.sequence ?? 0) }
             let after = response.items.compactMap(\.sequence).max()
             await socket?.send(.workSubscribe(taskID: task.id, afterSequence: after))
@@ -383,29 +406,19 @@ final class AppModel {
                 Task { await loadSessions(showSpinner: false) }
             }
         case .message(let message):
-            let role: MessageRole = ["trace", "progress", "tool"].contains(message.kind?.lowercased() ?? "")
-                ? .progress
-                : .assistant
-            let blocks = LegacyContentAdapter.blocks(text: message.text, role: role, kind: message.kind)
-            messagesByChatID[message.chatID, default: []].append(
-                ChatItem(chatID: message.chatID, role: role, text: message.text, blocks: blocks)
-            )
+            handle(chatReconciler.apply(
+                message: message,
+                capabilities: contentCapabilities,
+                to: &messagesByChatID
+            ))
         case .delta(let delta):
-            guard let chatID = delta.sessionKey else { return }
-            let id = "stream-\(delta.messageID ?? chatID)"
-            if let index = messagesByChatID[chatID, default: []].firstIndex(where: { $0.id == id }) {
-                messagesByChatID[chatID]?[index].append(delta: delta.text)
-            } else {
-                messagesByChatID[chatID, default: []].append(
-                    ChatItem(id: id, chatID: chatID, role: .assistant, text: delta.text, isStreaming: true)
-                )
-            }
+            handle(chatReconciler.apply(delta: delta, to: &messagesByChatID))
         case .streamEnd(let completion):
-            guard let chatID = completion.sessionKey else { return }
-            let id = "stream-\(completion.messageID ?? chatID)"
-            if let index = messagesByChatID[chatID, default: []].firstIndex(where: { $0.id == id }) {
-                messagesByChatID[chatID]?[index].isStreaming = false
-            }
+            handle(chatReconciler.apply(
+                completion: completion,
+                capabilities: contentCapabilities,
+                to: &messagesByChatID
+            ))
             Task { await loadSessions(showSpinner: false) }
         case .error(let error):
             bannerMessage = error.message
@@ -443,23 +456,94 @@ final class AppModel {
         }
     }
 
+    private func handle(_ result: ChatReconciliationResult) {
+        if case .rejected(let message) = result { bannerMessage = message }
+    }
+
     private func authenticatedRESTClient() async throws -> ZiggyRESTClient {
         if let client = restClient,
            restTokenExpiresAt.map({ $0 > Date() }) ?? true {
             return client
         }
-        guard let serverURL = configuredServerURL, let code = configuredAccessCode else {
-            throw ZiggyRESTError.invalidURL
-        }
-        let bootstrap = try await ZiggyRESTClient(baseURL: serverURL).bootstrapGuest(code: code)
-        installRESTClient(from: bootstrap, serverURL: serverURL)
+        _ = try await refreshBootstrap(force: false)
         guard let restClient else { throw ZiggyRESTError.invalidResponse }
         return restClient
     }
 
+    private func performAuthenticatedREST<Value>(
+        _ operation: (ZiggyRESTClient) async throws -> Value
+    ) async throws -> Value {
+        let client = try await authenticatedRESTClient()
+        let generation = credentialGeneration
+        do {
+            return try await operation(client)
+        } catch ZiggyRESTError.http(let statusCode, _) where statusCode == 401 {
+            if generation == credentialGeneration {
+                restClient = nil
+                restTokenExpiresAt = nil
+                currentBootstrap = nil
+            }
+            let retryClient = try await authenticatedRESTClient()
+            return try await operation(retryClient)
+        }
+    }
+
+    private func webSocketCredential() async throws -> WebSocketCredential {
+        let bootstrap = try await refreshBootstrap(force: true)
+        return WebSocketCredential(
+            bearerToken: bootstrap.webSocketToken ?? bootstrap.restToken,
+            capabilities: RichContentCapabilities(advertised: bootstrap.capabilities)
+        )
+    }
+
+    private func refreshBootstrap(force: Bool) async throws -> BootstrapResponse {
+        if !force,
+           let currentBootstrap,
+           restTokenExpiresAt.map({ $0 > Date() }) ?? true {
+            return currentBootstrap
+        }
+        if let bootstrapRefreshTask {
+            let bootstrap = try await bootstrapRefreshTask.value
+            if currentBootstrap != bootstrap {
+                guard let serverURL = configuredServerURL else { throw ZiggyRESTError.invalidURL }
+                installRESTClient(from: bootstrap, serverURL: serverURL)
+            }
+            return bootstrap
+        }
+        guard let serverURL = configuredServerURL, let code = configuredAccessCode else {
+            throw ZiggyRESTError.invalidURL
+        }
+
+        let task = Task {
+            try await ZiggyRESTClient(baseURL: serverURL).bootstrapGuest(code: code)
+        }
+        bootstrapRefreshTask = task
+        do {
+            let bootstrap = try await task.value
+            bootstrapRefreshTask = nil
+            if currentBootstrap != bootstrap {
+                installRESTClient(from: bootstrap, serverURL: serverURL)
+            }
+            return bootstrap
+        } catch {
+            bootstrapRefreshTask = nil
+            throw error
+        }
+    }
+
     private func installRESTClient(from bootstrap: BootstrapResponse, serverURL: URL) {
         restClient = ZiggyRESTClient(baseURL: serverURL, bearerToken: bootstrap.restToken)
-        restTokenExpiresAt = bootstrap.expiresIn.map { Date().addingTimeInterval(TimeInterval(max(5, $0 - 15))) }
+        currentBootstrap = bootstrap
+        restTokenExpiresAt = Self.credentialRefreshDate(for: bootstrap)
+        contentCapabilities = RichContentCapabilities(advertised: bootstrap.capabilities)
+        credentialGeneration += 1
+    }
+
+    static func credentialRefreshDate(for bootstrap: BootstrapResponse, now: Date = Date()) -> Date? {
+        guard let expiration = bootstrap.expirationDate(relativeTo: now) else { return nil }
+        let remaining = max(0, expiration.timeIntervalSince(now))
+        let leeway = min(15, max(1, remaining * 0.1))
+        return expiration.addingTimeInterval(-leeway)
     }
 
     private func stopSocket() async {
@@ -493,6 +577,7 @@ final class AppModel {
                     : "Ziggy returned HTTP \(statusCode)."
             case .invalidURL: return "The Ziggy server URL is invalid."
             case .invalidResponse: return "Ziggy returned an invalid response."
+            case .responseTooLarge: return "Ziggy returned more data than this app can safely display."
             case .decoding: return "Ziggy returned data this app could not read."
             }
         }

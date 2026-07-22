@@ -1,11 +1,4 @@
 receivers:
-  otlp:
-    protocols:
-      grpc:
-        endpoint: 127.0.0.1:4317
-      http:
-        endpoint: 127.0.0.1:4318
-
   hostmetrics:
     collection_interval: 60s
     scrapers:
@@ -77,39 +70,62 @@ receivers:
           metrics_path: /metrics
           static_configs:
             - targets: [127.0.0.1:8012]
+          metric_relabel_configs:
+            - source_labels: [__name__]
+              regex: '(vllm:num_requests_running|vllm:num_requests_waiting|vllm:gpu_cache_usage_perc|vllm:time_to_first_token_seconds|vllm:e2e_request_latency_seconds|vllm:generation_tokens_total|vllm:request_success_total|vllm:prompt_tokens_total|vllm:iteration_tokens_total)'
+              action: keep
+            - regex: '(user|user_id|workspace|workspace_id|session|session_id|request|request_id|client|client_id|url|uri|path|query|header|cookie|email|token|subject|prompt|model_name)'
+              action: labeldrop
+            - regex: '(__name__|job|instance|finished_reason|le|quantile)'
+              action: labelkeep
 
-  journald/ziggy_lifecycle:
-    start_at: end
-    priority: info
-    identifiers: [systemd]
-    grep: '(?i)(((qwen-vllm|anti-sycophancy-proxy|nanobot-gateway|whisper|ziggy-ingest|minimax).*(started|stopped|starting|stopping|failed|main process exited|scheduled restart))|((started|stopped|starting|stopping|failed|main process exited|scheduled restart).*(qwen-vllm|anti-sycophancy-proxy|nanobot-gateway|whisper|ziggy-ingest|minimax)))'
+  prometheus/otelcol:
+    config:
+      scrape_configs:
+        - job_name: ziggy-otelcol
+          scrape_interval: 30s
+          static_configs:
+            - targets: [127.0.0.1:8888]
+          metric_relabel_configs:
+            - source_labels: [__name__]
+              regex: '(otelcol_process_(cpu_seconds_total|memory_rss_bytes|uptime_seconds_total)|otelcol_exporter_(queue_(capacity|size)|enqueue_failed_.*_total|send_failed_.*_total|sent_.*_total)|otelcol_receiver_(failed|refused)_.*_total|otelcol_processor_refused_.*_total)'
+              action: keep
+            - regex: '(service_instance_id|service\.instance\.id)'
+              action: labeldrop
+            - regex: '(__name__|job|instance|exporter|receiver|processor|transport|signal|service_name|service_version)'
+              action: labelkeep
 
   journald/kernel:
     start_at: end
+    storage: file_storage
     priority: warning
     dmesg: true
     grep: '(?i)(out of memory|oom-kill|killed process|nvrm|xid|cuda|gpu|nvme|i/o error|filesystem)'
+    retry_on_failure:
+      enabled: true
+      initial_interval: 1s
+      max_interval: 30s
+      max_elapsed_time: 30m
 
 processors:
   memory_limiter:
     check_interval: 5s
-    limit_mib: 160
-    spike_limit_mib: 32
+    limit_mib: 128
+    spike_limit_mib: 16
 
   batch:
-    send_batch_size: 256
+    send_batch_size: 128
+    send_batch_max_size: 256
     timeout: 15s
 
   resourcedetection:
     detectors: [env, system]
     system:
       resource_attributes:
-        host.id:
-          enabled: true
         host.name:
           enabled: true
 
-  resource/ziggy:
+  resource/common:
     attributes:
       - key: deployment.environment
         value: production
@@ -121,19 +137,108 @@ processors:
         value: spark
         action: upsert
 
-  transform/promote_host:
-    metric_statements:
-      - set(datapoint.attributes["host.name"], resource.attributes["host.name"])
+  resource/host:
+    attributes:
+      - key: service.name
+        value: ziggy-host
+        action: upsert
 
-  transform/journald:
-    error_mode: ignore
+  resource/probes:
+    attributes:
+      - key: service.name
+        value: ziggy-health-probe
+        action: upsert
+
+  resource/qwen:
+    attributes:
+      - key: service.name
+        value: qwen-vllm
+        action: upsert
+
+  resource/otelcol:
+    attributes:
+      - key: service.name
+        value: ziggy-otelcol
+        action: upsert
+
+  resource/kernel:
+    attributes:
+      - key: service.name
+        value: kernel
+        action: upsert
+
+  filter/host_metrics:
+    error_mode: propagate
+    metric_conditions:
+      - not IsMatch(metric.name, "^system\\.(cpu\\.(logical\\.count|time|utilization|load_average\\.(1m|5m|15m))|disk\\.(io|operations|io_time|operation_time|pending_operations|weighted_io_time|merged)|filesystem\\.(usage|utilization|inodes\\.(usage|utilization))|memory\\.(usage|utilization|limit)|network\\.(dropped|errors|io|packets|connections)|paging\\.(usage|operations|faults|utilization)|uptime)$")
+
+  transform/host_metrics:
+    error_mode: propagate
+    metric_statements:
+      - context: resource
+        statements:
+          - keep_keys(resource.attributes, ["service.name", "service.namespace", "deployment.environment", "host.name", "ziggy.host.role"])
+      - context: datapoint
+        statements:
+          - keep_keys(datapoint.attributes, ["cpu", "state", "device", "direction", "type", "mode", "interface"])
+          - truncate_all(datapoint.attributes, 128)
+
+  filter/probe_metrics:
+    error_mode: propagate
+    metric_conditions:
+      - not IsMatch(metric.name, "^httpcheck\\.(status|duration|error)$")
+
+  transform/probe_metrics:
+    error_mode: propagate
+    metric_statements:
+      - context: resource
+        statements:
+          - keep_keys(resource.attributes, ["service.name", "service.namespace", "deployment.environment", "host.name", "ziggy.host.role"])
+      - context: datapoint
+        statements:
+          - set(datapoint.attributes["ziggy.probe.target"], "qwen") where datapoint.attributes["http.url"] == "http://127.0.0.1:8012/health"
+          - set(datapoint.attributes["ziggy.probe.target"], "anti-sycophancy-proxy") where datapoint.attributes["http.url"] == "http://127.0.0.1:8001/health"
+          - set(datapoint.attributes["ziggy.probe.target"], "nanobot-gateway") where datapoint.attributes["http.url"] == "http://spark-094a.tail6faf85.ts.net:18792/health"
+          - keep_keys(datapoint.attributes, ["ziggy.probe.target", "http.status_code", "http.status_class", "http.method", "network.transport"])
+
+  transform/qwen_metrics:
+    error_mode: propagate
+    metric_statements:
+      - context: resource
+        statements:
+          - keep_keys(resource.attributes, ["service.name", "service.namespace", "deployment.environment", "host.name", "ziggy.host.role"])
+      - context: datapoint
+        statements:
+          - keep_keys(datapoint.attributes, ["job", "instance", "finished_reason", "le", "quantile"])
+          - truncate_all(datapoint.attributes, 64)
+
+  transform/otelcol_metrics:
+    error_mode: propagate
+    metric_statements:
+      - context: resource
+        statements:
+          - keep_keys(resource.attributes, ["service.name", "service.namespace", "deployment.environment", "host.name", "ziggy.host.role"])
+      - context: datapoint
+        statements:
+          - keep_keys(datapoint.attributes, ["job", "instance", "exporter", "receiver", "processor", "transport", "signal", "service_name", "service_version"])
+          - truncate_all(datapoint.attributes, 64)
+
+  transform/kernel_logs:
+    error_mode: propagate
     log_statements:
-      - set(log.attributes, log.body)
-      - set(log.body, log.body["MESSAGE"])
-      - set(resource.attributes["service.name"], log.attributes["_SYSTEMD_USER_UNIT"]) where log.attributes["_SYSTEMD_USER_UNIT"] != nil
-      - set(resource.attributes["service.name"], log.attributes["_SYSTEMD_UNIT"]) where resource.attributes["service.name"] == nil and log.attributes["_SYSTEMD_UNIT"] != nil
-      - set(resource.attributes["service.name"], log.attributes["SYSLOG_IDENTIFIER"]) where resource.attributes["service.name"] == nil
-      - keep_keys(log.attributes, ["PRIORITY", "_SYSTEMD_UNIT", "_SYSTEMD_USER_UNIT", "SYSLOG_IDENTIFIER", "_BOOT_ID"])
+      - context: log
+        statements:
+          - set(log.attributes["event.name"], "host.oom") where IsMatch(log.body["MESSAGE"], "(?i)(out of memory|oom-kill|killed process)")
+          - set(log.attributes["event.name"], "host.gpu_error") where IsMatch(log.body["MESSAGE"], "(?i)(nvrm|xid|cuda|gpu)")
+          - set(log.attributes["event.name"], "host.storage_error") where IsMatch(log.body["MESSAGE"], "(?i)(nvme|i/o error|filesystem)")
+          - set(log.body, nil)
+          - keep_keys(log.attributes, ["event.name"])
+          - keep_keys(resource.attributes, ["service.name", "service.namespace", "deployment.environment", "host.name", "ziggy.host.role"])
+
+  filter/kernel_logs:
+    error_mode: propagate
+    log_conditions:
+      - log.attributes["event.name"] == nil
 
 exporters:
   otlphttp/grafana_cloud:
@@ -142,28 +247,58 @@ exporters:
       authenticator: basicauth/grafana_cloud
     sending_queue:
       enabled: true
+      storage: file_storage
+      sizer: bytes
+      queue_size: 33554432
       num_consumers: 1
-      queue_size: 64
     retry_on_failure:
       enabled: true
-      max_elapsed_time: 2m
+      initial_interval: 5s
+      max_interval: 60s
+      max_elapsed_time: 30m
 
 extensions:
   basicauth/grafana_cloud:
     client_auth:
       username: ${env:GRAFANA_CLOUD_INSTANCE_ID}
-      password: ${env:GRAFANA_CLOUD_API_KEY}
+      password_file: ${env:GRAFANA_CLOUD_API_KEY_FILE}
+
+  file_storage:
+    directory: /var/lib/ziggy-otelcol/storage
+    create_directory: true
+    directory_permissions: "0700"
+    timeout: 1s
+    fsync: true
+    compaction:
+      on_start: true
+      on_rebound: true
+      cleanup_on_start: true
+      directory: /var/lib/ziggy-otelcol/compaction
+      rebound_needed_threshold_mib: 32
+      rebound_trigger_threshold_mib: 8
 
 service:
-  extensions: [basicauth/grafana_cloud]
+  extensions: [basicauth/grafana_cloud, file_storage]
   pipelines:
-    metrics:
-      receivers: [otlp, hostmetrics, httpcheck/model_stack, prometheus/qwen]
-      processors: [memory_limiter, resourcedetection, resource/ziggy, transform/promote_host, batch]
+    metrics/host:
+      receivers: [hostmetrics]
+      processors: [memory_limiter, filter/host_metrics, resourcedetection, resource/common, resource/host, transform/host_metrics, batch]
       exporters: [otlphttp/grafana_cloud]
-    logs:
-      receivers: [journald/ziggy_lifecycle, journald/kernel]
-      processors: [memory_limiter, transform/journald, resourcedetection, resource/ziggy, batch]
+    metrics/probes:
+      receivers: [httpcheck/model_stack]
+      processors: [memory_limiter, filter/probe_metrics, resourcedetection, resource/common, resource/probes, transform/probe_metrics, batch]
+      exporters: [otlphttp/grafana_cloud]
+    metrics/qwen:
+      receivers: [prometheus/qwen]
+      processors: [memory_limiter, resourcedetection, resource/common, resource/qwen, transform/qwen_metrics, batch]
+      exporters: [otlphttp/grafana_cloud]
+    metrics/otelcol:
+      receivers: [prometheus/otelcol]
+      processors: [memory_limiter, resourcedetection, resource/common, resource/otelcol, transform/otelcol_metrics, batch]
+      exporters: [otlphttp/grafana_cloud]
+    logs/kernel:
+      receivers: [journald/kernel]
+      processors: [memory_limiter, resourcedetection, resource/common, resource/kernel, transform/kernel_logs, filter/kernel_logs, batch]
       exporters: [otlphttp/grafana_cloud]
   telemetry:
     resource:
@@ -171,11 +306,8 @@ service:
       host.name: ${env:HOSTNAME}
     metrics:
       readers:
-        - periodic:
+        - pull:
             exporter:
-              otlp:
-                protocol: http/protobuf
-                endpoint: ${env:GRAFANA_CLOUD_OTLP_ENDPOINT}/v1/metrics
-                headers:
-                  - name: authorization
-                    value: ${env:GRAFANA_CLOUD_BASIC_AUTH_HEADER}
+              prometheus:
+                host: 127.0.0.1
+                port: 8888

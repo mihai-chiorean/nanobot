@@ -83,12 +83,19 @@ struct ZiggyMessageBubble: View {
                         .background(ZiggyPalette.secondary.opacity(0.9))
                         .clipShape(RoundedRectangle(cornerRadius: 18))
                 }
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("User message")
+                .accessibilityIdentifier("user-message")
+                .accessibilityValue(text)
             case .assistant:
                 HStack(alignment: .lastTextBaseline, spacing: 5) {
                     RichContentView(blocks: blocks ?? [.markdown(MarkdownBlock(text: text))])
                         .frame(maxWidth: .infinity, alignment: .leading)
                     if isStreaming { StreamCursor() }
                 }
+                .accessibilityElement(children: .contain)
+                .accessibilityLabel("Assistant message")
+                .accessibilityIdentifier("assistant-message")
             case .progress:
                 HStack(alignment: .top, spacing: 8) {
                     Image(systemName: "wrench.and.screwdriver")
@@ -101,12 +108,12 @@ struct ZiggyMessageBubble: View {
                 }
                 .foregroundStyle(ZiggyPalette.mutedForeground)
                 .padding(.vertical, 3)
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("Progress message")
+                .accessibilityIdentifier("progress-message")
+                .accessibilityValue(text)
             }
         }
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(kind.rawValue.capitalized) message")
-        .accessibilityIdentifier("\(kind.rawValue)-message")
-        .accessibilityValue(text)
     }
 }
 

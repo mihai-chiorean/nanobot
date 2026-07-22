@@ -28,7 +28,7 @@ func TestHTTPReadinessChecker(t *testing.T) {
 			}))
 			defer server.Close()
 			target, _ := url.Parse(server.URL)
-			checker := NewHTTPReadinessChecker(target, "/healthz", time.Second, time.Second)
+			checker := NewHTTPReadinessChecker(target, "/healthz", time.Second, time.Second, nil)
 			err := checker.Check(context.Background())
 			if (err != nil) != test.wantErr {
 				t.Errorf("Check() error = %v, wantErr %v", err, test.wantErr)
@@ -43,7 +43,7 @@ func TestHTTPReadinessCheckerHonorsTimeout(t *testing.T) {
 	}))
 	defer server.Close()
 	target, _ := url.Parse(server.URL)
-	checker := NewHTTPReadinessChecker(target, "/", 20*time.Millisecond, time.Second)
+	checker := NewHTTPReadinessChecker(target, "/", 20*time.Millisecond, time.Second, nil)
 
 	if err := checker.Check(context.Background()); err == nil {
 		t.Fatal("Check() error = nil, want timeout")
@@ -61,7 +61,7 @@ func TestHTTPReadinessCheckerCachesSuccessfulProbe(t *testing.T) {
 	}))
 	defer server.Close()
 	target, _ := url.Parse(server.URL + "/base")
-	checker := NewHTTPReadinessChecker(target, "/healthz", time.Second, time.Minute)
+	checker := NewHTTPReadinessChecker(target, "/healthz", time.Second, time.Minute, nil)
 
 	for range 3 {
 		if err := checker.Check(context.Background()); err != nil {
@@ -70,5 +70,40 @@ func TestHTTPReadinessCheckerCachesSuccessfulProbe(t *testing.T) {
 	}
 	if got := requests.Load(); got != 1 {
 		t.Errorf("upstream requests = %d, want 1", got)
+	}
+}
+
+func TestHTTPReadinessCheckerPreflightRequiresOwnerLegacyRoutes(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/healthz":
+			w.WriteHeader(http.StatusNoContent)
+		case "/auth/bootstrap":
+			w.WriteHeader(http.StatusUnauthorized)
+		case "/webui/guest/bootstrap":
+			w.WriteHeader(http.StatusBadRequest)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	target, _ := url.Parse(server.URL)
+	checker := NewHTTPReadinessChecker(target, "/healthz", time.Second, time.Second, nil)
+	if err := checker.Preflight(context.Background()); err != nil {
+		t.Fatalf("Preflight() error = %v", err)
+	}
+
+	serverWithMissingRoute := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer serverWithMissingRoute.Close()
+	target, _ = url.Parse(serverWithMissingRoute.URL)
+	checker = NewHTTPReadinessChecker(target, "/healthz", time.Second, time.Second, nil)
+	if err := checker.Preflight(context.Background()); err == nil {
+		t.Fatal("Preflight() error = nil for missing legacy route")
 	}
 }
