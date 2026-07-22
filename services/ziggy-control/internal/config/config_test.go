@@ -119,6 +119,35 @@ func TestLoadFromConnectorTrustFile(t *testing.T) {
 	}
 }
 
+func TestLoadFromConnectorTrustSystemdCredential(t *testing.T) {
+	environment := map[string]string{
+		"ZIGGY_UPSTREAM_URL":         "http://127.0.0.1:8765",
+		"ZIGGY_OWNER_EMAIL":          "owner@example.com",
+		"ZIGGY_OWNER_SUBJECT":        "user_123",
+		"ZIGGY_AUTHORIZED_PARTIES":   "https://chat.example.com",
+		"ZIGGY_TENANTS_FILE":         "/etc/ziggy/tenants.json",
+		"ZIGGY_TENANT_BINDINGS_FILE": "/var/lib/ziggy-control/tenant-bindings.json",
+		"ZIGGY_CONNECTORS_URL":       "http://127.0.0.1:8790",
+		"CREDENTIALS_DIRECTORY":      "/run/credentials/ziggy-control.service",
+		"CLERK_SECRET_KEY":           "secret",
+	}
+	readFile := func(filename string) ([]byte, error) {
+		want := "/run/credentials/ziggy-control.service/connector-trust-key"
+		if filename != want {
+			t.Fatalf("read filename = %q, want %q", filename, want)
+		}
+		return []byte("01234567890123456789012345678901"), nil
+	}
+
+	loaded, err := loadFrom(mapLookup(environment), readFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.ConnectorsURL.String() != "http://127.0.0.1:8790" || len(loaded.ConnectorTrustKey) != 32 {
+		t.Fatalf("connector config = %+v", loaded)
+	}
+}
+
 func TestLoadFromRejectsInvalidSecretSources(t *testing.T) {
 	base := map[string]string{
 		"ZIGGY_UPSTREAM_URL": "http://127.0.0.1:8765",
