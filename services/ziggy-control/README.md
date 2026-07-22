@@ -173,7 +173,9 @@ The checked-in unit expects:
 
 - binary: `/usr/local/bin/ziggy-control`
 - non-secret config: `/etc/ziggy/ziggy-control.env`, mode `0600`
-- tenant manifest: `/etc/ziggy/tenants.json`, mode `0600`
+- tenant manifest: `/etc/ziggy/tenants.json`, owned by
+  `ziggy-control:ziggy-control` and mode `0600`; root-only ownership prevents
+  the unprivileged service from starting
 - tenant subject bindings: `/var/lib/ziggy-control/tenant-bindings.json`,
   written atomically by the `ziggy-control` account; the unit's
   `StateDirectory=ziggy-control` creates the parent
@@ -195,6 +197,8 @@ Install the base unit and only the optional credential drop-ins that are
 configured on this host:
 
 ```sh
+sudo chown ziggy-control:ziggy-control /etc/ziggy/tenants.json
+sudo chmod 0600 /etc/ziggy/tenants.json
 sudo install -D -o root -g root -m 0644 \
   services/ziggy-control/deploy/systemd/ziggy-control.service \
   /etc/systemd/system/ziggy-control.service
