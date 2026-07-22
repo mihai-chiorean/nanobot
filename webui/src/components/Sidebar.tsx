@@ -1,4 +1,5 @@
 import { Moon, PanelLeftClose, RefreshCcw, Settings, SquarePen, Sun } from "lucide-react";
+import { UserButton } from "@clerk/react";
 import { useTranslation } from "react-i18next";
 
 import { ChatList } from "@/components/ChatList";
@@ -95,14 +96,17 @@ export function Sidebar(props: SidebarProps) {
       <Separator className="bg-sidebar-border/50" />
       <div className="flex items-center justify-between gap-2 px-2.5 py-2 text-xs">
         <ConnectionBadge />
-        <Button
-          onClick={props.onOpenSettings}
-          className="h-7 gap-1.5 rounded-md px-2 text-[11px] text-muted-foreground hover:bg-sidebar-accent hover:text-sidebar-foreground"
-          variant={props.activeView === "settings" ? "secondary" : "ghost"}
-        >
-          <Settings className="h-3.5 w-3.5" />
-          Settings
-        </Button>
+        <div className="flex items-center gap-1.5">
+          <Button
+            onClick={props.onOpenSettings}
+            className="h-7 gap-1.5 rounded-md px-2 text-[11px] text-muted-foreground hover:bg-sidebar-accent hover:text-sidebar-foreground"
+            variant={props.activeView === "settings" ? "secondary" : "ghost"}
+          >
+            <Settings className="h-3.5 w-3.5" />
+            Settings
+          </Button>
+          <UserButton />
+        </div>
       </div>
     </aside>
   );

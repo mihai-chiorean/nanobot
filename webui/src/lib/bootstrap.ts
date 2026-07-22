@@ -1,15 +1,18 @@
 import type { BootstrapResponse } from "./types";
 
 /**
- * Fetch a short-lived token + the WebSocket path from the gateway's
- * ``/webui/bootstrap`` endpoint. Localhost-only on the server side.
+ * Exchange a Clerk session JWT for short-lived tenant REST and WebSocket
+ * credentials at the Ziggy front door.
  */
 export async function fetchBootstrap(
+  identityToken: string,
   baseUrl: string = "",
 ): Promise<BootstrapResponse> {
-  const res = await fetch(`${baseUrl}/webui/bootstrap`, {
+  const res = await fetch(`${baseUrl}/auth/bootstrap`, {
     method: "GET",
-    credentials: "same-origin",
+    headers: {
+      Authorization: `Bearer ${identityToken}`,
+    },
   });
   if (!res.ok) {
     throw new Error(`bootstrap failed: HTTP ${res.status}`);

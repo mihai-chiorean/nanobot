@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { SignInButton, SignUpButton, useAuth } from "@clerk/react";
 import { useTranslation } from "react-i18next";
 import { DeleteConfirm } from "@/components/DeleteConfirm";
 import { Sidebar } from "@/components/Sidebar";
 import { SettingsView } from "@/components/settings/SettingsView";
 import { ThreadShell } from "@/components/thread/ThreadShell";
 import { Sheet, SheetContent } from "@/components/ui/sheet";
+import { Button } from "@/components/ui/button";
 import { preloadMarkdownText } from "@/components/MarkdownText";
 import { useSessions } from "@/hooks/useSessions";
 import { useTheme } from "@/hooks/useTheme";
@@ -40,21 +42,38 @@ function readSidebarOpen(): boolean {
 }
 
 export default function App() {
+  const { getToken, isLoaded, isSignedIn } = useAuth();
+
+  if (!isLoaded) return <LoadingView />;
+  if (!isSignedIn) return <SignedOutView />;
+  return <AuthenticatedApp getIdentityToken={getToken} />;
+}
+
+function AuthenticatedApp({
+  getIdentityToken,
+}: {
+  getIdentityToken: () => Promise<string | null>;
+}) {
   const { t } = useTranslation();
   const [state, setState] = useState<BootState>({ status: "loading" });
 
   useEffect(() => {
     let cancelled = false;
+    let client: NanobotClient | undefined;
     (async () => {
       try {
-        const boot = await fetchBootstrap();
+        const identityToken = await getIdentityToken();
+        if (!identityToken) throw new Error("Clerk session is unavailable.");
+        const boot = await fetchBootstrap(identityToken);
         if (cancelled) return;
         const url = deriveWsUrl(boot.ws_path, boot.token);
-        const client = new NanobotClient({
+        client = new NanobotClient({
           url,
           onReauth: async () => {
             try {
-              const refreshed = await fetchBootstrap();
+              const refreshedIdentityToken = await getIdentityToken();
+              if (!refreshedIdentityToken) return null;
+              const refreshed = await fetchBootstrap(refreshedIdentityToken);
               return deriveWsUrl(refreshed.ws_path, refreshed.token);
             } catch {
               return null;
@@ -75,8 +94,9 @@ export default function App() {
     })();
     return () => {
       cancelled = true;
+      client?.close();
     };
-  }, []);
+  }, [getIdentityToken]);
 
   useEffect(() => {
     const warm = () => preloadMarkdownText();
@@ -95,28 +115,7 @@ export default function App() {
     return () => globalThis.clearTimeout(id);
   }, []);
 
-  if (state.status === "loading") {
-    return (
-      <div className="flex h-full w-full items-center justify-center">
-        <div className="flex flex-col items-center gap-3 animate-in fade-in-0 duration-300">
-          <img
-            src="/brand/nanobot_icon.png"
-            alt=""
-            className="h-10 w-10 animate-pulse select-none"
-            aria-hidden
-            draggable={false}
-          />
-          <div className="flex items-center gap-2 text-sm text-muted-foreground">
-            <span className="relative flex h-2 w-2">
-              <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-foreground/40" />
-              <span className="relative inline-flex h-2 w-2 rounded-full bg-foreground/60" />
-            </span>
-            {t("app.loading.connecting")}
-          </div>
-        </div>
-      </div>
-    );
-  }
+  if (state.status === "loading") return <LoadingView />;
   if (state.status === "error") {
     return (
       <div className="flex h-full w-full items-center justify-center px-4 text-center">
@@ -152,6 +151,58 @@ export default function App() {
     >
       <Shell onModelNameChange={handleModelNameChange} />
     </ClientProvider>
+  );
+}
+
+function LoadingView() {
+  const { t } = useTranslation();
+  return (
+    <div className="flex h-full w-full items-center justify-center">
+      <div className="flex flex-col items-center gap-3 animate-in fade-in-0 duration-300">
+        <img
+          src="/brand/nanobot_icon.png"
+          alt=""
+          className="h-10 w-10 animate-pulse select-none"
+          aria-hidden
+          draggable={false}
+        />
+        <div className="flex items-center gap-2 text-sm text-muted-foreground">
+          <span className="relative flex h-2 w-2">
+            <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-foreground/40" />
+            <span className="relative inline-flex h-2 w-2 rounded-full bg-foreground/60" />
+          </span>
+          {t("app.loading.connecting")}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function SignedOutView() {
+  return (
+    <main className="flex h-full w-full items-center justify-center bg-background px-6">
+      <div className="flex w-full max-w-xs flex-col items-center gap-6 text-center">
+        <picture>
+          <source srcSet="/brand/nanobot_logo.webp" type="image/webp" />
+          <img
+            src="/brand/nanobot_logo.png"
+            alt="Ziggy"
+            className="h-10 w-auto select-none object-contain"
+            draggable={false}
+          />
+        </picture>
+        <div className="flex w-full flex-col gap-2">
+          <SignInButton mode="modal">
+            <Button className="w-full">Sign in</Button>
+          </SignInButton>
+          <SignUpButton mode="modal">
+            <Button className="w-full" variant="outline">
+              Create account
+            </Button>
+          </SignUpButton>
+        </div>
+      </div>
+    </main>
   );
 }
 

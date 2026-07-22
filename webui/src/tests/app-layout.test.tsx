@@ -7,7 +7,20 @@ const connectSpy = vi.fn();
 const refreshSpy = vi.fn();
 const createChatSpy = vi.fn().mockResolvedValue("chat-1");
 const deleteChatSpy = vi.fn();
+const getTokenSpy = vi.fn().mockResolvedValue("clerk-token");
 let mockSessions: ChatSummary[] = [];
+let mockSignedIn = true;
+
+vi.mock("@clerk/react", () => ({
+  useAuth: () => ({
+    getToken: getTokenSpy,
+    isLoaded: true,
+    isSignedIn: mockSignedIn,
+  }),
+  SignInButton: ({ children }: { children: React.ReactNode }) => children,
+  SignUpButton: ({ children }: { children: React.ReactNode }) => children,
+  UserButton: () => <button aria-label="Account" />,
+}));
 
 vi.mock("@/hooks/useSessions", async (importOriginal) => {
   const React = await import("react");
@@ -70,6 +83,7 @@ import App from "@/App";
 describe("App layout", () => {
   beforeEach(() => {
     mockSessions = [];
+    mockSignedIn = true;
     connectSpy.mockClear();
     refreshSpy.mockReset();
     createChatSpy.mockClear();
@@ -81,6 +95,16 @@ describe("App layout", () => {
         status: 404,
       }),
     );
+  });
+
+  it("shows Clerk account actions before connecting a signed-out user", () => {
+    mockSignedIn = false;
+
+    render(<App />);
+
+    expect(screen.getByRole("button", { name: "Sign in" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Create account" })).toBeInTheDocument();
+    expect(connectSpy).not.toHaveBeenCalled();
   });
 
   it("keeps sidebar layout out of the main thread width contract", async () => {
