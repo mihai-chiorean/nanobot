@@ -177,9 +177,7 @@ final class AppModel {
 
     func connect(persist: Bool = true) async {
         let trimmedCode = accessCode.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let serverURL = URL(string: serverURLText),
-              ["http", "https"].contains(serverURL.scheme?.lowercased() ?? ""),
-              serverURL.host?.isEmpty == false else {
+        guard let serverURL = ZiggyServerURLValidation.url(from: serverURLText) else {
             phase = .failed("Enter a valid Ziggy server URL.")
             return
         }

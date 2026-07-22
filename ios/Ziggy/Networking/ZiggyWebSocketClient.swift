@@ -28,6 +28,52 @@ public struct WebSocketCredential: Sendable, Hashable {
 
 public enum ZiggyWebSocketClientError: Error, Equatable, Sendable {
     case frameTooLarge(limit: Int)
+    case upgradeFailed(statusCode: Int?)
+}
+
+protocol ZiggyWebSocketConnection: AnyObject, Sendable {
+    var response: URLResponse? { get }
+    func resume()
+    func ping() async throws
+    func send(_ message: URLSessionWebSocketTask.Message) async throws
+    func receive() async throws -> URLSessionWebSocketTask.Message
+    func cancel(with closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?)
+}
+
+final class URLSessionWebSocketConnection: ZiggyWebSocketConnection, @unchecked Sendable {
+    private let task: URLSessionWebSocketTask
+
+    init(task: URLSessionWebSocketTask) {
+        self.task = task
+    }
+
+    var response: URLResponse? { task.response }
+
+    func resume() { task.resume() }
+
+    func ping() async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            task.sendPing { error in
+                if let error {
+                    continuation.resume(throwing: error)
+                } else {
+                    continuation.resume()
+                }
+            }
+        }
+    }
+
+    func send(_ message: URLSessionWebSocketTask.Message) async throws {
+        try await task.send(message)
+    }
+
+    func receive() async throws -> URLSessionWebSocketTask.Message {
+        try await task.receive()
+    }
+
+    func cancel(with closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
+        task.cancel(with: closeCode, reason: reason)
+    }
 }
 
 public actor ZiggyWebSocketClient {
@@ -39,12 +85,13 @@ public actor ZiggyWebSocketClient {
     private let maxOutboundQueue: Int
     private let eventContinuation: AsyncStream<ZiggyWebSocketEvent>.Continuation
     private var assistantContinuations: [UUID: AsyncStream<AssistantStreamEvent>.Continuation] = [:]
-    private var socket: URLSessionWebSocketTask?
+    private var socket: (any ZiggyWebSocketConnection)?
     private var connectionTask: Task<Void, Never>?
     private var outboundQueue: [OutboundWebSocketEnvelope] = []
     private var attachedChatIDs: Set<String> = []
     private var shouldRun = false
     private var backoffNanoseconds: UInt64 = 500_000_000
+    private let connectionFactory: @Sendable (URLRequest) -> any ZiggyWebSocketConnection
 
     public init(baseURL: URL, session: URLSession = .shared, maxOutboundQueue: Int = 100,
                 tokenProvider: @escaping @Sendable () async throws -> String) {
@@ -53,6 +100,9 @@ public actor ZiggyWebSocketClient {
         self.maxOutboundQueue = max(1, maxOutboundQueue)
         self.credentialProvider = {
             WebSocketCredential(bearerToken: try await tokenProvider())
+        }
+        self.connectionFactory = { request in
+            URLSessionWebSocketConnection(task: session.webSocketTask(with: request))
         }
         var continuation: AsyncStream<ZiggyWebSocketEvent>.Continuation!
         self.events = AsyncStream { continuation = $0 }
@@ -65,6 +115,22 @@ public actor ZiggyWebSocketClient {
         self.session = session
         self.maxOutboundQueue = max(1, maxOutboundQueue)
         self.credentialProvider = credentialProvider
+        self.connectionFactory = { request in
+            URLSessionWebSocketConnection(task: session.webSocketTask(with: request))
+        }
+        var continuation: AsyncStream<ZiggyWebSocketEvent>.Continuation!
+        self.events = AsyncStream { continuation = $0 }
+        self.eventContinuation = continuation
+    }
+
+    init(baseURL: URL, maxOutboundQueue: Int = 100,
+         credentialProvider: @escaping @Sendable () async throws -> WebSocketCredential,
+         connectionFactory: @escaping @Sendable (URLRequest) -> any ZiggyWebSocketConnection) {
+        self.baseURL = baseURL
+        self.session = .shared
+        self.maxOutboundQueue = max(1, maxOutboundQueue)
+        self.credentialProvider = credentialProvider
+        self.connectionFactory = connectionFactory
         var continuation: AsyncStream<ZiggyWebSocketEvent>.Continuation!
         self.events = AsyncStream { continuation = $0 }
         self.eventContinuation = continuation
@@ -119,31 +185,30 @@ public actor ZiggyWebSocketClient {
         var hasOpened = false
         while shouldRun && !Task.isCancelled {
             emit(.state(hasOpened ? .reconnecting : .connecting))
+            var connection: (any ZiggyWebSocketConnection)?
             do {
                 let credential = try await credentialProvider()
                 let request = try Self.makeWebSocketRequest(baseURL: baseURL, credential: credential)
-                let task = session.webSocketTask(with: request)
+                let task = connectionFactory(request)
+                connection = task
                 socket = task
                 task.resume()
+                try await task.ping()
                 hasOpened = true
                 backoffNanoseconds = 500_000_000
                 emit(.state(.connected))
                 publishAssistant(.connected(nil))
-                if !attachedChatIDs.isEmpty {
-                    for chatID in attachedChatIDs.sorted() {
-                        try await task.send(.string(try encode(.attach(chatID: chatID))))
-                    }
-                    outboundQueue.removeAll { envelope in
-                        if case .attach = envelope { return true }
-                        return false
-                    }
-                }
+                try await flushAttachedChats(on: task)
                 try await flushQueue(on: task)
                 try await receiveLoop(on: task, capabilities: credential.capabilities)
             } catch is CancellationError {
                 break
             } catch {
-                socket?.cancel(with: .abnormalClosure, reason: nil)
+                let message = Self.failureMessage(for: error, response: connection?.response)
+                emit(.state(.failed(message)))
+                let terminal = Self.isTerminalFailure(error, response: connection?.response)
+                connection?.cancel(with: .abnormalClosure, reason: nil)
+                if terminal { shouldRun = false }
             }
             socket = nil
             guard shouldRun && !Task.isCancelled else { break }
@@ -153,22 +218,28 @@ public actor ZiggyWebSocketClient {
         }
     }
 
-    private func receiveLoop(on task: URLSessionWebSocketTask,
+    private func receiveLoop(on task: any ZiggyWebSocketConnection,
                              capabilities: RichContentCapabilities) async throws {
         while shouldRun && !Task.isCancelled {
             let message = try await task.receive()
+            _ = try await handle(message, capabilities: capabilities)
+        }
+    }
+
+    private func handle(_ message: URLSessionWebSocketTask.Message,
+                        capabilities: RichContentCapabilities) async throws -> Bool {
             let data: Data
             switch message {
             case .string(let string): data = Data(string.utf8)
             case .data(let value): data = value
-            @unknown default: continue
+            @unknown default: return true
             }
             let event: InboundWebSocketEvent
             do {
                 event = try Self.decodeFrame(data, capabilities: capabilities)
             } catch {
                 emit(.decodingFailure("Ziggy sent an event this app could not read."))
-                continue
+                return true
             }
             emit(.inbound(event))
             switch event {
@@ -179,6 +250,16 @@ public actor ZiggyWebSocketClient {
             case .error(let error): publishAssistant(.failed(AssistantStreamFailure(message: error.message, code: error.code)))
             default: break
             }
+        return true
+    }
+
+    private func flushAttachedChats(on task: any ZiggyWebSocketConnection) async throws {
+        for chatID in attachedChatIDs.sorted() {
+            try await task.send(.string(try encode(.attach(chatID: chatID))))
+        }
+        outboundQueue.removeAll { envelope in
+            if case .attach = envelope { return true }
+            return false
         }
     }
 
@@ -196,7 +277,8 @@ public actor ZiggyWebSocketClient {
         }
     }
 
-    private func enqueueAfterSendFailure(_ envelope: OutboundWebSocketEnvelope, task: URLSessionWebSocketTask) {
+    private func enqueueAfterSendFailure(_ envelope: OutboundWebSocketEnvelope,
+                                         task: any ZiggyWebSocketConnection) {
         if socket === task { socket = nil; task.cancel(with: .abnormalClosure, reason: nil) }
         enqueue(envelope)
     }
@@ -209,7 +291,7 @@ public actor ZiggyWebSocketClient {
         outboundQueue.append(envelope)
     }
 
-    private func flushQueue(on task: URLSessionWebSocketTask) async throws {
+    private func flushQueue(on task: any ZiggyWebSocketConnection) async throws {
         while !outboundQueue.isEmpty {
             let envelope = outboundQueue.removeFirst()
             do { try await task.send(.string(try encode(envelope))) }
@@ -217,8 +299,35 @@ public actor ZiggyWebSocketClient {
         }
     }
 
+    private static func failureMessage(for error: Error, response: URLResponse?) -> String {
+        if let statusCode = (response as? HTTPURLResponse)?.statusCode {
+            return "WebSocket upgrade failed (HTTP \(statusCode))."
+        }
+        if case let ZiggyWebSocketClientError.upgradeFailed(statusCode) = error {
+            if let statusCode { return "WebSocket upgrade failed (HTTP \(statusCode))." }
+            return "WebSocket upgrade failed."
+        }
+        if case let ZiggyRESTError.http(statusCode, _) = error {
+            return statusCode == 401
+                ? "WebSocket authentication failed (HTTP 401)."
+                : "WebSocket upgrade failed (HTTP \(statusCode))."
+        }
+        return "WebSocket connection failed."
+    }
+
+    private static func isTerminalFailure(_ error: Error, response: URLResponse?) -> Bool {
+        if let statusCode = (response as? HTTPURLResponse)?.statusCode { return statusCode != 101 }
+        if let socketError = error as? ZiggyWebSocketClientError,
+           case .upgradeFailed = socketError { return true }
+        if case let ZiggyRESTError.http(statusCode, _) = error { return statusCode == 401 }
+        return false
+    }
+
     static func makeWebSocketRequest(baseURL: URL, credential: WebSocketCredential) throws -> URLRequest {
-        guard var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false) else { throw ZiggyRESTError.invalidURL }
+        guard ZiggyServerURLValidation.isValid(baseURL),
+              var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false) else {
+            throw ZiggyRESTError.invalidURL
+        }
         if components.scheme == "https" { components.scheme = "wss" }
         else if components.scheme == "http" { components.scheme = "ws" }
         let secretQueryNames: Set<String> = ["token", "access_token", "authorization", "code"]

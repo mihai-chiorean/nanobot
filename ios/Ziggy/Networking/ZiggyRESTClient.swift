@@ -89,6 +89,7 @@ public struct ZiggyRESTClient: Sendable {
 
     private func data(path: [String], query: [URLQueryItem] = [], headers: [String: String] = [:],
                       token: String? = nil, method: String = "GET", body: Data? = nil) async throws -> Data {
+        guard ZiggyServerURLValidation.isValid(baseURL) else { throw ZiggyRESTError.invalidURL }
         var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false)
         let basePath = components?.percentEncodedPath ?? baseURL.path
         let encodedPath = path.map(Self.encodePathSegment).joined(separator: "/")

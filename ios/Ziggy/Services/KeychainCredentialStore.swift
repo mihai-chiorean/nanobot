@@ -43,11 +43,14 @@ final class KeychainCredentialStore: CredentialStoring, Sendable {
 
         var item = baseQuery(for: key)
         item[kSecValueData as String] = data
-        item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        item[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
 
         var status = SecItemAdd(item as CFDictionary, nil)
         if status == errSecDuplicateItem {
-            let update = [kSecValueData as String: data]
+            let update: [String: Any] = [
+                kSecValueData as String: data,
+                kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+            ]
             status = SecItemUpdate(baseQuery(for: key) as CFDictionary, update as CFDictionary)
         }
 
