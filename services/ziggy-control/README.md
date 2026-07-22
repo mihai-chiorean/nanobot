@@ -25,9 +25,6 @@ iOS / web -> Cloudflare -> ziggy-control -> private Nanobot -> Spark models
 - Accept WebSocket bearer credentials in the upgrade `Authorization` header and
   translate them for the current private Nanobot protocol. Query-token support
   remains a deprecated compatibility path.
-- Accept guest enrollment at `POST /webui/guest/bootstrap` using a form `code`
-  or `join_code` field, or a Bearer `Authorization` header. Legacy GET/query
-  enrollment remains temporarily available and returns `Deprecation: true`.
 - Proxy tenant-authenticated Gmail connector routes through the private
   connector service using a signed, one-minute internal principal envelope.
   Client-supplied principal headers are stripped. The Google callback remains
@@ -42,7 +39,7 @@ iOS / web -> Cloudflare -> ziggy-control -> private Nanobot -> Spark models
   credential, query, request ID, or session ID.
 - Optionally emit content-free OpenTelemetry metrics and traces to a loopback
   OTLP/HTTP collector.
-- Admit bounded owner-only HTTP, SSE, and WebSocket traffic without waiting;
+- Admit bounded tenant HTTP, SSE, and WebSocket traffic without waiting;
   health and readiness remain available when a traffic class is full.
 
 Configuration is immutable after startup. Admission uses atomic try-acquire
@@ -54,7 +51,7 @@ each request carries a fresh cryptographic correlation ID.
 
 The current Nanobot `/auth/bootstrap` endpoint both validates Clerk and mints
 the opaque REST/WebSocket token expected by the existing iOS and web clients.
-For this first phase, `ziggy-control` validates and authorizes the owner, then
+For this first phase, `ziggy-control` validates and authorizes the tenant, then
 forwards the original Clerk bearer token to that endpoint. Nanobot validates it
 a second time and returns its existing response unchanged.
 
@@ -70,15 +67,15 @@ Required variables:
 | Variable | Purpose |
 |---|---|
 | `CLERK_SECRET_KEY` or `CLERK_SECRET_KEY_FILE` | Backend key, supplied inline for development or through a credential file. Set exactly one. |
-| `ZIGGY_OWNER_EMAIL` | Legacy owner identity used only for the temporary guest/bootstrap compatibility route. |
 | `ZIGGY_UPSTREAM_URL` | Private Nanobot origin. It must use an explicit loopback, RFC1918 IPv4, IPv6 ULA/link-local, or Tailscale `100.64.0.0/10` address. Userinfo, query, fragment, and public hostnames are rejected. |
 | `ZIGGY_TENANTS_FILE` | Immutable tenant allocation manifest. Production requires it. |
 | `ZIGGY_TENANT_BINDINGS_FILE` | Durable first-login Clerk subject bindings. Production requires it and the service must be able to write it. |
 
 Optional variables are documented in [`.env.example`](.env.example). In
-production, `ZIGGY_OWNER_SUBJECT` and at least one
-`ZIGGY_AUTHORIZED_PARTIES` value are mandatory: an email match alone is not an
-identity boundary. The allowlist is enforced when a token contains `azp`;
+production, at least one `ZIGGY_AUTHORIZED_PARTIES` value is mandatory. Tenant
+identity is resolved through the manifest and durable Clerk subject binding;
+an email match alone is not an identity boundary. The origin allowlist is
+enforced when a token contains `azp`;
 Clerk's native clients legitimately omit that browser-origin claim, so those
 tokens continue through issuer, signature, lifetime, subject, and tenant
 binding validation. Development, local, staging, and test environments retain
@@ -99,18 +96,16 @@ private-network validation as Nanobot. The systemd unit discovers the shared
 `ZIGGY_CONNECTORS_TRUST_KEY_FILE`. The key is shared only with
 `ziggy-connectors`.
 
-The default owner-only admission limits are 64 ordinary HTTP requests, 8 SSE
+The default admission limits are 64 ordinary HTTP requests, 8 SSE
 streams, and 8 WebSocket connections. Override them with
 `ZIGGY_MAX_HTTP_IN_FLIGHT`, `ZIGGY_MAX_SSE_IN_FLIGHT`, and
 `ZIGGY_MAX_WEBSOCKET_IN_FLIGHT`. `/healthz` and `/readyz` bypass these limits.
 
 Startup first requires the configured readiness path to return 2xx, then
-requires the owner-only legacy Nanobot contract: unauthenticated `GET
-/auth/bootstrap` must return `401`, and credential-less `GET
-/webui/guest/bootstrap` must return `400`. A missing or incompatible upstream
-blocks deployment before the listener starts. `ZIGGY_LEGACY_UPSTREAM_PREFLIGHT`
-may be disabled only outside production when deliberately testing against the
-checked-in Nanobot source, which does not contain these vendor routes.
+requires the private Nanobot contract: unauthenticated `GET /auth/bootstrap`
+must return `401`. A missing or incompatible upstream blocks deployment before
+the listener starts. `ZIGGY_UPSTREAM_PREFLIGHT` may be disabled only outside
+production when deliberately testing against an incomplete runtime.
 
 Set `ZIGGY_OTEL_ENDPOINT=http://127.0.0.1:4318` and
 `ZIGGY_OTEL_AUTH_FILE` to enable application metrics and traces through the
@@ -246,7 +241,6 @@ leases and automatic cold-start scheduling remain later milestones.
 
 The checked-in Spark template `deploy/systemd/spark/nanobot-tenant@.service`
 adds a read-only home/system view and one tenant-specific writable tree. Tools
-must also run with Nanobot's `restrictToWorkspace` enabled. Current legacy guest
-enrollment routes only to the configured default owner runtime and must be
-retired before distributing external TestFlight builds. Query-token WebSocket
+must also run with Nanobot's `restrictToWorkspace` enabled. Legacy guest
+enrollment routes are blocked at the public front door. Query-token WebSocket
 compatibility remains transport plumbing, not a tenant selector.

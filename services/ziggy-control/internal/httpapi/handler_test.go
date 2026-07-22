@@ -67,79 +67,30 @@ func TestBootstrapAuthenticatesOwnerAndPreservesAuthorization(t *testing.T) {
 	}
 }
 
-func TestEnrollmentBootstrapAcceptsPostFormAndAuthorization(t *testing.T) {
-	requests := make(chan *http.Request, 2)
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requests <- r.Clone(context.Background())
-		w.Header().Set("Cache-Control", "public, max-age=3600")
-		_, _ = io.WriteString(w, `{"token":"nanobot-token"}`)
+func TestLegacyGuestRoutesAreBlocked(t *testing.T) {
+	var requests atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		requests.Add(1)
 	}))
 	defer upstream.Close()
 	handler := newTestHandler(t, upstream.URL, principalMiddleware(identity.Principal{}))
 
-	tests := []struct {
-		name     string
-		body     string
-		header   string
-		wantCode string
-	}{
-		{name: "form", body: "join_code=form-canary", wantCode: "form-canary"},
-		{name: "authorization", header: "Bearer header-canary", wantCode: "header-canary"},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			request := httptest.NewRequest(http.MethodPost, "/webui/guest/bootstrap", strings.NewReader(test.body))
-			request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-			if test.header != "" {
-				request.Header.Set("Authorization", test.header)
-			}
+	for _, method := range []string{http.MethodGet, http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete} {
+		for _, requestPath := range []string{
+			"/webui/guest/bootstrap",
+			"/api/guest",
+			"/api/guest/join",
+			"/api/guest/invite/child",
+		} {
 			response := httptest.NewRecorder()
-			handler.ServeHTTP(response, request)
-
-			if response.Code != http.StatusOK {
-				t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+			handler.ServeHTTP(response, httptest.NewRequest(method, requestPath, nil))
+			if response.Code != http.StatusNotFound {
+				t.Errorf("%s %s status = %d, want 404", method, requestPath, response.Code)
 			}
-			if got := response.Header().Get("Cache-Control"); got != "no-store" {
-				t.Errorf("Cache-Control = %q, want no-store", got)
-			}
-			upstreamRequest := <-requests
-			if upstreamRequest.Method != http.MethodGet || upstreamRequest.URL.Path != "/webui/guest/bootstrap" {
-				t.Errorf("upstream request = %s %s", upstreamRequest.Method, upstreamRequest.URL.Path)
-			}
-			if got := upstreamRequest.URL.Query().Get("code"); got != test.wantCode {
-				t.Errorf("upstream code = %q, want %q", got, test.wantCode)
-			}
-			if got := upstreamRequest.Header.Get("Authorization"); got != "" {
-				t.Errorf("upstream Authorization = %q, want empty", got)
-			}
-		})
-	}
-}
-
-func TestEnrollmentBootstrapKeepsDeprecatedGetCompatibility(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if got := r.URL.Query().Get("code"); got != "legacy-canary" {
-			t.Errorf("upstream code = %q", got)
 		}
-		w.WriteHeader(http.StatusNoContent)
-	}))
-	defer upstream.Close()
-	handler := newTestHandler(t, upstream.URL, principalMiddleware(identity.Principal{}))
-
-	response := httptest.NewRecorder()
-	handler.ServeHTTP(response, httptest.NewRequest(
-		http.MethodGet,
-		"/webui/guest/bootstrap?code=legacy-canary&ignored=query-canary",
-		nil,
-	))
-	if response.Code != http.StatusNoContent {
-		t.Fatalf("status = %d", response.Code)
 	}
-	if got := response.Header().Get("Deprecation"); got != "true" {
-		t.Errorf("Deprecation = %q, want true", got)
-	}
-	if got := response.Header().Get("Cache-Control"); got != "no-store" {
-		t.Errorf("Cache-Control = %q, want no-store", got)
+	if requests.Load() != 0 {
+		t.Errorf("upstream requests = %d, want 0", requests.Load())
 	}
 }
 
@@ -202,6 +153,11 @@ func TestPrivateRoutesAreNotProxied(t *testing.T) {
 	for _, requestPath := range []string{
 		"/webui/bootstrap",
 		"/webui/bootstrap/",
+		"/webui/guest/bootstrap",
+		"/webui/guest/bootstrap/",
+		"/api/guest",
+		"/api/guest/join",
+		"/api/guest/invite/child",
 		"/auth/token",
 		"/auth/token/private",
 		"/auth/bootstrap/",
@@ -462,22 +418,6 @@ func TestRequestFailureLogsExcludeCredentialsAndIdentifiers(t *testing.T) {
 				return request
 			},
 		},
-		{
-			name: "enrollment rejection",
-			handler: func(t *testing.T, logger *slog.Logger) http.Handler {
-				upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
-					t.Fatal("rejected enrollment reached upstream")
-				}))
-				t.Cleanup(upstream.Close)
-				return newTestHandlerWithLogger(t, upstream.URL, principalMiddleware(identity.Principal{}), logger, 64<<20)
-			},
-			request: func() *http.Request {
-				request := httptest.NewRequest(http.MethodPost, "/webui/guest/bootstrap?ignored=query-canary", strings.NewReader("code=enrollment-canary&join_code=conflict-canary"))
-				request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-				request.Header.Set("Authorization", "Bearer token-canary")
-				return request
-			},
-		},
 	}
 
 	for _, test := range tests {
@@ -491,7 +431,7 @@ func TestRequestFailureLogsExcludeCredentialsAndIdentifiers(t *testing.T) {
 			serialized := logs.String()
 			for _, forbidden := range []string{
 				"user-canary", "email-canary@example.com", "session-canary",
-				"token-canary", "query-canary", "enrollment-canary", "conflict-canary",
+				"token-canary", "query-canary",
 				"request_id", "trace_id", "127.0.0.1:",
 			} {
 				if strings.Contains(serialized, forbidden) {

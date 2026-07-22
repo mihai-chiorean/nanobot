@@ -30,7 +30,7 @@ const (
 	defaultWebSocketInFlight   = int64(8)
 	defaultOTelTraceSampleRate = 1.0
 	defaultDeploymentEnv       = "production"
-	defaultLegacyPreflight     = true
+	defaultUpstreamPreflight   = true
 )
 
 var tailscaleCGNATPrefix = netip.MustParsePrefix("100.64.0.0/10")
@@ -55,7 +55,7 @@ type Config struct {
 	HTTPInFlight      int64
 	SSEInFlight       int64
 	WebSocketInFlight int64
-	LegacyPreflight   bool
+	UpstreamPreflight bool
 	LogLevel          slog.Level
 	OTelEndpoint      string
 	OTelAuthFile      string
@@ -82,16 +82,6 @@ func loadFrom(lookup LookupEnv, readFile ReadFile) (Config, error) {
 	upstream, err := parseUpstream(upstreamValue)
 	if err != nil {
 		return Config{}, fmt.Errorf("ZIGGY_UPSTREAM_URL: %w", err)
-	}
-
-	ownerEmail, err := required(lookup, "ZIGGY_OWNER_EMAIL")
-	if err != nil {
-		return Config{}, err
-	}
-	ownerEmail = strings.ToLower(strings.TrimSpace(ownerEmail))
-	parsedEmail, err := mail.ParseAddress(ownerEmail)
-	if err != nil || parsedEmail.Address != ownerEmail {
-		return Config{}, fmt.Errorf("ZIGGY_OWNER_EMAIL: invalid email address")
 	}
 
 	secret, err := clerkSecret(lookup, readFile)
@@ -155,11 +145,21 @@ func loadFrom(lookup LookupEnv, readFile ReadFile) (Config, error) {
 	if (tenantManifest == "") != (tenantBindings == "") {
 		return Config{}, fmt.Errorf("ZIGGY_TENANTS_FILE and ZIGGY_TENANT_BINDINGS_FILE must be set together")
 	}
+	ownerEmail := strings.ToLower(optional(lookup, "ZIGGY_OWNER_EMAIL"))
+	if ownerEmail != "" {
+		parsedEmail, err := mail.ParseAddress(ownerEmail)
+		if err != nil || parsedEmail.Address != ownerEmail {
+			return Config{}, fmt.Errorf("ZIGGY_OWNER_EMAIL: invalid email address")
+		}
+	}
+	if tenantManifest == "" && ownerEmail == "" {
+		return Config{}, fmt.Errorf("ZIGGY_OWNER_EMAIL is required without a tenant manifest")
+	}
 	connectorsURL, connectorTrustKey, err := connectorConfig(lookup, readFile)
 	if err != nil {
 		return Config{}, err
 	}
-	legacyPreflight, err := boolean(lookup, "ZIGGY_LEGACY_UPSTREAM_PREFLIGHT", defaultLegacyPreflight)
+	upstreamPreflight, err := boolean(lookup, "ZIGGY_UPSTREAM_PREFLIGHT", defaultUpstreamPreflight)
 	if err != nil {
 		return Config{}, err
 	}
@@ -167,14 +167,11 @@ func loadFrom(lookup LookupEnv, readFile ReadFile) (Config, error) {
 		if len(authorizedParties) == 0 {
 			return Config{}, fmt.Errorf("ZIGGY_AUTHORIZED_PARTIES is required in production")
 		}
-		if ownerSubject == "" {
-			return Config{}, fmt.Errorf("ZIGGY_OWNER_SUBJECT is required in production")
-		}
 		if tenantManifest == "" {
 			return Config{}, fmt.Errorf("ZIGGY_TENANTS_FILE and ZIGGY_TENANT_BINDINGS_FILE are required in production")
 		}
-		if !legacyPreflight {
-			return Config{}, fmt.Errorf("ZIGGY_LEGACY_UPSTREAM_PREFLIGHT cannot be disabled in production")
+		if !upstreamPreflight {
+			return Config{}, fmt.Errorf("ZIGGY_UPSTREAM_PREFLIGHT cannot be disabled in production")
 		}
 	}
 
@@ -198,7 +195,7 @@ func loadFrom(lookup LookupEnv, readFile ReadFile) (Config, error) {
 		HTTPInFlight:      httpInFlight,
 		SSEInFlight:       sseInFlight,
 		WebSocketInFlight: webSocketInFlight,
-		LegacyPreflight:   legacyPreflight,
+		UpstreamPreflight: upstreamPreflight,
 		LogLevel:          logLevel,
 		OTelEndpoint:      optional(lookup, "ZIGGY_OTEL_ENDPOINT"),
 		OTelAuthFile:      optional(lookup, "ZIGGY_OTEL_AUTH_FILE"),

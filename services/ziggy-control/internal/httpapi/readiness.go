@@ -70,27 +70,16 @@ func NewHTTPReadinessChecker(
 	}
 }
 
-// Preflight verifies both the configured health path and the owner-only legacy
-// routes that ziggy-control must proxy to the production Nanobot build.
+// Preflight verifies the configured health path and the private runtime's
+// authenticated bootstrap contract before the front door starts accepting traffic.
 func (checker *HTTPReadinessChecker) Preflight(ctx context.Context) error {
 	if err := checker.check(ctx); err != nil {
 		return fmt.Errorf("configured readiness path: %w", err)
 	}
-	for _, contract := range []struct {
-		path       string
-		wantStatus int
-	}{
-		{path: "/auth/bootstrap", wantStatus: http.StatusUnauthorized},
-		{path: "/webui/guest/bootstrap", wantStatus: http.StatusBadRequest},
-	} {
-		if err := checker.checkLegacyRoute(ctx, contract.path, contract.wantStatus); err != nil {
-			return err
-		}
-	}
-	return nil
+	return checker.checkContractRoute(ctx, "/auth/bootstrap", http.StatusUnauthorized)
 }
 
-func (checker *HTTPReadinessChecker) checkLegacyRoute(ctx context.Context, route string, wantStatus int) error {
+func (checker *HTTPReadinessChecker) checkContractRoute(ctx context.Context, route string, wantStatus int) error {
 	ctx, cancel := context.WithTimeout(ctx, checker.timeout)
 	defer cancel()
 	target := *checker.origin
@@ -100,16 +89,16 @@ func (checker *HTTPReadinessChecker) checkLegacyRoute(ctx context.Context, route
 	target.Fragment = ""
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
 	if err != nil {
-		return fmt.Errorf("create legacy contract request %s: %w", route, err)
+		return fmt.Errorf("create upstream contract request %s: %w", route, err)
 	}
 	response, err := checker.client.Do(request)
 	if err != nil {
-		return fmt.Errorf("legacy route %s unavailable: %w", route, err)
+		return fmt.Errorf("upstream contract %s unavailable: %w", route, err)
 	}
 	defer response.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4<<10))
 	if response.StatusCode != wantStatus {
-		return fmt.Errorf("legacy route %s returned %s, want %d", route, response.Status, wantStatus)
+		return fmt.Errorf("upstream contract %s returned %s, want %d", route, response.Status, wantStatus)
 	}
 	return nil
 }

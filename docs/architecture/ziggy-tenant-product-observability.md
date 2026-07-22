@@ -12,10 +12,10 @@ yet.
 
 Implemented today:
 
-- `ziggy-control` is a single-owner front door. One configured Clerk email and
-  optional subject map to one existing Nanobot upstream and workspace.
-- It proxies REST, SSE, WebSocket, owner bootstrap, and legacy guest enrollment.
-  It has no tenant resolver or control-plane database.
+- `ziggy-control` resolves admitted Clerk identities through an immutable
+  tenant manifest and durable first-login subject bindings.
+- It proxies REST, SSE, WebSocket, tenant bootstrap, and tenant-scoped connector
+  requests to isolated Nanobot runtimes. Legacy guest enrollment is blocked.
 - It now emits optional OTLP/HTTP metrics and traces to a loopback collector for
   HTTP, bootstrap outcome, Clerk calls, Nanobot calls, and readiness probes.
 - Beelink and Spark collector profiles already collect host, probe, systemd,
@@ -28,15 +28,14 @@ Implemented today:
 
 Not implemented today:
 
-- invited, active, disabled, or deleted tenant records;
-- a user-to-workspace registry, runtime supervisor, runtime leases, or multiple
-  isolated Nanobot processes;
+- a mutable tenant control-plane database or invited/deleted lifecycle records;
+- a runtime supervisor, runtime leases, or automatic runtime placement;
 - authoritative turn/token/queue usage events or product events;
 - a memory service, memory inventory snapshots, or memory search telemetry;
 - PostgreSQL reporting tables/views or the admin observability API defined
   below; and
-- a filesystem inventory scanner. Any such scan is explicitly a temporary
-  single-owner source, not proof of tenant isolation.
+- a filesystem inventory scanner. Any such scan is operational inventory, not
+  proof of tenant isolation by itself.
 
 The fleet dashboard is usable with current metrics. The tenant/product
 dashboard is a versioned contract: its fleet aggregate panels work now, while
@@ -103,14 +102,14 @@ Resource attributes are `service.name=ziggy-control`,
 | `ziggy.control.http.server.duration` | `s` | same as requests | Full handler duration, including long-lived streams/upgrades. |
 | `ziggy.control.http.server.response.size` | `By` | same as requests | Bytes written through the HTTP response writer. |
 | `ziggy.control.http.server.active_requests` | `{request}` | `ziggy.route` | Requests currently in the handler. |
-| `ziggy.control.auth.bootstrap.attempts` | `{attempt}` | `ziggy.outcome` | Owner bootstrap outcomes: `authorized`, `unauthenticated`, `denied`, `invalid_method`, `unavailable`, or `rejected`. |
-| `ziggy.control.upstream.requests` | `{request}` | `ziggy.operation`, `http.response.status_class`, `ziggy.outcome` | Clerk, readiness, enrollment, bootstrap, and ordinary Nanobot calls. |
+| `ziggy.control.auth.bootstrap.attempts` | `{attempt}` | `ziggy.outcome` | Tenant bootstrap outcomes: `authorized`, `unauthenticated`, `denied`, `invalid_method`, `unavailable`, or `rejected`. |
+| `ziggy.control.upstream.requests` | `{request}` | `ziggy.operation`, `http.response.status_class`, `ziggy.outcome` | Clerk, readiness, bootstrap, and ordinary Nanobot calls. |
 | `ziggy.control.upstream.duration` | `s` | same as upstream requests | Upstream request duration. |
 | `ziggy.control.upstream.active_requests` | `{request}` | `ziggy.operation` | Current calls to each bounded upstream class. |
 
-Routes are `health`, `readiness`, `bootstrap`, `enrollment`, `proxy`, and
-`other`. Upstream operations are `identity`, `readiness`,
-`nanobot_bootstrap`, `nanobot_enrollment`, `nanobot_proxy`, and `other`.
+Routes are `health`, `readiness`, `bootstrap`, `proxy`, and `other`. Upstream
+operations are `identity`, `readiness`, `nanobot_bootstrap`, `nanobot_proxy`,
+and `other`.
 
 Server spans are named `HTTP <route>` and client spans are named
 `upstream <operation>`. Span attributes are limited to `ziggy.route`,
@@ -250,16 +249,16 @@ The runtime endpoint accepts an internal capability bound to one workspace;
 the tenant key is resolved server-side. None of these endpoints is implemented
 on the current branch.
 
-### Temporary single-owner inventory
+### Temporary filesystem inventory
 
 Before the tenancy database exists, a future operator-run inventory job may
-scan exactly one configured owner workspace root and write an
-`inventory_snapshot_v1` with `source=single_owner_filesystem`. It must report
+scan each workspace root declared by the immutable tenant manifest and write an
+`inventory_snapshot_v1` keyed by an internal tenant reference. It must report
 aggregate counts/bytes only, reject symlink escapes, avoid filenames/paths,
-mark partial scans, and never export the owner as an OTel label. This is a
-temporary migration measurement, not a tenant inventory and not evidence that
-multiple users are isolated. No scanner is implemented today, so the dashboard
-states `inventory unavailable` rather than manufacturing a value.
+mark partial scans, and never export tenant identity as an OTel label. This is
+an operational measurement, not evidence that runtime isolation is correct.
+No scanner is implemented today, so the dashboard states `inventory
+unavailable` rather than manufacturing a value.
 
 ## Retention and deletion
 

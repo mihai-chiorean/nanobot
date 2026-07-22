@@ -80,14 +80,14 @@ writable workspace mount as specified in `ziggy-multitenant-runtime.md`.
 4. Restart `ziggy-control`. Startup validates all IDs, emails, duplicate
    workspaces, duplicate subjects, and private upstream addresses before it
    accepts traffic.
-5. Have the tester sign in through Clerk. Do not give testers the legacy guest
-   code; guest enrollment always targets the owner compatibility runtime.
+5. Have the tester sign in through Clerk. Legacy guest enrollment routes are
+   blocked at the public front door and are not part of tenant provisioning.
 
 ## Acceptance tests
 
 Run these before admitting a tester:
 
-1. Owner bootstrap and existing iOS conversation history still work.
+1. Existing owner-tenant bootstrap and iOS conversation history still work.
 2. Tester bootstrap reaches the tester runtime and begins with zero owner
    sessions and zero owner memory.
 3. A tester transport token plus `workspace_id=<owner>` still returns only the
@@ -117,5 +117,5 @@ tokens and Gmail cursors never enter Nanobot cron payloads or workspace files.
 Disable only the affected allocation, restart `ziggy-control`, and stop its
 tenant unit. Do not point the user at the owner runtime as a fallback. Preserve
 the tenant tree for investigation or export. Rolling back the front-door binary
-to the owner-only version requires first removing all non-owner admissions;
+to a single-tenant version requires first removing all non-owner admissions;
 otherwise a tester could be routed into shared owner state.

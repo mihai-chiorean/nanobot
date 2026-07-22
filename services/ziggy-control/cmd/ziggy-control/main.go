@@ -39,8 +39,8 @@ func run() error {
 		"version", version,
 	)
 	slog.SetDefault(logger)
-	if cfg.DeploymentEnv != "production" && cfg.OwnerSubject == "" {
-		logger.Warn("owner subject is not pinned")
+	if cfg.TenantManifest == "" && cfg.OwnerSubject == "" {
+		logger.Warn("single-tenant fallback subject is not pinned")
 	}
 	if cfg.DeploymentEnv != "production" && len(cfg.AuthorizedParties) == 0 {
 		logger.Warn("Clerk authorized-party validation is disabled")
@@ -115,7 +115,7 @@ func run() error {
 	}
 
 	readiness := httpapi.NewHTTPReadinessChecker(cfg.UpstreamURL, cfg.UpstreamReadyPath, cfg.ReadinessTimeout, cfg.ReadinessCacheTTL, observability)
-	if cfg.LegacyPreflight {
+	if cfg.UpstreamPreflight {
 		preflightCtx, cancel := context.WithTimeout(context.Background(), cfg.ReadinessTimeout)
 		err := readiness.Preflight(preflightCtx)
 		cancel()

@@ -10,8 +10,6 @@ import (
 func TestLoadFromDefaults(t *testing.T) {
 	environment := map[string]string{
 		"ZIGGY_UPSTREAM_URL":         "http://127.0.0.1:8765/",
-		"ZIGGY_OWNER_EMAIL":          " Owner@Example.com ",
-		"ZIGGY_OWNER_SUBJECT":        "user_123",
 		"ZIGGY_AUTHORIZED_PARTIES":   "https://chat.example.com",
 		"ZIGGY_TENANTS_FILE":         "/etc/ziggy/tenants.json",
 		"ZIGGY_TENANT_BINDINGS_FILE": "/var/lib/ziggy-control/tenant-bindings.json",
@@ -28,8 +26,8 @@ func TestLoadFromDefaults(t *testing.T) {
 	if config.UpstreamURL.String() != "http://127.0.0.1:8765" {
 		t.Errorf("UpstreamURL = %q", config.UpstreamURL)
 	}
-	if config.OwnerEmail != "owner@example.com" {
-		t.Errorf("OwnerEmail = %q", config.OwnerEmail)
+	if config.OwnerEmail != "" || config.OwnerSubject != "" {
+		t.Errorf("tenant mode loaded legacy owner config: %+v", config)
 	}
 	if config.TenantManifest != "/etc/ziggy/tenants.json" || config.TenantBindings != "/var/lib/ziggy-control/tenant-bindings.json" {
 		t.Errorf("tenant files not loaded: %+v", config)
@@ -62,6 +60,26 @@ func TestLoadFromDefaults(t *testing.T) {
 		if _, ok := config.BlockedPaths[blocked]; !ok {
 			t.Errorf("BlockedPaths does not contain %q", blocked)
 		}
+	}
+}
+
+func TestLoadFromRequiresOwnerOnlyForSingleTenantFallback(t *testing.T) {
+	environment := map[string]string{
+		"ZIGGY_UPSTREAM_URL":           "http://127.0.0.1:8765",
+		"CLERK_SECRET_KEY":             "secret",
+		"ZIGGY_DEPLOYMENT_ENVIRONMENT": "development",
+	}
+	if _, err := LoadFrom(mapLookup(environment)); err == nil {
+		t.Fatal("LoadFrom() error = nil without a tenant manifest or fallback owner")
+	}
+
+	environment["ZIGGY_OWNER_EMAIL"] = "owner@example.com"
+	config, err := LoadFrom(mapLookup(environment))
+	if err != nil {
+		t.Fatalf("LoadFrom() single-tenant fallback error = %v", err)
+	}
+	if config.OwnerEmail != "owner@example.com" {
+		t.Errorf("OwnerEmail = %q", config.OwnerEmail)
 	}
 }
 
@@ -201,27 +219,27 @@ func TestLoadFromRejectsInvalidSecretSources(t *testing.T) {
 
 func TestLoadFromOverrides(t *testing.T) {
 	environment := map[string]string{
-		"ZIGGY_UPSTREAM_URL":              "https://10.20.30.40/base",
-		"ZIGGY_OWNER_EMAIL":               "owner@example.com",
-		"ZIGGY_OWNER_SUBJECT":             "user_123",
-		"CLERK_SECRET_KEY":                "secret",
-		"ZIGGY_LISTEN_ADDR":               ":9000",
-		"ZIGGY_AUTHORIZED_PARTIES":        "https://app.example, native://ziggy,https://app.example",
-		"ZIGGY_BLOCKED_PATHS":             "private,/internal",
-		"ZIGGY_SHUTDOWN_TIMEOUT":          "3s",
-		"ZIGGY_UPSTREAM_READY_TIMEOUT":    "750ms",
-		"ZIGGY_UPSTREAM_READY_CACHE_TTL":  "250ms",
-		"ZIGGY_UPSTREAM_READY_PATH":       "/healthz",
-		"ZIGGY_MAX_REQUEST_BODY_BYTES":    "1024",
-		"ZIGGY_LOG_LEVEL":                 "debug",
-		"ZIGGY_OTEL_ENDPOINT":             "http://127.0.0.1:4318",
-		"ZIGGY_OTEL_AUTH_FILE":            "/run/credentials/otel-local-auth",
-		"ZIGGY_OTEL_TRACE_SAMPLE_RATIO":   "0.25",
-		"ZIGGY_DEPLOYMENT_ENVIRONMENT":    "staging",
-		"ZIGGY_MAX_HTTP_IN_FLIGHT":        "12",
-		"ZIGGY_MAX_SSE_IN_FLIGHT":         "3",
-		"ZIGGY_MAX_WEBSOCKET_IN_FLIGHT":   "2",
-		"ZIGGY_LEGACY_UPSTREAM_PREFLIGHT": "false",
+		"ZIGGY_UPSTREAM_URL":             "https://10.20.30.40/base",
+		"ZIGGY_OWNER_EMAIL":              "owner@example.com",
+		"ZIGGY_OWNER_SUBJECT":            "user_123",
+		"CLERK_SECRET_KEY":               "secret",
+		"ZIGGY_LISTEN_ADDR":              ":9000",
+		"ZIGGY_AUTHORIZED_PARTIES":       "https://app.example, native://ziggy,https://app.example",
+		"ZIGGY_BLOCKED_PATHS":            "private,/internal",
+		"ZIGGY_SHUTDOWN_TIMEOUT":         "3s",
+		"ZIGGY_UPSTREAM_READY_TIMEOUT":   "750ms",
+		"ZIGGY_UPSTREAM_READY_CACHE_TTL": "250ms",
+		"ZIGGY_UPSTREAM_READY_PATH":      "/healthz",
+		"ZIGGY_MAX_REQUEST_BODY_BYTES":   "1024",
+		"ZIGGY_LOG_LEVEL":                "debug",
+		"ZIGGY_OTEL_ENDPOINT":            "http://127.0.0.1:4318",
+		"ZIGGY_OTEL_AUTH_FILE":           "/run/credentials/otel-local-auth",
+		"ZIGGY_OTEL_TRACE_SAMPLE_RATIO":  "0.25",
+		"ZIGGY_DEPLOYMENT_ENVIRONMENT":   "staging",
+		"ZIGGY_MAX_HTTP_IN_FLIGHT":       "12",
+		"ZIGGY_MAX_SSE_IN_FLIGHT":        "3",
+		"ZIGGY_MAX_WEBSOCKET_IN_FLIGHT":  "2",
+		"ZIGGY_UPSTREAM_PREFLIGHT":       "false",
 	}
 
 	config, err := LoadFrom(mapLookup(environment))
@@ -246,7 +264,7 @@ func TestLoadFromOverrides(t *testing.T) {
 	if config.MaxRequestBody != 1024 {
 		t.Errorf("MaxRequestBody = %d, want 1024", config.MaxRequestBody)
 	}
-	if config.HTTPInFlight != 12 || config.SSEInFlight != 3 || config.WebSocketInFlight != 2 || config.LegacyPreflight {
+	if config.HTTPInFlight != 12 || config.SSEInFlight != 3 || config.WebSocketInFlight != 2 || config.UpstreamPreflight {
 		t.Errorf("admission/preflight overrides not applied: %+v", config)
 	}
 	if config.OTelEndpoint != "http://127.0.0.1:4318" || config.OTelAuthFile != "/run/credentials/otel-local-auth" || config.OTelTraceSample != 0.25 {
@@ -293,7 +311,7 @@ func TestLoadFromRejectsInvalidConfiguration(t *testing.T) {
 		{name: "high trace ratio", key: "ZIGGY_OTEL_TRACE_SAMPLE_RATIO", value: "1.1"},
 		{name: "bad deployment environment", key: "ZIGGY_DEPLOYMENT_ENVIRONMENT", value: "tenant-123"},
 		{name: "bad HTTP admission limit", key: "ZIGGY_MAX_HTTP_IN_FLIGHT", value: "0"},
-		{name: "bad preflight boolean", key: "ZIGGY_LEGACY_UPSTREAM_PREFLIGHT", value: "maybe"},
+		{name: "bad preflight boolean", key: "ZIGGY_UPSTREAM_PREFLIGHT", value: "maybe"},
 	}
 
 	for _, test := range tests {

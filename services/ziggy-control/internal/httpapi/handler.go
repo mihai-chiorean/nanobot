@@ -7,12 +7,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"io"
 	"log/slog"
-	"mime"
 	"net"
 	"net/http"
-	"net/url"
 	"path"
 	"strings"
 	"sync/atomic"
@@ -60,8 +57,6 @@ type API struct {
 }
 
 type requestIDKey struct{}
-
-const maxEnrollmentBody = 4 << 10
 
 const (
 	defaultHTTPInFlight      = int64(64)
@@ -141,7 +136,7 @@ func New(config Config) (http.Handler, error) {
 	if config.Logger == nil {
 		return nil, errors.New("logger is required")
 	}
-	if strings.TrimSpace(config.OwnerEmail) == "" {
+	if config.TenantRouter == nil && strings.TrimSpace(config.OwnerEmail) == "" {
 		return nil, errors.New("owner email is required")
 	}
 	if config.MaxRequestBody <= 0 {
@@ -166,7 +161,7 @@ func New(config Config) (http.Handler, error) {
 	if api.telemetry == nil {
 		api.telemetry = telemetry.Noop()
 	}
-	for _, reserved := range []string{"/auth/bootstrap", "/webui/guest/bootstrap", "/healthz", "/readyz", "/connectors"} {
+	for _, reserved := range []string{"/auth/bootstrap", "/webui/guest/bootstrap", "/api/guest", "/healthz", "/readyz", "/connectors"} {
 		api.blockedPaths[reserved] = struct{}{}
 	}
 
@@ -174,7 +169,6 @@ func New(config Config) (http.Handler, error) {
 	mux.HandleFunc("/healthz", api.health)
 	mux.HandleFunc("/readyz", api.ready)
 	mux.Handle("/auth/bootstrap", config.Authenticate(http.HandlerFunc(api.bootstrap)))
-	mux.HandleFunc("/webui/guest/bootstrap", api.enroll)
 	mux.HandleFunc("/connectors/oauth/google/callback", api.connectorCallback)
 	mux.Handle("/connectors/", config.Authenticate(http.HandlerFunc(api.connectors)))
 	mux.HandleFunc("/", api.forward)
@@ -268,35 +262,6 @@ func (api *API) bootstrap(w http.ResponseWriter, r *http.Request) {
 	api.proxyTenantBootstrap(w, r, route)
 }
 
-func (api *API) enroll(w http.ResponseWriter, r *http.Request) {
-	writer := noStoreResponseWriter{ResponseWriter: w}
-	credential, status, err := enrollmentCredential(&writer, r)
-	if err != nil {
-		writeError(&writer, status, err.Error())
-		return
-	}
-	if r.Method == http.MethodGet {
-		writer.Header().Set("Deprecation", "true")
-	}
-
-	request := r.Clone(r.Context())
-	requestURL := *r.URL
-	requestURL.RawQuery = url.Values{"code": []string{credential}}.Encode()
-	request.URL = &requestURL
-	request.Method = http.MethodGet
-	request.Body = http.NoBody
-	request.ContentLength = 0
-	request.GetBody = nil
-	request.Header.Del("Authorization")
-	request.Header.Del("Content-Type")
-	request.Header.Del("Content-Length")
-	if api.tenantRouter == nil {
-		api.proxy.ServeHTTP(&writer, request)
-		return
-	}
-	api.proxyTenantBootstrap(&writer, request, api.tenantRouter.Default())
-}
-
 func (api *API) forward(w http.ResponseWriter, r *http.Request) {
 	if api.isBlocked(r.URL.Path) {
 		http.NotFound(w, r)
@@ -351,67 +316,6 @@ func (api *API) proxyTenantBootstrap(w http.ResponseWriter, r *http.Request, rou
 		}
 	}
 	response.send(w)
-}
-
-func enrollmentCredential(w http.ResponseWriter, r *http.Request) (string, int, error) {
-	if r.Method != http.MethodGet && r.Method != http.MethodPost {
-		w.Header().Set("Allow", "GET, POST")
-		return "", http.StatusMethodNotAllowed, errors.New("method not allowed")
-	}
-	headerCredential, headerPresent, headerValid := bearerCredential(r.Header.Get("Authorization"))
-	if headerPresent && !headerValid {
-		return "", http.StatusUnauthorized, errors.New("valid enrollment credential required")
-	}
-
-	var supplied []string
-	if r.Method == http.MethodGet {
-		supplied = append(supplied, r.URL.Query()["code"]...)
-		supplied = append(supplied, r.URL.Query()["join_code"]...)
-	} else {
-		mediaType := "application/x-www-form-urlencoded"
-		if contentType := strings.TrimSpace(r.Header.Get("Content-Type")); contentType != "" {
-			parsedType, _, err := mime.ParseMediaType(contentType)
-			if err != nil || parsedType != mediaType {
-				return "", http.StatusUnsupportedMediaType, errors.New("form-encoded enrollment body required")
-			}
-		}
-		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxEnrollmentBody))
-		if err != nil {
-			var tooLarge *http.MaxBytesError
-			if errors.As(err, &tooLarge) {
-				return "", http.StatusRequestEntityTooLarge, errors.New("enrollment body too large")
-			}
-			return "", http.StatusBadRequest, errors.New("invalid enrollment body")
-		}
-		form, err := url.ParseQuery(string(body))
-		if err != nil {
-			return "", http.StatusBadRequest, errors.New("invalid enrollment body")
-		}
-		supplied = append(supplied, form["code"]...)
-		supplied = append(supplied, form["join_code"]...)
-	}
-	if headerCredential != "" {
-		supplied = append(supplied, headerCredential)
-	}
-
-	credential := ""
-	for _, candidate := range supplied {
-		candidate = strings.TrimSpace(candidate)
-		if candidate == "" {
-			continue
-		}
-		if len(candidate) > 512 {
-			return "", http.StatusBadRequest, errors.New("invalid enrollment credential")
-		}
-		if credential != "" && candidate != credential {
-			return "", http.StatusBadRequest, errors.New("conflicting enrollment credentials")
-		}
-		credential = candidate
-	}
-	if credential == "" {
-		return "", http.StatusUnauthorized, errors.New("valid enrollment credential required")
-	}
-	return credential, 0, nil
 }
 
 func webSocketRequest(r *http.Request) (*http.Request, int, error) {
@@ -470,7 +374,7 @@ func (api *API) isBlocked(requestPath string) bool {
 }
 
 func cloneBlockedPaths(source map[string]struct{}) map[string]struct{} {
-	result := make(map[string]struct{}, len(source)+3)
+	result := make(map[string]struct{}, len(source)+5)
 	for blocked := range source {
 		result[blocked] = struct{}{}
 	}
@@ -578,29 +482,9 @@ func routeName(requestPath string) string {
 		return "readiness"
 	case "/auth/bootstrap":
 		return "bootstrap"
-	case "/webui/guest/bootstrap":
-		return "enrollment"
 	default:
 		return "proxy"
 	}
-}
-
-type noStoreResponseWriter struct {
-	http.ResponseWriter
-}
-
-func (w noStoreResponseWriter) Unwrap() http.ResponseWriter {
-	return w.ResponseWriter
-}
-
-func (w noStoreResponseWriter) WriteHeader(status int) {
-	w.Header().Set("Cache-Control", "no-store")
-	w.ResponseWriter.WriteHeader(status)
-}
-
-func (w noStoreResponseWriter) Write(body []byte) (int, error) {
-	w.Header().Set("Cache-Control", "no-store")
-	return w.ResponseWriter.Write(body)
 }
 
 func RequestID(ctx context.Context) string {
