@@ -83,6 +83,12 @@ func New(config Config) (func(http.Handler) http.Handler, error) {
 			allowed[party] = struct{}{}
 		}
 		options = append(options, clerkhttp.AuthorizedParty(func(party string) bool {
+			// Native Clerk clients do not send a browser Origin when minting a
+			// session token, so their tokens legitimately omit azp. Clerk's
+			// verification guidance applies this allowlist only when azp exists.
+			if party == "" {
+				return true
+			}
 			_, ok := allowed[party]
 			return ok
 		}))

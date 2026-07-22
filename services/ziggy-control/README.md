@@ -78,9 +78,12 @@ Required variables:
 Optional variables are documented in [`.env.example`](.env.example). In
 production, `ZIGGY_OWNER_SUBJECT` and at least one
 `ZIGGY_AUTHORIZED_PARTIES` value are mandatory: an email match alone is not an
-identity boundary. Development, local, staging, and test environments retain
-the explicit escape hatch for clients that do not yet emit `azp` or use a
-subject pin.
+identity boundary. The allowlist is enforced when a token contains `azp`;
+Clerk's native clients legitimately omit that browser-origin claim, so those
+tokens continue through issuer, signature, lifetime, subject, and tenant
+binding validation. Development, local, staging, and test environments retain
+the explicit escape hatch for deployments without a browser origin or subject
+pin.
 
 The manifest format is shown in
 [`deploy/tenants.example.json`](deploy/tenants.example.json). It must contain
