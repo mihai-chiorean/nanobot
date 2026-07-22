@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { Composer } from "@/components/Composer";
 import { MessageList } from "@/components/MessageList";
-import { useClient } from "@/providers/ClientProvider";
+import { useClient } from "@/providers/client-context";
 import { useNanobotStream } from "@/hooks/useNanobotStream";
 import { useSessionHistory } from "@/hooks/useSessions";
 import { randomId } from "@/lib/id";

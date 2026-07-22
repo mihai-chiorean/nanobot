@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { ApiError, fetchActivity } from "@/lib/api";
 import type { ActivityItem } from "@/lib/types";
-import { useClient } from "@/providers/ClientProvider";
+import { useClient } from "@/providers/client-context";
 
 export function useActivity(): {
   activity: ActivityItem[];

@@ -14,7 +14,7 @@ import { useWork } from "@/hooks/useWork";
 import { relativeTime, shortChatId } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import type { InboundEvent, WorkStatus, WorkTask } from "@/lib/types";
-import { useClient } from "@/providers/ClientProvider";
+import { useClient } from "@/providers/client-context";
 
 interface ActivityViewProps {
   onBackToChat: () => void;

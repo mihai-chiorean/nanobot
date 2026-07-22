@@ -10,7 +10,7 @@ import { useNanobotStream, type SendImage } from "@/hooks/useNanobotStream";
 import { useSessionHistory } from "@/hooks/useSessions";
 import { randomId } from "@/lib/id";
 import type { ChatSummary, UIMessage } from "@/lib/types";
-import { useClient } from "@/providers/ClientProvider";
+import { useClient } from "@/providers/client-context";
 
 interface ThreadShellProps {
   session: ChatSummary | null;

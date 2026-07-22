@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { useClient } from "@/providers/ClientProvider";
+import { useClient } from "@/providers/client-context";
 import i18n from "@/i18n";
 import {
   ApiError,

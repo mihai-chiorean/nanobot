@@ -6,7 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { fetchSettings, switchModel, updateSettings } from "@/lib/api";
 import { cn } from "@/lib/utils";
-import { useClient } from "@/providers/ClientProvider";
+import { useClient } from "@/providers/client-context";
 import type { ModelSwitchTarget, SettingsPayload } from "@/lib/types";
 
 interface SettingsViewProps {

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { ApiError, fetchWorkTask, fetchWorkTasks } from "@/lib/api";
 import type { WorkTask } from "@/lib/types";
-import { useClient } from "@/providers/ClientProvider";
+import { useClient } from "@/providers/client-context";
 
 export function useWork(): {
   tasks: WorkTask[];

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { useClient } from "@/providers/ClientProvider";
+import { useClient } from "@/providers/client-context";
 import { randomId } from "@/lib/id";
 import { toMediaAttachment } from "@/lib/media";
 import type { StreamError } from "@/lib/nanobot-client";
