@@ -12,7 +12,14 @@ from typing import Any, Callable, Coroutine, Literal
 from filelock import FileLock
 from loguru import logger
 
-from nanobot.cron.types import CronJob, CronJobState, CronPayload, CronRunRecord, CronSchedule, CronStore
+from nanobot.cron.types import (
+    CronJob,
+    CronJobState,
+    CronPayload,
+    CronRunRecord,
+    CronSchedule,
+    CronStore,
+)
 
 
 def _now_ms() -> int:
@@ -389,6 +396,8 @@ class CronService:
         delete_after_run: bool = False,
         channel_meta: dict | None = None,
         session_key: str | None = None,
+        *,
+        payload_kind: Literal["agent_turn", "work_task"] = "agent_turn",
     ) -> CronJob:
         """Add a new job."""
         _validate_schedule_for_add(schedule)
@@ -400,7 +409,7 @@ class CronService:
             enabled=True,
             schedule=schedule,
             payload=CronPayload(
-                kind="agent_turn",
+                kind=payload_kind,
                 message=message,
                 deliver=deliver,
                 channel=channel,

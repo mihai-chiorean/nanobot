@@ -3,12 +3,16 @@
 import asyncio
 import functools
 import json
+import time
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
+import jwt
 import pytest
+import websockets
+from cryptography.hazmat.primitives.asymmetric import rsa
 
 from nanobot.channels.websocket import WebSocketChannel
 from nanobot.session.manager import Session, SessionManager
@@ -21,6 +25,7 @@ def _ch(
     *,
     session_manager: SessionManager | None = None,
     static_dist_path: Path | None = None,
+    active_session_keys: Any = None,
     port: int = _PORT,
     **extra: Any,
 ) -> WebSocketChannel:
@@ -38,6 +43,7 @@ def _ch(
         bus,
         session_manager=session_manager,
         static_dist_path=static_dist_path,
+        active_session_keys=active_session_keys,
     )
 
 
@@ -165,6 +171,49 @@ async def test_sessions_list_only_returns_websocket_sessions_by_default(
         # Only websocket-channel sessions are part of the webui surface; CLI /
         # Slack / Lark rows would be non-resumable from the browser.
         assert keys == {"websocket:alpha", "websocket:beta"}
+    finally:
+        await channel.stop()
+        await server_task
+
+
+@pytest.mark.asyncio
+async def test_activity_route_matches_webui_contract(
+    bus: MagicMock, tmp_path: Path
+) -> None:
+    sm = _seed_many(tmp_path, ["websocket:active", "websocket:waiting", "cli:hidden"])
+    waiting = sm.get_or_create("websocket:waiting")
+    waiting.add_message("assistant", "Choose one", buttons=[["Continue"]])
+    sm.save(waiting)
+    channel = _ch(
+        bus,
+        session_manager=sm,
+        active_session_keys=lambda: {"websocket:active"},
+        port=29911,
+    )
+    live_connection = AsyncMock()
+    channel._attach(live_connection, "waiting")
+    server_task = asyncio.create_task(channel.start())
+    await asyncio.sleep(0.3)
+    try:
+        denied = await _http_get("http://127.0.0.1:29911/api/activity")
+        assert denied.status_code == 401
+        boot = await _http_get("http://127.0.0.1:29911/webui/bootstrap")
+        auth = {"Authorization": f"Bearer {boot.json()['token']}"}
+
+        response = await _http_get(
+            "http://127.0.0.1:29911/api/activity", headers=auth
+        )
+
+        assert response.status_code == 200
+        rows = {row["key"]: row for row in response.json()["activity"]}
+        assert set(rows) == {"websocket:active", "websocket:waiting"}
+        assert rows["websocket:active"]["status"] == "active"
+        assert rows["websocket:active"]["chat_id"] == "active"
+        assert rows["websocket:waiting"]["status"] == "waiting"
+        assert rows["websocket:waiting"]["preview"] == "hi from websocket:waiting"
+        assert rows["websocket:waiting"]["last_role"] == "assistant"
+        assert rows["websocket:waiting"]["last_text"] == "Choose one"
+        assert "path" not in rows["websocket:waiting"]
     finally:
         await channel.stop()
         await server_task
@@ -379,3 +428,93 @@ async def test_api_token_pool_purges_expired(bus: MagicMock, tmp_path: Path) -> 
         headers = {"Authorization": "Bearer live"}
 
     assert channel._check_api_token(_LiveReq()) is True
+
+    class _QueryReq:
+        path = "/api/sessions?token=live"
+        headers = {}
+
+    assert channel._check_api_token(_QueryReq()) is False
+
+
+@pytest.mark.asyncio
+async def test_clerk_bootstrap_token_serves_rest_and_one_websocket(
+    bus: MagicMock, tmp_path: Path
+) -> None:
+    issuer = "https://clerk.example.test"
+    audience = "ziggy-control"
+    authorized_party = "https://ziggy-control.example.test"
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    jwk = jwt.algorithms.RSAAlgorithm.to_jwk(private_key.public_key(), as_dict=True)
+    jwk.update({"kid": "test-key", "use": "sig", "alg": "RS256"})
+    channel = _ch(
+        bus,
+        session_manager=_seed_session(tmp_path, key="websocket:clerk"),
+        port=29921,
+        websocketRequiresToken=True,
+        authIssuer=issuer,
+        authJwksUrl=f"{issuer}/.well-known/jwks.json",
+        authAudience=audience,
+        authAllowedEmails=["tenant@example.com"],
+        authAuthorizedParties=[authorized_party],
+    )
+    channel._clerk_verifier._fetch_jwks = AsyncMock(return_value={"keys": [jwk]})
+    now = int(time.time())
+
+    def identity_token(email: str) -> str:
+        return jwt.encode(
+            {
+                "iss": issuer,
+                "sub": "user_test",
+                "iat": now,
+                "exp": now + 300,
+                "email": email,
+                "aud": audience,
+                "azp": authorized_party,
+            },
+            private_key,
+            algorithm="RS256",
+            headers={"kid": "test-key"},
+        )
+
+    server_task = asyncio.create_task(channel.start())
+    await asyncio.sleep(0.3)
+    try:
+        local_bootstrap = await _http_get(
+            "http://127.0.0.1:29921/webui/bootstrap"
+        )
+        assert local_bootstrap.status_code == 404
+
+        missing = await _http_get("http://127.0.0.1:29921/auth/bootstrap")
+        assert missing.status_code == 401
+        forbidden = await _http_get(
+            "http://127.0.0.1:29921/auth/bootstrap",
+            headers={"Authorization": f"Bearer {identity_token('other@example.com')}"},
+        )
+        assert forbidden.status_code == 403
+
+        bootstrap = await _http_get(
+            "http://127.0.0.1:29921/auth/bootstrap",
+            headers={"Authorization": f"Bearer {identity_token('TENANT@example.com')}"},
+        )
+        assert bootstrap.status_code == 200
+        token = bootstrap.json()["token"]
+        rest_headers = {"Authorization": f"Bearer {token}"}
+        rest = await _http_get(
+            "http://127.0.0.1:29921/api/sessions", headers=rest_headers
+        )
+        assert rest.status_code == 200
+
+        async with websockets.connect(f"ws://127.0.0.1:29921/?token={token}") as client:
+            assert json.loads(await client.recv())["event"] == "ready"
+
+        rest_after_ws = await _http_get(
+            "http://127.0.0.1:29921/api/sessions", headers=rest_headers
+        )
+        assert rest_after_ws.status_code == 200
+        with pytest.raises(websockets.exceptions.InvalidStatus) as reused:
+            async with websockets.connect(f"ws://127.0.0.1:29921/?token={token}"):
+                pass
+        assert reused.value.response.status_code == 401
+    finally:
+        await channel.stop()
+        await server_task

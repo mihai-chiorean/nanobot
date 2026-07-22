@@ -47,21 +47,27 @@ def registry() -> ToolRegistry:
 
 
 class TestSchemaContract:
+    @staticmethod
+    def _validation_errors(registry: ToolRegistry, params: dict) -> list[str]:
+        tool = registry.get("cron")
+        assert tool is not None
+        return tool.validate_params(tool.cast_params(params))
+
     def test_list_accepted_without_message(self, registry: ToolRegistry) -> None:
         # action='list' must pass schema validation with nothing but 'action'.
-        _, _, err = registry.prepare_call("cron", {"action": "list"})
-        assert err is None
+        assert self._validation_errors(registry, {"action": "list"}) == []
 
     def test_remove_accepted_without_message(self, registry: ToolRegistry) -> None:
         # action='remove' must pass schema validation with just 'action' + 'job_id'.
-        _, _, err = registry.prepare_call("cron", {"action": "remove", "job_id": "abc"})
-        assert err is None
+        assert self._validation_errors(
+            registry, {"action": "remove", "job_id": "abc"}
+        ) == []
 
     def test_add_with_message_accepted(self, registry: ToolRegistry) -> None:
-        _, _, err = registry.prepare_call(
-            "cron", {"action": "add", "message": "ping", "at": "2030-01-01T00:00:00"}
-        )
-        assert err is None
+        assert self._validation_errors(
+            registry,
+            {"action": "add", "message": "ping", "at": "2030-01-01T00:00:00"},
+        ) == []
 
     def test_add_without_message_surfaces_actionable_runtime_error(
         self, registry: ToolRegistry

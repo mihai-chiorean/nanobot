@@ -1,5 +1,12 @@
 import { useState } from "react";
-import { ChevronRight, FileIcon, ImageIcon, PlaySquare, Wrench } from "lucide-react";
+import {
+  ChevronRight,
+  FileIcon,
+  ImageIcon,
+  PlaySquare,
+  Sparkles,
+  Wrench,
+} from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 import { ImageLightbox } from "@/components/ImageLightbox";
@@ -131,15 +138,39 @@ function MediaCell({ media }: { media: UIMediaAttachment }) {
       ? t("message.videoAttachment", { defaultValue: "Video attachment" })
       : t("message.fileAttachment", { defaultValue: "File attachment" });
   const Icon = media.kind === "video" ? PlaySquare : FileIcon;
+  const cellClass =
+    "flex max-w-[18rem] items-center gap-2 rounded-[14px] border border-border/60 bg-muted/40 px-3 py-2 text-xs text-muted-foreground";
+  const body = (
+    <>
+      <Icon className="h-4 w-4 flex-none" aria-hidden />
+      <span className="truncate">{media.name ?? label}</span>
+    </>
+  );
+
+  if (hasUrl) {
+    return (
+      <a
+        href={media.url}
+        download={media.name ?? undefined}
+        className={cn(
+          cellClass,
+          "transition-colors hover:border-foreground/20 hover:bg-muted/70 hover:text-foreground",
+        )}
+        title={media.name ?? undefined}
+        aria-label={media.name ? `${label}: ${media.name}` : label}
+      >
+        {body}
+      </a>
+    );
+  }
 
   return (
     <div
-      className="flex max-w-[18rem] items-center gap-2 rounded-[14px] border border-border/60 bg-muted/40 px-3 py-2 text-xs text-muted-foreground"
+      className={cellClass}
       title={media.name ?? undefined}
       aria-label={label}
     >
-      <Icon className="h-4 w-4 flex-none" aria-hidden />
-      <span className="truncate">{media.name ?? label}</span>
+      {body}
     </div>
   );
 }
@@ -326,6 +357,16 @@ function TraceGroup({ message, animClass }: TraceGroupProps) {
   const lines = message.traces ?? [message.content];
   const count = lines.length;
   const [open, setOpen] = useState(true);
+  const traceKind = message.traceKind ?? "tool";
+  const Icon = traceKind === "tool" ? Wrench : Sparkles;
+  const label =
+    traceKind === "tool"
+      ? count === 1
+        ? t("message.toolSingle")
+        : t("message.toolMany", { count })
+      : count === 1
+        ? t("message.progressSingle")
+        : t("message.progressMany", { count });
   return (
     <div className={cn("w-full", animClass)}>
       <button
@@ -337,12 +378,8 @@ function TraceGroup({ message, animClass }: TraceGroupProps) {
         )}
         aria-expanded={open}
       >
-        <Wrench className="h-3.5 w-3.5" aria-hidden />
-        <span className="font-medium">
-          {count === 1
-            ? t("message.toolSingle")
-            : t("message.toolMany", { count })}
-        </span>
+        <Icon className="h-3.5 w-3.5" aria-hidden />
+        <span className="font-medium">{label}</span>
         <ChevronRight
           aria-hidden
           className={cn(

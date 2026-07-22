@@ -3,7 +3,7 @@ import XCTest
 @testable import Ziggy
 
 final class WebSocketLifecycleTests: XCTestCase {
-    func testConnectedWaitsForPingCompletion() async throws {
+    func testConnectedWaitsForFirstServerFrame() async throws {
         let connection = TestWebSocketConnection()
         let client = makeClient(connection: connection)
         let collector = EventCollector()
@@ -11,13 +11,14 @@ final class WebSocketLifecycleTests: XCTestCase {
 
         await client.start()
         try await Task.sleep(for: .milliseconds(50))
-        let beforePing = await collector.events
-        XCTAssertEqual(beforePing, [.state(.connecting)])
+        let beforeFrame = await collector.events
+        XCTAssertEqual(beforeFrame, [.state(.connecting)])
 
-        await connection.completePing()
+        await connection.receive(.string(#"{"event":"ready","chat_id":"chat-1"}"#))
         try await Task.sleep(for: .milliseconds(50))
-        let afterPing = await collector.events
-        XCTAssertEqual(afterPing.prefix(2), [.state(.connecting), .state(.connected)])
+        let afterFrame = await collector.events
+        XCTAssertEqual(afterFrame.first, .state(.connecting))
+        XCTAssertTrue(afterFrame.contains(.state(.connected)))
 
         await client.stop()
         eventTask.cancel()
@@ -31,10 +32,10 @@ final class WebSocketLifecycleTests: XCTestCase {
 
         await client.start()
         try await Task.sleep(for: .milliseconds(50))
-        let beforePing = await collector.events
-        XCTAssertEqual(beforePing, [.state(.connecting)])
+        let beforeFrame = await collector.events
+        XCTAssertEqual(beforeFrame, [.state(.connecting)])
 
-        await connection.failPing(with: .upgradeFailed(statusCode: 401))
+        await connection.failReceive(with: .upgradeFailed(statusCode: 401))
         try await Task.sleep(for: .milliseconds(50))
         let events = await collector.events
 
@@ -46,9 +47,31 @@ final class WebSocketLifecycleTests: XCTestCase {
         eventTask.cancel()
     }
 
-    private func makeClient(connection: TestWebSocketConnection) -> ZiggyWebSocketClient {
+    func testConnectedSocketSendsPeriodicHeartbeatPings() async throws {
+        let connection = TestWebSocketConnection()
+        let client = makeClient(connection: connection, heartbeatInterval: .milliseconds(10))
+        let collector = EventCollector()
+        let eventTask = collect(client.events, into: collector)
+
+        await client.start()
+        await connection.completePing()
+        await connection.receive(.string(#"{"event":"ready","chat_id":"chat-1"}"#))
+        try await Task.sleep(for: .milliseconds(45))
+
+        let pingCount = await connection.pingCount()
+        XCTAssertGreaterThanOrEqual(pingCount, 3)
+
+        await client.stop()
+        eventTask.cancel()
+    }
+
+    private func makeClient(
+        connection: TestWebSocketConnection,
+        heartbeatInterval: Duration = .seconds(10)
+    ) -> ZiggyWebSocketClient {
         ZiggyWebSocketClient(
-            baseURL: URL(string: "https://ziggy.example.test")!,
+            baseURL: URL(string: "https://chat.mihaichiorean.com")!,
+            heartbeatInterval: heartbeatInterval,
             credentialProvider: { WebSocketCredential(bearerToken: "test-token") },
             connectionFactory: { _ in connection }
         )
@@ -80,10 +103,13 @@ private final class TestWebSocketConnection: ZiggyWebSocketConnection, @unchecke
 
         var messages: [URLSessionWebSocketTask.Message] = []
         var waiters: [CheckedContinuation<URLSessionWebSocketTask.Message, Error>] = []
+        var receiveFailure: ZiggyWebSocketClientError?
         var pingResult: PingResult?
         var pingWaiter: CheckedContinuation<Void, Error>?
+        var pingCount = 0
 
         func waitForPing() async throws {
+            pingCount += 1
             if let pingResult {
                 switch pingResult {
                 case .success: return
@@ -108,6 +134,10 @@ private final class TestWebSocketConnection: ZiggyWebSocketConnection, @unchecke
         }
 
         func next() async throws -> URLSessionWebSocketTask.Message {
+            if let receiveFailure {
+                self.receiveFailure = nil
+                throw receiveFailure
+            }
             if !messages.isEmpty { return messages.removeFirst() }
             return try await withCheckedThrowingContinuation { continuation in
                 waiters.append(continuation)
@@ -123,12 +153,23 @@ private final class TestWebSocketConnection: ZiggyWebSocketConnection, @unchecke
             }
         }
 
+        func failNext(_ error: ZiggyWebSocketClientError) {
+            if let waiter = waiters.first {
+                waiters.removeFirst()
+                waiter.resume(throwing: error)
+            } else {
+                receiveFailure = error
+            }
+        }
+
         func finish() {
             for waiter in waiters { waiter.resume(throwing: CancellationError()) }
             waiters.removeAll()
             pingWaiter?.resume(throwing: CancellationError())
             pingWaiter = nil
         }
+
+        func currentPingCount() -> Int { pingCount }
     }
 
     private let state: State
@@ -138,7 +179,7 @@ private final class TestWebSocketConnection: ZiggyWebSocketConnection, @unchecke
         self.state = State()
         if let statusCode {
             response = HTTPURLResponse(
-                url: URL(string: "https://ziggy.example.test")!,
+                url: URL(string: "https://chat.mihaichiorean.com")!,
                 statusCode: statusCode,
                 httpVersion: nil,
                 headerFields: nil
@@ -172,7 +213,15 @@ private final class TestWebSocketConnection: ZiggyWebSocketConnection, @unchecke
         await state.completePing(.success)
     }
 
+    func pingCount() async -> Int {
+        await state.currentPingCount()
+    }
+
     func failPing(with error: ZiggyWebSocketClientError) async {
         await state.completePing(.failure(error))
+    }
+
+    func failReceive(with error: ZiggyWebSocketClientError) async {
+        await state.failNext(error)
     }
 }

@@ -19,24 +19,11 @@ public struct ZiggyRESTClient: Sendable {
                         maxResponseBytes: maxResponseBytes)
     }
 
-    public func bootstrapGuest(code: String) async throws -> BootstrapResponse {
-        var form = URLComponents()
-        form.queryItems = [URLQueryItem(name: "code", value: code)]
-        guard let encoded = form.percentEncodedQuery,
-              let body = encoded.data(using: .utf8) else {
-            throw ZiggyRESTError.invalidResponse
+    public func bootstrapAuthenticated(identityToken: String) async throws -> BootstrapResponse {
+        guard ZiggyServerURLValidation.isTrustedForIdentityToken(baseURL) else {
+            throw ZiggyRESTError.invalidURL
         }
-        return try await request(
-            path: ["webui", "guest", "bootstrap"],
-            headers: ["Content-Type": "application/x-www-form-urlencoded"],
-            token: nil,
-            method: "POST",
-            body: body
-        )
-    }
-
-    public func bootstrapOwner(ownerCode: String) async throws -> BootstrapResponse {
-        try await request(path: ["webui", "bootstrap"], headers: ["X-Ziggy-Owner-Code": ownerCode], token: nil)
+        return try await request(path: ["auth", "bootstrap"], token: identityToken)
     }
 
     public func fetchSessions() async throws -> RESTListResponse<SessionSummary> {
@@ -102,12 +89,25 @@ public struct ZiggyRESTClient: Sendable {
         request.httpBody = body
         for (header, value) in headers { request.setValue(value, forHTTPHeaderField: header) }
         if let token = token ?? bearerToken { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
-        let (responseData, response) = try await session.data(for: request)
+        try Task.checkCancellation()
+        let (bytes, response) = try await session.bytes(for: request)
         guard let response = response as? HTTPURLResponse else { throw ZiggyRESTError.invalidResponse }
-        guard response.expectedContentLength <= 0 || response.expectedContentLength <= Int64(maxResponseBytes),
-              responseData.count <= maxResponseBytes else {
+        if response.expectedContentLength > Int64(maxResponseBytes) {
             throw ZiggyRESTError.responseTooLarge(limit: maxResponseBytes)
         }
+
+        var responseData = Data()
+        if response.expectedContentLength > 0 {
+            responseData.reserveCapacity(min(Int(response.expectedContentLength), maxResponseBytes))
+        }
+        for try await byte in bytes {
+            try Task.checkCancellation()
+            guard responseData.count < maxResponseBytes else {
+                throw ZiggyRESTError.responseTooLarge(limit: maxResponseBytes)
+            }
+            responseData.append(byte)
+        }
+        try Task.checkCancellation()
         guard (200..<300).contains(response.statusCode) else {
             let boundedBody = String(data: responseData, encoding: .utf8)?
                 .ziggyTruncatedUTF8(maxBytes: ZiggyProtocolLimits.maxUnsupportedPayloadBytes)

@@ -1,5 +1,6 @@
 import { Suspense, lazy } from "react";
 
+import { loadMarkdownRenderer } from "@/components/markdown-loader";
 import { cn } from "@/lib/utils";
 
 interface MarkdownTextProps {
@@ -7,12 +8,7 @@ interface MarkdownTextProps {
   className?: string;
 }
 
-const loadMarkdownRenderer = () => import("@/components/MarkdownTextRenderer");
 const LazyMarkdownRenderer = lazy(loadMarkdownRenderer);
-
-export function preloadMarkdownText(): void {
-  void loadMarkdownRenderer();
-}
 
 /**
  * Lightweight markdown renderer mirroring agent-chat-ui: GFM + math via

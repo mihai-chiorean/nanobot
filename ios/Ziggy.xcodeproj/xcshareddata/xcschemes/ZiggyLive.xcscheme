@@ -69,8 +69,8 @@
       </CommandLineArguments>
       <EnvironmentVariables>
          <EnvironmentVariable
-            key = "ZIGGY_GUEST_CODE"
-            value = "$(ZIGGY_GUEST_CODE)"
+            key = "ZIGGY_LIVE_SESSION_READY"
+            value = "$(ZIGGY_LIVE_SESSION_READY)"
             isEnabled = "YES">
          </EnvironmentVariable>
          <EnvironmentVariable

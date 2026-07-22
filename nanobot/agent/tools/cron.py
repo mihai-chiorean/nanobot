@@ -39,6 +39,14 @@ _CRON_PARAMETERS = tool_parameters_schema(
         description="Whether to deliver the execution result to the user channel (default true)",
         default=True,
     ),
+    as_work=BooleanSchema(
+        description=(
+            "When true, run the scheduled instruction as a background Work task "
+            "instead of a chat reminder."
+        ),
+        default=False,
+    ),
+    work_title=StringSchema("Optional Work task title when as_work=true."),
     job_id=StringSchema("REQUIRED when action='remove'. Job ID to remove (obtain via action='list')."),
     required=["action"],
     description=(
@@ -134,12 +142,24 @@ class CronTool(Tool):
         at: str | None = None,
         job_id: str | None = None,
         deliver: bool = True,
+        as_work: bool = False,
+        work_title: str | None = None,
         **kwargs: Any,
     ) -> str:
         if action == "add":
             if self._in_cron_context.get():
                 return "Error: cannot schedule new jobs from within a cron job execution"
-            return self._add_job(name, message, every_seconds, cron_expr, tz, at, deliver)
+            return self._add_job(
+                name,
+                message,
+                every_seconds,
+                cron_expr,
+                tz,
+                at,
+                deliver,
+                as_work=as_work,
+                work_title=work_title,
+            )
         elif action == "list":
             return self._list_jobs()
         elif action == "remove":
@@ -155,6 +175,8 @@ class CronTool(Tool):
         tz: str | None,
         at: str | None,
         deliver: bool = True,
+        as_work: bool = False,
+        work_title: str | None = None,
     ) -> str:
         if not message:
             return (
@@ -198,17 +220,26 @@ class CronTool(Tool):
         else:
             return "Error: either every_seconds, cron_expr, or at is required"
 
+        clean_name = name or message[:30]
+        channel_meta = dict(self._metadata.get() or {})
+        if as_work:
+            channel_meta.setdefault("work_title", work_title or clean_name)
+            channel_meta.setdefault("work_chat_id", chat_id)
+
         job = self._cron.add_job(
-            name=name or message[:30],
+            name=clean_name,
             schedule=schedule,
             message=message,
-            deliver=deliver,
+            payload_kind="work_task" if as_work else "agent_turn",
+            deliver=False if as_work else deliver,
             channel=channel,
             to=chat_id,
             delete_after_run=delete_after,
-            channel_meta=self._metadata.get(),
+            channel_meta=channel_meta,
             session_key=self._session_key.get() or None,
         )
+        if as_work:
+            return f"Created scheduled Work job '{job.name}' (id: {job.id})"
         return f"Created job '{job.name}' (id: {job.id})"
 
     def _format_timing(self, schedule: CronSchedule) -> str:

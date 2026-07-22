@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { ChatSummary } from "@/lib/types";
@@ -7,7 +7,21 @@ const connectSpy = vi.fn();
 const refreshSpy = vi.fn();
 const createChatSpy = vi.fn().mockResolvedValue("chat-1");
 const deleteChatSpy = vi.fn();
+const getTokenSpy = vi.fn().mockResolvedValue("clerk-token");
 let mockSessions: ChatSummary[] = [];
+let mockSignedIn = true;
+let clientOptions: { onReauth?: () => Promise<string | null> } | null = null;
+
+vi.mock("@clerk/react", () => ({
+  useAuth: () => ({
+    getToken: getTokenSpy,
+    isLoaded: true,
+    isSignedIn: mockSignedIn,
+  }),
+  SignInButton: ({ children }: { children: React.ReactNode }) => children,
+  SignUpButton: ({ children }: { children: React.ReactNode }) => children,
+  UserButton: () => <button aria-label="Account" />,
+}));
 
 vi.mock("@/hooks/useSessions", async (importOriginal) => {
   const React = await import("react");
@@ -22,6 +36,7 @@ vi.mock("@/hooks/useSessions", async (importOriginal) => {
         error: null,
         refresh: refreshSpy,
         createChat: createChatSpy,
+        updateSessionPreview: vi.fn(),
         deleteChat: async (key: string) => {
           await deleteChatSpy(key);
           setSessions((prev: ChatSummary[]) => prev.filter((s) => s.key !== key));
@@ -39,6 +54,13 @@ vi.mock("@/hooks/useTheme", () => ({
 }));
 
 vi.mock("@/lib/bootstrap", () => ({
+  BootstrapError: class BootstrapError extends Error {
+    status: number;
+    constructor(status: number, message: string) {
+      super(message);
+      this.status = status;
+    }
+  },
   fetchBootstrap: vi.fn().mockResolvedValue({
     token: "tok",
     ws_path: "/",
@@ -55,25 +77,41 @@ vi.mock("@/lib/nanobot-client", () => {
     onStatus = () => () => {};
     onError = () => () => {};
     onChat = () => () => {};
+    onWork = () => () => {};
     sendMessage = vi.fn();
+    sendWorkMessage = vi.fn();
+    cancelWork = vi.fn();
     newChat = vi.fn();
     attach = vi.fn();
     close = vi.fn();
     updateUrl = vi.fn();
+
+    constructor(options: { onReauth?: () => Promise<string | null> }) {
+      clientOptions = options;
+    }
   }
 
   return { NanobotClient: MockClient };
 });
 
 import App from "@/App";
+import { fetchBootstrap } from "@/lib/bootstrap";
 
 describe("App layout", () => {
   beforeEach(() => {
+    window.history.replaceState(null, "", "/");
     mockSessions = [];
+    mockSignedIn = true;
     connectSpy.mockClear();
     refreshSpy.mockReset();
     createChatSpy.mockClear();
     deleteChatSpy.mockReset();
+    clientOptions = null;
+    vi.mocked(fetchBootstrap).mockReset().mockResolvedValue({
+      token: "tok",
+      ws_path: "/",
+      expires_in: 300,
+    });
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValue({
@@ -81,6 +119,16 @@ describe("App layout", () => {
         status: 404,
       }),
     );
+  });
+
+  it("shows Clerk account actions before connecting a signed-out user", () => {
+    mockSignedIn = false;
+
+    render(<App />);
+
+    expect(screen.getByRole("button", { name: "Sign in" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Create account" })).toBeInTheDocument();
+    expect(connectSpy).not.toHaveBeenCalled();
   });
 
   it("keeps sidebar layout out of the main thread width contract", async () => {
@@ -183,7 +231,79 @@ describe("App layout", () => {
     fireEvent.click(screen.getByRole("button", { name: "Settings" }));
 
     expect(await screen.findByRole("heading", { name: "General" })).toBeInTheDocument();
-    expect(screen.getByText("AI")).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "AI" })).toBeInTheDocument();
     expect(screen.getByDisplayValue("openai/gpt-4o")).toBeInTheDocument();
+  });
+
+  it("opens tenant-scoped Work from the sidebar", async () => {
+    render(<App />);
+
+    await waitFor(() => expect(connectSpy).toHaveBeenCalled());
+    fireEvent.click(screen.getByRole("button", { name: "Work" }));
+
+    expect(
+      await screen.findByRole("heading", { name: "Work" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/background tasks/i)).toBeInTheDocument();
+  });
+
+  it("uses a refreshed bootstrap token for later REST requests", async () => {
+    const fetchSpy = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ tasks: [] }),
+    });
+    vi.stubGlobal("fetch", fetchSpy);
+    vi.mocked(fetchBootstrap)
+      .mockResolvedValueOnce({ token: "initial", ws_path: "/", expires_in: 300 })
+      .mockResolvedValueOnce({ token: "refreshed", ws_path: "/", expires_in: 300 });
+
+    render(<App />);
+    await waitFor(() => expect(connectSpy).toHaveBeenCalled());
+
+    await act(async () => {
+      await clientOptions?.onReauth?.();
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Work" }));
+
+    await waitFor(() => {
+      const workRequest = fetchSpy.mock.calls.find(([input]) =>
+        String(input).endsWith("/api/work"),
+      );
+      expect(workRequest?.[1]?.headers).toMatchObject({
+        Authorization: "Bearer refreshed",
+      });
+    });
+  });
+
+  it("refreshes bootstrap credentials before expiry and retries without reconnecting", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.mocked(fetchBootstrap)
+        .mockResolvedValueOnce({ token: "initial", ws_path: "/", expires_in: 31 })
+        .mockRejectedValueOnce(new Error("temporary bootstrap failure"))
+        .mockResolvedValueOnce({ token: "renewed", ws_path: "/", expires_in: 300 });
+
+      render(<App />);
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(connectSpy).toHaveBeenCalledTimes(1);
+      expect(fetchBootstrap).toHaveBeenCalledTimes(1);
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1_000);
+      });
+      expect(fetchBootstrap).toHaveBeenCalledTimes(2);
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5_000);
+      });
+      expect(fetchBootstrap).toHaveBeenCalledTimes(3);
+      expect(connectSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

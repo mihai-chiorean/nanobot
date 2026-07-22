@@ -4,8 +4,16 @@ import XCTest
 
 final class ServerURLValidationTests: XCTestCase {
     func testHTTPSIsRequiredForNonLocalHosts() {
-        XCTAssertTrue(ZiggyServerURLValidation.isValid(URL(string: "https://ziggy.example.test")!))
-        XCTAssertFalse(ZiggyServerURLValidation.isValid(URL(string: "http://ziggy.example.test")!))
+        XCTAssertTrue(ZiggyServerURLValidation.isValid(URL(string: "https://chat.mihaichiorean.com")!))
+        XCTAssertFalse(ZiggyServerURLValidation.isValid(URL(string: "https://ziggy.example.test")!))
+        XCTAssertFalse(ZiggyServerURLValidation.isValid(URL(string: "http://chat.mihaichiorean.com")!))
+    }
+
+    func testOnlyProductionAndLoopbackHostsCanReceiveIdentityTokens() {
+        XCTAssertTrue(ZiggyServerURLValidation.isTrustedForIdentityToken(URL(string: "https://chat.mihaichiorean.com")!))
+        XCTAssertTrue(ZiggyServerURLValidation.isTrustedForIdentityToken(URL(string: "http://127.0.0.1:8080")!))
+        XCTAssertFalse(ZiggyServerURLValidation.isTrustedForIdentityToken(URL(string: "https://attacker.example")!))
+        XCTAssertFalse(ZiggyServerURLValidation.isTrustedForIdentityToken(URL(string: "https://chat.mihaichiorean.com:8443")!))
     }
 
     func testHTTPIsAllowedOnlyForLocalHosts() {

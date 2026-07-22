@@ -8,38 +8,85 @@ final class AuthenticationTests: XCTestCase {
         super.tearDown()
     }
 
-    func testGuestBootstrapPostsSecretInBodyNotURL() async throws {
+    func testAuthenticatedBootstrapUsesBearerTokenAndNoURLCredential() async throws {
         let session = makeSession()
         URLProtocolStub.handler = { request in
-            XCTAssertEqual(request.httpMethod, "POST")
+            XCTAssertEqual(request.httpMethod, "GET")
             XCTAssertNil(URLComponents(url: try XCTUnwrap(request.url), resolvingAgainstBaseURL: false)?.query)
-            XCTAssertEqual(
-                request.value(forHTTPHeaderField: "Content-Type"),
-                "application/x-www-form-urlencoded"
-            )
-            let body = try XCTUnwrap(String(data: try XCTUnwrap(Self.bodyData(for: request)), encoding: .utf8))
-            XCTAssertEqual(URLComponents(string: "?" + body)?.queryItems?.first?.value, "private-code")
-            XCTAssertFalse(try XCTUnwrap(request.url).absoluteString.contains("private-code"))
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer clerk-session-token")
+            XCTAssertFalse(try XCTUnwrap(request.url).absoluteString.contains("clerk-session-token"))
             return Self.response(for: request, body: #"{"token":"short","expires_in":300}"#)
         }
 
         let result = try await ZiggyRESTClient(
-            baseURL: try XCTUnwrap(URL(string: "https://example.test")),
+            baseURL: try XCTUnwrap(URL(string: "https://chat.mihaichiorean.com")),
             session: session
-        ).bootstrapGuest(code: "private-code")
+        ).bootstrapAuthenticated(identityToken: "clerk-session-token")
         XCTAssertEqual(result.restToken, "short")
     }
 
-    func testRESTResponseLimitAppliesBeforeDecode() async throws {
+    func testAuthenticatedBootstrapRejectsAnUntrustedConfiguredHostBeforeNetworking() async throws {
+        let session = makeSession()
+        URLProtocolStub.handler = { _ in
+            XCTFail("an identity token request must not reach an untrusted host")
+            throw URLError(.badServerResponse)
+        }
+
+        do {
+            _ = try await ZiggyRESTClient(
+                baseURL: try XCTUnwrap(URL(string: "https://attacker.example")),
+                session: session
+            ).bootstrapAuthenticated(identityToken: "clerk-session-token")
+            XCTFail("expected untrusted host rejection")
+        } catch {
+            XCTAssertEqual(error as? ZiggyRESTError, .invalidURL)
+        }
+    }
+
+    func testClerkCallbackValidationAcceptsOnlyTheRegisteredCallback() throws {
+        XCTAssertTrue(ClerkCallbackValidation.accepts(try XCTUnwrap(
+            URL(string: "com.mihaichiorean.ziggy://callback?code=example&state=opaque")
+        )))
+        XCTAssertFalse(ClerkCallbackValidation.accepts(try XCTUnwrap(
+            URL(string: "com.mihaichiorean.ziggy://attacker/callback?code=example")
+        )))
+        XCTAssertFalse(ClerkCallbackValidation.accepts(try XCTUnwrap(
+            URL(string: "https://chat.mihaichiorean.com/callback?code=example")
+        )))
+        XCTAssertFalse(ClerkCallbackValidation.accepts(try XCTUnwrap(
+            URL(string: "com.mihaichiorean.ziggy://callback/extra?code=example")
+        )))
+    }
+
+    func testRESTResponseLimitUsesContentLengthPrecheck() async throws {
         let session = makeSession()
         URLProtocolStub.handler = { request in
             Self.response(for: request, body: String(repeating: "x", count: 65))
         }
         let client = ZiggyRESTClient(
-            baseURL: try XCTUnwrap(URL(string: "https://example.test")),
+            baseURL: try XCTUnwrap(URL(string: "https://chat.mihaichiorean.com")),
             session: session,
             maxResponseBytes: 64
         )
+        do {
+            _ = try await client.fetchSessions()
+            XCTFail("expected response limit")
+        } catch {
+            XCTAssertEqual(error as? ZiggyRESTError, .responseTooLarge(limit: 64))
+        }
+    }
+
+    func testRESTResponseLimitAppliesWhileReadingChunkedBody() async throws {
+        let session = makeSession()
+        URLProtocolStub.handler = { request in
+            Self.response(for: request, body: String(repeating: "x", count: 65), includeContentLength: false)
+        }
+        let client = ZiggyRESTClient(
+            baseURL: try XCTUnwrap(URL(string: "https://chat.mihaichiorean.com")),
+            session: session,
+            maxResponseBytes: 64
+        )
+
         do {
             _ = try await client.fetchSessions()
             XCTFail("expected response limit")
@@ -70,31 +117,21 @@ final class AuthenticationTests: XCTestCase {
         return URLSession(configuration: configuration)
     }
 
-    private static func response(for request: URLRequest, body: String) -> (HTTPURLResponse, Data) {
+    private static func response(for request: URLRequest, body: String,
+                                 includeContentLength: Bool = true) -> (HTTPURLResponse, Data) {
+        var headers = ["Content-Type": "application/json"]
+        if includeContentLength {
+            headers["Content-Length"] = String(Data(body.utf8).count)
+        }
         let response = HTTPURLResponse(
             url: request.url!,
             statusCode: 200,
             httpVersion: nil,
-            headerFields: ["Content-Type": "application/json"]
+            headerFields: headers
         )!
         return (response, Data(body.utf8))
     }
 
-    private static func bodyData(for request: URLRequest) -> Data? {
-        if let body = request.httpBody { return body }
-        guard let stream = request.httpBodyStream else { return nil }
-        stream.open()
-        defer { stream.close() }
-        var data = Data()
-        var buffer = [UInt8](repeating: 0, count: 1_024)
-        while stream.hasBytesAvailable {
-            let count = stream.read(&buffer, maxLength: buffer.count)
-            guard count >= 0 else { return nil }
-            if count == 0 { break }
-            data.append(buffer, count: count)
-        }
-        return data
-    }
 }
 
 private final class URLProtocolStub: URLProtocol, @unchecked Sendable {

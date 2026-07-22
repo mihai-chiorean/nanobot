@@ -64,10 +64,10 @@ struct SettingsView: View {
                         }
                         .buttonStyle(.plain)
                         SettingsDivider()
-                        Button(role: .destructive) {
-                            Task { await appModel.disconnectAndForget() }
+                        Button {
+                            Task { await appModel.signOut() }
                         } label: {
-                            SettingsAction(title: "Remove access", symbol: "trash", destructive: true)
+                            SettingsAction(title: "Sign out", symbol: "rectangle.portrait.and.arrow.right")
                         }
                         .buttonStyle(.plain)
                     }

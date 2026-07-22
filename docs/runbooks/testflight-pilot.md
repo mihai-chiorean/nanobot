@@ -1,7 +1,7 @@
 # TestFlight Pilot Runbook
 
-Status: preparation only. Do not invite external testers until the tenant release
-gate below passes.
+Status: native Clerk authentication is implemented. Do not invite external
+testers until live Clerk sign-in and the tenant release gate below pass.
 
 This runbook covers a private Ziggy pilot. Apple TestFlight distribution and
 Ziggy account admission are independent controls: a tester must be invited in
@@ -11,7 +11,8 @@ both places, and removing a tester from TestFlight does not revoke Ziggy access.
 
 Before uploading an external build:
 
-- Replace owner/guest bootstrap with authenticated user sessions.
+- Verify the native Clerk callback and authenticated bootstrap on a physical
+  device using the release Clerk instance.
 - Resolve every request to a server-owned user and workspace mapping.
 - Give every tester a separate Nanobot runtime and filesystem root.
 - Pass the two-user REST, SSE, WebSocket, session, file, context, and memory
@@ -24,7 +25,8 @@ Before uploading an external build:
 - Keep integrations, Work, cron, shell execution, arbitrary MCP, uploads, and
   remote media disabled for the first pilot.
 
-The current owner-only build does not pass this gate and must not be shared.
+Record the gate evidence for two real accounts before the first external
+invite. A passing unit or single-owner device test is not sufficient.
 
 ## Apple Prerequisites
 
@@ -50,7 +52,9 @@ Apple references:
 
 ## Local Preflight
 
-Run from `ios/` after the release-gate changes have landed:
+Create `ios/Config/Local.xcconfig` from the checked-in example and set the
+release Clerk publishable key. Run from `ios/` after the release-gate changes
+have landed:
 
 ```sh
 xcodegen generate
@@ -105,6 +109,10 @@ App Store Connect users. On a TestFlight-installed build, verify:
 - Disable and deletion take effect without an app update.
 - Server overload returns a bounded retryable response.
 - App version/build and a content-free correlation ID are visible for support.
+
+Never archive a build whose `ZiggyClerkPublishableKey` is empty or points at an
+unintended Clerk instance. The publishable key is not secret, but keeping it in
+the local release configuration prevents accidental cross-environment builds.
 
 ## External Pilot
 

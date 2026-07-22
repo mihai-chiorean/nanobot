@@ -7,14 +7,12 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"io"
 	"log/slog"
-	"mime"
 	"net"
 	"net/http"
-	"net/url"
 	"path"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -40,6 +38,7 @@ type Config struct {
 	HTTPInFlight      int64
 	SSEInFlight       int64
 	WebSocketInFlight int64
+	TenantCount       int
 	Version           string
 }
 
@@ -61,15 +60,18 @@ type API struct {
 
 type requestIDKey struct{}
 
-const maxEnrollmentBody = 4 << 10
-
 const (
 	defaultHTTPInFlight      = int64(64)
 	defaultSSEInFlight       = int64(8)
 	defaultWebSocketInFlight = int64(8)
+	anonymousTenant          = "<anonymous>"
 )
 
 type admissionClass uint8
+
+type tenantCountProvider interface {
+	TenantCount() int
+}
 
 const (
 	admissionHTTP admissionClass = iota
@@ -100,12 +102,20 @@ func (gate *admissionGate) tryAcquire() (func(), bool) {
 }
 
 type inboundAdmission struct {
-	http      admissionGate
-	sse       admissionGate
-	webSocket admissionGate
+	http             admissionGate
+	sse              admissionGate
+	webSocket        admissionGate
+	tenantCount      int64
+	httpTenants      sync.Map
+	sseTenants       sync.Map
+	webSocketTenants sync.Map
 }
 
 func newInboundAdmission(httpLimit, sseLimit, webSocketLimit int64) *inboundAdmission {
+	return newInboundAdmissionWithTenantCount(httpLimit, sseLimit, webSocketLimit, 1)
+}
+
+func newInboundAdmissionWithTenantCount(httpLimit, sseLimit, webSocketLimit int64, tenantCount int) *inboundAdmission {
 	if httpLimit <= 0 {
 		httpLimit = defaultHTTPInFlight
 	}
@@ -115,10 +125,14 @@ func newInboundAdmission(httpLimit, sseLimit, webSocketLimit int64) *inboundAdmi
 	if webSocketLimit <= 0 {
 		webSocketLimit = defaultWebSocketInFlight
 	}
+	if tenantCount <= 0 {
+		tenantCount = 1
+	}
 	return &inboundAdmission{
-		http:      admissionGate{limit: httpLimit},
-		sse:       admissionGate{limit: sseLimit},
-		webSocket: admissionGate{limit: webSocketLimit},
+		http:        admissionGate{limit: httpLimit},
+		sse:         admissionGate{limit: sseLimit},
+		webSocket:   admissionGate{limit: webSocketLimit},
+		tenantCount: int64(tenantCount),
 	}
 }
 
@@ -141,11 +155,17 @@ func New(config Config) (http.Handler, error) {
 	if config.Logger == nil {
 		return nil, errors.New("logger is required")
 	}
-	if strings.TrimSpace(config.OwnerEmail) == "" {
+	if config.TenantRouter == nil && strings.TrimSpace(config.OwnerEmail) == "" {
 		return nil, errors.New("owner email is required")
 	}
 	if config.MaxRequestBody <= 0 {
 		return nil, errors.New("maximum request body must be positive")
+	}
+	tenantCount := config.TenantCount
+	if tenantCount <= 0 {
+		if provider, ok := config.TenantRouter.(tenantCountProvider); ok {
+			tenantCount = provider.TenantCount()
+		}
 	}
 
 	api := &API{
@@ -160,25 +180,24 @@ func New(config Config) (http.Handler, error) {
 		ownerSubject:    strings.TrimSpace(config.OwnerSubject),
 		blockedPaths:    cloneBlockedPaths(config.BlockedPaths),
 		maxRequestBody:  config.MaxRequestBody,
-		admission:       newInboundAdmission(config.HTTPInFlight, config.SSEInFlight, config.WebSocketInFlight),
+		admission:       newInboundAdmissionWithTenantCount(config.HTTPInFlight, config.SSEInFlight, config.WebSocketInFlight, tenantCount),
 		version:         config.Version,
 	}
 	if api.telemetry == nil {
 		api.telemetry = telemetry.Noop()
 	}
-	for _, reserved := range []string{"/auth/bootstrap", "/webui/guest/bootstrap", "/healthz", "/readyz", "/connectors"} {
+	for _, reserved := range []string{"/auth/bootstrap", "/auth/token", "/webui/guest/bootstrap", "/api/guest", "/healthz", "/readyz", "/connectors"} {
 		api.blockedPaths[reserved] = struct{}{}
 	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", api.health)
 	mux.HandleFunc("/readyz", api.ready)
-	mux.Handle("/auth/bootstrap", config.Authenticate(http.HandlerFunc(api.bootstrap)))
-	mux.HandleFunc("/webui/guest/bootstrap", api.enroll)
-	mux.HandleFunc("/connectors/oauth/google/callback", api.connectorCallback)
-	mux.Handle("/connectors/", config.Authenticate(http.HandlerFunc(api.connectors)))
-	mux.HandleFunc("/", api.forward)
-	return api.assignRequestID(api.observe(api.admit(mux))), nil
+	mux.Handle("/auth/bootstrap", config.Authenticate(api.admit(http.HandlerFunc(api.bootstrap))))
+	mux.Handle("/connectors/oauth/google/callback", api.admit(http.HandlerFunc(api.connectorCallback)))
+	mux.Handle("/connectors/", config.Authenticate(api.admit(http.HandlerFunc(api.connectors))))
+	mux.Handle("/", api.admit(http.HandlerFunc(api.forward)))
+	return api.assignRequestID(api.observe(mux)), nil
 }
 
 func (api *API) admit(next http.Handler) http.Handler {
@@ -188,14 +207,14 @@ func (api *API) admit(next http.Handler) http.Handler {
 			return
 		}
 
-		gate := &api.admission.http
+		class := admissionHTTP
 		switch {
 		case isWebSocketUpgrade(r):
-			gate = &api.admission.webSocket
+			class = admissionWebSocket
 		case acceptsSSE(r):
-			gate = &api.admission.sse
+			class = admissionSSE
 		}
-		release, acquired := gate.tryAcquire()
+		release, acquired := api.admission.tryAcquire(class, api.admissionTenant(r))
 		if !acquired {
 			w.Header().Set("Retry-After", "1")
 			writeError(w, http.StatusServiceUnavailable, "inbound capacity unavailable")
@@ -204,6 +223,78 @@ func (api *API) admit(next http.Handler) http.Handler {
 		defer release()
 		next.ServeHTTP(w, r)
 	})
+}
+
+func (admission *inboundAdmission) tryAcquire(class admissionClass, tenant string) (func(), bool) {
+	global, tenants := admission.gates(class)
+	globalRelease, acquired := global.tryAcquire()
+	if !acquired {
+		return nil, false
+	}
+
+	if strings.TrimSpace(tenant) == "" {
+		tenant = anonymousTenant
+	}
+	tenantCount := admission.tenantCount
+	if tenant == anonymousTenant {
+		tenantCount++
+	}
+	tenantLimit := admission.share(global.limit, tenantCount)
+	entry := &admissionGate{limit: tenantLimit}
+	actual, _ := tenants.LoadOrStore(tenant, entry)
+	tenantRelease, acquired := actual.(*admissionGate).tryAcquire()
+	if !acquired {
+		globalRelease()
+		return nil, false
+	}
+	return func() {
+		tenantRelease()
+		globalRelease()
+	}, true
+}
+
+func (admission *inboundAdmission) gates(class admissionClass) (*admissionGate, *sync.Map) {
+	switch class {
+	case admissionSSE:
+		return &admission.sse, &admission.sseTenants
+	case admissionWebSocket:
+		return &admission.webSocket, &admission.webSocketTenants
+	default:
+		return &admission.http, &admission.httpTenants
+	}
+}
+
+func (admission *inboundAdmission) share(limit, tenantCount int64) int64 {
+	if tenantCount <= 0 {
+		tenantCount = 1
+	}
+	share := (limit + tenantCount - 1) / tenantCount
+	if share < 1 {
+		return 1
+	}
+	return share
+}
+
+func (api *API) admissionTenant(r *http.Request) string {
+	if principal, ok := identity.FromContext(r.Context()); ok {
+		if api.tenantRouter != nil {
+			route, err := api.tenantRouter.ResolvePrincipal(r.Context(), principal)
+			if err == nil && strings.TrimSpace(route.UserID) != "" {
+				return route.UserID
+			}
+			return anonymousTenant
+		}
+		if api.isOwner(principal) {
+			return "owner"
+		}
+		return anonymousTenant
+	}
+	if api.tenantRouter != nil {
+		if route, ok := api.tenantRouter.ResolveCredential(requestCredential(r)); ok && strings.TrimSpace(route.UserID) != "" {
+			return route.UserID
+		}
+	}
+	return anonymousTenant
 }
 
 func acceptsSSE(r *http.Request) bool {
@@ -268,35 +359,6 @@ func (api *API) bootstrap(w http.ResponseWriter, r *http.Request) {
 	api.proxyTenantBootstrap(w, r, route)
 }
 
-func (api *API) enroll(w http.ResponseWriter, r *http.Request) {
-	writer := noStoreResponseWriter{ResponseWriter: w}
-	credential, status, err := enrollmentCredential(&writer, r)
-	if err != nil {
-		writeError(&writer, status, err.Error())
-		return
-	}
-	if r.Method == http.MethodGet {
-		writer.Header().Set("Deprecation", "true")
-	}
-
-	request := r.Clone(r.Context())
-	requestURL := *r.URL
-	requestURL.RawQuery = url.Values{"code": []string{credential}}.Encode()
-	request.URL = &requestURL
-	request.Method = http.MethodGet
-	request.Body = http.NoBody
-	request.ContentLength = 0
-	request.GetBody = nil
-	request.Header.Del("Authorization")
-	request.Header.Del("Content-Type")
-	request.Header.Del("Content-Length")
-	if api.tenantRouter == nil {
-		api.proxy.ServeHTTP(&writer, request)
-		return
-	}
-	api.proxyTenantBootstrap(&writer, request, api.tenantRouter.Default())
-}
-
 func (api *API) forward(w http.ResponseWriter, r *http.Request) {
 	if api.isBlocked(r.URL.Path) {
 		http.NotFound(w, r)
@@ -333,11 +395,21 @@ func (api *API) forward(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *API) proxyTenantBootstrap(w http.ResponseWriter, r *http.Request, route TenantRoute) {
-	if route.Proxy == nil {
+	if route.Proxy == nil || len(route.UpstreamBootstrapSecret) < 32 {
 		writeError(w, http.StatusServiceUnavailable, "tenant runtime unavailable")
 		return
 	}
-	response, credentials, ttl, err := captureBootstrap(route.Proxy, r)
+	request := r.Clone(r.Context())
+	request.URL = cloneURL(r.URL)
+	request.URL.Path = "/auth/token"
+	request.URL.RawPath = ""
+	request.URL.RawQuery = ""
+	request.RequestURI = ""
+	request.Header = r.Header.Clone()
+	request.Header.Del("Authorization")
+	request.Header.Del("X-Nanobot-Auth")
+	request.Header.Set("Authorization", "Bearer "+route.UpstreamBootstrapSecret)
+	response, credentials, ttl, err := captureBootstrap(route.Proxy, request)
 	if err != nil {
 		api.logger.ErrorContext(r.Context(), "tenant bootstrap failed", "route", "bootstrap", "error_class", "invalid_upstream_response")
 		writeError(w, http.StatusBadGateway, "upstream bootstrap unavailable")
@@ -351,67 +423,6 @@ func (api *API) proxyTenantBootstrap(w http.ResponseWriter, r *http.Request, rou
 		}
 	}
 	response.send(w)
-}
-
-func enrollmentCredential(w http.ResponseWriter, r *http.Request) (string, int, error) {
-	if r.Method != http.MethodGet && r.Method != http.MethodPost {
-		w.Header().Set("Allow", "GET, POST")
-		return "", http.StatusMethodNotAllowed, errors.New("method not allowed")
-	}
-	headerCredential, headerPresent, headerValid := bearerCredential(r.Header.Get("Authorization"))
-	if headerPresent && !headerValid {
-		return "", http.StatusUnauthorized, errors.New("valid enrollment credential required")
-	}
-
-	var supplied []string
-	if r.Method == http.MethodGet {
-		supplied = append(supplied, r.URL.Query()["code"]...)
-		supplied = append(supplied, r.URL.Query()["join_code"]...)
-	} else {
-		mediaType := "application/x-www-form-urlencoded"
-		if contentType := strings.TrimSpace(r.Header.Get("Content-Type")); contentType != "" {
-			parsedType, _, err := mime.ParseMediaType(contentType)
-			if err != nil || parsedType != mediaType {
-				return "", http.StatusUnsupportedMediaType, errors.New("form-encoded enrollment body required")
-			}
-		}
-		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxEnrollmentBody))
-		if err != nil {
-			var tooLarge *http.MaxBytesError
-			if errors.As(err, &tooLarge) {
-				return "", http.StatusRequestEntityTooLarge, errors.New("enrollment body too large")
-			}
-			return "", http.StatusBadRequest, errors.New("invalid enrollment body")
-		}
-		form, err := url.ParseQuery(string(body))
-		if err != nil {
-			return "", http.StatusBadRequest, errors.New("invalid enrollment body")
-		}
-		supplied = append(supplied, form["code"]...)
-		supplied = append(supplied, form["join_code"]...)
-	}
-	if headerCredential != "" {
-		supplied = append(supplied, headerCredential)
-	}
-
-	credential := ""
-	for _, candidate := range supplied {
-		candidate = strings.TrimSpace(candidate)
-		if candidate == "" {
-			continue
-		}
-		if len(candidate) > 512 {
-			return "", http.StatusBadRequest, errors.New("invalid enrollment credential")
-		}
-		if credential != "" && candidate != credential {
-			return "", http.StatusBadRequest, errors.New("conflicting enrollment credentials")
-		}
-		credential = candidate
-	}
-	if credential == "" {
-		return "", http.StatusUnauthorized, errors.New("valid enrollment credential required")
-	}
-	return credential, 0, nil
 }
 
 func webSocketRequest(r *http.Request) (*http.Request, int, error) {
@@ -470,7 +481,7 @@ func (api *API) isBlocked(requestPath string) bool {
 }
 
 func cloneBlockedPaths(source map[string]struct{}) map[string]struct{} {
-	result := make(map[string]struct{}, len(source)+3)
+	result := make(map[string]struct{}, len(source)+5)
 	for blocked := range source {
 		result[blocked] = struct{}{}
 	}
@@ -578,29 +589,9 @@ func routeName(requestPath string) string {
 		return "readiness"
 	case "/auth/bootstrap":
 		return "bootstrap"
-	case "/webui/guest/bootstrap":
-		return "enrollment"
 	default:
 		return "proxy"
 	}
-}
-
-type noStoreResponseWriter struct {
-	http.ResponseWriter
-}
-
-func (w noStoreResponseWriter) Unwrap() http.ResponseWriter {
-	return w.ResponseWriter
-}
-
-func (w noStoreResponseWriter) WriteHeader(status int) {
-	w.Header().Set("Cache-Control", "no-store")
-	w.ResponseWriter.WriteHeader(status)
-}
-
-func (w noStoreResponseWriter) Write(body []byte) (int, error) {
-	w.Header().Set("Cache-Control", "no-store")
-	return w.ResponseWriter.Write(body)
 }
 
 func RequestID(ctx context.Context) string {

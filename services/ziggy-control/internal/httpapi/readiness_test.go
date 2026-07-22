@@ -73,15 +73,13 @@ func TestHTTPReadinessCheckerCachesSuccessfulProbe(t *testing.T) {
 	}
 }
 
-func TestHTTPReadinessCheckerPreflightRequiresOwnerLegacyRoutes(t *testing.T) {
+func TestHTTPReadinessCheckerPreflightRequiresPrivateTokenIssuer(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/healthz":
 			w.WriteHeader(http.StatusNoContent)
-		case "/auth/bootstrap":
+		case "/auth/token":
 			w.WriteHeader(http.StatusUnauthorized)
-		case "/webui/guest/bootstrap":
-			w.WriteHeader(http.StatusBadRequest)
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -104,6 +102,6 @@ func TestHTTPReadinessCheckerPreflightRequiresOwnerLegacyRoutes(t *testing.T) {
 	target, _ = url.Parse(serverWithMissingRoute.URL)
 	checker = NewHTTPReadinessChecker(target, "/healthz", time.Second, time.Second, nil)
 	if err := checker.Preflight(context.Background()); err == nil {
-		t.Fatal("Preflight() error = nil for missing legacy route")
+		t.Fatal("Preflight() error = nil for missing private token issuer")
 	}
 }

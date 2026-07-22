@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { cn } from "@/lib/utils";
-import { useClient } from "@/providers/ClientProvider";
+import { useClient } from "@/providers/client-context";
 import type { ConnectionStatus } from "@/lib/types";
 
 const COPY: Record<ConnectionStatus, { color: string }> = {

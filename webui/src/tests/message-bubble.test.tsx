@@ -26,6 +26,7 @@ describe("MessageBubble", () => {
       id: "t1",
       role: "tool",
       kind: "trace",
+      traceKind: "tool",
       content: 'search "hk weather"',
       traces: ['weather("get")', 'search "hk weather"'],
       createdAt: Date.now(),
@@ -39,6 +40,21 @@ describe("MessageBubble", () => {
 
     fireEvent.click(toggle);
     expect(screen.queryByText('weather("get")')).not.toBeInTheDocument();
+  });
+
+  it("renders progress traces as thinking updates", () => {
+    const message: UIMessage = {
+      id: "p1",
+      role: "tool",
+      kind: "trace",
+      traceKind: "progress",
+      content: "Qwen is processing your request on Spark.",
+      traces: ["Qwen is processing your request on Spark."],
+      createdAt: Date.now(),
+    };
+
+    render(<MessageBubble message={message} />);
+    expect(screen.getByRole("button", { name: /thinking/i })).toBeInTheDocument();
   });
 
   it("renders video media as an inline player", () => {

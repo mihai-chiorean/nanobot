@@ -1,44 +1,49 @@
 # Authentication
 
-## Current personal build
+## Identity flow
 
-The iOS app has one fixed principal:
+The app uses Clerk's native iOS SDK. `AuthView` presents the methods enabled in
+the Clerk application, Clerk persists its own session, and the app requests a
+fresh Clerk session token when it needs to bootstrap Ziggy.
 
-- Name: Mihai Chiorean
-- Email: `mihai.v.chiorean@gmail.com`
+1. The user signs in through Clerk.
+2. The app sends the Clerk session JWT in the `Authorization` header to
+   `GET /auth/bootstrap`.
+3. `ziggy-control` verifies the JWT and resolves the signed Clerk subject to a
+   server-owned user and workspace. Email is admission/profile data, not the
+   tenant key.
+4. The gateway returns short-lived REST and WebSocket credentials scoped to
+   that resolved runtime.
+5. The app keeps Ziggy credentials in memory. Refresh is serialized and one
+   authenticated REST request may be retried after a `401`.
 
-This identity is presentation and policy context, not a credential supplied by
-the phone. The server remains the authority. The installation is enrolled with
-a private guest code, stores that code in Keychain, and exchanges it for
-short-lived `nbwt_` credentials. Those credentials are never committed or
-persisted by the app.
+The app never accepts a user, tenant, or workspace ID from the client as an
+authorization decision. It does not compare an email locally, ship a guest
+code, or reuse the Clerk JWT as a long-lived Ziggy socket credential.
 
-The enrollment exchange sends the private code in a JSON `POST` body. REST and
-WebSocket traffic use `Authorization: Bearer <short-lived token>` headers; no
-credential is placed in a URL. Token refresh is serialized, honors both
-absolute and relative expiry values, and retries an authenticated REST request
-once after a `401`.
+## Configuration
 
-All conversations, work, and memory continue to use Ziggy's existing personal
-namespace. V1 intentionally has no per-user data partitioning.
+The Xcode build setting `CLERK_PUBLISHABLE_KEY` is injected into Info.plist as
+`ZiggyClerkPublishableKey`. Put the publishable key in the ignored
+`Config/Local.xcconfig`; do not commit deployment-specific configuration.
 
-## Google sign-in follow-up
+The Clerk Native API application must register:
 
-Do not implement this as a client-side email comparison. A production flow
-needs these pieces:
+- App ID prefix: `98KW2QQ963`
+- Bundle ID: `com.mihaichiorean.ziggy`
+- Callback: `com.mihaichiorean.ziggy://callback`
 
-1. The app completes Google OIDC with the native SDK or an
-   `ASWebAuthenticationSession` authorization-code flow using PKCE.
-2. The server verifies signature, issuer, audience, expiry, nonce, and
-   `email_verified` on the returned identity.
-3. The server allowlists both the stable Google `sub` and
-   `mihai.v.chiorean@gmail.com`.
-4. Ziggy issues its own revocable device/session credential. The Google token
-   is not used as the Ziggy WebSocket credential.
-5. The existing `CredentialStoring` and bootstrap boundary swaps from private
-   code enrollment to that server-issued credential; chat and work code remain
-   unchanged.
+`ZiggyApp` forwards callback URLs to Clerk and observes Clerk session changes
+so sign-in, sign-out, expiry, and account switching rebuild the Ziggy
+connection. Initial launch is handled once by `AppModel.start()` to avoid
+creating duplicate sockets when Clerk restores an existing session.
 
-Cloudflare's browser owner challenge is not a native authentication API. The
-gateway needs a dedicated native exchange endpoint before the private code can
-be retired.
+Social login methods and Gmail connector authorization are separate grants.
+Signing in with Google does not grant Ziggy access to Gmail, and disconnecting
+Gmail does not sign the user out of Ziggy.
+
+## Server policy
+
+Clerk proves identity; `ziggy-control` controls admission and tenancy. Every
+TestFlight tester needs an enabled server-side mapping to a dedicated workspace
+and runtime. Unknown or disabled identities fail closed.

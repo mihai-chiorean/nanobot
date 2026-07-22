@@ -4,17 +4,19 @@
 
 - Swift 6 and SwiftUI.
 - iOS 17 minimum, tested primarily on iOS 26 and iPhone 17 Pro.
-- No third-party runtime dependencies in V1. Textual 0.5.0 was evaluated but
-  its package manifest requires iOS 18, so iOS 17 keeps Foundation's native
-  AttributedString Markdown path with link/image safety gates.
+- ClerkKit and ClerkKitUI provide native authentication. Textual 0.5.0 was
+  evaluated but its package manifest requires iOS 18, so iOS 17 keeps
+  Foundation's native AttributedString Markdown path with link/image safety
+  gates.
 - XcodeGen owns deterministic project generation through `project.yml`.
 
 ## Layers
 
 ### App
 
-`ZiggyApp` builds the dependency graph and owns scene lifecycle. `AppModel` is
-the V1 main-actor state machine for enrollment, routing, conversation state,
+`ZiggyApp` configures Clerk, builds the dependency graph, and owns scene
+lifecycle. `AppModel` is the V1 main-actor state machine for authentication,
+routing, conversation state,
 work state, global connection status, and persisted appearance preference. Its
 transport-facing methods are small enough to extract into feature stores when
 local persistence arrives.
@@ -47,10 +49,12 @@ endpoint and future stateless completion surfaces.
 
 ### Security
 
-- `CredentialStore` stores the long-lived guest enrollment code in Keychain.
-- Enrollment credentials use `WhenUnlockedThisDeviceOnly` Keychain
-  accessibility.
+- Clerk owns the persisted native identity session.
+- `CredentialStore` stores only the selected server URL using
+  `WhenUnlockedThisDeviceOnly` Keychain accessibility.
 - Short-lived `nbwt_` tokens remain in memory and are refreshed for reconnects.
+- `GET /auth/bootstrap` receives a fresh Clerk session JWT in its
+  `Authorization` header and resolves tenancy on the server.
 - REST sends tokens in the `Authorization` header.
 - WebSocket handshakes send short-lived credentials in the `Authorization`
   header. Credentials are never placed in WebSocket URLs.
@@ -59,7 +63,7 @@ endpoint and future stateless completion surfaces.
 
 - `Chat`: conversation list, transcript, streaming reducer, composer, media.
 - `Work`: task list, detail timeline, cancellation, follow-up.
-- `Settings`: enrollment, endpoint, diagnostics, owner-only controls.
+- `Settings`: identity, sign-out, endpoint, and transport diagnostics.
 - `Speech`: permission and dictation service behind a protocol.
 
 The SwiftUI design system mirrors the PWA's neutral light/dark tokens and
@@ -72,16 +76,17 @@ emit `AsyncStream` values that are reduced into stable view state.
 
 ### Bootstrap and REST
 
-- `POST /webui/guest/bootstrap` with a JSON enrollment body
+- `GET /auth/bootstrap` with a Clerk bearer token
 - `GET /api/sessions`
 - `GET /api/sessions/{key}/messages`
 - `GET /api/work`
 - `GET /api/work/{task_id}`
 - `GET /api/work/{task_id}/events?after_seq=...`
-- `GET /api/settings` for owner scope
+- `GET /api/settings` when authorized by server policy
 
 REST requests use `Authorization: Bearer <short-lived token>`.
-Enrollment codes are sent only in request bodies or headers and never in URLs.
+The Clerk JWT and Ziggy credentials are sent only in authorization headers and
+never in URLs.
 
 ### WebSocket client frames
 
@@ -108,6 +113,9 @@ The optional OpenAI-compatible endpoint uses `POST /v1/chat/completions` with
 ## State and failure policy
 
 - UI state is main-actor isolated.
+- Connection, bootstrap-refresh, and REST results are generation-fenced so an
+  account switch cannot apply stale credentials or tenant data to the new
+  session. Old sockets cannot request credentials for a newer account.
 - A socket drop moves the app to reconnecting and retains unsent frames.
 - Exponential reconnect backoff is bounded and reset after a successful
   ping/pong confirms the WebSocket upgrade.

@@ -88,6 +88,34 @@ func TestRouterExpiresCredentialWithoutAReaperGoroutine(t *testing.T) {
 	}
 }
 
+func TestRouterRejectsMissingUpstreamBootstrapSecret(t *testing.T) {
+	directory := t.TempDir()
+	manifestPath := filepath.Join(directory, "tenants.json")
+	document := map[string]any{
+		"version": 1,
+		"tenants": []map[string]any{{
+			"user_id": "usr_owner", "workspace_id": "ws_owner", "email": "owner@example.com",
+			"clerk_subject": "clerk_owner", "upstream_url": "http://127.0.0.1:10001",
+			"status": "active", "legacy_default": true,
+		}},
+	}
+	contents, err := json.Marshal(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manifestPath, contents, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	registry, err := tenant.Load(manifestPath, filepath.Join(directory, "bindings.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := New(registry, slog.New(slog.NewTextHandler(io.Discard, nil)), nil); err == nil {
+		t.Fatal("New() error = nil for missing upstream bootstrap secret")
+	}
+}
+
 func loadTestRegistry(t *testing.T, ownerURL, testerURL string) *tenant.Registry {
 	t.Helper()
 	directory := t.TempDir()
@@ -98,11 +126,13 @@ func loadTestRegistry(t *testing.T, ownerURL, testerURL string) *tenant.Registry
 		"tenants": []map[string]any{
 			{
 				"user_id": "usr_owner", "workspace_id": "ws_owner", "email": "owner@example.com",
-				"clerk_subject": "clerk_owner", "upstream_url": ownerURL, "status": "active", "legacy_default": true,
+				"clerk_subject": "clerk_owner", "upstream_url": ownerURL,
+				"upstream_bootstrap_secret": "owner-bootstrap-secret-with-32-bytes", "status": "active", "legacy_default": true,
 			},
 			{
 				"user_id": "usr_tester", "workspace_id": "ws_tester", "email": "tester@example.com",
-				"clerk_subject": "clerk_tester", "upstream_url": testerURL, "status": "active",
+				"clerk_subject": "clerk_tester", "upstream_url": testerURL,
+				"upstream_bootstrap_secret": "tester-bootstrap-secret-with-32-bytes", "status": "active",
 			},
 		},
 	}

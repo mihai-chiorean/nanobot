@@ -2,9 +2,10 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { Composer } from "@/components/Composer";
 import { MessageList } from "@/components/MessageList";
-import { useClient } from "@/providers/ClientProvider";
+import { useClient } from "@/providers/client-context";
 import { useNanobotStream } from "@/hooks/useNanobotStream";
 import { useSessionHistory } from "@/hooks/useSessions";
+import { randomId } from "@/lib/id";
 import type { ChatSummary } from "@/lib/types";
 
 interface ChatPaneProps {
@@ -49,7 +50,7 @@ export function ChatPane({ session, onNewChat }: ChatPaneProps) {
     setMessages((prev) => [
       ...prev,
       {
-        id: crypto.randomUUID(),
+        id: randomId(),
         role: "user",
         content: pending,
         createdAt: Date.now(),
@@ -78,24 +79,27 @@ export function ChatPane({ session, onNewChat }: ChatPaneProps) {
       <section className="flex min-h-0 flex-1 flex-col">
         <div className="flex flex-1 flex-col items-center justify-center gap-8 px-4 pb-6">
           <div className="flex flex-col items-center gap-4 animate-in fade-in-0 slide-in-from-bottom-2 duration-500">
-            <picture>
-              <source
-                srcSet="/brand/nanobot_logo.webp"
-                type="image/webp"
-              />
+            <div className="flex items-center gap-3">
               <img
-                src="/brand/nanobot_logo.png"
-                alt="nanobot"
-                className="h-12 w-auto select-none drop-shadow-sm"
+                src="/brand/ziggy_icon.png"
+                alt=""
+                className="h-11 w-11 select-none rounded-xl drop-shadow-sm"
+                aria-hidden
                 draggable={false}
               />
-            </picture>
+              <div className="text-left">
+                <div className="text-2xl font-semibold leading-7">Ziggy</div>
+                <div className="text-xs font-medium text-muted-foreground">
+                  private agent workspace
+                </div>
+              </div>
+            </div>
             <h1 className="text-xl font-medium tracking-tight text-foreground/90">
               What's on your mind?
             </h1>
             <p className="max-w-md text-center text-sm text-muted-foreground">
-              Your conversations are persisted locally under the nanobot
-              workspace. Start typing and I'll open a new chat.
+              Your conversations stay in the private workspace on Spark. Start
+              typing and I'll open a new chat.
             </p>
           </div>
           <div className="w-full animate-in fade-in-0 slide-in-from-bottom-2 duration-500">

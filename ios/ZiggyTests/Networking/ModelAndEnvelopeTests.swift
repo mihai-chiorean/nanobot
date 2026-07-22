@@ -3,15 +3,14 @@ import XCTest
 
 final class ModelAndEnvelopeTests: XCTestCase {
     func testProductionBootstrapShape() throws {
-        let data = Data(#"{"token":"nbwt_short-lived","ws_path":"/","expires_in":299,"model_name":"qwen3.6-35b","access":"guest","guest_code":"enrolled"}"#.utf8)
+        let data = Data(#"{"token":"nbwt_short-lived","ws_path":"/","expires_in":299,"model_name":"qwen3.6-35b","access":"tenant"}"#.utf8)
         let response = try JSONDecoder().decode(BootstrapResponse.self, from: data)
         XCTAssertEqual(response.restToken, "nbwt_short-lived")
         XCTAssertNil(response.webSocketToken)
         XCTAssertEqual(response.webSocketPath, "/")
         XCTAssertEqual(response.expiresIn, 299)
         XCTAssertEqual(response.model, "qwen3.6-35b")
-        XCTAssertEqual(response.access, "guest")
-        XCTAssertEqual(response.isOwner, false)
+        XCTAssertEqual(response.access, "tenant")
     }
 
     func testCapabilitiesRemainIndependent() {
@@ -40,6 +39,59 @@ final class ModelAndEnvelopeTests: XCTestCase {
         XCTAssertEqual(message.content.text, "hello")
         if case .unknown("future_role") = message.role {} else { XCTFail("role should preserve unknown value") }
         if case .unknown("future_state") = message.status {} else { XCTFail("status should preserve unknown value") }
+    }
+
+    func testWorkStatusesMatchServerContractAndPreserveLegacyAliases() {
+        let serverStatuses: [ZiggyStatus] = [
+            .scheduled, .queued, .running, .waiting,
+            .succeeded, .failed, .cancelled, .interrupted
+        ]
+        XCTAssertEqual(serverStatuses.map(\.rawValue), [
+            "scheduled", "queued", "running", "waiting",
+            "succeeded", "failed", "cancelled", "interrupted"
+        ])
+        XCTAssertEqual(ZiggyStatus("pending"), .queued)
+        XCTAssertEqual(ZiggyStatus("completed"), .succeeded)
+        XCTAssertEqual(ZiggyStatus("canceled"), .cancelled)
+        XCTAssertEqual(ZiggyStatus("in-progress"), .running)
+    }
+
+    func testWorkStatusChangedPayloadDecodesTerminalStatus() throws {
+        let data = Data(#"{"event":"work.event","task_id":"task-1","seq":8,"type":"status.changed","payload":{"status":"succeeded","result_summary":"Done"}}"#.utf8)
+        let event = try JSONDecoder().decode(InboundWebSocketEvent.self, from: data)
+        guard case .workEvent(let workEvent) = event else { return XCTFail("expected work event") }
+
+        XCTAssertEqual(workEvent.status, .succeeded)
+        XCTAssertTrue(AppModel.shouldRefreshWork(for: workEvent))
+    }
+
+    func testOnlyTerminalStatusChangedEventsRefreshWork() {
+        for status in [ZiggyStatus.succeeded, .failed, .cancelled, .interrupted] {
+            XCTAssertTrue(status.isTerminal)
+            XCTAssertTrue(AppModel.shouldRefreshWork(for: WorkEvent(
+                taskID: "task-1", type: "status.changed", status: status
+            )))
+        }
+        for status in [ZiggyStatus.scheduled, .queued, .running, .waiting] {
+            XCTAssertFalse(status.isTerminal)
+        }
+        XCTAssertFalse(AppModel.shouldRefreshWork(for: WorkEvent(
+            taskID: "task-1", type: "status.changed", status: .running
+        )))
+        XCTAssertFalse(AppModel.shouldRefreshWork(for: WorkEvent(
+            taskID: "task-1", type: "progress", status: .succeeded
+        )))
+        XCTAssertTrue(AppModel.shouldRefreshWork(for: WorkEvent(
+            taskID: "task-1", type: "status.changed", status: .interrupted
+        )))
+    }
+
+    func testEveryServerStatusHasWorkPresentation() {
+        let statuses: [ZiggyStatus] = [
+            .scheduled, .queued, .running, .waiting,
+            .succeeded, .failed, .cancelled, .interrupted
+        ]
+        XCTAssertEqual(statuses.map(\.presentation.rawValue), statuses.map(\.rawValue))
     }
 
     func testProductionHistoryMessageAllowsNoIDAndUTCWithoutSuffix() throws {

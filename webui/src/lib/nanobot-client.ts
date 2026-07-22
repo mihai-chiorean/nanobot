@@ -13,6 +13,7 @@ const WS_CLOSING = 2;
 type Unsubscribe = () => void;
 type EventHandler = (ev: InboundEvent) => void;
 type StatusHandler = (status: ConnectionStatus) => void;
+type WorkHandler = (ev: InboundEvent) => void;
 
 /** Structured connection-level errors surfaced to the UI.
  *
@@ -60,6 +61,9 @@ export class NanobotClient {
   private errorHandlers = new Set<ErrorHandler>();
   // chat_id -> handlers listening on it
   private chatHandlers = new Map<string, Set<EventHandler>>();
+  private workHandlers = new Map<string, Set<WorkHandler>>();
+  // task_id -> last event sequence delivered/requested for that subscription
+  private workSubscriptions = new Map<string, number>();
   // chat_ids we've attached to since connect; re-attached after reconnects
   private knownChats = new Set<string>();
   private pendingNewChat: PendingNewChat | null = null;
@@ -76,6 +80,8 @@ export class NanobotClient {
   // Set by ``close()`` so the onclose handler knows the drop was intentional
   // and must not schedule a reconnect or flip status back to "reconnecting".
   private intentionallyClosed = false;
+  // Invalidates reconnect callbacks that are awaiting token refresh.
+  private reconnectGeneration = 0;
 
   constructor(private options: NanobotClientOptions) {
     this.shouldReconnect = options.reconnect ?? true;
@@ -145,9 +151,15 @@ export class NanobotClient {
 
   close(): void {
     this.intentionallyClosed = true;
+    this.reconnectGeneration += 1;
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
+    }
+    if (this.pendingNewChat) {
+      clearTimeout(this.pendingNewChat.timer);
+      this.pendingNewChat.reject(new Error("socket closed"));
+      this.pendingNewChat = null;
     }
     const sock = this.socket;
     this.socket = null;
@@ -190,6 +202,50 @@ export class NanobotClient {
     this.queueSend(frame);
   }
 
+  createWork(chatId: string, content: string, media?: OutboundMedia[]): void {
+    this.knownChats.add(chatId);
+    this.queueSend(
+      media && media.length > 0
+        ? { type: "work.create", chat_id: chatId, content, mode: "background", media }
+        : { type: "work.create", chat_id: chatId, content, mode: "background" },
+    );
+  }
+
+  subscribeWork(taskId: string, afterSeq: number = 0): void {
+    const cursor = Math.max(0, Math.floor(afterSeq));
+    this.workSubscriptions.set(taskId, cursor);
+    if (this.socket?.readyState === WS_OPEN) {
+      this.queueSend({ type: "work.subscribe", task_id: taskId, after_seq: cursor });
+    }
+  }
+
+  cancelWork(taskId: string): void {
+    this.queueSend({ type: "work.cancel", task_id: taskId });
+  }
+
+  sendWorkMessage(taskId: string, content: string): void {
+    this.queueSend({ type: "work.message", task_id: taskId, content });
+  }
+
+  onWork(taskId: string, handler: WorkHandler): Unsubscribe {
+    let handlers = this.workHandlers.get(taskId);
+    if (!handlers) {
+      handlers = new Set();
+      this.workHandlers.set(taskId, handlers);
+    }
+    handlers.add(handler);
+    if (!this.workSubscriptions.has(taskId)) this.subscribeWork(taskId);
+    return () => {
+      const current = this.workHandlers.get(taskId);
+      if (!current) return;
+      current.delete(handler);
+      if (current.size === 0) {
+        this.workHandlers.delete(taskId);
+        this.workSubscriptions.delete(taskId);
+      }
+    };
+  }
+
   // -- internals ---------------------------------------------------------
 
   private setStatus(status: ConnectionStatus): void {
@@ -204,6 +260,10 @@ export class NanobotClient {
     // Re-attach every known chat_id so deliveries continue routing after a drop.
     for (const chatId of this.knownChats) {
       this.rawSend({ type: "attach", chat_id: chatId });
+    }
+    // Re-subscribe every active Work stream from its last delivered sequence.
+    for (const [taskId, afterSeq] of this.workSubscriptions) {
+      this.rawSend({ type: "work.subscribe", task_id: taskId, after_seq: afterSeq });
     }
     // Flush anything queued during reconnect.
     const queued = this.sendQueue.splice(0);
@@ -235,12 +295,32 @@ export class NanobotClient {
       return;
     }
 
+    if (parsed.event === "work.created") {
+      this.dispatchWork(parsed.task_id, parsed);
+      return;
+    }
+
+    if (parsed.event === "work.subscribed" || parsed.event === "work.event") {
+      if (parsed.event === "work.event") {
+        const current = this.workSubscriptions.get(parsed.task_id) ?? 0;
+        this.workSubscriptions.set(parsed.task_id, Math.max(current, parsed.seq));
+      }
+      this.dispatchWork(parsed.task_id, parsed);
+      return;
+    }
+
     const chatId = (parsed as { chat_id?: string }).chat_id;
     if (chatId) this.dispatch(chatId, parsed);
   }
 
   private dispatch(chatId: string, ev: InboundEvent): void {
     const handlers = this.chatHandlers.get(chatId);
+    if (!handlers) return;
+    for (const h of handlers) h(ev);
+  }
+
+  private dispatchWork(taskId: string, ev: InboundEvent): void {
+    const handlers = this.workHandlers.get(taskId);
     if (!handlers) return;
     for (const h of handlers) h(ev);
   }
@@ -283,18 +363,22 @@ export class NanobotClient {
   private scheduleReconnect(): void {
     this.setStatus("reconnecting");
     const attempt = this.reconnectAttempts++;
+    const generation = this.reconnectGeneration;
     // Exponential backoff: 0.5s, 1s, 2s, 4s, capped.
     const delay = Math.min(500 * 2 ** attempt, this.maxBackoffMs);
     this.reconnectTimer = setTimeout(async () => {
       this.reconnectTimer = null;
+      if (this.intentionallyClosed || generation !== this.reconnectGeneration) return;
       if (this.options.onReauth) {
         try {
           const refreshed = await this.options.onReauth();
+          if (this.intentionallyClosed || generation !== this.reconnectGeneration) return;
           if (refreshed) this.currentUrl = refreshed;
         } catch {
           // fall through to retry with current URL
         }
       }
+      if (this.intentionallyClosed || generation !== this.reconnectGeneration) return;
       this.connect();
     }, delay);
   }

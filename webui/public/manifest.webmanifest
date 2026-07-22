@@ -1,0 +1,31 @@
+{
+  "name": "Ziggy",
+  "short_name": "Ziggy",
+  "description": "Chat with your private agent workspace.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#161618",
+  "orientation": "portrait-primary",
+  "icons": [
+    {
+      "src": "/brand/ziggy_icon_192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/brand/ziggy_icon_512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/brand/ziggy_apple_touch.png",
+      "sizes": "180x180",
+      "type": "image/png",
+      "purpose": "any"
+    }
+  ]
+}

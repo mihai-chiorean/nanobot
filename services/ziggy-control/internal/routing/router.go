@@ -51,15 +51,28 @@ func New(registry *tenant.Registry, logger *slog.Logger, observability *telemetr
 		now:      time.Now,
 		capacity: defaultCredentialCapacity,
 	}
-	for _, allocation := range registry.Allocations() {
+	allocations := registry.Allocations()
+	bootstrapSecrets := make(map[string]struct{}, len(allocations))
+	for _, allocation := range allocations {
+		if len(allocation.UpstreamBootstrapSecret) < 32 {
+			return nil, fmt.Errorf(
+				"tenant %q upstream_bootstrap_secret must contain at least 32 characters",
+				allocation.UserID,
+			)
+		}
+		if _, exists := bootstrapSecrets[allocation.UpstreamBootstrapSecret]; exists {
+			return nil, fmt.Errorf("tenant %q reuses an upstream bootstrap secret", allocation.UserID)
+		}
+		bootstrapSecrets[allocation.UpstreamBootstrapSecret] = struct{}{}
 		upstream, err := config.ParsePrivateUpstream(allocation.UpstreamURL)
 		if err != nil {
 			return nil, fmt.Errorf("tenant %q upstream: %w", allocation.UserID, err)
 		}
 		route := httpapi.TenantRoute{
-			UserID:      allocation.UserID,
-			WorkspaceID: allocation.WorkspaceID,
-			Proxy:       httpapi.NewReverseProxy(upstream, logger, observability),
+			UserID:                  allocation.UserID,
+			WorkspaceID:             allocation.WorkspaceID,
+			UpstreamBootstrapSecret: allocation.UpstreamBootstrapSecret,
+			Proxy:                   httpapi.NewReverseProxy(upstream, logger, observability),
 		}
 		router.byUserID[allocation.UserID] = route
 		if allocation.LegacyDefault {
@@ -142,6 +155,10 @@ func (router *Router) RememberCredentials(route httpapi.TenantRoute, credentials
 
 func (router *Router) Default() httpapi.TenantRoute {
 	return router.fallback
+}
+
+func (router *Router) TenantCount() int {
+	return len(router.byUserID)
 }
 
 func (router *Router) cleanupExpired() {

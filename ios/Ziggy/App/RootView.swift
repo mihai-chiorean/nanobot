@@ -1,3 +1,4 @@
+import ClerkKit
 import SwiftUI
 
 struct RootView: View {
@@ -11,7 +12,7 @@ struct RootView: View {
             case .connecting:
                 ZiggyLaunchView(label: "Connecting")
             case .needsEnrollment:
-                EnrollmentView()
+                EnrollmentView(errorMessage: appModel.bannerMessage)
             case .failed(let message):
                 EnrollmentView(errorMessage: message)
             case .ready:
@@ -133,4 +134,5 @@ private struct ZiggyBanner: View {
 #Preview {
     RootView()
         .environment(AppModel(credentialStore: InMemoryCredentialStore()))
+        .environment(Clerk.preview { $0.isSignedIn = false })
 }

@@ -8,7 +8,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { relativeTime } from "@/lib/format";
+import { relativeTime, shortChatId } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import type { ChatSummary } from "@/lib/types";
 
@@ -57,7 +57,7 @@ export function ChatList({
           const active = s.key === activeKey;
           const title = titleFor(
             s,
-            t("chat.fallbackTitle", { id: s.chatId.slice(0, 6) }),
+            t("chat.fallbackTitle", { id: shortChatId(s.chatId) }),
           );
           return (
             <li key={s.key}>

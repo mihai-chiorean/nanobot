@@ -83,6 +83,15 @@ func TestNewVerifiesJWTAndAuthorizedParty(t *testing.T) {
 		t.Errorf("valid token status = %d, body = %s", response.Code, response.Body.String())
 	}
 
+	nativeToken := signToken(t, privateKey, keyID, "")
+	request = httptest.NewRequest(http.MethodGet, "/auth/bootstrap", nil)
+	request.Header.Set("Authorization", "Bearer "+nativeToken)
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusNoContent {
+		t.Errorf("native token without azp status = %d, body = %s", response.Code, response.Body.String())
+	}
+
 	wrongPartyToken := signToken(t, privateKey, keyID, "https://other.example.com")
 	request = httptest.NewRequest(http.MethodGet, "/auth/bootstrap", nil)
 	request.Header.Set("Authorization", "Bearer "+wrongPartyToken)
@@ -103,15 +112,18 @@ func signToken(t *testing.T, privateKey *rsa.PrivateKey, keyID, authorizedParty 
 		t.Fatal(err)
 	}
 	now := time.Now()
-	token, err := jwt.Signed(signer).Claims(map[string]any{
+	claims := map[string]any{
 		"iss":   "https://clerk.unit-test",
 		"sub":   "user_123",
 		"iat":   now.Unix(),
 		"nbf":   now.Add(-time.Minute).Unix(),
 		"exp":   now.Add(time.Minute).Unix(),
-		"azp":   authorizedParty,
 		"email": "Owner@Example.com",
-	}).CompactSerialize()
+	}
+	if authorizedParty != "" {
+		claims["azp"] = authorizedParty
+	}
+	token, err := jwt.Signed(signer).Claims(claims).CompactSerialize()
 	if err != nil {
 		t.Fatal(err)
 	}

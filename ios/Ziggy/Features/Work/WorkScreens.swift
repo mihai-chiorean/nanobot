@@ -160,16 +160,18 @@ private extension WorkTask {
     }
 }
 
-private extension ZiggyStatus {
+extension ZiggyStatus {
     var presentation: ZiggyWorkStatus {
         switch self {
+        case .scheduled: .scheduled
         case .queued: .queued
         case .running: .running
         case .waiting: .waiting
-        case .completed: .completed
+        case .succeeded: .succeeded
         case .failed: .failed
         case .cancelled: .cancelled
-        case .unknown: .waiting
+        case .interrupted: .interrupted
+        case .unknown: .unknown
         }
     }
 }

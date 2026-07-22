@@ -25,9 +25,6 @@ iOS / web -> Cloudflare -> ziggy-control -> private Nanobot -> Spark models
 - Accept WebSocket bearer credentials in the upgrade `Authorization` header and
   translate them for the current private Nanobot protocol. Query-token support
   remains a deprecated compatibility path.
-- Accept guest enrollment at `POST /webui/guest/bootstrap` using a form `code`
-  or `join_code` field, or a Bearer `Authorization` header. Legacy GET/query
-  enrollment remains temporarily available and returns `Deprecation: true`.
 - Proxy tenant-authenticated Gmail connector routes through the private
   connector service using a signed, one-minute internal principal envelope.
   Client-supplied principal headers are stripped. The Google callback remains
@@ -42,7 +39,7 @@ iOS / web -> Cloudflare -> ziggy-control -> private Nanobot -> Spark models
   credential, query, request ID, or session ID.
 - Optionally emit content-free OpenTelemetry metrics and traces to a loopback
   OTLP/HTTP collector.
-- Admit bounded owner-only HTTP, SSE, and WebSocket traffic without waiting;
+- Admit bounded tenant-fair HTTP, SSE, and WebSocket traffic without waiting;
   health and readiness remain available when a traffic class is full.
 
 Configuration is immutable after startup. Admission uses atomic try-acquire
@@ -52,16 +49,17 @@ each request carries a fresh cryptographic correlation ID.
 
 ## Compatibility bridge
 
-The current Nanobot `/auth/bootstrap` endpoint both validates Clerk and mints
-the opaque REST/WebSocket token expected by the existing iOS and web clients.
-For this first phase, `ziggy-control` validates and authorizes the owner, then
-forwards the original Clerk bearer token to that endpoint. Nanobot validates it
-a second time and returns its existing response unchanged.
+The current Nanobot `/auth/token` endpoint mints the opaque REST/WebSocket token
+expected by the existing iOS and web clients. `ziggy-control` validates Clerk
+at the control boundary, then calls the selected private tenant's `/auth/token`
+with `Authorization: Bearer <upstream_bootstrap_secret>`. The public Clerk
+bearer is replaced and is never forwarded to a tenant. The reverse proxy strips
+`X-Nanobot-Auth` rather than treating it as a client-controlled credential.
 
-This duplicate validation is deliberate and temporary. The next protocol
-change should add a private Nanobot token-broker endpoint authenticated only by
-`ziggy-control`; it should not expose another public token mint or change the
-mobile protocol during the front-door cutover.
+This private token-issue exchange is deliberate and temporary. The next
+protocol change should add a private Nanobot token-broker endpoint authenticated
+only by `ziggy-control`; it should not expose another public token mint or
+change the mobile protocol during the front-door cutover.
 
 ## Configuration
 
@@ -70,25 +68,30 @@ Required variables:
 | Variable | Purpose |
 |---|---|
 | `CLERK_SECRET_KEY` or `CLERK_SECRET_KEY_FILE` | Backend key, supplied inline for development or through a credential file. Set exactly one. |
-| `ZIGGY_OWNER_EMAIL` | Legacy owner identity used only for the temporary guest/bootstrap compatibility route. |
 | `ZIGGY_UPSTREAM_URL` | Private Nanobot origin. It must use an explicit loopback, RFC1918 IPv4, IPv6 ULA/link-local, or Tailscale `100.64.0.0/10` address. Userinfo, query, fragment, and public hostnames are rejected. |
 | `ZIGGY_TENANTS_FILE` | Immutable tenant allocation manifest. Production requires it. |
 | `ZIGGY_TENANT_BINDINGS_FILE` | Durable first-login Clerk subject bindings. Production requires it and the service must be able to write it. |
 
 Optional variables are documented in [`.env.example`](.env.example). In
-production, `ZIGGY_OWNER_SUBJECT` and at least one
-`ZIGGY_AUTHORIZED_PARTIES` value are mandatory: an email match alone is not an
-identity boundary. Development, local, staging, and test environments retain
-the explicit escape hatch for clients that do not yet emit `azp` or use a
-subject pin.
+production, at least one `ZIGGY_AUTHORIZED_PARTIES` value is mandatory. Tenant
+identity is resolved through the manifest and durable Clerk subject binding;
+an email match alone is not an identity boundary. The origin allowlist is
+enforced when a token contains `azp`;
+Clerk's native clients legitimately omit that browser-origin claim, so those
+tokens continue through issuer, signature, lifetime, subject, and tenant
+binding validation. Development, local, staging, and test environments retain
+the explicit escape hatch for deployments without a browser origin or subject
+pin.
 
 The manifest format is shown in
 [`deploy/tenants.example.json`](deploy/tenants.example.json). It must contain
 exactly one `legacy_default` allocation. Every active tenant has unique
-`user_id`, `workspace_id`, email, and private upstream URL. Pin known Clerk
-subjects in the manifest; otherwise the first verified matching email binds
-the subject atomically in `ZIGGY_TENANT_BINDINGS_FILE`. Removing or disabling
-an allocation immediately blocks new bootstraps after restart.
+`user_id`, `workspace_id`, email, private upstream URL, and
+`upstream_bootstrap_secret` with at least 32 characters. Keep the production
+manifest mode `0600`. Pin known Clerk subjects in the manifest; otherwise the
+first verified matching email binds the subject atomically in
+`ZIGGY_TENANT_BINDINGS_FILE`. Removing or disabling an allocation immediately
+blocks new bootstraps after restart.
 
 Set `ZIGGY_CONNECTORS_URL` to enable `/connectors/*`. The URL must pass the same
 private-network validation as Nanobot. The systemd unit discovers the shared
@@ -96,18 +99,18 @@ private-network validation as Nanobot. The systemd unit discovers the shared
 `ZIGGY_CONNECTORS_TRUST_KEY_FILE`. The key is shared only with
 `ziggy-connectors`.
 
-The default owner-only admission limits are 64 ordinary HTTP requests, 8 SSE
-streams, and 8 WebSocket connections. Override them with
+The default global admission limits are 64 ordinary HTTP requests, 8 SSE
+streams, and 8 WebSocket connections. Each configured tenant receives an
+equal share of each class, while anonymous traffic receives a separate share;
+the global limits remain hard caps. Override the global limits with
 `ZIGGY_MAX_HTTP_IN_FLIGHT`, `ZIGGY_MAX_SSE_IN_FLIGHT`, and
 `ZIGGY_MAX_WEBSOCKET_IN_FLIGHT`. `/healthz` and `/readyz` bypass these limits.
 
 Startup first requires the configured readiness path to return 2xx, then
-requires the owner-only legacy Nanobot contract: unauthenticated `GET
-/auth/bootstrap` must return `401`, and credential-less `GET
-/webui/guest/bootstrap` must return `400`. A missing or incompatible upstream
-blocks deployment before the listener starts. `ZIGGY_LEGACY_UPSTREAM_PREFLIGHT`
-may be disabled only outside production when deliberately testing against the
-checked-in Nanobot source, which does not contain these vendor routes.
+requires the private Nanobot contract: unauthenticated `GET /auth/bootstrap`
+must return `401`. A missing or incompatible upstream blocks deployment before
+the listener starts. `ZIGGY_UPSTREAM_PREFLIGHT` may be disabled only outside
+production when deliberately testing against an incomplete runtime.
 
 Set `ZIGGY_OTEL_ENDPOINT=http://127.0.0.1:4318` and
 `ZIGGY_OTEL_AUTH_FILE` to enable application metrics and traces through the
@@ -175,17 +178,48 @@ The checked-in unit expects:
   written atomically by the `ziggy-control` account; the unit's
   `StateDirectory=ziggy-control` creates the parent
 - Clerk credential: `/etc/ziggy/secrets/clerk-secret-key`, owned by root and
-  mode `0400`; systemd exposes it to the service with `LoadCredential`
-- local OTel client credential: `/etc/ziggy/secrets/otel-local-auth`, owned by
-  root and mode `0400`; it contains
-  `ziggy-control:<plain random password>`, and the checked-in unit maps it to
-  `ZIGGY_OTEL_AUTH_FILE` with `LoadCredential`. The separate collector file
+  mode `0400`; the base unit is the only unit that loads it with
+  `LoadCredential`
+- optional local OTel client credential: `/etc/ziggy/secrets/otel-local-auth`,
+  owned by root and mode `0400`; it contains
+  `ziggy-control:<plain random password>`. The separate collector file
   `/etc/ziggy/secrets/otel-local-users.htpasswd` contains the same username and
   a hash of the same password. The two files are not interchangeable. The
-  generated client file is required by the production unit.
-- connector trust credential: `/etc/ziggy/secrets/connector-trust-key`, shared
-  with `ziggy-connectors`, owned by root and mode `0400`
+  generated client file is loaded only by the OTel drop-in.
+- optional connector trust credential: `/etc/ziggy/secrets/connector-trust-key`,
+  shared with `ziggy-connectors`, owned by root and mode `0400`; it is loaded
+  only by the connector drop-in
 - unprivileged system account: `ziggy-control`
+
+Install the base unit and only the optional credential drop-ins that are
+configured on this host:
+
+```sh
+sudo install -D -o root -g root -m 0644 \
+  services/ziggy-control/deploy/systemd/ziggy-control.service \
+  /etc/systemd/system/ziggy-control.service
+sudo install -d -o root -g root -m 0755 /etc/systemd/system/ziggy-control.service.d
+# Install when ZIGGY_OTEL_ENDPOINT is configured:
+sudo install -o root -g root -m 0644 \
+  services/ziggy-control/deploy/systemd/ziggy-control.service.d/10-otel-credential.conf \
+  /etc/systemd/system/ziggy-control.service.d/10-otel-credential.conf
+# Install when ZIGGY_CONNECTORS_URL is configured:
+sudo install -o root -g root -m 0644 \
+  services/ziggy-control/deploy/systemd/ziggy-control.service.d/20-connector-credential.conf \
+  /etc/systemd/system/ziggy-control.service.d/20-connector-credential.conf
+```
+
+The base unit loads only Clerk. Its `EnvironmentFile` is read before the
+credential-path assignments, and the optional OTel path is assigned by its
+drop-in after that file, so an empty environment-file value cannot blank a
+credential path. The connector uses systemd's `CREDENTIALS_DIRECTORY` and
+does not need an environment-file path. To disable an optional integration,
+remove its exact drop-in, run `systemctl daemon-reload`, and restart the
+service. Upgrades replace the base unit but preserve installed drop-ins;
+install, remove, or change a drop-in before the same reload and restart. On the
+first upgrade from the older unit, its inline OTel and connector credentials
+are removed with the base file, so install the desired drop-ins before
+restarting if either integration must remain enabled.
 
 Install or upgrade the versioned binary atomically, retain the previous binary
 as `/usr/local/bin/ziggy-control.previous`, then:
@@ -243,7 +277,9 @@ leases and automatic cold-start scheduling remain later milestones.
 
 The checked-in Spark template `deploy/systemd/spark/nanobot-tenant@.service`
 adds a read-only home/system view and one tenant-specific writable tree. Tools
-must also run with Nanobot's `restrictToWorkspace` enabled. Current legacy guest
-enrollment routes only to the configured default owner runtime and must be
-retired before distributing external TestFlight builds. Query-token WebSocket
-compatibility remains transport plumbing, not a tenant selector.
+must also run with Nanobot's `restrictToWorkspace` enabled. Legacy guest
+enrollment routes are blocked at the public front door. Each generated tenant
+config has `tokenIssuePath: "/auth/token"` and its per-runtime
+`tokenIssueSecret`; the user unit removes Clerk variables and tenant processes
+do not need a Clerk backend key. Query-token WebSocket compatibility remains
+transport plumbing, not a tenant selector.

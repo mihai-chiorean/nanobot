@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { useClient } from "@/providers/ClientProvider";
+import { useClient } from "@/providers/client-context";
+import { randomId } from "@/lib/id";
 import { toMediaAttachment } from "@/lib/media";
 import type { StreamError } from "@/lib/nanobot-client";
 import type {
@@ -15,6 +16,10 @@ interface StreamBuffer {
   messageId: string;
   /** Sequence of deltas accumulated in order. */
   parts: string[];
+}
+
+function eventText(value: unknown): string {
+  return typeof value === "string" ? value : "";
 }
 
 /**
@@ -78,7 +83,7 @@ export function useNanobotStream(
 
     const handle = (ev: InboundEvent) => {
       if (ev.event === "delta") {
-        const id = buffer.current?.messageId ?? crypto.randomUUID();
+        const id = buffer.current?.messageId ?? randomId();
         if (!buffer.current) {
           buffer.current = { messageId: id, parts: [] };
           setMessages((prev) => [
@@ -93,7 +98,7 @@ export function useNanobotStream(
           ]);
           setIsStreaming(true);
         }
-        buffer.current.parts.push(ev.text);
+        buffer.current.parts.push(eventText(ev.text));
         const combined = buffer.current.parts.join("");
         const targetId = buffer.current.messageId;
         setMessages((prev) =>
@@ -123,10 +128,16 @@ export function useNanobotStream(
         // Attach them to the last trace row if it was the last emitted item
         // so a sequence of calls collapses into one compact trace group.
         if (ev.kind === "tool_hint" || ev.kind === "progress") {
-          const line = ev.text;
+          const line = eventText(ev.text);
+          const traceKind = ev.kind === "tool_hint" ? "tool" : "progress";
           setMessages((prev) => {
             const last = prev[prev.length - 1];
-            if (last && last.kind === "trace" && !last.isStreaming) {
+            if (
+              last &&
+              last.kind === "trace" &&
+              (last.traceKind ?? "tool") === traceKind &&
+              !last.isStreaming
+            ) {
               const merged: UIMessage = {
                 ...last,
                 traces: [...(last.traces ?? [last.content]), line],
@@ -137,9 +148,10 @@ export function useNanobotStream(
             return [
               ...prev,
               {
-                id: crypto.randomUUID(),
+                id: randomId(),
                 role: "tool",
                 kind: "trace",
+                traceKind,
                 content: line,
                 traces: [line],
                 createdAt: Date.now(),
@@ -160,11 +172,11 @@ export function useNanobotStream(
         setIsStreaming(false);
         setMessages((prev) => {
           const filtered = activeId ? prev.filter((m) => m.id !== activeId) : prev;
-          const content = ev.buttons?.length ? (ev.button_prompt ?? ev.text) : ev.text;
+          const content = ev.buttons?.length ? eventText(ev.button_prompt ?? ev.text) : eventText(ev.text);
           return [
             ...filtered,
             {
-              id: crypto.randomUUID(),
+              id: randomId(),
               role: "assistant",
               content,
               createdAt: Date.now(),
@@ -198,7 +210,7 @@ export function useNanobotStream(
       setMessages((prev) => [
         ...prev,
         {
-          id: crypto.randomUUID(),
+          id: randomId(),
           role: "user",
           content,
           createdAt: Date.now(),

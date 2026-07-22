@@ -74,6 +74,7 @@ describe("useNanobotStream", () => {
 
     expect(result.current.messages).toHaveLength(1);
     expect(result.current.messages[0].kind).toBe("trace");
+    expect(result.current.messages[0].traceKind).toBe("tool");
     expect(result.current.messages[0].role).toBe("tool");
     expect(result.current.messages[0].traces).toEqual([
       'weather("get")',

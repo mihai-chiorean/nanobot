@@ -1,15 +1,28 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  Component,
+  type ErrorInfo,
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { SignInButton, SignUpButton, useAuth } from "@clerk/react";
 import { useTranslation } from "react-i18next";
 import { DeleteConfirm } from "@/components/DeleteConfirm";
 import { Sidebar } from "@/components/Sidebar";
+import { ActivityView } from "@/components/activity/ActivityView";
 import { SettingsView } from "@/components/settings/SettingsView";
 import { ThreadShell } from "@/components/thread/ThreadShell";
 import { Sheet, SheetContent } from "@/components/ui/sheet";
-import { preloadMarkdownText } from "@/components/MarkdownText";
+import { Button } from "@/components/ui/button";
+import { preloadMarkdownText } from "@/components/markdown-loader";
 import { useSessions } from "@/hooks/useSessions";
 import { useTheme } from "@/hooks/useTheme";
 import { cn } from "@/lib/utils";
 import { deriveWsUrl, fetchBootstrap } from "@/lib/bootstrap";
+import { shortChatId } from "@/lib/format";
 import { NanobotClient } from "@/lib/nanobot-client";
 import { ClientProvider } from "@/providers/ClientProvider";
 import type { ChatSummary } from "@/lib/types";
@@ -26,7 +39,59 @@ type BootState =
 
 const SIDEBAR_STORAGE_KEY = "nanobot-webui.sidebar";
 const SIDEBAR_WIDTH = 279;
-type ShellView = "chat" | "settings";
+const BOOTSTRAP_REFRESH_LEEWAY_MS = 30_000;
+const BOOTSTRAP_REFRESH_RETRY_MS = 5_000;
+type ShellView = "chat" | "activity" | "settings";
+
+interface ErrorBoundaryState {
+  error: Error | null;
+}
+
+class ErrorBoundary extends Component<
+  { children: ReactNode },
+  ErrorBoundaryState
+> {
+  state: ErrorBoundaryState = { error: null };
+
+  static getDerivedStateFromError(error: Error): ErrorBoundaryState {
+    return { error };
+  }
+
+  componentDidCatch(error: Error, info: ErrorInfo) {
+    console.error("Ziggy Web render error", error, info);
+  }
+
+  render() {
+    if (this.state.error) {
+      return (
+        <div className="flex h-full w-full items-center justify-center px-4 text-center">
+          <div className="flex max-w-md flex-col items-center gap-3">
+            <img
+              src="/brand/ziggy_icon.png"
+              alt=""
+              className="h-10 w-10 opacity-60 grayscale select-none"
+              aria-hidden
+              draggable={false}
+            />
+            <p className="text-lg font-semibold">Something went wrong</p>
+            <p className="text-sm text-muted-foreground">
+              {this.state.error.message}
+            </p>
+            <button
+              type="button"
+              className="rounded-md border border-border px-3 py-1.5 text-sm hover:bg-muted"
+              onClick={() => this.setState({ error: null })}
+            >
+              Try again
+            </button>
+          </div>
+        </div>
+      );
+    }
+
+    return this.props.children;
+  }
+}
 
 function readSidebarOpen(): boolean {
   if (typeof window === "undefined") return true;
@@ -40,28 +105,102 @@ function readSidebarOpen(): boolean {
 }
 
 export default function App() {
+  const { getToken, isLoaded, isSignedIn } = useAuth();
+
+  if (!isLoaded) return <LoadingView />;
+  if (!isSignedIn) return <SignedOutView />;
+  return <AuthenticatedApp getIdentityToken={getToken} />;
+}
+
+function AuthenticatedApp({
+  getIdentityToken,
+}: {
+  getIdentityToken: () => Promise<string | null>;
+}) {
   const { t } = useTranslation();
   const [state, setState] = useState<BootState>({ status: "loading" });
+  const handleModelNameChange = useCallback((modelName: string | null) => {
+    setState((current) =>
+      current.status === "ready" ? { ...current, modelName } : current,
+    );
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
+    let client: NanobotClient | undefined;
+    let refreshTimer: ReturnType<typeof setTimeout> | null = null;
+    let refreshInFlight: Promise<string | null> | null = null;
+    let scheduleRefresh: (expiresIn: number) => void = () => {};
+    let refreshBootstrap: () => Promise<string | null> = async () => null;
+
+    const scheduleRetry = () => {
+      if (cancelled) return;
+      if (refreshTimer) clearTimeout(refreshTimer);
+      refreshTimer = setTimeout(() => {
+        refreshTimer = null;
+        void refreshBootstrap();
+      }, BOOTSTRAP_REFRESH_RETRY_MS);
+    };
+
+    refreshBootstrap = async (): Promise<string | null> => {
+      if (refreshInFlight) return refreshInFlight;
+      refreshInFlight = (async () => {
+        try {
+          const refreshedIdentityToken = await getIdentityToken();
+          if (cancelled) return null;
+          if (!refreshedIdentityToken) throw new Error("Clerk session is unavailable.");
+          const refreshed = await fetchBootstrap(refreshedIdentityToken);
+          if (cancelled) return null;
+          const refreshedUrl = deriveWsUrl(refreshed.ws_path, refreshed.token);
+          // This updates REST credentials and the URL for a future socket;
+          // an already healthy WebSocket remains open.
+          client?.updateUrl(refreshedUrl);
+          setState((current) =>
+            current.status === "ready"
+              ? {
+                  ...current,
+                  token: refreshed.token,
+                  modelName: refreshed.model_name ?? current.modelName,
+                }
+              : current,
+          );
+          scheduleRefresh(refreshed.expires_in);
+          return refreshedUrl;
+        } catch {
+          scheduleRetry();
+          return null;
+        } finally {
+          refreshInFlight = null;
+        }
+      })();
+      return refreshInFlight;
+    };
+
+    scheduleRefresh = (expiresIn: number) => {
+      if (cancelled) return;
+      if (refreshTimer) clearTimeout(refreshTimer);
+      const lifetimeMs = Math.max(0, expiresIn * 1000);
+      const delay = Math.max(1_000, lifetimeMs - BOOTSTRAP_REFRESH_LEEWAY_MS);
+      refreshTimer = setTimeout(() => {
+        refreshTimer = null;
+        void refreshBootstrap();
+      }, delay);
+    };
     (async () => {
       try {
-        const boot = await fetchBootstrap();
+        const identityToken = await getIdentityToken();
+        if (!identityToken) throw new Error("Clerk session is unavailable.");
+        const boot = await fetchBootstrap(identityToken);
         if (cancelled) return;
         const url = deriveWsUrl(boot.ws_path, boot.token);
-        const client = new NanobotClient({
+        client = new NanobotClient({
           url,
           onReauth: async () => {
-            try {
-              const refreshed = await fetchBootstrap();
-              return deriveWsUrl(refreshed.ws_path, refreshed.token);
-            } catch {
-              return null;
-            }
+            return refreshBootstrap();
           },
         });
         client.connect();
+        scheduleRefresh(boot.expires_in);
         setState({
           status: "ready",
           client,
@@ -75,8 +214,10 @@ export default function App() {
     })();
     return () => {
       cancelled = true;
+      if (refreshTimer) clearTimeout(refreshTimer);
+      client?.close();
     };
-  }, []);
+  }, [getIdentityToken]);
 
   useEffect(() => {
     const warm = () => preloadMarkdownText();
@@ -95,34 +236,13 @@ export default function App() {
     return () => globalThis.clearTimeout(id);
   }, []);
 
-  if (state.status === "loading") {
-    return (
-      <div className="flex h-full w-full items-center justify-center">
-        <div className="flex flex-col items-center gap-3 animate-in fade-in-0 duration-300">
-          <img
-            src="/brand/nanobot_icon.png"
-            alt=""
-            className="h-10 w-10 animate-pulse select-none"
-            aria-hidden
-            draggable={false}
-          />
-          <div className="flex items-center gap-2 text-sm text-muted-foreground">
-            <span className="relative flex h-2 w-2">
-              <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-foreground/40" />
-              <span className="relative inline-flex h-2 w-2 rounded-full bg-foreground/60" />
-            </span>
-            {t("app.loading.connecting")}
-          </div>
-        </div>
-      </div>
-    );
-  }
+  if (state.status === "loading") return <LoadingView />;
   if (state.status === "error") {
     return (
       <div className="flex h-full w-full items-center justify-center px-4 text-center">
         <div className="flex max-w-md flex-col items-center gap-3">
           <img
-            src="/brand/nanobot_icon.png"
+            src="/brand/ziggy_icon.png"
             alt=""
             className="h-10 w-10 opacity-60 grayscale select-none"
             aria-hidden
@@ -137,28 +257,82 @@ export default function App() {
       </div>
     );
   }
-
-  const handleModelNameChange = (modelName: string | null) => {
-    setState((current) =>
-      current.status === "ready" ? { ...current, modelName } : current,
-    );
-  };
-
   return (
     <ClientProvider
       client={state.client}
       token={state.token}
       modelName={state.modelName}
     >
-      <Shell onModelNameChange={handleModelNameChange} />
+      <ErrorBoundary>
+        <Shell onModelNameChange={handleModelNameChange} />
+      </ErrorBoundary>
     </ClientProvider>
+  );
+}
+
+function LoadingView() {
+  const { t } = useTranslation();
+  return (
+    <div className="flex h-full w-full items-center justify-center">
+      <div className="flex flex-col items-center gap-3 animate-in fade-in-0 duration-300">
+        <img
+          src="/brand/ziggy_icon.png"
+          alt=""
+          className="h-10 w-10 animate-pulse select-none"
+          aria-hidden
+          draggable={false}
+        />
+        <div className="flex items-center gap-2 text-sm text-muted-foreground">
+          <span className="relative flex h-2 w-2">
+            <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-foreground/40" />
+            <span className="relative inline-flex h-2 w-2 rounded-full bg-foreground/60" />
+          </span>
+          {t("app.loading.connecting")}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function SignedOutView() {
+  return (
+    <main className="flex h-full w-full items-center justify-center bg-background px-6">
+      <div className="flex w-full max-w-xs flex-col items-center gap-6 text-center">
+        <picture>
+          <source srcSet="/brand/ziggy_wordmark.svg" type="image/svg+xml" />
+          <img
+            src="/brand/ziggy_wordmark.png"
+            alt="Ziggy"
+            className="h-10 w-auto select-none object-contain"
+            draggable={false}
+          />
+        </picture>
+        <div className="flex w-full flex-col gap-2">
+          <SignInButton mode="modal">
+            <Button className="w-full">Sign in</Button>
+          </SignInButton>
+          <SignUpButton mode="modal">
+            <Button className="w-full" variant="outline">
+              Create account
+            </Button>
+          </SignUpButton>
+        </div>
+      </div>
+    </main>
   );
 }
 
 function Shell({ onModelNameChange }: { onModelNameChange: (modelName: string | null) => void }) {
   const { t, i18n } = useTranslation();
   const { theme, toggle } = useTheme();
-  const { sessions, loading, refresh, createChat, deleteChat } = useSessions();
+  const {
+    sessions,
+    loading,
+    refresh,
+    createChat,
+    deleteChat,
+    updateSessionPreview,
+  } = useSessions();
   const [activeKey, setActiveKey] = useState<string | null>(null);
   const [view, setView] = useState<ShellView>("chat");
   const [desktopSidebarOpen, setDesktopSidebarOpen] =
@@ -255,7 +429,7 @@ function Shell({ onModelNameChange }: { onModelNameChange: (modelName: string | 
 
   const headerTitle = activeSession
     ? activeSession.preview ||
-      t("chat.fallbackTitle", { id: activeSession.chatId.slice(0, 6) })
+      t("chat.fallbackTitle", { id: shortChatId(activeSession.chatId) })
     : t("app.brand");
 
   useEffect(() => {
@@ -278,6 +452,10 @@ function Shell({ onModelNameChange }: { onModelNameChange: (modelName: string | 
     onRequestDelete: (key: string, label: string) =>
       setPendingDelete({ key, label }),
     activeView: view,
+    onOpenActivity: () => {
+      setView("activity" as const);
+      setMobileSidebarOpen(false);
+    },
     onOpenSettings: () => {
       setView("settings" as const);
       setMobileSidebarOpen(false);
@@ -319,7 +497,16 @@ function Shell({ onModelNameChange }: { onModelNameChange: (modelName: string | 
       </Sheet>
 
       <main className="flex h-full min-w-0 flex-1 flex-col">
-        {view === "settings" ? (
+        {view === "activity" ? (
+          <ActivityView
+            onBackToChat={() => setView("chat")}
+            onOpenChat={(key) => {
+              setActiveKey(key);
+              setView("chat");
+              setMobileSidebarOpen(false);
+            }}
+          />
+        ) : view === "settings" ? (
           <SettingsView
             theme={theme}
             onToggleTheme={toggle}
@@ -333,6 +520,7 @@ function Shell({ onModelNameChange }: { onModelNameChange: (modelName: string | 
             onToggleSidebar={toggleSidebar}
             onGoHome={() => setActiveKey(null)}
             onNewChat={onNewChat}
+            onSessionPreview={updateSessionPreview}
             hideSidebarToggleOnDesktop={desktopSidebarOpen}
           />
         )}

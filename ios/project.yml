@@ -11,6 +11,11 @@ configs:
   Debug: debug
   Release: release
 
+packages:
+  Clerk:
+    url: https://github.com/clerk/clerk-ios.git
+    from: 1.3.2
+
 configFiles:
   Debug: Config/Base.xcconfig
   Release: Config/Base.xcconfig
@@ -29,11 +34,17 @@ targets:
     platform: iOS
     sources:
       - path: Ziggy
+    dependencies:
+      - package: Clerk
+        product: ClerkKit
+      - package: Clerk
+        product: ClerkKitUI
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.mihaichiorean.ziggy
         PRODUCT_NAME: Ziggy
-        GENERATE_INFOPLIST_FILE: true
+        GENERATE_INFOPLIST_FILE: false
+        INFOPLIST_FILE: Ziggy/Resources/Info.plist
         INFOPLIST_KEY_CFBundleDisplayName: Ziggy
         INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.productivity
         INFOPLIST_KEY_NSMicrophoneUsageDescription: Ziggy uses the microphone when you dictate a prompt.
@@ -98,6 +109,6 @@ schemes:
       targets:
         - ZiggyLiveUITests
       environmentVariables:
-        ZIGGY_GUEST_CODE: "$(ZIGGY_GUEST_CODE)"
+        ZIGGY_LIVE_SESSION_READY: "$(ZIGGY_LIVE_SESSION_READY)"
         ZIGGY_SERVER_URL: "$(ZIGGY_SERVER_URL)"
         ZIGGY_THEME: "$(ZIGGY_THEME)"

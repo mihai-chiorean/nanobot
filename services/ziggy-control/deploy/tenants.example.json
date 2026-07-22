@@ -7,6 +7,7 @@
       "email": "owner@example.com",
       "clerk_subject": "user_replace_with_clerk_subject",
       "upstream_url": "http://100.64.0.10:18792",
+      "upstream_bootstrap_secret": "replace-with-32-or-more-random-characters",
       "status": "active",
       "legacy_default": true
     },
@@ -15,6 +16,7 @@
       "workspace_id": "ws_replace_with_stable_id_2",
       "email": "tester@example.com",
       "upstream_url": "http://100.64.0.10:18802",
+      "upstream_bootstrap_secret": "replace-with-a-different-random-secret",
       "status": "active"
     }
   ]

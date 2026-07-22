@@ -11,34 +11,43 @@ import hmac
 import http
 import json
 import mimetypes
+import os
 import re
 import secrets
 import shutil
 import ssl
+import stat
 import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self
 from urllib.parse import parse_qs, unquote, urlparse
 
 from loguru import logger
 from pydantic import Field, field_validator, model_validator
-from websockets.asyncio.server import ServerConnection, serve
 from websockets.datastructures import Headers
 from websockets.exceptions import ConnectionClosed
 from websockets.http11 import Request as WsRequest
 from websockets.http11 import Response
 
-from nanobot.bus.events import OutboundMessage
+from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
-from nanobot.config.paths import get_media_dir
+from nanobot.config.paths import get_media_dir, get_workspace_path
 from nanobot.config.schema import Base
+from nanobot.security.clerk import (
+    ClerkAuthenticationError,
+    ClerkAuthorizationError,
+    ClerkTokenVerifier,
+    ClerkUnavailableError,
+)
 from nanobot.utils.helpers import safe_filename
 from nanobot.utils.media_decode import (
     FileSizeExceeded,
     save_base64_data_url,
 )
+from nanobot.work.store import ACTIVE_STATUSES, MAX_EVENT_PAGE, WorkStore
 
 if TYPE_CHECKING:
     from nanobot.session.manager import SessionManager
@@ -52,6 +61,21 @@ def _strip_trailing_slash(path: str) -> str:
 
 def _normalize_config_path(path: str) -> str:
     return _strip_trailing_slash(path)
+
+
+def _contains_symlink_component(path: Path) -> bool:
+    """Return whether *path* contains a symlink component."""
+    current = Path(path.anchor)
+    for part in path.parts:
+        if part == path.anchor:
+            continue
+        current /= part
+        try:
+            if current.is_symlink():
+                return True
+        except OSError:
+            return True
+    return False
 
 
 def _append_buttons_as_text(text: str, buttons: list[list[str]]) -> str:
@@ -91,6 +115,11 @@ class WebSocketConfig(Base):
     token_issue_secret: str = ""
     token_ttl_s: int = Field(default=300, ge=30, le=86_400)
     websocket_requires_token: bool = True
+    auth_jwks_url: str = ""
+    auth_issuer: str = ""
+    auth_audience: str = ""
+    auth_allowed_emails: list[str] = Field(default_factory=list)
+    auth_authorized_parties: list[str] = Field(default_factory=list)
     allow_from: list[str] = Field(default_factory=lambda: ["*"])
     streaming: bool = True
     # Default 36 MB, upper 40 MB: supports up to 4 images at ~6 MB each after
@@ -98,7 +127,8 @@ class WebSocketConfig(Base):
     # (base64 overhead) + envelope framing stays under 36 MB; the 40 MB ceiling
     # leaves a small margin for sender slop without opening a DoS avenue.
     max_message_bytes: int = Field(default=37_748_736, ge=1024, le=41_943_040)
-    ping_interval_s: float = Field(default=20.0, ge=5.0, le=300.0)
+    # Set to null when a client-owned heartbeat is responsible for liveness.
+    ping_interval_s: float | None = Field(default=20.0, ge=5.0, le=300.0)
     ping_timeout_s: float = Field(default=20.0, ge=5.0, le=300.0)
     ssl_certfile: str = ""
     ssl_keyfile: str = ""
@@ -145,6 +175,11 @@ def _http_json_response(data: dict[str, Any], *, status: int = 200) -> Response:
 
 def _read_webui_model_name() -> str | None:
     """Return the configured default model for readonly webui display."""
+    from nanobot.model_runtime import read_status
+
+    active = read_status().get("active_model")
+    if isinstance(active, str) and active.strip():
+        return active.strip()
     try:
         from nanobot.config.loader import load_config
 
@@ -272,6 +307,8 @@ _LOCALHOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 # Matches the legacy chat-id pattern but allows file-system-safe stems too,
 # so the API can address sessions whose keys came from non-WebSocket channels.
 _API_KEY_RE = re.compile(r"^[A-Za-z0-9_:.-]{1,128}$")
+_WORK_ID_RE = re.compile(r"^work_[0-9a-f]{32}$")
+_ARTIFACT_ID_RE = re.compile(r"^artifact_[0-9a-f]{32}$")
 
 
 def _decode_api_key(raw_key: str) -> str | None:
@@ -280,6 +317,22 @@ def _decode_api_key(raw_key: str) -> str | None:
     if _API_KEY_RE.match(key) is None:
         return None
     return key
+
+
+def _decode_id(raw_value: str, pattern: re.Pattern[str]) -> str | None:
+    value = unquote(raw_value)
+    return value if pattern.fullmatch(value) is not None else None
+
+
+def _request_json(request: Any) -> dict[str, Any] | None:
+    body = getattr(request, "body", b"")
+    if not body:
+        return {}
+    try:
+        data = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def _is_localhost(connection: Any) -> bool:
@@ -392,6 +445,7 @@ class WebSocketChannel(BaseChannel):
         *,
         session_manager: "SessionManager | None" = None,
         static_dist_path: Path | None = None,
+        active_session_keys: Callable[[], set[str]] | None = None,
     ):
         if isinstance(config, dict):
             config = WebSocketConfig.model_validate(config)
@@ -403,13 +457,28 @@ class WebSocketChannel(BaseChannel):
         self._conn_chats: dict[Any, set[str]] = {}
         # connection -> default chat_id for legacy frames that omit routing.
         self._conn_default: dict[Any, str] = {}
+        # task_id -> WebSocket subscribers for durable Work events.
+        self._work_subs: dict[str, set[Any]] = {}
+        self._conn_work: dict[Any, set[str]] = {}
         # Single-use tokens consumed at WebSocket handshake.
         self._issued_tokens: dict[str, float] = {}
         # Multi-use tokens for the embedded webui's REST surface; checked but not consumed.
         self._api_tokens: dict[str, float] = {}
+        self._clerk_verifier = ClerkTokenVerifier(
+            issuer=config.auth_issuer,
+            jwks_url=config.auth_jwks_url,
+            audience=config.auth_audience,
+            allowed_emails=config.auth_allowed_emails,
+            authorized_parties=config.auth_authorized_parties,
+            secret_key=os.environ.get("CLERK_SECRET_KEY", ""),
+        )
         self._stop_event: asyncio.Event | None = None
         self._server_task: asyncio.Task[None] | None = None
         self._session_manager = session_manager
+        self._active_session_keys = active_session_keys
+        self._work_store = (
+            WorkStore(session_manager.workspace) if session_manager is not None else None
+        )
         self._static_dist_path: Path | None = (
             static_dist_path.resolve() if static_dist_path is not None else None
         )
@@ -437,6 +506,14 @@ class WebSocketChannel(BaseChannel):
             if not subs:
                 self._subs.pop(cid, None)
         self._conn_default.pop(connection, None)
+        task_ids = self._conn_work.pop(connection, set())
+        for task_id in task_ids:
+            subscribers = self._work_subs.get(task_id)
+            if subscribers is None:
+                continue
+            subscribers.discard(connection)
+            if not subscribers:
+                self._work_subs.pop(task_id, None)
 
     async def _send_event(self, connection: Any, event: str, **fields: Any) -> None:
         """Send a control event (attached, error, ...) to a single connection."""
@@ -449,6 +526,10 @@ class WebSocketChannel(BaseChannel):
             self._cleanup_connection(connection)
         except Exception as e:
             logger.warning("websocket: failed to send {} event: {}", event, e)
+
+    def _attach_work(self, connection: Any, task_id: str) -> None:
+        self._work_subs.setdefault(task_id, set()).add(connection)
+        self._conn_work.setdefault(connection, set()).add(task_id)
 
     @classmethod
     def default_config(cls) -> dict[str, Any]:
@@ -516,7 +597,11 @@ class WebSocketChannel(BaseChannel):
         self._issued_tokens[token_value] = time.monotonic() + float(self.config.token_ttl_s)
 
         return _http_json_response(
-            {"token": token_value, "expires_in": self.config.token_ttl_s}
+            {
+                "token": token_value,
+                "expires_in": self.config.token_ttl_s,
+                "ws_path": self._expected_path(),
+            }
         )
 
     # -- HTTP dispatch ------------------------------------------------------
@@ -524,35 +609,107 @@ class WebSocketChannel(BaseChannel):
     async def _dispatch_http(self, connection: Any, request: WsRequest) -> Any:
         """Route an inbound HTTP request to a handler or to the WS upgrade path."""
         got, query = _parse_request_path(request.path)
+        method = getattr(request, "method", "GET").upper()
 
         # 1. Token issue endpoint (legacy, optional, gated by configured secret).
         if self.config.token_issue_path:
             issue_expected = _normalize_config_path(self.config.token_issue_path)
             if got == issue_expected:
+                if method != "GET":
+                    return _http_error(405, "Method Not Allowed")
                 return self._handle_token_issue_http(connection, request)
+
+        if got == "/auth/bootstrap":
+            if method != "GET":
+                return _http_error(405, "Method Not Allowed")
+            return await self._handle_auth_bootstrap(request)
 
         # 2. WebUI bootstrap: localhost-only, mints tokens for the embedded UI.
         if got == "/webui/bootstrap":
+            if method != "GET":
+                return _http_error(405, "Method Not Allowed")
             return self._handle_webui_bootstrap(connection)
 
         # 3. REST surface for the embedded UI.
         if got == "/api/sessions":
+            if method != "GET":
+                return _http_error(405, "Method Not Allowed")
             return self._handle_sessions_list(request)
 
+        if got == "/api/activity":
+            if method != "GET":
+                return _http_error(405, "Method Not Allowed")
+            return self._handle_activity(request)
+
+        if got == "/api/work":
+            if method == "GET":
+                return await self._handle_work_list(request)
+            if method == "POST":
+                return await self._handle_work_create(request)
+            return _http_error(405, "Method Not Allowed")
+
+        match = re.match(r"^/api/work/artifacts/([^/]+)$", got)
+        if match:
+            if method != "GET":
+                return _http_error(405, "Method Not Allowed")
+            return await self._handle_work_artifact(request, match.group(1))
+
+        match = re.match(r"^/api/work/([^/]+)/events$", got)
+        if match:
+            if method != "GET":
+                return _http_error(405, "Method Not Allowed")
+            return await self._handle_work_events(request, match.group(1))
+
+        match = re.match(r"^/api/work/([^/]+)/cancel$", got)
+        if match:
+            if method != "POST":
+                return _http_error(405, "Method Not Allowed")
+            return await self._handle_work_cancel(request, match.group(1))
+
+        match = re.match(r"^/api/work/([^/]+)/message$", got)
+        if match:
+            if method != "POST":
+                return _http_error(405, "Method Not Allowed")
+            return await self._handle_work_message(request, match.group(1))
+
+        match = re.match(r"^/api/work/([^/]+)$", got)
+        if match:
+            if method != "GET":
+                return _http_error(405, "Method Not Allowed")
+            return await self._handle_work_detail(request, match.group(1))
+
+        if got == "/api/model/status":
+            if method != "GET":
+                return _http_error(405, "Method Not Allowed")
+            return self._handle_model_status(request)
+
+        if got == "/api/model/switch":
+            if method != "POST":
+                return _http_error(405, "Method Not Allowed")
+            return self._handle_model_switch(request)
+
         if got == "/api/settings":
+            if method != "GET":
+                return _http_error(405, "Method Not Allowed")
             return self._handle_settings(request)
 
         if got == "/api/settings/update":
+            if method not in {"GET", "POST"}:
+                return _http_error(405, "Method Not Allowed")
             return self._handle_settings_update(request)
 
         m = re.match(r"^/api/sessions/([^/]+)/messages$", got)
         if m:
+            if method != "GET":
+                return _http_error(405, "Method Not Allowed")
             return self._handle_session_messages(request, m.group(1))
 
         # NOTE: websockets' HTTP parser only accepts GET, so we cannot expose a
         # true ``DELETE`` verb. The action is folded into the path instead.
         m = re.match(r"^/api/sessions/([^/]+)/delete$", got)
         if m:
+            if method not in {"GET", "POST"}:
+                return _http_error(405, "Method Not Allowed")
             return self._handle_session_delete(request, m.group(1))
 
         # Signed media fetch: ``<sig>`` is an HMAC over ``<payload>``; the
@@ -561,6 +718,8 @@ class WebSocketChannel(BaseChannel):
         # these URLs when replaying a session.
         m = re.match(r"^/api/media/([A-Za-z0-9_-]+)/([A-Za-z0-9_-]+)$", got)
         if m:
+            if method != "GET":
+                return _http_error(405, "Method Not Allowed")
             return self._handle_media_fetch(m.group(1), m.group(2))
 
         # 4. WebSocket upgrade (the channel's primary purpose). Only run the
@@ -568,7 +727,7 @@ class WebSocketChannel(BaseChannel):
         # a bare ``GET /`` from the browser would be rejected as an
         # unauthorized WS handshake instead of serving the SPA's index.html.
         expected_ws = self._expected_path()
-        if got == expected_ws and _is_websocket_upgrade(request):
+        if method == "GET" and got == expected_ws and _is_websocket_upgrade(request):
             client_id = _query_first(query, "client_id") or ""
             if len(client_id) > 128:
                 client_id = client_id[:128]
@@ -577,7 +736,7 @@ class WebSocketChannel(BaseChannel):
             return self._authorize_websocket_handshake(connection, query)
 
         # 5. Static SPA serving (only if a build directory was wired in).
-        if self._static_dist_path is not None:
+        if method == "GET" and self._static_dist_path is not None:
             response = self._serve_static(got)
             if response is not None:
                 return response
@@ -589,9 +748,7 @@ class WebSocketChannel(BaseChannel):
     def _check_api_token(self, request: WsRequest) -> bool:
         """Validate a request against the API token pool (multi-use, TTL-bound)."""
         self._purge_expired_api_tokens()
-        token = _bearer_token(request.headers) or _query_first(
-            _parse_query(request.path), "token"
-        )
+        token = _bearer_token(request.headers)
         if not token:
             return False
         expiry = self._api_tokens.get(token)
@@ -607,8 +764,30 @@ class WebSocketChannel(BaseChannel):
                 self._api_tokens.pop(token_key, None)
 
     def _handle_webui_bootstrap(self, connection: Any) -> Response:
+        if self._clerk_verifier.enabled:
+            return _http_error(404, "Not Found")
         if not _is_localhost(connection):
             return _http_error(403, "webui bootstrap is localhost-only")
+        return self._mint_transport_token()
+
+    async def _handle_auth_bootstrap(self, request: WsRequest) -> Response:
+        token = _bearer_token(request.headers)
+        if not token:
+            return _http_json_response({"error": "authentication required"}, status=401)
+        try:
+            await self._clerk_verifier.verify(token)
+        except ClerkAuthenticationError:
+            return _http_json_response({"error": "authentication required"}, status=401)
+        except ClerkAuthorizationError:
+            return _http_json_response({"error": "forbidden"}, status=403)
+        except ClerkUnavailableError:
+            logger.warning("websocket: Clerk bootstrap verification unavailable")
+            return _http_json_response(
+                {"error": "identity verification unavailable"}, status=503
+            )
+        return self._mint_transport_token()
+
+    def _mint_transport_token(self) -> Response:
         # Cap outstanding tokens to avoid runaway growth from a misbehaving client.
         self._purge_expired_issued_tokens()
         self._purge_expired_api_tokens()
@@ -653,6 +832,373 @@ class WebSocketChannel(BaseChannel):
         ]
         return _http_json_response({"sessions": cleaned})
 
+    @staticmethod
+    def _message_text(content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return " ".join(
+                item["text"]
+                for item in content
+                if isinstance(item, dict) and isinstance(item.get("text"), str)
+            )
+        return ""
+
+    @classmethod
+    def _session_preview(cls, messages: list[Any]) -> str:
+        for message in messages:
+            if not isinstance(message, dict) or message.get("role") != "user":
+                continue
+            text = " ".join(cls._message_text(message.get("content", "")).split())
+            if text:
+                return text[:160]
+            media = message.get("media")
+            if isinstance(media, list) and media:
+                return "Media attachment"
+        return ""
+
+    @staticmethod
+    def _activity_status(messages: list[Any], live: bool) -> str:
+        if live:
+            return "active"
+        for message in reversed(messages):
+            if not isinstance(message, dict):
+                continue
+            if message.get("role") == "assistant" and message.get("buttons"):
+                return "waiting"
+            if message.get("role") in {"user", "assistant"}:
+                break
+        return "idle"
+
+    def _handle_activity(self, request: WsRequest) -> Response:
+        if not self._check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        if self._session_manager is None:
+            return _http_error(503, "session manager unavailable")
+        active_keys = self._active_session_keys() if self._active_session_keys else set()
+        items: list[dict[str, Any]] = []
+        for session in self._session_manager.list_sessions():
+            key = session.get("key")
+            if not isinstance(key, str) or not self._is_webui_session_key(key):
+                continue
+            payload = self._session_manager.read_session_file(key)
+            messages = payload.get("messages", []) if isinstance(payload, dict) else []
+            if not isinstance(messages, list):
+                messages = []
+            chat_id = key.split(":", 1)[1]
+            live = key in active_keys
+            last = next(
+                (message for message in reversed(messages) if isinstance(message, dict)),
+                {},
+            )
+            last_role = last.get("role")
+            last_text = self._message_text(last.get("content", ""))
+            items.append(
+                {
+                    "key": key,
+                    "chat_id": chat_id,
+                    "created_at": session.get("created_at"),
+                    "updated_at": session.get("updated_at"),
+                    "preview": self._session_preview(messages),
+                    "status": self._activity_status(messages, live),
+                    "live": live,
+                    "message_count": len(messages),
+                    "last_role": last_role if isinstance(last_role, str) else None,
+                    "last_text": " ".join(last_text.split())[:240],
+                }
+            )
+        return _http_json_response({"activity": items})
+
+    async def _handle_work_list(self, request: WsRequest) -> Response:
+        if not self._check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        if self._work_store is None:
+            return _http_error(503, "work store unavailable")
+        query = _parse_query(request.path)
+        status = _query_first(query, "status")
+        try:
+            limit = int(_query_first(query, "limit") or "50")
+        except ValueError:
+            limit = 50
+        tasks = await self._work_store.run_io(
+            self._work_store.list_tasks, status=status, limit=limit
+        )
+        return _http_json_response({"tasks": tasks})
+
+    async def _handle_work_create(self, request: WsRequest) -> Response:
+        if not self._check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        if self._work_store is None:
+            return _http_error(503, "work store unavailable")
+        body = _request_json(request)
+        if body is None:
+            return _http_error(400, "invalid JSON body")
+        chat_id = body.get("chat_id")
+        content = body.get("content")
+        if not _is_valid_chat_id(chat_id):
+            return _http_error(400, "invalid chat_id")
+        if not isinstance(content, str) or not content.strip():
+            return _http_error(400, "content is required")
+        media_paths, media_error = self._work_media(body.get("media"))
+        if media_error is not None:
+            return _http_error(400, f"media rejected: {media_error}")
+        task = await self._work_store.run_io(
+            self._work_store.create_task,
+            chat_id=chat_id,
+            content=content,
+            mode="background",
+            title=body.get("title") if isinstance(body.get("title"), str) else None,
+            model=_read_webui_model_name() or "",
+        )
+        task_id = str(task["task_id"])
+        try:
+            await self._publish_work_inbound(
+                task,
+                sender_id="rest",
+                content=content,
+                media=media_paths,
+            )
+        except Exception:
+            logger.exception("failed to enqueue REST Work task {}", task_id)
+            await self._fail_work_enqueue(task_id)
+            return _http_error(503, "failed to enqueue work")
+        return _http_json_response({"task": task}, status=201)
+
+    async def _handle_work_detail(
+        self, request: WsRequest, raw_task_id: str
+    ) -> Response:
+        if not self._check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        if self._work_store is None:
+            return _http_error(503, "work store unavailable")
+        task_id = _decode_id(raw_task_id, _WORK_ID_RE)
+        if task_id is None:
+            return _http_error(400, "invalid task id")
+        task = await self._work_store.run_io(self._work_store.task_snapshot, task_id)
+        if task is None:
+            return _http_error(404, "task not found")
+        self._augment_work_artifact_urls(task)
+        return _http_json_response({"task": task})
+
+    async def _handle_work_events(
+        self, request: WsRequest, raw_task_id: str
+    ) -> Response:
+        if not self._check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        if self._work_store is None:
+            return _http_error(503, "work store unavailable")
+        task_id = _decode_id(raw_task_id, _WORK_ID_RE)
+        if task_id is None:
+            return _http_error(400, "invalid task id")
+        if await self._work_store.run_io(self._work_store.get_task, task_id) is None:
+            return _http_error(404, "task not found")
+        query = _parse_query(request.path)
+        after_raw = _query_first(query, "after") or _query_first(query, "after_seq") or "0"
+        try:
+            after_seq = max(0, int(after_raw))
+        except ValueError:
+            return _http_error(400, "after must be an integer")
+        try:
+            limit = max(
+                1,
+                min(MAX_EVENT_PAGE, int(_query_first(query, "limit") or MAX_EVENT_PAGE)),
+            )
+        except ValueError:
+            return _http_error(400, "limit must be an integer")
+        events = await self._work_store.run_io(
+            self._work_store.list_events,
+            task_id,
+            after_seq=after_seq,
+            limit=limit,
+        )
+        next_after_seq = events[-1]["seq"] if events else after_seq
+        return _http_json_response(
+            {
+                "events": events,
+                "has_more": len(events) == limit,
+                "next_after_seq": next_after_seq,
+            }
+        )
+
+    async def _handle_work_cancel(
+        self, request: WsRequest, raw_task_id: str
+    ) -> Response:
+        if not self._check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        if self._work_store is None:
+            return _http_error(503, "work store unavailable")
+        task_id = _decode_id(raw_task_id, _WORK_ID_RE)
+        if task_id is None:
+            return _http_error(400, "invalid task id")
+        task = await self._work_store.run_io(self._work_store.get_task, task_id)
+        if task is None:
+            return _http_error(404, "task not found")
+        error = await self._cancel_work_task(task, sender_id="rest")
+        if error == "terminal":
+            return _http_error(409, "task is already complete")
+        if error is not None:
+            return _http_error(503, "failed to signal cancellation")
+        current = await self._work_store.run_io(self._work_store.get_task, task_id)
+        return _http_json_response({"task": current})
+
+    async def _handle_work_message(
+        self, request: WsRequest, raw_task_id: str
+    ) -> Response:
+        if not self._check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        if self._work_store is None:
+            return _http_error(503, "work store unavailable")
+        task_id = _decode_id(raw_task_id, _WORK_ID_RE)
+        if task_id is None:
+            return _http_error(400, "invalid task id")
+        task = await self._work_store.run_io(self._work_store.get_task, task_id)
+        if task is None:
+            return _http_error(404, "task not found")
+        if task.get("status") not in ACTIVE_STATUSES:
+            return _http_error(409, "task does not accept messages")
+        body = _request_json(request)
+        content = body.get("content") if body is not None else None
+        if not isinstance(content, str) or not content.strip():
+            return _http_error(400, "content is required")
+        chat_id = str(task.get("chat_id") or "")
+        if not _is_valid_chat_id(chat_id):
+            return _http_error(500, "task chat is invalid")
+        try:
+            await self._publish_work_inbound(
+                task,
+                sender_id="rest",
+                content=content,
+            )
+        except Exception:
+            logger.exception("failed to enqueue message for Work task {}", task_id)
+            return _http_error(503, "failed to enqueue work message")
+        await self._record_work_message(task_id, content)
+        return _http_json_response({"accepted": True, "task_id": task_id}, status=202)
+
+    async def _publish_work_inbound(
+        self,
+        task: dict[str, Any],
+        *,
+        sender_id: str,
+        content: str,
+        media: list[str] | None = None,
+        remote: Any = None,
+    ) -> None:
+        task_id = str(task["task_id"])
+        session_key = str(task.get("session_key") or "")
+        chat_id = str(task.get("chat_id") or "")
+        if not session_key or not _is_valid_chat_id(chat_id):
+            raise ValueError("Work task routing is invalid")
+        metadata: dict[str, Any] = {
+            "_wants_stream": True,
+            "work_task_id": task_id,
+            "work_mode": "background",
+        }
+        if remote is not None:
+            metadata["remote"] = remote
+        await self.bus.publish_inbound(
+            InboundMessage(
+                channel=self.name,
+                sender_id=sender_id,
+                chat_id=chat_id,
+                content=content,
+                media=media or [],
+                metadata=metadata,
+                session_key_override=session_key,
+            )
+        )
+
+    async def _fail_work_enqueue(self, task_id: str) -> None:
+        assert self._work_store is not None
+        event = await self._work_store.run_io(
+            self._work_store.update_status,
+            task_id,
+            "failed",
+            error="Failed to enqueue Work task.",
+        )
+        if event is not None:
+            await self._broadcast_work_event(event)
+
+    async def _record_work_message(self, task_id: str, content: str) -> None:
+        assert self._work_store is not None
+        event = await self._work_store.run_io(
+            self._work_store.append_event,
+            task_id,
+            "message.received",
+            {"content": content},
+            actor="user",
+        )
+        if event is not None:
+            await self._broadcast_work_event(event)
+
+    async def _cancel_work_task(
+        self, task: dict[str, Any], *, sender_id: str
+    ) -> str | None:
+        assert self._work_store is not None
+        if task.get("status") not in ACTIVE_STATUSES:
+            return "terminal"
+        try:
+            await self._publish_work_inbound(
+                task,
+                sender_id=sender_id,
+                content="/stop",
+            )
+        except Exception:
+            logger.exception("failed to signal cancellation for Work task {}", task["task_id"])
+            return "publish_failed"
+        task_id = str(task["task_id"])
+        event = await self._work_store.run_io(
+            self._work_store.update_status, task_id, "cancelled"
+        )
+        if event is None:
+            current = await self._work_store.run_io(self._work_store.get_task, task_id)
+            if current is not None and current.get("status") == "cancelled":
+                return None
+            return "terminal"
+        await self._broadcast_work_event(event)
+        return None
+
+    async def _handle_work_artifact(
+        self, request: WsRequest, raw_artifact_id: str
+    ) -> Any:
+        if not self._check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        if self._work_store is None:
+            return _http_error(503, "work store unavailable")
+        artifact_id = _decode_id(raw_artifact_id, _ARTIFACT_ID_RE)
+        if artifact_id is None:
+            return _http_error(400, "invalid artifact id")
+        item = await self._work_store.run_io(
+            self._work_store.artifact_path, artifact_id
+        )
+        if item is None:
+            return _http_error(404, "artifact not found")
+        path, metadata = item
+        mime = metadata.get("mime")
+        if not isinstance(mime, str) or not mime:
+            mime = "application/octet-stream"
+        from nanobot.channels.websocket_server import TransportFileResponse
+
+        return TransportFileResponse(
+            path=path,
+            content_type=mime,
+            headers={
+                "Cache-Control": "private, no-store",
+                "X-Content-Type-Options": "nosniff",
+                "Content-Disposition": (
+                    f'attachment; filename="{metadata.get("name", "artifact")}"'
+                ),
+            },
+        )
+
+    @staticmethod
+    def _work_media(raw_media: Any) -> tuple[list[str], str | None]:
+        if raw_media is None:
+            return [], None
+        if not isinstance(raw_media, list):
+            return [], "malformed"
+        return WebSocketChannel._save_envelope_media(raw_media)
+
     def _settings_payload(self, *, requires_restart: bool = False) -> dict[str, Any]:
         from nanobot.config.loader import get_config_path, load_config
         from nanobot.providers.registry import PROVIDERS, find_by_name
@@ -681,6 +1227,7 @@ class WebSocketChannel(BaseChannel):
             "runtime": {
                 "config_path": str(get_config_path().expanduser()),
             },
+            "model_runtime": self._model_status_payload(),
             "requires_restart": requires_restart,
         }
 
@@ -721,6 +1268,51 @@ class WebSocketChannel(BaseChannel):
         if changed:
             save_config(config)
         return _http_json_response(self._settings_payload(requires_restart=changed))
+
+    @staticmethod
+    def _model_status_payload() -> dict[str, Any]:
+        from nanobot.model_runtime import read_status
+
+        return read_status()
+
+    def _handle_model_status(self, request: WsRequest) -> Response:
+        if not self._check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        return _http_json_response({"model_runtime": self._model_status_payload()})
+
+    def _handle_model_switch(self, request: WsRequest) -> Response:
+        if not self._check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        from nanobot.model_runtime import (
+            ModelSwitchInProgressError,
+            ModelSwitchUnavailableError,
+            request_switch,
+        )
+
+        query = _parse_query(request.path)
+        body = _request_json(request)
+        if body is None:
+            return _http_error(400, "invalid JSON body")
+        raw_target = body.get("target") or _query_first(query, "target") or ""
+        target = str(raw_target).strip().lower()
+        if target not in {"qwen", "minimax"}:
+            return _http_error(400, "target must be qwen or minimax")
+        raw_force = body.get("force", _query_first(query, "force"))
+        force = raw_force is True or str(raw_force or "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+        try:
+            status = request_switch(target, force=force)
+        except ModelSwitchInProgressError as exc:
+            return _http_error(409, str(exc))
+        except ModelSwitchUnavailableError as exc:
+            return _http_error(503, str(exc))
+        except Exception:
+            logger.exception("failed to start model switch")
+            return _http_error(500, "failed to start model switch")
+        return _http_json_response({"model_runtime": status}, status=202)
 
     @staticmethod
     def _is_webui_session_key(key: str) -> bool:
@@ -766,20 +1358,52 @@ class WebSocketChannel(BaseChannel):
             if not isinstance(msg, dict):
                 continue
             media = msg.get("media")
-            if not isinstance(media, list) or not media:
-                continue
             urls: list[dict[str, str]] = []
-            for entry in media:
-                if not isinstance(entry, str) or not entry:
-                    continue
-                signed = self._sign_media_path(Path(entry))
-                if signed is None:
-                    continue
-                urls.append({"url": signed, "name": Path(entry).name})
+            if isinstance(media, list):
+                for entry in media:
+                    if not isinstance(entry, str) or not entry:
+                        continue
+                    signed = self._sign_media_path(Path(entry))
+                    if signed is None:
+                        continue
+                    urls.append({"url": signed, "name": Path(entry).name})
+                # Always drop raw filesystem paths from the wire payload.
+                msg.pop("media", None)
+            urls.extend(self._work_artifact_media_urls(msg.get("work_artifacts")))
             if urls:
-                msg["media_urls"] = urls
-            # Always drop the raw paths from the wire payload.
-            msg.pop("media", None)
+                msg["media_urls"] = [*(msg.get("media_urls") or []), *urls]
+
+    @staticmethod
+    def _work_artifact_url(artifact_id: str) -> str:
+        return f"/api/work/artifacts/{artifact_id}"
+
+    def _work_artifact_media_urls(self, artifacts: Any) -> list[dict[str, str]]:
+        if not isinstance(artifacts, list):
+            return []
+        urls: list[dict[str, str]] = []
+        for artifact in artifacts:
+            if not isinstance(artifact, dict):
+                continue
+            artifact_id = artifact.get("artifact_id")
+            if not isinstance(artifact_id, str) or _ARTIFACT_ID_RE.fullmatch(artifact_id) is None:
+                continue
+            item = {"url": self._work_artifact_url(artifact_id)}
+            name = artifact.get("name")
+            if isinstance(name, str) and name:
+                item["name"] = name
+            urls.append(item)
+        return urls
+
+    def _augment_work_artifact_urls(self, task: dict[str, Any]) -> None:
+        artifacts = task.get("artifacts")
+        if not isinstance(artifacts, list):
+            return
+        for artifact in artifacts:
+            if not isinstance(artifact, dict):
+                continue
+            artifact_id = artifact.get("artifact_id")
+            if isinstance(artifact_id, str) and _ARTIFACT_ID_RE.fullmatch(artifact_id):
+                artifact["url"] = self._work_artifact_url(artifact_id)
 
     def _sign_media_path(self, abs_path: Path) -> str | None:
         """Return a ``/api/media/<sig>/<payload>`` URL for *abs_path*, or
@@ -791,6 +1415,8 @@ class WebSocketChannel(BaseChannel):
         client joins it against the existing webui base.
         """
         try:
+            if _contains_symlink_component(abs_path):
+                return None
             media_root = get_media_dir().resolve()
             rel = abs_path.resolve().relative_to(media_root)
         except (OSError, ValueError):
@@ -801,32 +1427,70 @@ class WebSocketChannel(BaseChannel):
         ).digest()[:16]
         return f"/api/media/{_b64url_encode(mac)}/{payload}"
 
+    def _allowed_outbound_media(self, path: Path) -> Path | None:
+        """Resolve an outbound source under this tenant's allowed roots."""
+        if _contains_symlink_component(path):
+            return None
+        workspace = (
+            self._session_manager.workspace
+            if self._session_manager is not None
+            else get_workspace_path()
+        )
+        try:
+            resolved = path.resolve(strict=True)
+            roots = (Path(workspace).resolve(strict=False), get_media_dir().resolve(strict=False))
+            if not any(resolved == root or root in resolved.parents for root in roots):
+                return None
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(resolved, flags)
+            try:
+                if not stat.S_ISREG(os.fstat(fd).st_mode):
+                    return None
+            finally:
+                os.close(fd)
+        except (OSError, ValueError):
+            return None
+        return resolved
+
     def _sign_or_stage_media_path(self, path: Path) -> dict[str, str] | None:
         """Return a signed media URL payload for *path*.
 
         Persisted inbound media already lives under ``get_media_dir`` and can
-        be signed directly. Outbound bot-generated files may live anywhere on
-        disk; copy those into the websocket media bucket first so the browser
-        can fetch them through the existing signed media route without
-        exposing arbitrary filesystem paths.
+        be signed directly. Workspace files are copied into the websocket
+        media bucket first so the browser can fetch them through the existing
+        signed media route without exposing arbitrary filesystem paths.
         """
-        signed = self._sign_media_path(path)
+        resolved = self._allowed_outbound_media(path)
+        if resolved is None:
+            return None
+        signed = self._sign_media_path(resolved)
         if signed is not None:
-            return {"url": signed, "name": path.name}
+            return {"url": signed, "name": resolved.name}
         try:
-            if not path.is_file():
-                return None
             media_dir = get_media_dir("websocket")
-            safe_name = safe_filename(path.name) or "attachment"
+            safe_name = safe_filename(resolved.name) or "attachment"
             staged = media_dir / f"{uuid.uuid4().hex[:12]}-{safe_name}"
-            shutil.copyfile(path, staged)
+            source_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            source_fd = os.open(resolved, source_flags)
+            try:
+                staged_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+                staged_fd = os.open(staged, staged_flags, 0o600)
+                try:
+                    with os.fdopen(source_fd, "rb", closefd=False) as source, os.fdopen(
+                        staged_fd, "wb", closefd=False
+                    ) as destination:
+                        shutil.copyfileobj(source, destination)
+                finally:
+                    os.close(staged_fd)
+            finally:
+                os.close(source_fd)
         except OSError as exc:
-            logger.warning("websocket: failed to stage outbound media {}: {}", path, exc)
+            logger.warning("websocket: failed to stage outbound media {}: {}", resolved, exc)
             return None
         signed = self._sign_media_path(staged)
         if signed is None:
             return None
-        return {"url": signed, "name": path.name}
+        return {"url": signed, "name": resolved.name}
 
     def _handle_media_fetch(self, sig: str, payload: str) -> Response:
         """Serve a single media file previously signed via
@@ -852,6 +1516,8 @@ class WebSocketChannel(BaseChannel):
         # the resolved path to escape the media root; guard defensively.
         try:
             media_root = get_media_dir().resolve()
+            if _contains_symlink_component(media_root / rel_str):
+                return _http_error(404, "not found")
             candidate = (media_root / rel_str).resolve()
             candidate.relative_to(media_root)
         except (OSError, ValueError):
@@ -957,20 +1623,13 @@ class WebSocketChannel(BaseChannel):
         return None
 
     async def start(self) -> None:
+        from nanobot.channels.websocket_server import run_channel_server
+
         self._running = True
         self._stop_event = asyncio.Event()
 
         ssl_context = self._build_ssl_context()
         scheme = "wss" if ssl_context else "ws"
-
-        async def process_request(
-            connection: ServerConnection,
-            request: WsRequest,
-        ) -> Any:
-            return await self._dispatch_http(connection, request)
-
-        async def handler(connection: ServerConnection) -> None:
-            await self._connection_loop(connection)
 
         logger.info(
             "WebSocket server listening on {}://{}:{}{}",
@@ -989,18 +1648,16 @@ class WebSocketChannel(BaseChannel):
             )
 
         async def runner() -> None:
-            async with serve(
-                handler,
-                self.config.host,
-                self.config.port,
-                process_request=process_request,
-                max_size=self.config.max_message_bytes,
-                ping_interval=self.config.ping_interval_s,
-                ping_timeout=self.config.ping_timeout_s,
-                ssl=ssl_context,
-            ):
-                assert self._stop_event is not None
-                await self._stop_event.wait()
+            assert self._stop_event is not None
+            await run_channel_server(
+                self,
+                host=self.config.host,
+                port=self.config.port,
+                max_message_bytes=self.config.max_message_bytes,
+                ping_interval_s=self.config.ping_interval_s,
+                ssl_context=ssl_context,
+                stop_event=self._stop_event,
+            )
 
         self._server_task = asyncio.create_task(runner())
         await self._server_task
@@ -1192,7 +1849,223 @@ class WebSocketChannel(BaseChannel):
                 metadata={"remote": getattr(connection, "remote_address", None)},
             )
             return
+        if t == "work.create":
+            await self._handle_work_create_envelope(connection, client_id, envelope)
+            return
+        if t == "work.subscribe":
+            await self._handle_work_subscribe_envelope(connection, envelope)
+            return
+        if t == "work.cancel":
+            await self._handle_work_cancel_envelope(connection, envelope)
+            return
+        if t == "work.message":
+            await self._handle_work_message_envelope(connection, client_id, envelope)
+            return
         await self._send_event(connection, "error", detail=f"unknown type: {t!r}")
+
+    async def _handle_work_create_envelope(
+        self,
+        connection: Any,
+        client_id: str,
+        envelope: dict[str, Any],
+    ) -> None:
+        if self._work_store is None:
+            await self._send_event(connection, "error", detail="work unavailable")
+            return
+        chat_id = envelope.get("chat_id")
+        content = envelope.get("content")
+        if not _is_valid_chat_id(chat_id):
+            await self._send_event(connection, "error", detail="invalid chat_id")
+            return
+        if not isinstance(content, str) or not content.strip():
+            await self._send_event(connection, "error", detail="missing content")
+            return
+        media_paths, media_error = self._work_media(envelope.get("media"))
+        if media_error is not None:
+            await self._send_event(
+                connection,
+                "error",
+                detail="image_rejected",
+                reason=media_error,
+            )
+            return
+        task = await self._work_store.run_io(
+            self._work_store.create_task,
+            chat_id=chat_id,
+            content=content,
+            mode="background",
+            title=(
+                envelope.get("title")
+                if isinstance(envelope.get("title"), str)
+                else None
+            ),
+            model=_read_webui_model_name() or "",
+        )
+        task_id = str(task["task_id"])
+        self._attach(connection, chat_id)
+        self._attach_work(connection, task_id)
+        await self._send_event(
+            connection,
+            "work.created",
+            task_id=task_id,
+            task=task,
+        )
+        try:
+            await self._publish_work_inbound(
+                task,
+                sender_id=client_id,
+                content=content,
+                media=media_paths,
+                remote=getattr(connection, "remote_address", None),
+            )
+        except Exception:
+            logger.exception("failed to enqueue WebSocket Work task {}", task_id)
+            await self._fail_work_enqueue(task_id)
+            await self._send_event(
+                connection,
+                "error",
+                detail="failed to enqueue work",
+                task_id=task_id,
+            )
+
+    async def _handle_work_subscribe_envelope(
+        self, connection: Any, envelope: dict[str, Any]
+    ) -> None:
+        if self._work_store is None:
+            await self._send_event(connection, "error", detail="work unavailable")
+            return
+        task_id = envelope.get("task_id")
+        if not isinstance(task_id, str) or _WORK_ID_RE.fullmatch(task_id) is None:
+            await self._send_event(connection, "error", detail="task not found")
+            return
+        if await self._work_store.run_io(self._work_store.get_task, task_id) is None:
+            await self._send_event(connection, "error", detail="task not found")
+            return
+        try:
+            after_seq = max(0, int(envelope.get("after_seq") or 0))
+        except (TypeError, ValueError):
+            await self._send_event(connection, "error", detail="invalid after_seq")
+            return
+        self._attach_work(connection, task_id)
+        await self._send_event(connection, "work.subscribed", task_id=task_id)
+        cursor = after_seq
+        while True:
+            events = await self._work_store.run_io(
+                self._work_store.list_events,
+                task_id,
+                after_seq=cursor,
+                limit=MAX_EVENT_PAGE,
+            )
+            for event in events:
+                await self._send_work_event(connection, event)
+            if len(events) < MAX_EVENT_PAGE:
+                break
+            cursor = int(events[-1]["seq"])
+            await asyncio.sleep(0)
+
+    async def _handle_work_cancel_envelope(
+        self, connection: Any, envelope: dict[str, Any]
+    ) -> None:
+        if self._work_store is None:
+            await self._send_event(connection, "error", detail="work unavailable")
+            return
+        task_id = envelope.get("task_id")
+        if not isinstance(task_id, str) or _WORK_ID_RE.fullmatch(task_id) is None:
+            await self._send_event(connection, "error", detail="task not found")
+            return
+        task = await self._work_store.run_io(self._work_store.get_task, task_id)
+        if task is None:
+            await self._send_event(connection, "error", detail="task not found")
+            return
+        assert task is not None
+        self._attach_work(connection, task_id)
+        error = await self._cancel_work_task(task, sender_id="websocket")
+        if error == "terminal":
+            await self._send_event(connection, "error", detail="task already complete")
+            return
+        if error is not None:
+            await self._send_event(
+                connection, "error", detail="failed to signal cancellation"
+            )
+
+    async def _handle_work_message_envelope(
+        self,
+        connection: Any,
+        client_id: str,
+        envelope: dict[str, Any],
+    ) -> None:
+        if self._work_store is None:
+            await self._send_event(connection, "error", detail="work unavailable")
+            return
+        task_id = envelope.get("task_id")
+        content = envelope.get("content")
+        if not isinstance(task_id, str) or _WORK_ID_RE.fullmatch(task_id) is None:
+            await self._send_event(connection, "error", detail="task not found")
+            return
+        task = await self._work_store.run_io(self._work_store.get_task, task_id)
+        if task is None:
+            await self._send_event(connection, "error", detail="task not found")
+            return
+        if task.get("status") not in ACTIVE_STATUSES:
+            await self._send_event(connection, "error", detail="task does not accept messages")
+            return
+        if not isinstance(content, str) or not content.strip():
+            await self._send_event(connection, "error", detail="missing content")
+            return
+        chat_id = str(task.get("chat_id") or "")
+        if not _is_valid_chat_id(chat_id):
+            await self._send_event(connection, "error", detail="invalid task chat")
+            return
+        self._attach_work(connection, task_id)
+        try:
+            await self._publish_work_inbound(
+                task,
+                sender_id=client_id,
+                content=content,
+                remote=getattr(connection, "remote_address", None),
+            )
+        except Exception:
+            logger.exception("failed to enqueue message for Work task {}", task_id)
+            await self._send_event(
+                connection, "error", detail="failed to enqueue work message"
+            )
+            return
+        await self._record_work_message(task_id, content)
+
+    async def _send_work_event(self, connection: Any, event: Any) -> None:
+        data = event.to_api() if hasattr(event, "to_api") else event
+        await self._send_event(
+            connection,
+            "work.event",
+            task_id=data.get("task_id"),
+            seq=data.get("seq"),
+            type=data.get("type"),
+            payload=data.get("payload") or {},
+            actor=data.get("actor"),
+            step_id=data.get("step_id"),
+            created_at=data.get("created_at"),
+        )
+
+    async def _broadcast_work_event(self, event: Any) -> None:
+        data = event.to_api() if hasattr(event, "to_api") else event
+        task_id = data.get("task_id") if isinstance(data, dict) else None
+        if not isinstance(task_id, str):
+            return
+        raw = json.dumps(
+            {
+                "event": "work.event",
+                "task_id": task_id,
+                "seq": data.get("seq"),
+                "type": data.get("type"),
+                "payload": data.get("payload") or {},
+                "actor": data.get("actor"),
+                "step_id": data.get("step_id"),
+                "created_at": data.get("created_at"),
+            },
+            ensure_ascii=False,
+        )
+        for connection in list(self._work_subs.get(task_id, ())):
+            await self._safe_send_to(connection, raw, label=" work ")
 
     async def stop(self) -> None:
         if not self._running:
@@ -1209,6 +2082,8 @@ class WebSocketChannel(BaseChannel):
         self._subs.clear()
         self._conn_chats.clear()
         self._conn_default.clear()
+        self._work_subs.clear()
+        self._conn_work.clear()
         self._issued_tokens.clear()
         self._api_tokens.clear()
 
@@ -1224,6 +2099,9 @@ class WebSocketChannel(BaseChannel):
             raise
 
     async def send(self, msg: OutboundMessage) -> None:
+        if msg.metadata.get("_work_event"):
+            await self._broadcast_work_event(msg.metadata["_work_event"])
+            return
         # Snapshot the subscriber set so ConnectionClosed cleanups mid-iteration are safe.
         conns = list(self._subs.get(msg.chat_id, ()))
         if not conns:
@@ -1241,14 +2119,28 @@ class WebSocketChannel(BaseChannel):
             payload["buttons"] = msg.buttons
             payload["button_prompt"] = msg.content
         if msg.media:
-            payload["media"] = msg.media
+            accepted_media: list[str] = []
             urls: list[dict[str, str]] = []
             for entry in msg.media:
+                if isinstance(entry, str) and entry.lower().startswith(("http://", "https://")):
+                    accepted_media.append(entry)
+                    continue
                 signed = self._sign_or_stage_media_path(Path(entry))
                 if signed is not None:
+                    accepted_media.append(entry)
                     urls.append(signed)
+            if accepted_media:
+                payload["media"] = accepted_media
             if urls:
                 payload["media_urls"] = urls
+        artifact_urls = self._work_artifact_media_urls(
+            msg.metadata.get("_work_artifacts")
+        )
+        if artifact_urls:
+            payload["media_urls"] = [
+                *(payload.get("media_urls") or []),
+                *artifact_urls,
+            ]
         if msg.reply_to:
             payload["reply_to"] = msg.reply_to
         # Mark intermediate agent breadcrumbs (tool-call hints, generic

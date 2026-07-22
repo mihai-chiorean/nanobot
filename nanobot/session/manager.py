@@ -266,6 +266,23 @@ class SessionManager:
             raise RuntimeError("legacy session migration is disabled for custom workspaces")
         return self.legacy_sessions_dir / f"{self.safe_key(key)}.jsonl"
 
+    def _migrate_legacy_sessions(self) -> None:
+        """Move discoverable owner sessions into the workspace before listing."""
+        legacy_dir = self.legacy_sessions_dir
+        if legacy_dir is None or not legacy_dir.is_dir():
+            return
+        for legacy_path in legacy_dir.glob("*.jsonl"):
+            if legacy_path.is_symlink() or not legacy_path.is_file():
+                continue
+            destination = self.sessions_dir / legacy_path.name
+            if destination.exists():
+                continue
+            try:
+                shutil.move(str(legacy_path), str(destination))
+                logger.info("Migrated legacy session {} before listing", legacy_path.stem)
+            except Exception:
+                logger.exception("Failed to migrate legacy session {}", legacy_path.stem)
+
     def get_or_create(self, key: str) -> Session:
         """
         Get an existing session or create a new one.
@@ -539,6 +556,7 @@ class SessionManager:
         Returns:
             List of session info dicts.
         """
+        self._migrate_legacy_sessions()
         sessions = []
 
         for path in self.sessions_dir.glob("*.jsonl"):

@@ -1,18 +1,30 @@
 import type { BootstrapResponse } from "./types";
 
+export class BootstrapError extends Error {
+  status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.status = status;
+    this.name = "BootstrapError";
+  }
+}
+
 /**
- * Fetch a short-lived token + the WebSocket path from the gateway's
- * ``/webui/bootstrap`` endpoint. Localhost-only on the server side.
+ * Exchange a Clerk session JWT for short-lived tenant REST and WebSocket
+ * credentials at the Ziggy front door.
  */
 export async function fetchBootstrap(
+  identityToken: string,
   baseUrl: string = "",
 ): Promise<BootstrapResponse> {
-  const res = await fetch(`${baseUrl}/webui/bootstrap`, {
+  const res = await fetch(`${baseUrl}/auth/bootstrap`, {
     method: "GET",
-    credentials: "same-origin",
+    headers: {
+      Authorization: `Bearer ${identityToken}`,
+    },
   });
   if (!res.ok) {
-    throw new Error(`bootstrap failed: HTTP ${res.status}`);
+    throw new BootstrapError(res.status, `bootstrap failed: HTTP ${res.status}`);
   }
   const body = (await res.json()) as BootstrapResponse;
   if (!body.token || !body.ws_path) {

@@ -291,7 +291,7 @@ func (transport roundTripper) RoundTrip(request *http.Request) (*http.Response, 
 
 func safeRoute(route string) string {
 	switch route {
-	case "health", "readiness", "bootstrap", "enrollment", "proxy":
+	case "health", "readiness", "bootstrap", "proxy":
 		return route
 	default:
 		return "other"
@@ -372,9 +372,6 @@ func operationFromContext(ctx context.Context) string {
 	route, _ := ctx.Value(routeContextKey{}).(string)
 	if route == "bootstrap" {
 		return "nanobot_bootstrap"
-	}
-	if route == "enrollment" {
-		return "nanobot_enrollment"
 	}
 	return "nanobot_proxy"
 }

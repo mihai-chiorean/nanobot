@@ -1,0 +1,2 @@
+// Copy this file to Local.xcconfig and use the publishable key from Clerk.
+CLERK_PUBLISHABLE_KEY = pk_test_replace_me

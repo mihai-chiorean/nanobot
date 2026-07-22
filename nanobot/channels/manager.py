@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from collections.abc import Callable
 from contextlib import suppress
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -54,10 +55,12 @@ class ChannelManager:
         bus: MessageBus,
         *,
         session_manager: "SessionManager | None" = None,
+        active_session_keys: Callable[[], set[str]] | None = None,
     ):
         self.config = config
         self.bus = bus
         self._session_manager = session_manager
+        self._active_session_keys = active_session_keys
         self.channels: dict[str, BaseChannel] = {}
         self._dispatch_task: asyncio.Task | None = None
         self._origin_reply_fingerprints: dict[tuple[str, str, str], str] = {}
@@ -90,6 +93,7 @@ class ChannelManager:
                 # surface; other channels stay oblivious to these knobs.
                 if cls.name == "websocket" and self._session_manager is not None:
                     kwargs["session_manager"] = self._session_manager
+                    kwargs["active_session_keys"] = self._active_session_keys
                     static_path = _default_webui_dist()
                     if static_path is not None:
                         kwargs["static_dist_path"] = static_path

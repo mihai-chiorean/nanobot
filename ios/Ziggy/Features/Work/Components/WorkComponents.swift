@@ -1,14 +1,41 @@
 import SwiftUI
 
 enum ZiggyWorkStatus: String, CaseIterable, Sendable {
-    case queued, running, waiting, completed, failed, cancelled
+    case scheduled, queued, running, waiting, succeeded, failed, cancelled, interrupted, unknown
 
-    var title: String { rawValue.capitalized }
+    var title: String {
+        switch self {
+        case .scheduled: "Scheduled"
+        case .queued: "Queued"
+        case .running: "Running"
+        case .waiting: "Waiting"
+        case .succeeded: "Succeeded"
+        case .failed: "Failed"
+        case .cancelled: "Cancelled"
+        case .interrupted: "Interrupted"
+        case .unknown: "Unknown"
+        }
+    }
     var color: Color {
-        switch self { case .queued: ZiggyPalette.mutedForeground; case .running: ZiggyPalette.emerald; case .waiting: ZiggyPalette.amber; case .completed: ZiggyPalette.emerald; case .failed: ZiggyPalette.destructive; case .cancelled: ZiggyPalette.mutedForeground }
+        switch self {
+        case .scheduled, .queued, .cancelled, .unknown: ZiggyPalette.mutedForeground
+        case .running, .succeeded: ZiggyPalette.emerald
+        case .waiting: ZiggyPalette.amber
+        case .failed, .interrupted: ZiggyPalette.destructive
+        }
     }
     var symbol: String {
-        switch self { case .queued: "clock"; case .running: "bolt.horizontal.circle"; case .waiting: "pause.circle"; case .completed: "checkmark.circle"; case .failed: "exclamationmark.circle"; case .cancelled: "xmark.circle" }
+        switch self {
+        case .scheduled: "calendar"
+        case .queued: "clock"
+        case .running: "bolt.horizontal.circle"
+        case .waiting: "pause.circle"
+        case .succeeded: "checkmark.circle"
+        case .failed: "exclamationmark.circle"
+        case .cancelled: "xmark.circle"
+        case .interrupted: "exclamationmark.triangle"
+        case .unknown: "questionmark.circle"
+        }
     }
 }
 
