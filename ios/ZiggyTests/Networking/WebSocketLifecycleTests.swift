@@ -3,7 +3,7 @@ import XCTest
 @testable import Ziggy
 
 final class WebSocketLifecycleTests: XCTestCase {
-    func testConnectedWaitsForPingCompletion() async throws {
+    func testConnectedWaitsForFirstServerFrame() async throws {
         let connection = TestWebSocketConnection()
         let client = makeClient(connection: connection)
         let collector = EventCollector()
@@ -11,13 +11,14 @@ final class WebSocketLifecycleTests: XCTestCase {
 
         await client.start()
         try await Task.sleep(for: .milliseconds(50))
-        let beforePing = await collector.events
-        XCTAssertEqual(beforePing, [.state(.connecting)])
+        let beforeFrame = await collector.events
+        XCTAssertEqual(beforeFrame, [.state(.connecting)])
 
-        await connection.completePing()
+        await connection.receive(.string(#"{"event":"ready","chat_id":"chat-1"}"#))
         try await Task.sleep(for: .milliseconds(50))
-        let afterPing = await collector.events
-        XCTAssertEqual(afterPing.prefix(2), [.state(.connecting), .state(.connected)])
+        let afterFrame = await collector.events
+        XCTAssertEqual(afterFrame.first, .state(.connecting))
+        XCTAssertTrue(afterFrame.contains(.state(.connected)))
 
         await client.stop()
         eventTask.cancel()
@@ -31,10 +32,10 @@ final class WebSocketLifecycleTests: XCTestCase {
 
         await client.start()
         try await Task.sleep(for: .milliseconds(50))
-        let beforePing = await collector.events
-        XCTAssertEqual(beforePing, [.state(.connecting)])
+        let beforeFrame = await collector.events
+        XCTAssertEqual(beforeFrame, [.state(.connecting)])
 
-        await connection.failPing(with: .upgradeFailed(statusCode: 401))
+        await connection.failReceive(with: .upgradeFailed(statusCode: 401))
         try await Task.sleep(for: .milliseconds(50))
         let events = await collector.events
 
@@ -54,6 +55,7 @@ final class WebSocketLifecycleTests: XCTestCase {
 
         await client.start()
         await connection.completePing()
+        await connection.receive(.string(#"{"event":"ready","chat_id":"chat-1"}"#))
         try await Task.sleep(for: .milliseconds(45))
 
         let pingCount = await connection.pingCount()
@@ -101,6 +103,7 @@ private final class TestWebSocketConnection: ZiggyWebSocketConnection, @unchecke
 
         var messages: [URLSessionWebSocketTask.Message] = []
         var waiters: [CheckedContinuation<URLSessionWebSocketTask.Message, Error>] = []
+        var receiveFailure: ZiggyWebSocketClientError?
         var pingResult: PingResult?
         var pingWaiter: CheckedContinuation<Void, Error>?
         var pingCount = 0
@@ -131,6 +134,10 @@ private final class TestWebSocketConnection: ZiggyWebSocketConnection, @unchecke
         }
 
         func next() async throws -> URLSessionWebSocketTask.Message {
+            if let receiveFailure {
+                self.receiveFailure = nil
+                throw receiveFailure
+            }
             if !messages.isEmpty { return messages.removeFirst() }
             return try await withCheckedThrowingContinuation { continuation in
                 waiters.append(continuation)
@@ -143,6 +150,15 @@ private final class TestWebSocketConnection: ZiggyWebSocketConnection, @unchecke
                 waiter.resume(returning: message)
             } else {
                 messages.append(message)
+            }
+        }
+
+        func failNext(_ error: ZiggyWebSocketClientError) {
+            if let waiter = waiters.first {
+                waiters.removeFirst()
+                waiter.resume(throwing: error)
+            } else {
+                receiveFailure = error
             }
         }
 
@@ -203,5 +219,9 @@ private final class TestWebSocketConnection: ZiggyWebSocketConnection, @unchecke
 
     func failPing(with error: ZiggyWebSocketClientError) async {
         await state.completePing(.failure(error))
+    }
+
+    func failReceive(with error: ZiggyWebSocketClientError) async {
+        await state.failNext(error)
     }
 }

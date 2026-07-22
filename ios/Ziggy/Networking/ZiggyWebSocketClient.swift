@@ -198,7 +198,10 @@ public actor ZiggyWebSocketClient {
                 connection = task
                 socket = task
                 task.resume()
-                try await task.ping()
+                let firstMessage = try await task.receive()
+                guard try await handle(firstMessage, capabilities: credential.capabilities) else {
+                    throw ZiggyRESTError.decoding
+                }
                 hasOpened = true
                 backoffNanoseconds = 500_000_000
                 emit(.state(.connected))
@@ -273,7 +276,7 @@ public actor ZiggyWebSocketClient {
                 event = try Self.decodeFrame(data, capabilities: capabilities)
             } catch {
                 emit(.decodingFailure("Ziggy sent an event this app could not read."))
-                return true
+                return false
             }
             emit(.inbound(event))
             switch event {
