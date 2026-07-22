@@ -30,13 +30,13 @@ func TestOAuthFlowIsTenantBoundAndOneUse(t *testing.T) {
 		Environment:       "test",
 		Version:           "test",
 		GoogleRedirectURI: "https://gateway.test/oauth/google/callback",
-		GoogleScopes:      []string{"openid", "email", "gmail.readonly"},
+		GoogleScopes:      []string{"openid", "email", googleGmailReadonlyScope},
 		StateTTL:          time.Minute,
 		StateSigner:       crypto.NewStateSigner(key),
 		TokenCipher:       cipher,
 		Accounts:          repo,
 		OAuthTransactions: repo,
-		Google:            provider.Fake{Token: provider.Token{AccessToken: "access", RefreshToken: "refresh", Scopes: []string{"gmail.readonly"}}, Profile: provider.Profile{Provider: "google", Subject: "google-sub", Email: "a@example.test"}},
+		Google:            provider.Fake{Token: provider.Token{AccessToken: "access", RefreshToken: "refresh", Scopes: []string{"openid", "email", googleGmailReadonlyScope}}, Profile: provider.Profile{Provider: "google", Subject: "google-sub", Email: "a@example.test"}},
 		PrincipalVerifier: principal.NewVerifier(key),
 		Now:               func() time.Time { return now },
 	})
@@ -82,6 +82,59 @@ func TestOAuthFlowIsTenantBoundAndOneUse(t *testing.T) {
 	api.ServeHTTP(foreign, foreignRequest)
 	if foreign.Code != http.StatusOK || strings.Contains(foreign.Body.String(), "a@example.test") {
 		t.Fatalf("foreign account response exposed tenant A: %s", foreign.Body)
+	}
+}
+
+func TestOAuthRejectsPartialGrantWithoutPersistingAccount(t *testing.T) {
+	now := time.Now()
+	key := []byte("01234567890123456789012345678901")
+	cipher, err := crypto.NewAESGCM(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo := store.NewMemoryRepository()
+	api, err := New(Config{
+		GoogleRedirectURI: "https://gateway.test/oauth/google/callback",
+		GoogleScopes:      []string{"openid", "email", googleGmailReadonlyScope},
+		StateTTL:          time.Minute,
+		StateSigner:       crypto.NewStateSigner(key),
+		TokenCipher:       cipher,
+		Accounts:          repo,
+		OAuthTransactions: repo,
+		Google: provider.Fake{
+			Token:   provider.Token{AccessToken: "access", RefreshToken: "refresh", Scopes: []string{"openid", "email"}},
+			Profile: provider.Profile{Provider: "google", Subject: "google-sub", Email: "a@example.test"},
+		},
+		PrincipalVerifier: principal.NewVerifier(key),
+		Now:               func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tenant := principal.Principal{UserID: "user-a", WorkspaceID: "workspace-a", ExpiresAt: now.Add(time.Hour).Unix()}
+	start := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/oauth/google/start", nil)
+	withPrincipal(request, tenant, key)
+	api.ServeHTTP(start, request)
+	if start.Code != http.StatusOK {
+		t.Fatalf("start status = %d, body = %s", start.Code, start.Body)
+	}
+	var startBody map[string]string
+	if err := json.Unmarshal(start.Body.Bytes(), &startBody); err != nil {
+		t.Fatal(err)
+	}
+	state := queryValue(startBody["authorization_url"], "state")
+	callback := httptest.NewRecorder()
+	api.ServeHTTP(callback, httptest.NewRequest(http.MethodGet, "/oauth/google/callback?code=code&state="+state, nil))
+	if callback.Code != http.StatusBadRequest || !strings.Contains(callback.Body.String(), "Gmail read permission") {
+		t.Fatalf("callback status = %d, body = %s", callback.Code, callback.Body)
+	}
+	accounts, err := repo.ListAccounts(context.Background(), store.Tenant{UserID: tenant.UserID, WorkspaceID: tenant.WorkspaceID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(accounts) != 0 {
+		t.Fatalf("stored %d accounts after partial grant", len(accounts))
 	}
 }
 

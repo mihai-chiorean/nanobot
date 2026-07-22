@@ -42,6 +42,8 @@ type API struct {
 
 type principalContextKey struct{}
 
+const googleGmailReadonlyScope = "https://www.googleapis.com/auth/gmail.readonly"
+
 func New(config Config) (http.Handler, error) {
 	if strings.TrimSpace(config.GoogleRedirectURI) == "" || config.StateTTL <= 0 || len(config.GoogleScopes) == 0 {
 		return nil, errors.New("OAuth redirect URI, scopes, and state TTL are required")
@@ -201,6 +203,11 @@ func (api *API) oauthCallback(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "Google authorization failed"})
 		return
 	}
+	if !hasScope(token.Scopes, googleGmailReadonlyScope) {
+		api.logger.WarnContext(r.Context(), "Required Google scope was not granted", "error_class", "google_required_scope_missing")
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Google Gmail read permission was not granted; reconnect and approve Gmail access"})
+		return
+	}
 	profile, err := api.config.Google.ValidateProfile(r.Context(), token.AccessToken)
 	if err != nil || profile.Provider != "google" || profile.Subject == "" || profile.Email == "" {
 		api.logger.WarnContext(r.Context(), "Google profile validation failed", "error_class", "google_profile_validation_failure")
@@ -216,9 +223,6 @@ func (api *API) oauthCallback(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "unable to save Google account"})
 		return
 	}
-	if len(token.Scopes) == 0 {
-		token.Scopes = append([]string(nil), api.config.GoogleScopes...)
-	}
 	now := api.config.Now()
 	account := store.Account{ID: accountID, Tenant: tenant, Provider: profile.Provider, ProviderSubject: profile.Subject, Email: profile.Email, Scopes: token.Scopes, EncryptedRefreshToken: encryptedRefresh, TokenKeyVersion: "v1", Status: "active", CreatedAt: now, UpdatedAt: now}
 	if err := api.config.Accounts.SaveAccount(r.Context(), tenant, account); err != nil {
@@ -227,6 +231,15 @@ func (api *API) oauthCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "connected", "account_id": account.ID})
+}
+
+func hasScope(scopes []string, required string) bool {
+	for _, scope := range scopes {
+		if scope == required {
+			return true
+		}
+	}
+	return false
 }
 
 func (api *API) accounts(w http.ResponseWriter, r *http.Request) {
