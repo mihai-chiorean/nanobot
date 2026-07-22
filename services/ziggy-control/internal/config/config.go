@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -209,11 +210,19 @@ func loadFrom(lookup LookupEnv, readFile ReadFile) (Config, error) {
 func connectorConfig(lookup LookupEnv, readFile ReadFile) (*url.URL, []byte, error) {
 	rawURL := optional(lookup, "ZIGGY_CONNECTORS_URL")
 	keyFile := optional(lookup, "ZIGGY_CONNECTORS_TRUST_KEY_FILE")
-	if (rawURL == "") != (keyFile == "") {
-		return nil, nil, fmt.Errorf("ZIGGY_CONNECTORS_URL and ZIGGY_CONNECTORS_TRUST_KEY_FILE must be set together")
-	}
 	if rawURL == "" {
+		if keyFile != "" {
+			return nil, nil, fmt.Errorf("ZIGGY_CONNECTORS_URL and ZIGGY_CONNECTORS_TRUST_KEY_FILE must be set together")
+		}
 		return nil, nil, nil
+	}
+	if keyFile == "" {
+		if credentialsDirectory := optional(lookup, "CREDENTIALS_DIRECTORY"); credentialsDirectory != "" {
+			keyFile = filepath.Join(credentialsDirectory, "connector-trust-key")
+		}
+	}
+	if keyFile == "" {
+		return nil, nil, fmt.Errorf("ZIGGY_CONNECTORS_URL and ZIGGY_CONNECTORS_TRUST_KEY_FILE must be set together")
 	}
 	parsed, err := parseUpstream(rawURL)
 	if err != nil {

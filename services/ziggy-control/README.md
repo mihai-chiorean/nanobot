@@ -90,10 +90,11 @@ subjects in the manifest; otherwise the first verified matching email binds
 the subject atomically in `ZIGGY_TENANT_BINDINGS_FILE`. Removing or disabling
 an allocation immediately blocks new bootstraps after restart.
 
-Set `ZIGGY_CONNECTORS_URL` and `ZIGGY_CONNECTORS_TRUST_KEY_FILE` together to
-enable `/connectors/*`. The URL must pass the same private-network validation as
-Nanobot. The trust key is shared only with `ziggy-connectors` and should be
-loaded into both services as a systemd credential.
+Set `ZIGGY_CONNECTORS_URL` to enable `/connectors/*`. The URL must pass the same
+private-network validation as Nanobot. The systemd unit discovers the shared
+`connector-trust-key` through `CREDENTIALS_DIRECTORY`; outside systemd, also set
+`ZIGGY_CONNECTORS_TRUST_KEY_FILE`. The key is shared only with
+`ziggy-connectors`.
 
 The default owner-only admission limits are 64 ordinary HTTP requests, 8 SSE
 streams, and 8 WebSocket connections. Override them with
