@@ -9,11 +9,13 @@ import (
 
 func TestLoadFromDefaults(t *testing.T) {
 	environment := map[string]string{
-		"ZIGGY_UPSTREAM_URL":       "http://127.0.0.1:8765/",
-		"ZIGGY_OWNER_EMAIL":        " Owner@Example.com ",
-		"ZIGGY_OWNER_SUBJECT":      "user_123",
-		"ZIGGY_AUTHORIZED_PARTIES": "https://chat.example.com",
-		"CLERK_SECRET_KEY":         "secret",
+		"ZIGGY_UPSTREAM_URL":         "http://127.0.0.1:8765/",
+		"ZIGGY_OWNER_EMAIL":          " Owner@Example.com ",
+		"ZIGGY_OWNER_SUBJECT":        "user_123",
+		"ZIGGY_AUTHORIZED_PARTIES":   "https://chat.example.com",
+		"ZIGGY_TENANTS_FILE":         "/etc/ziggy/tenants.json",
+		"ZIGGY_TENANT_BINDINGS_FILE": "/var/lib/ziggy-control/tenant-bindings.json",
+		"CLERK_SECRET_KEY":           "secret",
 	}
 
 	config, err := LoadFrom(mapLookup(environment))
@@ -28,6 +30,9 @@ func TestLoadFromDefaults(t *testing.T) {
 	}
 	if config.OwnerEmail != "owner@example.com" {
 		t.Errorf("OwnerEmail = %q", config.OwnerEmail)
+	}
+	if config.TenantManifest != "/etc/ziggy/tenants.json" || config.TenantBindings != "/var/lib/ziggy-control/tenant-bindings.json" {
+		t.Errorf("tenant files not loaded: %+v", config)
 	}
 	if config.ShutdownTimeout != 10*time.Second {
 		t.Errorf("ShutdownTimeout = %s", config.ShutdownTimeout)
@@ -62,11 +67,13 @@ func TestLoadFromDefaults(t *testing.T) {
 
 func TestLoadFromSecretFile(t *testing.T) {
 	environment := map[string]string{
-		"ZIGGY_UPSTREAM_URL":       "http://127.0.0.1:8765",
-		"ZIGGY_OWNER_EMAIL":        "owner@example.com",
-		"ZIGGY_OWNER_SUBJECT":      "user_123",
-		"ZIGGY_AUTHORIZED_PARTIES": "https://chat.example.com",
-		"CLERK_SECRET_KEY_FILE":    "/run/credentials/clerk-secret-key",
+		"ZIGGY_UPSTREAM_URL":         "http://127.0.0.1:8765",
+		"ZIGGY_OWNER_EMAIL":          "owner@example.com",
+		"ZIGGY_OWNER_SUBJECT":        "user_123",
+		"ZIGGY_AUTHORIZED_PARTIES":   "https://chat.example.com",
+		"ZIGGY_TENANTS_FILE":         "/etc/ziggy/tenants.json",
+		"ZIGGY_TENANT_BINDINGS_FILE": "/var/lib/ziggy-control/tenant-bindings.json",
+		"CLERK_SECRET_KEY_FILE":      "/run/credentials/clerk-secret-key",
 	}
 	readFile := func(filename string) ([]byte, error) {
 		if filename != environment["CLERK_SECRET_KEY_FILE"] {
@@ -81,6 +88,34 @@ func TestLoadFromSecretFile(t *testing.T) {
 	}
 	if config.ClerkSecretKey != "file-secret" {
 		t.Errorf("ClerkSecretKey = %q", config.ClerkSecretKey)
+	}
+}
+
+func TestLoadFromConnectorTrustFile(t *testing.T) {
+	environment := map[string]string{
+		"ZIGGY_UPSTREAM_URL":              "http://127.0.0.1:8765",
+		"ZIGGY_OWNER_EMAIL":               "owner@example.com",
+		"ZIGGY_OWNER_SUBJECT":             "user_123",
+		"ZIGGY_AUTHORIZED_PARTIES":        "https://chat.example.com",
+		"ZIGGY_TENANTS_FILE":              "/etc/ziggy/tenants.json",
+		"ZIGGY_TENANT_BINDINGS_FILE":      "/var/lib/ziggy-control/tenant-bindings.json",
+		"ZIGGY_CONNECTORS_URL":            "http://127.0.0.1:8790",
+		"ZIGGY_CONNECTORS_TRUST_KEY_FILE": "/run/credentials/connector-trust-key",
+		"CLERK_SECRET_KEY":                "secret",
+	}
+	readFile := func(filename string) ([]byte, error) {
+		if filename != environment["ZIGGY_CONNECTORS_TRUST_KEY_FILE"] {
+			t.Fatalf("read filename = %q", filename)
+		}
+		return []byte("01234567890123456789012345678901"), nil
+	}
+
+	loaded, err := loadFrom(mapLookup(environment), readFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.ConnectorsURL.String() != "http://127.0.0.1:8790" || len(loaded.ConnectorTrustKey) != 32 {
+		t.Fatalf("connector config = %+v", loaded)
 	}
 }
 
@@ -195,11 +230,13 @@ func TestLoadFromOverrides(t *testing.T) {
 
 func TestLoadFromRejectsInvalidConfiguration(t *testing.T) {
 	base := map[string]string{
-		"ZIGGY_UPSTREAM_URL":       "http://127.0.0.1:8765",
-		"ZIGGY_OWNER_EMAIL":        "owner@example.com",
-		"ZIGGY_OWNER_SUBJECT":      "user_123",
-		"ZIGGY_AUTHORIZED_PARTIES": "https://chat.example.com",
-		"CLERK_SECRET_KEY":         "secret",
+		"ZIGGY_UPSTREAM_URL":         "http://127.0.0.1:8765",
+		"ZIGGY_OWNER_EMAIL":          "owner@example.com",
+		"ZIGGY_OWNER_SUBJECT":        "user_123",
+		"ZIGGY_AUTHORIZED_PARTIES":   "https://chat.example.com",
+		"ZIGGY_TENANTS_FILE":         "/etc/ziggy/tenants.json",
+		"ZIGGY_TENANT_BINDINGS_FILE": "/var/lib/ziggy-control/tenant-bindings.json",
+		"CLERK_SECRET_KEY":           "secret",
 	}
 	tests := []struct {
 		name   string
@@ -208,6 +245,8 @@ func TestLoadFromRejectsInvalidConfiguration(t *testing.T) {
 		remove string
 	}{
 		{name: "missing upstream", remove: "ZIGGY_UPSTREAM_URL"},
+		{name: "missing tenant bindings", remove: "ZIGGY_TENANT_BINDINGS_FILE"},
+		{name: "connector URL without trust key", key: "ZIGGY_CONNECTORS_URL", value: "http://127.0.0.1:8790"},
 		{name: "unsupported scheme", key: "ZIGGY_UPSTREAM_URL", value: "ftp://example.com"},
 		{name: "public upstream", key: "ZIGGY_UPSTREAM_URL", value: "https://8.8.8.8:443"},
 		{name: "upstream credentials", key: "ZIGGY_UPSTREAM_URL", value: "http://user:pass@example.com"},

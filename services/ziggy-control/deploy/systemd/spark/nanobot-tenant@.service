@@ -1,0 +1,45 @@
+[Unit]
+Description=Ziggy tenant Nanobot runtime %i
+After=anti-sycophancy-proxy.service network-online.target
+Wants=network-online.target
+Requires=anti-sycophancy-proxy.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/mihai/workspace/ziggy
+ExecStartPre=/usr/bin/curl --fail --silent --show-error http://127.0.0.1:8001/health
+ExecStart=/home/mihai/workspace/ziggy/.venv/bin/python3 -m nanobot gateway --config /home/mihai/.local/share/ziggy/tenants/%i/runtime/config.json
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+EnvironmentFile=-/home/mihai/.config/ziggy/clerk.env
+EnvironmentFile=-/home/mihai/.config/ziggy/tenants/%i.env
+Restart=on-failure
+RestartSec=10s
+TimeoutStartSec=120s
+TimeoutStopSec=30s
+
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectHome=read-only
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ReadWritePaths=/home/mihai/.local/share/ziggy/tenants/%i
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictRealtime=true
+LockPersonality=true
+RestrictSUIDSGID=true
+MemoryHigh=768M
+MemoryMax=1G
+TasksMax=256
+UMask=0077
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=nanobot-tenant-%i
+
+[Install]
+WantedBy=default.target

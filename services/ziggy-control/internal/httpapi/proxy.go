@@ -13,6 +13,14 @@ import (
 )
 
 func NewReverseProxy(target *url.URL, logger *slog.Logger, observability *telemetry.Recorder) *httputil.ReverseProxy {
+	return newReverseProxy(target, logger, observability, false)
+}
+
+func NewConnectorReverseProxy(target *url.URL, logger *slog.Logger, observability *telemetry.Recorder) *httputil.ReverseProxy {
+	return newReverseProxy(target, logger, observability, true)
+}
+
+func newReverseProxy(target *url.URL, logger *slog.Logger, observability *telemetry.Recorder, connector bool) *httputil.ReverseProxy {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.MaxIdleConns = 100
 	transport.MaxIdleConnsPerHost = 32
@@ -33,7 +41,20 @@ func NewReverseProxy(target *url.URL, logger *slog.Logger, observability *teleme
 		FlushInterval: -1,
 		Rewrite: func(request *httputil.ProxyRequest) {
 			request.SetURL(target)
+			if connector {
+				request.Out.URL.Path = strings.TrimPrefix(request.In.URL.Path, "/connectors")
+				if request.Out.URL.Path == "" {
+					request.Out.URL.Path = "/"
+				}
+				request.Out.URL.RawPath = ""
+			}
 			stripUntrustedUpstreamHeaders(request.Out.Header)
+			if connector {
+				if principal, ok := connectorPrincipalFromContext(request.In.Context()); ok {
+					request.Out.Header.Set("X-Ziggy-Principal", principal.payload)
+					request.Out.Header.Set("X-Ziggy-Principal-Signature", principal.signature)
+				}
+			}
 			request.SetXForwarded()
 			request.Out.Host = target.Host
 		},
@@ -59,6 +80,8 @@ func stripUntrustedUpstreamHeaders(headers http.Header) {
 		"X-Nanobot-Auth",
 		"X-Ziggy-Subject",
 		"X-Ziggy-Email",
+		"X-Ziggy-Principal",
+		"X-Ziggy-Principal-Signature",
 		"X-Clerk-Session",
 		"X-Clerk-User",
 		"X-User-Email",

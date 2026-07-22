@@ -27,6 +27,9 @@ type Middleware func(http.Handler) http.Handler
 type Config struct {
 	Authenticate      Middleware
 	Proxy             http.Handler
+	TenantRouter      TenantRouter
+	ConnectorProxy    http.Handler
+	ConnectorSigner   *ConnectorSigner
 	Readiness         ReadinessChecker
 	Logger            *slog.Logger
 	Telemetry         *telemetry.Recorder
@@ -41,16 +44,19 @@ type Config struct {
 }
 
 type API struct {
-	proxy          http.Handler
-	readiness      ReadinessChecker
-	logger         *slog.Logger
-	telemetry      *telemetry.Recorder
-	ownerEmail     string
-	ownerSubject   string
-	blockedPaths   map[string]struct{}
-	maxRequestBody int64
-	admission      *inboundAdmission
-	version        string
+	proxy           http.Handler
+	tenantRouter    TenantRouter
+	connectorProxy  http.Handler
+	connectorSigner *ConnectorSigner
+	readiness       ReadinessChecker
+	logger          *slog.Logger
+	telemetry       *telemetry.Recorder
+	ownerEmail      string
+	ownerSubject    string
+	blockedPaths    map[string]struct{}
+	maxRequestBody  int64
+	admission       *inboundAdmission
+	version         string
 }
 
 type requestIDKey struct{}
@@ -123,6 +129,12 @@ func New(config Config) (http.Handler, error) {
 	if config.Proxy == nil {
 		return nil, errors.New("proxy handler is required")
 	}
+	if (config.ConnectorProxy == nil) != (config.ConnectorSigner == nil) {
+		return nil, errors.New("connector proxy and signer must be configured together")
+	}
+	if config.ConnectorProxy != nil && config.TenantRouter == nil {
+		return nil, errors.New("tenant routing is required for connectors")
+	}
 	if config.Readiness == nil {
 		return nil, errors.New("readiness checker is required")
 	}
@@ -137,21 +149,24 @@ func New(config Config) (http.Handler, error) {
 	}
 
 	api := &API{
-		proxy:          config.Proxy,
-		readiness:      config.Readiness,
-		logger:         config.Logger,
-		telemetry:      config.Telemetry,
-		ownerEmail:     strings.ToLower(strings.TrimSpace(config.OwnerEmail)),
-		ownerSubject:   strings.TrimSpace(config.OwnerSubject),
-		blockedPaths:   cloneBlockedPaths(config.BlockedPaths),
-		maxRequestBody: config.MaxRequestBody,
-		admission:      newInboundAdmission(config.HTTPInFlight, config.SSEInFlight, config.WebSocketInFlight),
-		version:        config.Version,
+		proxy:           config.Proxy,
+		tenantRouter:    config.TenantRouter,
+		connectorProxy:  config.ConnectorProxy,
+		connectorSigner: config.ConnectorSigner,
+		readiness:       config.Readiness,
+		logger:          config.Logger,
+		telemetry:       config.Telemetry,
+		ownerEmail:      strings.ToLower(strings.TrimSpace(config.OwnerEmail)),
+		ownerSubject:    strings.TrimSpace(config.OwnerSubject),
+		blockedPaths:    cloneBlockedPaths(config.BlockedPaths),
+		maxRequestBody:  config.MaxRequestBody,
+		admission:       newInboundAdmission(config.HTTPInFlight, config.SSEInFlight, config.WebSocketInFlight),
+		version:         config.Version,
 	}
 	if api.telemetry == nil {
 		api.telemetry = telemetry.Noop()
 	}
-	for _, reserved := range []string{"/auth/bootstrap", "/webui/guest/bootstrap", "/healthz", "/readyz"} {
+	for _, reserved := range []string{"/auth/bootstrap", "/webui/guest/bootstrap", "/healthz", "/readyz", "/connectors"} {
 		api.blockedPaths[reserved] = struct{}{}
 	}
 
@@ -160,6 +175,8 @@ func New(config Config) (http.Handler, error) {
 	mux.HandleFunc("/readyz", api.ready)
 	mux.Handle("/auth/bootstrap", config.Authenticate(http.HandlerFunc(api.bootstrap)))
 	mux.HandleFunc("/webui/guest/bootstrap", api.enroll)
+	mux.HandleFunc("/connectors/oauth/google/callback", api.connectorCallback)
+	mux.Handle("/connectors/", config.Authenticate(http.HandlerFunc(api.connectors)))
 	mux.HandleFunc("/", api.forward)
 	return api.assignRequestID(api.observe(api.admit(mux))), nil
 }
@@ -226,13 +243,29 @@ func (api *API) bootstrap(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	principal, ok := identity.FromContext(r.Context())
-	if !ok || !api.isOwner(principal) {
+	if !ok {
+		api.logger.WarnContext(r.Context(), "bootstrap authorization denied", "route", "bootstrap")
+		writeError(w, http.StatusForbidden, "account not authorized")
+		return
+	}
+	if api.tenantRouter == nil {
+		if !api.isOwner(principal) {
+			api.logger.WarnContext(r.Context(), "bootstrap authorization denied", "route", "bootstrap")
+			writeError(w, http.StatusForbidden, "account not authorized")
+			return
+		}
+		api.logger.InfoContext(r.Context(), "bootstrap authorized", "route", "bootstrap")
+		api.proxy.ServeHTTP(w, r)
+		return
+	}
+	route, err := api.tenantRouter.ResolvePrincipal(r.Context(), principal)
+	if err != nil || route.Proxy == nil {
 		api.logger.WarnContext(r.Context(), "bootstrap authorization denied", "route", "bootstrap")
 		writeError(w, http.StatusForbidden, "account not authorized")
 		return
 	}
 	api.logger.InfoContext(r.Context(), "bootstrap authorized", "route", "bootstrap")
-	api.proxy.ServeHTTP(w, r)
+	api.proxyTenantBootstrap(w, r, route)
 }
 
 func (api *API) enroll(w http.ResponseWriter, r *http.Request) {
@@ -257,7 +290,11 @@ func (api *API) enroll(w http.ResponseWriter, r *http.Request) {
 	request.Header.Del("Authorization")
 	request.Header.Del("Content-Type")
 	request.Header.Del("Content-Length")
-	api.proxy.ServeHTTP(&writer, request)
+	if api.tenantRouter == nil {
+		api.proxy.ServeHTTP(&writer, request)
+		return
+	}
+	api.proxyTenantBootstrap(&writer, request, api.tenantRouter.Default())
 }
 
 func (api *API) forward(w http.ResponseWriter, r *http.Request) {
@@ -279,7 +316,41 @@ func (api *API) forward(w http.ResponseWriter, r *http.Request) {
 		}
 		r.Body = http.MaxBytesReader(w, r.Body, api.maxRequestBody)
 	}
-	api.proxy.ServeHTTP(w, r)
+	proxy := api.proxy
+	if api.tenantRouter != nil {
+		if credential := requestCredential(r); credential != "" {
+			route, ok := api.tenantRouter.ResolveCredential(credential)
+			if !ok || route.Proxy == nil {
+				writeError(w, http.StatusUnauthorized, "transport credential expired or unknown")
+				return
+			}
+			proxy = route.Proxy
+		} else if route := api.tenantRouter.Default(); route.Proxy != nil {
+			proxy = route.Proxy
+		}
+	}
+	proxy.ServeHTTP(w, r)
+}
+
+func (api *API) proxyTenantBootstrap(w http.ResponseWriter, r *http.Request, route TenantRoute) {
+	if route.Proxy == nil {
+		writeError(w, http.StatusServiceUnavailable, "tenant runtime unavailable")
+		return
+	}
+	response, credentials, ttl, err := captureBootstrap(route.Proxy, r)
+	if err != nil {
+		api.logger.ErrorContext(r.Context(), "tenant bootstrap failed", "route", "bootstrap", "error_class", "invalid_upstream_response")
+		writeError(w, http.StatusBadGateway, "upstream bootstrap unavailable")
+		return
+	}
+	if len(credentials) > 0 {
+		if err := api.tenantRouter.RememberCredentials(route, credentials, ttl); err != nil {
+			api.logger.ErrorContext(r.Context(), "tenant bootstrap routing failed", "route", "bootstrap", "error_class", "credential_capacity")
+			writeError(w, http.StatusServiceUnavailable, "tenant routing capacity unavailable")
+			return
+		}
+	}
+	response.send(w)
 }
 
 func enrollmentCredential(w http.ResponseWriter, r *http.Request) (string, int, error) {

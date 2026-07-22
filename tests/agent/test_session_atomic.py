@@ -8,6 +8,30 @@ from nanobot.session.manager import Session, SessionManager
 
 
 class TestAtomicSave:
+    def test_custom_workspace_never_reads_global_legacy_session(
+        self, tmp_path: Path, monkeypatch
+    ):
+        workspace = tmp_path / "tenant" / "workspace"
+        legacy = tmp_path / "global" / "sessions"
+        legacy.mkdir(parents=True)
+        legacy_file = legacy / "websocket_shared.jsonl"
+        legacy_file.write_text(
+            json.dumps({"role": "user", "content": "other tenant"}) + "\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            "nanobot.session.manager.is_default_workspace", lambda _workspace: False
+        )
+        monkeypatch.setattr(
+            "nanobot.session.manager.get_legacy_sessions_dir", lambda: legacy
+        )
+
+        mgr = SessionManager(workspace)
+        session = mgr.get_or_create("websocket:shared")
+
+        assert session.messages == []
+        assert legacy_file.exists()
+
     def test_save_creates_valid_jsonl(self, tmp_path: Path):
         mgr = SessionManager(tmp_path)
         session = Session(key="test:1")
