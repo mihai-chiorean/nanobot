@@ -28,7 +28,17 @@ struct ZiggyApp: App {
                         .prefetchClerkImages()
                         .environment(clerk)
                         .onOpenURL { url in
-                            Task { try? await clerk.handle(url) }
+                            guard ClerkCallbackValidation.accepts(url) else {
+                                appModel.bannerMessage = "Ziggy received an invalid sign-in callback."
+                                return
+                            }
+                            Task {
+                                do {
+                                    try await clerk.handle(url)
+                                } catch {
+                                    appModel.bannerMessage = "Sign-in could not be completed. Please try again."
+                                }
+                            }
                         }
                         .onChange(of: clerk.session?.id) { _, _ in
                             Task { await appModel.authenticationDidChange() }

@@ -110,11 +110,13 @@ final class AppModel {
     private var restTokenExpiresAt: Date?
     private var currentBootstrap: BootstrapResponse?
     private var bootstrapRefreshTask: Task<BootstrapResponse, Error>?
+    private var bootstrapRefreshGeneration = 0
     private var credentialGeneration = 0
     private var contentCapabilities = RichContentCapabilities.legacyOnly
     private var socket: ZiggyWebSocketClient?
     private var socketEventTask: Task<Void, Never>?
     private var configuredServerURL: URL?
+    private var connectionAttempt = 0
     private var pendingNewChat = false
     private var hasStarted = false
     private var chatReconciler = ChatStreamReconciler()
@@ -163,6 +165,9 @@ final class AppModel {
     }
 
     func connectAuthenticated() async {
+        connectionAttempt += 1
+        let attempt = connectionAttempt
+
         guard let serverURL = ZiggyServerURLValidation.url(from: serverURLText) else {
             phase = .failed("Enter a valid Ziggy server URL.")
             return
@@ -175,18 +180,22 @@ final class AppModel {
         phase = .connecting
         bannerMessage = nil
         await stopSocket()
-        bootstrapRefreshTask?.cancel()
-        bootstrapRefreshTask = nil
+        invalidateBootstrapRefresh()
         restClient = nil
         currentBootstrap = nil
         restTokenExpiresAt = nil
+        configuredServerURL = nil
         contentCapabilities = .legacyOnly
+        credentialGeneration += 1
 
         do {
             let identityToken = try await authSession.sessionToken()
+            guard attempt == connectionAttempt else { return }
             let bootstrap = try await ZiggyRESTClient(baseURL: serverURL)
                 .bootstrapAuthenticated(identityToken: identityToken)
+            guard attempt == connectionAttempt else { return }
             try await credentialStore.save(serverURL: serverURL)
+            guard attempt == connectionAttempt else { return }
             identity = authSession.identity ?? .signedOut
             configuredServerURL = serverURL
             installRESTClient(from: bootstrap, serverURL: serverURL)
@@ -195,29 +204,33 @@ final class AppModel {
             let webSocketURL = Self.webSocketURL(baseURL: serverURL, path: bootstrap.webSocketPath)
             let socket = ZiggyWebSocketClient(baseURL: webSocketURL) { [weak self] in
                 guard let self else { throw ZiggyRESTError.invalidResponse }
-                return try await self.webSocketCredential()
+                return try await self.webSocketCredential(for: attempt)
             }
             self.socket = socket
             observe(socket)
             await socket.start()
+            guard attempt == connectionAttempt else {
+                await socket.stop()
+                return
+            }
 
             async let sessionsLoad: Void = loadSessions(showSpinner: false)
             async let workLoad: Void = loadWork(showSpinner: false)
             _ = await (sessionsLoad, workLoad)
         } catch {
+            guard attempt == connectionAttempt else { return }
             connectionState = .failed(Self.message(for: error))
             phase = .failed(Self.message(for: error))
         }
     }
 
     func authenticationDidChange() async {
-        if authSession.isSignedIn {
-            identity = authSession.identity ?? .signedOut
-            await connectAuthenticated()
-        } else {
-            await clearConnectionState()
+        guard await clearConnectionState() else { return }
+        guard authSession.isSignedIn else {
             phase = .needsEnrollment
+            return
         }
+        await connectAuthenticated()
     }
 
     func retryConnection() async {
@@ -225,33 +238,46 @@ final class AppModel {
     }
 
     func signOut() async {
+        await clearConnectionState()
         do {
             try await authSession.signOut()
-            await clearConnectionState()
             phase = .needsEnrollment
         } catch {
             bannerMessage = Self.message(for: error)
+            if authSession.isSignedIn {
+                await connectAuthenticated()
+            }
         }
     }
 
-    private func clearConnectionState() async {
+    @discardableResult
+    private func clearConnectionState() async -> Bool {
+        connectionAttempt += 1
+        let attempt = connectionAttempt
         await stopSocket()
+        guard attempt == connectionAttempt else { return false }
         restClient = nil
         currentBootstrap = nil
-        bootstrapRefreshTask?.cancel()
-        bootstrapRefreshTask = nil
+        invalidateBootstrapRefresh()
         restTokenExpiresAt = nil
         contentCapabilities = .legacyOnly
-        credentialGeneration = 0
+        credentialGeneration += 1
         chatReconciler = ChatStreamReconciler()
         configuredServerURL = nil
         identity = .signedOut
         sessions = []
         workTasks = []
+        workEventsByTaskID = [:]
         messagesByChatID = [:]
         selectedSessionKey = nil
         chatNavigationPath = []
+        pendingNewChat = false
+        isRefreshing = false
+        isSending = false
+        modelName = "Ziggy"
+        bannerMessage = nil
         phase = .needsEnrollment
+        return true
     }
 
     func refreshAll() async {
@@ -276,6 +302,8 @@ final class AppModel {
                 refreshed.insert(active, at: 0)
             }
             sessions = refreshed
+        } catch is CancellationError {
+            return
         } catch {
             bannerMessage = Self.message(for: error)
         }
@@ -305,6 +333,8 @@ final class AppModel {
             }
         } catch ZiggyRESTError.http(let statusCode, _) where statusCode == 404 {
             messagesByChatID[Self.chatID(from: sessionKey)] = []
+        } catch is CancellationError {
+            return
         } catch {
             bannerMessage = Self.message(for: error)
         }
@@ -341,6 +371,8 @@ final class AppModel {
                 (lhs.updatedAt?.date ?? lhs.createdAt?.date ?? .distantPast)
                     > (rhs.updatedAt?.date ?? rhs.createdAt?.date ?? .distantPast)
             }
+        } catch is CancellationError {
+            return
         } catch {
             bannerMessage = Self.message(for: error)
         }
@@ -352,6 +384,8 @@ final class AppModel {
             workEventsByTaskID[task.id] = response.items.sorted { ($0.sequence ?? 0) < ($1.sequence ?? 0) }
             let after = response.items.compactMap(\.sequence).max()
             await socket?.send(.workSubscribe(taskID: task.id, afterSequence: after))
+        } catch is CancellationError {
+            return
         } catch {
             bannerMessage = Self.message(for: error)
         }
@@ -473,23 +507,38 @@ final class AppModel {
     private func performAuthenticatedREST<Value>(
         _ operation: (ZiggyRESTClient) async throws -> Value
     ) async throws -> Value {
-        let client = try await authenticatedRESTClient()
-        let generation = credentialGeneration
+        let attempt = connectionAttempt
         do {
-            return try await operation(client)
-        } catch ZiggyRESTError.http(let statusCode, _) where statusCode == 401 {
-            if generation == credentialGeneration {
-                restClient = nil
-                restTokenExpiresAt = nil
-                currentBootstrap = nil
+            let client = try await authenticatedRESTClient()
+            guard attempt == connectionAttempt else { throw CancellationError() }
+            let generation = credentialGeneration
+            do {
+                let value = try await operation(client)
+                guard attempt == connectionAttempt else { throw CancellationError() }
+                return value
+            } catch ZiggyRESTError.http(let statusCode, _) where statusCode == 401 {
+                guard attempt == connectionAttempt else { throw CancellationError() }
+                if generation == credentialGeneration {
+                    restClient = nil
+                    restTokenExpiresAt = nil
+                    currentBootstrap = nil
+                }
+                let retryClient = try await authenticatedRESTClient()
+                guard attempt == connectionAttempt else { throw CancellationError() }
+                let value = try await operation(retryClient)
+                guard attempt == connectionAttempt else { throw CancellationError() }
+                return value
             }
-            let retryClient = try await authenticatedRESTClient()
-            return try await operation(retryClient)
+        } catch {
+            guard attempt == connectionAttempt else { throw CancellationError() }
+            throw error
         }
     }
 
-    private func webSocketCredential() async throws -> WebSocketCredential {
+    private func webSocketCredential(for attempt: Int) async throws -> WebSocketCredential {
+        guard attempt == connectionAttempt else { throw CancellationError() }
         let bootstrap = try await refreshBootstrap(force: true)
+        guard attempt == connectionAttempt else { throw CancellationError() }
         return WebSocketCredential(
             bearerToken: bootstrap.webSocketToken ?? bootstrap.restToken,
             capabilities: RichContentCapabilities(advertised: bootstrap.capabilities)
@@ -503,7 +552,13 @@ final class AppModel {
             return currentBootstrap
         }
         if let bootstrapRefreshTask {
+            let refreshGeneration = bootstrapRefreshGeneration
+            let attempt = connectionAttempt
             let bootstrap = try await bootstrapRefreshTask.value
+            guard refreshGeneration == bootstrapRefreshGeneration,
+                  attempt == connectionAttempt else {
+                throw CancellationError()
+            }
             if currentBootstrap != bootstrap {
                 guard let serverURL = configuredServerURL else { throw ZiggyRESTError.invalidURL }
                 installRESTClient(from: bootstrap, serverURL: serverURL)
@@ -514,6 +569,9 @@ final class AppModel {
             throw ZiggyRESTError.invalidURL
         }
 
+        bootstrapRefreshGeneration += 1
+        let refreshGeneration = bootstrapRefreshGeneration
+        let attempt = connectionAttempt
         let task = Task { @MainActor in
             let identityToken = try await authSession.sessionToken()
             return try await ZiggyRESTClient(baseURL: serverURL)
@@ -522,15 +580,27 @@ final class AppModel {
         bootstrapRefreshTask = task
         do {
             let bootstrap = try await task.value
+            guard refreshGeneration == bootstrapRefreshGeneration,
+                  attempt == connectionAttempt else {
+                throw CancellationError()
+            }
             bootstrapRefreshTask = nil
             if currentBootstrap != bootstrap {
                 installRESTClient(from: bootstrap, serverURL: serverURL)
             }
             return bootstrap
         } catch {
-            bootstrapRefreshTask = nil
+            if refreshGeneration == bootstrapRefreshGeneration {
+                bootstrapRefreshTask = nil
+            }
             throw error
         }
+    }
+
+    private func invalidateBootstrapRefresh() {
+        bootstrapRefreshGeneration += 1
+        bootstrapRefreshTask?.cancel()
+        bootstrapRefreshTask = nil
     }
 
     private func installRESTClient(from bootstrap: BootstrapResponse, serverURL: URL) {

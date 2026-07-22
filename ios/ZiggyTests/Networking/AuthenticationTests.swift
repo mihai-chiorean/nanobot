@@ -25,6 +25,21 @@ final class AuthenticationTests: XCTestCase {
         XCTAssertEqual(result.restToken, "short")
     }
 
+    func testClerkCallbackValidationAcceptsOnlyTheRegisteredCallback() throws {
+        XCTAssertTrue(ClerkCallbackValidation.accepts(try XCTUnwrap(
+            URL(string: "com.mihaichiorean.ziggy://callback?code=example&state=opaque")
+        )))
+        XCTAssertFalse(ClerkCallbackValidation.accepts(try XCTUnwrap(
+            URL(string: "com.mihaichiorean.ziggy://attacker/callback?code=example")
+        )))
+        XCTAssertFalse(ClerkCallbackValidation.accepts(try XCTUnwrap(
+            URL(string: "https://chat.mihaichiorean.com/callback?code=example")
+        )))
+        XCTAssertFalse(ClerkCallbackValidation.accepts(try XCTUnwrap(
+            URL(string: "com.mihaichiorean.ziggy://callback/extra?code=example")
+        )))
+    }
+
     func testRESTResponseLimitAppliesBeforeDecode() async throws {
         let session = makeSession()
         URLProtocolStub.handler = { request in

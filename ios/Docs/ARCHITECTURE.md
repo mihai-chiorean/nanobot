@@ -113,6 +113,9 @@ The optional OpenAI-compatible endpoint uses `POST /v1/chat/completions` with
 ## State and failure policy
 
 - UI state is main-actor isolated.
+- Connection, bootstrap-refresh, and REST results are generation-fenced so an
+  account switch cannot apply stale credentials or tenant data to the new
+  session. Old sockets cannot request credentials for a newer account.
 - A socket drop moves the app to reconnecting and retains unsent frames.
 - Exponential reconnect backoff is bounded and reset after a successful
   ping/pong confirms the WebSocket upgrade.

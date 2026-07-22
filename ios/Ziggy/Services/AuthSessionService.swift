@@ -1,6 +1,22 @@
 import ClerkKit
 import Foundation
 
+enum ClerkCallbackValidation {
+    static let scheme = "com.mihaichiorean.ziggy"
+
+    static func accepts(_ url: URL) -> Bool {
+        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+            return false
+        }
+        return components.scheme?.lowercased() == scheme
+            && components.host?.lowercased() == "callback"
+            && (components.path.isEmpty || components.path == "/")
+            && components.user == nil
+            && components.password == nil
+            && components.port == nil
+    }
+}
+
 struct ZiggyIdentity: Sendable, Equatable {
     let name: String
     let email: String
