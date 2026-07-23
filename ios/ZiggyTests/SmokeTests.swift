@@ -15,6 +15,22 @@ final class SmokeTests: XCTestCase {
     }
 
     @MainActor
+    func testNewChatImmediatelyOpensAnEphemeralDraft() {
+        let model = AppModel()
+
+        model.newChat()
+
+        guard let sessionKey = model.selectedSessionKey else {
+            XCTFail("Expected the draft to become the selected conversation")
+            return
+        }
+        XCTAssertEqual(model.chatNavigationPath, [sessionKey])
+        XCTAssertTrue(sessionKey.hasPrefix("websocket:"))
+        XCTAssertTrue(model.sessions.isEmpty)
+        XCTAssertTrue(model.messagesByChatID.isEmpty)
+    }
+
+    @MainActor
     func testBackgroundTransitionImmediatelyMarksSocketIdle() async {
         let model = AppModel()
         model.connectionState = .connected

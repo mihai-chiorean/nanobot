@@ -17,6 +17,8 @@
 ### Conversations
 
 - Live conversation list and REST history restoration.
+- New conversations open as local drafts immediately and only enter history after the
+  first submitted turn.
 - New and resumed WebSocket chats with reconnect-safe attachment.
 - User, assistant, progress, and streaming message presentation.
 - Structured Markdown with paragraph spacing, headings, lists, code blocks,
