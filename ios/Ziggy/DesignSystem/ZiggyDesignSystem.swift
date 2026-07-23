@@ -1,4 +1,5 @@
 import SwiftUI
+import Textual
 
 enum ZiggyPalette {
     // Mirrors webui/src/globals.css. Color is reserved for status and errors.
@@ -54,24 +55,20 @@ struct ZiggyMarkdownText: View {
 
     var body: some View {
         Group {
-            // Textual 0.5.0 is pinned to iOS 18 in its Package.swift, so it cannot
-            // be added while Ziggy supports iOS 17. Keep Foundation's native path
-            // until a compatible release is available.
-            if RichContentSafety.allowsAttributedString(markdown),
-               let attributed = try? AttributedString(
-                markdown: markdown,
-                options: .init(interpretedSyntax: .full)
-            ) {
-                Text(attributed)
+            if RichContentSafety.allowsStructuredMarkdown(markdown) {
+                StructuredText(markdown: markdown)
+                    .textual.structuredTextStyle(.gitHub)
+                    .textual.textSelection(.enabled)
             } else {
                 Text(markdown)
+                    .lineSpacing(3)
+                    .textSelection(.enabled)
             }
         }
         .font(font)
         .foregroundStyle(ZiggyPalette.foreground.opacity(0.94))
-        .lineSpacing(3)
-        .textSelection(.enabled)
         .tint(ZiggyPalette.foreground)
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 

@@ -16,7 +16,7 @@ SPEC.loader.exec_module(MODULE)
 CAPABILITY = "runtime-capability-012345678901234567890"
 
 
-def test_update_adds_only_managed_gmail_server():
+def test_update_hardens_workspace_and_adds_only_managed_gmail_server():
     document = {
         "channels": {"websocket": {"tokenIssueSecret": CAPABILITY}},
         "tools": {
@@ -25,6 +25,7 @@ def test_update_adds_only_managed_gmail_server():
         },
     }
     assert MODULE.update_config(document) is True
+    assert document["tools"]["restrictToWorkspace"] is True
     assert document["tools"]["web"] == {"enable": True}
     assert document["tools"]["mcpServers"]["other"] == {
         "url": "https://example.test/mcp"

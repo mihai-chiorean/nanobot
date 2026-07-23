@@ -120,8 +120,8 @@ final class RichContentTests: XCTestCase {
             return XCTFail("legacy assistant text should become markdown")
         }
         XCTAssertEqual(markdown.text, raw)
-        XCTAssertFalse(RichContentSafety.allowsAttributedString(raw))
-        XCTAssertTrue(RichContentSafety.allowsAttributedString("**safe** [link](https://example.test)"))
+        XCTAssertFalse(RichContentSafety.allowsStructuredMarkdown(raw))
+        XCTAssertTrue(RichContentSafety.allowsStructuredMarkdown("**safe** [link](https://example.test)"))
     }
 
     func testLegacyProgressAndToolMetadataRemainTimelineBlocks() {

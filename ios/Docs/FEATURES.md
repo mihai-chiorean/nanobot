@@ -19,7 +19,8 @@
 - Live conversation list and REST history restoration.
 - New and resumed WebSocket chats with reconnect-safe attachment.
 - User, assistant, progress, and streaming message presentation.
-- Basic Markdown and selectable text.
+- Structured Markdown with paragraph spacing, headings, lists, code blocks,
+  tables, selectable text, and dynamic type.
 - Multi-line composer with image attachments, background-work mode, and
   Apple Speech dictation.
 

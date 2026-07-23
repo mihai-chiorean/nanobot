@@ -24,30 +24,15 @@ struct ZiggyApp: App {
     var body: some Scene {
         WindowGroup {
             Group {
-                if let clerk {
-                    RootView()
-                        .prefetchClerkImages()
-                        .environment(clerk)
-                        .onOpenURL { url in
-                            guard ClerkCallbackValidation.accepts(url) else {
-                                appModel.bannerMessage = "Ziggy received an invalid sign-in callback."
-                                return
-                            }
-                            Task {
-                                do {
-                                    try await clerk.handle(url)
-                                } catch {
-                                    appModel.bannerMessage = "Sign-in could not be completed. Please try again."
-                                }
-                            }
-                        }
-                        .onChange(of: clerk.session?.id) { _, _ in
-                            appModel.authenticationWillChange()
-                            Task { await appModel.authenticationDidChange() }
-                        }
+#if DEBUG
+                if ProcessInfo.processInfo.environment["ZIGGY_UI_FIXTURE"] == "markdown" {
+                    MarkdownFixtureView()
                 } else {
-                    AuthenticationConfigurationView()
+                    authenticatedRoot
                 }
+#else
+                authenticatedRoot
+#endif
             }
             .environment(appModel)
             .preferredColorScheme(appModel.theme.colorScheme)
@@ -63,6 +48,34 @@ struct ZiggyApp: App {
                     break
                 }
             }
+        }
+    }
+
+    @ViewBuilder
+    private var authenticatedRoot: some View {
+        if let clerk {
+            RootView()
+                .prefetchClerkImages()
+                .environment(clerk)
+                .onOpenURL { url in
+                    guard ClerkCallbackValidation.accepts(url) else {
+                        appModel.bannerMessage = "Ziggy received an invalid sign-in callback."
+                        return
+                    }
+                    Task {
+                        do {
+                            try await clerk.handle(url)
+                        } catch {
+                            appModel.bannerMessage = "Sign-in could not be completed. Please try again."
+                        }
+                    }
+                }
+                .onChange(of: clerk.session?.id) { _, _ in
+                    appModel.authenticationWillChange()
+                    Task { await appModel.authenticationDidChange() }
+                }
+        } else {
+            AuthenticationConfigurationView()
         }
     }
 }
