@@ -94,13 +94,28 @@ systemctl --user enable --now nanobot-tenant@<workspace-id>.service
 ```
 
 The generator creates an empty workspace, preserves only loopback model
-providers, removes every non-WebSocket channel, removes MCP servers, disables
-shell execution, enables `restrictToWorkspace`, and pins the runtime's Clerk
-email allowlist. It also sets WebSocket `tokenIssuePath` to `/auth/token` and
-stores the trimmed per-runtime `tokenIssueSecret`; the CLI rejects missing or
-short secret material and never prints it. Tenant processes receive no Clerk
-backend key. It does not copy sessions, memory, cron state, media, or the
+providers, removes every non-WebSocket channel and inherited MCP server,
+disables shell execution, enables `restrictToWorkspace`, and pins the runtime's
+Clerk email allowlist. It also sets WebSocket `tokenIssuePath` to `/auth/token`
+and stores the trimmed per-runtime `tokenIssueSecret`; the CLI rejects missing
+or short secret material and never prints it. Tenant processes receive no
+Clerk backend key. It does not copy sessions, memory, cron state, media, or the
 owner's cloud provider credentials.
+
+`--enable-gmail-mcp` adds only Ziggy's read-only Gmail MCP server. Do not enable
+it for untrusted testers while tenant runtimes share the `mihai` Unix account;
+the same-account pilot boundary does not defend against a compromised runtime
+reading another runtime's config. Existing trusted runtimes can be patched
+without replacing the rest of their config:
+
+```sh
+python3 configure_gmail_mcp.py \
+  --config /path/to/runtime/config.json
+systemctl --user restart <runtime-unit>
+```
+
+The migration is idempotent, writes atomically, preserves file ownership and
+mode, and never prints the capability.
 
 The systemd template presents home and system paths read-only and permits
 writes only below that tenant root. `UnsetEnvironment=CLERK_SECRET_KEY

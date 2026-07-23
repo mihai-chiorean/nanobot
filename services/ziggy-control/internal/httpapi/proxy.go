@@ -66,6 +66,7 @@ func newReverseProxy(target *url.URL, logger *slog.Logger, observability *teleme
 				}
 			}
 			if kind == proxyKindConnector {
+				request.Out.Header.Del("Authorization")
 				if principal, ok := connectorPrincipalFromContext(request.In.Context()); ok {
 					request.Out.Header.Set("X-Ziggy-Principal", principal.payload)
 					request.Out.Header.Set("X-Ziggy-Principal-Signature", principal.signature)

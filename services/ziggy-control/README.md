@@ -30,6 +30,11 @@ iOS / web -> Cloudflare -> ziggy-control -> private Nanobot -> Spark models
   Client-supplied principal headers are stripped. The Google callback remains
   public but receives no principal envelope and is authorized by one-use OAuth
   state.
+- Proxy `/runtime/connectors/mcp` for Nanobot using the tenant runtime's unique
+  bootstrap capability. The capability is stripped and replaced with the same
+  signed, one-minute tenant principal before the request reaches connectors.
+  Gmail MCP is opt-in while pilot runtimes share one Unix account; wider use
+  requires per-tenant process or container isolation.
 - Optionally proxy `/api/work` to the private durable Work service. Work
   requests use the remembered Nanobot transport bearer only for tenant lookup;
   Clerk is not run on this iOS transport route. The proxy strips the client

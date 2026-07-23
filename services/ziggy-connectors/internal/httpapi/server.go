@@ -11,12 +11,15 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mihai-chiorean/nanobot/services/ziggy-connectors/internal/crypto"
 	"github.com/mihai-chiorean/nanobot/services/ziggy-connectors/internal/principal"
 	"github.com/mihai-chiorean/nanobot/services/ziggy-connectors/internal/provider"
 	"github.com/mihai-chiorean/nanobot/services/ziggy-connectors/internal/store"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"golang.org/x/sync/singleflight"
 )
 
 type Config struct {
@@ -36,13 +39,18 @@ type Config struct {
 }
 
 type API struct {
-	config Config
-	logger *slog.Logger
+	config         Config
+	logger         *slog.Logger
+	mcpSchemaCache *mcp.SchemaCache
+	accessTokens   sync.Map
+	accessRefresh  singleflight.Group
+	gmailLimiters  sync.Map
 }
 
 type principalContextKey struct{}
 
 const googleGmailReadonlyScope = "https://www.googleapis.com/auth/gmail.readonly"
+const maximumMCPRequestBytes = 1 << 20
 
 func New(config Config) (http.Handler, error) {
 	if strings.TrimSpace(config.GoogleRedirectURI) == "" || config.StateTTL <= 0 || len(config.GoogleScopes) == 0 {
@@ -57,13 +65,14 @@ func New(config Config) (http.Handler, error) {
 	if config.Now == nil {
 		config.Now = time.Now
 	}
-	api := &API{config: config, logger: config.Logger}
+	api := &API{config: config, logger: config.Logger, mcpSchemaCache: mcp.NewSchemaCache()}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", api.health)
 	mux.HandleFunc("/readyz", api.ready)
 	mux.Handle("/oauth/google/start", api.auth(http.HandlerFunc(api.oauthStart)))
 	mux.HandleFunc("/oauth/google/callback", api.oauthCallback)
 	mux.Handle("/accounts", api.auth(http.HandlerFunc(api.accounts)))
+	mux.Handle("/mcp", http.MaxBytesHandler(api.auth(api.newMCPHandler()), maximumMCPRequestBytes))
 	return mux, nil
 }
 

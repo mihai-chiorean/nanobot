@@ -60,6 +60,29 @@ func TestRouterKeepsCredentialsBoundToTheirRuntime(t *testing.T) {
 	if _, ok := router.ResolveCredential("unknown-token"); ok {
 		t.Fatal("unknown token resolved")
 	}
+	runtimeOwner, ok := router.ResolveRuntimeCredential("owner-bootstrap-secret-with-32-bytes")
+	if !ok || runtimeOwner.WorkspaceID != owner.WorkspaceID {
+		t.Fatalf("owner runtime capability route = %+v, %v", runtimeOwner, ok)
+	}
+	if _, ok := router.ResolveRuntimeCredential("unknown-runtime-secret"); ok {
+		t.Fatal("unknown runtime capability resolved")
+	}
+}
+
+func TestRouterRejectsDisabledRuntimeCapability(t *testing.T) {
+	registry := loadTestRegistryWithTesterStatus(
+		t,
+		"http://127.0.0.1:10001",
+		"http://127.0.0.1:10002",
+		"disabled",
+	)
+	router, err := New(registry, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := router.ResolveRuntimeCredential("tester-bootstrap-secret-with-32-bytes"); ok {
+		t.Fatal("disabled runtime capability resolved")
+	}
 }
 
 func TestRouterExpiresCredentialWithoutAReaperGoroutine(t *testing.T) {
@@ -117,6 +140,10 @@ func TestRouterRejectsMissingUpstreamBootstrapSecret(t *testing.T) {
 }
 
 func loadTestRegistry(t *testing.T, ownerURL, testerURL string) *tenant.Registry {
+	return loadTestRegistryWithTesterStatus(t, ownerURL, testerURL, "active")
+}
+
+func loadTestRegistryWithTesterStatus(t *testing.T, ownerURL, testerURL, testerStatus string) *tenant.Registry {
 	t.Helper()
 	directory := t.TempDir()
 	manifestPath := filepath.Join(directory, "tenants.json")
@@ -132,7 +159,7 @@ func loadTestRegistry(t *testing.T, ownerURL, testerURL string) *tenant.Registry
 			{
 				"user_id": "usr_tester", "workspace_id": "ws_tester", "email": "tester@example.com",
 				"clerk_subject": "clerk_tester", "upstream_url": testerURL,
-				"upstream_bootstrap_secret": "tester-bootstrap-secret-with-32-bytes", "status": "active",
+				"upstream_bootstrap_secret": "tester-bootstrap-secret-with-32-bytes", "status": testerStatus,
 			},
 		},
 	}

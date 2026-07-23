@@ -75,6 +75,7 @@ func newAPI(cfg config.Config, accounts store.AccountRepository, transactions st
 		TokenURL:     cfg.GoogleTokenURL,
 		UserInfoURL:  cfg.GoogleUserInfoURL,
 		ProfileURL:   cfg.GoogleProfileURL,
+		GmailAPIURL:  cfg.GoogleGmailAPIURL,
 	})
 	return httpapi.New(httpapi.Config{
 		Environment:       cfg.Environment,

@@ -29,6 +29,10 @@ type TenantRouter interface {
 	Default() TenantRoute
 }
 
+type runtimeCredentialRouter interface {
+	ResolveRuntimeCredential(string) (TenantRoute, bool)
+}
+
 type capturedResponse struct {
 	header   http.Header
 	body     bytes.Buffer
