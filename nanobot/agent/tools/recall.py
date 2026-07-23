@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
@@ -174,11 +173,6 @@ class IngestTool(Tool):
         }
 
     async def execute(self, path: str, glob: str = "**/*.md", **kwargs: Any) -> str:
-        try:
-            rag = self._get_rag()
-        except RuntimeError as exc:
-            return f"Error: {exc}"
-
         target = Path(path).expanduser()
         if not target.is_absolute():
             target = self._workspace / target
@@ -193,6 +187,15 @@ class IngestTool(Tool):
 
         if not target.exists():
             return f"Error: path does not exist: {path}"
+
+        glob_path = Path(glob)
+        if glob_path.is_absolute() or ".." in glob_path.parts:
+            return "Error: glob must be a relative pattern without parent traversal"
+
+        try:
+            rag = self._get_rag()
+        except RuntimeError as exc:
+            return f"Error: {exc}"
 
         try:
             if target.is_dir():

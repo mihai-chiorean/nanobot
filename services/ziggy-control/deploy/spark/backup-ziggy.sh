@@ -32,6 +32,25 @@ fi
 if [[ -f /etc/ziggy/tenants.json ]]; then
   install --mode=0600 /etc/ziggy/tenants.json "${staging}/tenants.json"
 fi
+if [[ -d /home/mihai/.nanobot/workspace ]]; then
+  tar --create --gzip --file="${staging}/ziggy-owner-workspace.tgz" \
+    --directory=/home/mihai/.nanobot \
+    --exclude='workspace/.cache' \
+    --exclude='workspace/.venv' \
+    --exclude='workspace/venv' \
+    --exclude='workspace/node_modules' \
+    --exclude='workspace/*/node_modules' \
+    --exclude='workspace/rag' \
+    --exclude='workspace/rag.bak-*' \
+    workspace
+fi
+if [[ -d /home/mihai/.local/share/ziggy/tenants ]]; then
+  tar --create --gzip --file="${staging}/ziggy-tenant-workspaces.tgz" \
+    --directory=/home/mihai/.local/share/ziggy \
+    --exclude='tenants/*/runtime' \
+    --exclude='tenants/*/runtime/**' \
+    tenants
+fi
 
 printf 'created_at=%s\nhost=%s\nrelease=%s\n' \
   "${timestamp}" "$(hostname)" "${ZIGGY_RELEASE:-unknown}" \
