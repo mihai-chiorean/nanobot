@@ -413,6 +413,74 @@ public struct SettingsSnapshot: Codable, Hashable, Sendable {
     }
 }
 
+public struct ConnectorAccount: Codable, Hashable, Identifiable, Sendable {
+    public let accountID: String
+    public let provider: String
+    public let email: String
+    public let scopes: [String]
+    public let status: String
+    public let lastError: String?
+    public let createdAt: ZiggyTimestamp?
+    public let updatedAt: ZiggyTimestamp?
+
+    public var id: String { accountID }
+
+    public init(
+        accountID: String,
+        provider: String,
+        email: String,
+        scopes: [String],
+        status: String,
+        lastError: String? = nil,
+        createdAt: ZiggyTimestamp? = nil,
+        updatedAt: ZiggyTimestamp? = nil
+    ) {
+        self.accountID = accountID
+        self.provider = provider
+        self.email = email
+        self.scopes = scopes
+        self.status = status
+        self.lastError = lastError
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case accountID = "account_id"
+        case provider
+        case email
+        case scopes
+        case status
+        case lastError = "last_error"
+        case createdAt = "created_at"
+        case updatedAt = "updated_at"
+    }
+}
+
+public struct ConnectorAuthorization: Codable, Hashable, Sendable {
+    public let authorizationURL: String
+
+    public init(authorizationURL: String) {
+        self.authorizationURL = authorizationURL
+    }
+
+    public var googleURL: URL? {
+        guard let components = URLComponents(string: authorizationURL),
+              components.scheme?.lowercased() == "https",
+              components.host?.lowercased() == "accounts.google.com",
+              components.user == nil,
+              components.password == nil,
+              components.port == nil else {
+            return nil
+        }
+        return components.url
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case authorizationURL = "authorization_url"
+    }
+}
+
 public struct RESTEnvelope<Value: Codable & Sendable>: Codable, Sendable {
     public let data: Value?
     public let result: Value?

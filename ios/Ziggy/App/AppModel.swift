@@ -55,6 +55,7 @@ final class AppModel {
     enum Tab: Hashable {
         case chats
         case work
+        case integrations
         case settings
     }
 
@@ -79,8 +80,11 @@ final class AppModel {
     var messagesByChatID: [String: [ChatItem]] = [:]
     var workTasks: [WorkTask] = []
     var workEventsByTaskID: [String: [WorkEvent]] = [:]
+    var connectorAccounts: [ConnectorAccount] = []
     var isRefreshing = false
     var isSending = false
+    var isLoadingConnectors = false
+    var isStartingGoogleConnector = false
     var bannerMessage: String?
 
     var isConfigured: Bool {
@@ -234,7 +238,8 @@ final class AppModel {
 
             async let sessionsLoad: Void = loadSessions(showSpinner: false)
             async let workLoad: Void = loadWork(showSpinner: false)
-            _ = await (sessionsLoad, workLoad)
+            async let connectorsLoad: Void = loadConnectors(showSpinner: false)
+            _ = await (sessionsLoad, workLoad, connectorsLoad)
         } catch {
             guard attempt == connectionAttempt else { return }
             connectionState = .failed(Self.message(for: error))
@@ -304,12 +309,15 @@ final class AppModel {
         sessions = []
         workTasks = []
         workEventsByTaskID = [:]
+        connectorAccounts = []
         messagesByChatID = [:]
         selectedSessionKey = nil
         chatNavigationPath = []
         pendingNewChat = false
         isRefreshing = false
         isSending = false
+        isLoadingConnectors = false
+        isStartingGoogleConnector = false
         modelName = "Ziggy"
         bannerMessage = nil
         phase = .needsEnrollment
@@ -320,7 +328,8 @@ final class AppModel {
         isRefreshing = true
         async let sessionsLoad: Void = loadSessions(showSpinner: false)
         async let workLoad: Void = loadWork(showSpinner: false)
-        _ = await (sessionsLoad, workLoad)
+        async let connectorsLoad: Void = loadConnectors(showSpinner: false)
+        _ = await (sessionsLoad, workLoad, connectorsLoad)
         isRefreshing = false
     }
 
@@ -429,6 +438,56 @@ final class AppModel {
             return
         } catch {
             bannerMessage = Self.message(for: error)
+        }
+    }
+
+    func loadConnectors(showSpinner: Bool = true) async {
+        if showSpinner { isLoadingConnectors = true }
+        defer { if showSpinner { isLoadingConnectors = false } }
+
+        let attempt = connectionAttempt
+        guard let serverURL = configuredServerURL else { return }
+        do {
+            let identityToken = try await authSession.sessionToken()
+            guard attempt == connectionAttempt else { throw CancellationError() }
+            let response = try await ZiggyRESTClient(baseURL: serverURL)
+                .fetchConnectorAccounts(identityToken: identityToken)
+            guard attempt == connectionAttempt else { throw CancellationError() }
+            connectorAccounts = response.items.sorted {
+                ($0.updatedAt?.date ?? $0.createdAt?.date ?? .distantPast)
+                    > ($1.updatedAt?.date ?? $1.createdAt?.date ?? .distantPast)
+            }
+        } catch is CancellationError {
+            return
+        } catch {
+            bannerMessage = Self.message(for: error)
+        }
+    }
+
+    func googleConnectorAuthorizationURL() async -> URL? {
+        isStartingGoogleConnector = true
+        defer { isStartingGoogleConnector = false }
+
+        let attempt = connectionAttempt
+        guard let serverURL = configuredServerURL else {
+            bannerMessage = Self.message(for: ZiggyRESTError.invalidURL)
+            return nil
+        }
+        do {
+            let identityToken = try await authSession.sessionToken()
+            guard attempt == connectionAttempt else { throw CancellationError() }
+            let authorization = try await ZiggyRESTClient(baseURL: serverURL)
+                .startGoogleConnector(identityToken: identityToken)
+            guard attempt == connectionAttempt else { throw CancellationError() }
+            guard let url = authorization.googleURL else {
+                throw ZiggyRESTError.invalidResponse
+            }
+            return url
+        } catch is CancellationError {
+            return nil
+        } catch {
+            bannerMessage = Self.message(for: error)
+            return nil
         }
     }
 

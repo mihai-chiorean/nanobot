@@ -58,6 +58,7 @@ private struct ZiggyTabView: View {
                 switch appModel.selectedTab {
                 case .chats: ChatListView()
                 case .work: WorkListView()
+                case .integrations: IntegrationsView()
                 case .settings: SettingsView()
                 }
             }
@@ -68,6 +69,7 @@ private struct ZiggyTabView: View {
                 HStack(spacing: 6) {
                     TabButton(tab: .chats, title: "Chats", symbol: "bubble.left.and.bubble.right")
                     TabButton(tab: .work, title: "Work", symbol: "bolt.horizontal")
+                    TabButton(tab: .integrations, title: "Integrations", symbol: "puzzlepiece.extension")
                     TabButton(tab: .settings, title: "Settings", symbol: "gearshape")
                 }
                 .padding(.horizontal, 10)

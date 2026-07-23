@@ -43,6 +43,80 @@ final class AuthenticationTests: XCTestCase {
         }
     }
 
+    func testConnectorAccountsUseFreshIdentityTokenAndDecodeTenantEnvelope() async throws {
+        let session = makeSession()
+        URLProtocolStub.handler = { request in
+            XCTAssertEqual(request.httpMethod, "GET")
+            XCTAssertEqual(request.url?.path, "/connectors/accounts")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer clerk-session-token")
+            XCTAssertFalse(try XCTUnwrap(request.url).absoluteString.contains("clerk-session-token"))
+            return Self.response(
+                for: request,
+                body: """
+                {"accounts":[{
+                  "account_id":"acct-google-1",
+                  "provider":"google",
+                  "email":"owner@example.com",
+                  "scopes":["openid","https://www.googleapis.com/auth/gmail.readonly"],
+                  "status":"active",
+                  "created_at":"2026-07-22T18:00:00Z",
+                  "updated_at":"2026-07-22T18:30:00Z"
+                }]}
+                """
+            )
+        }
+
+        let response = try await ZiggyRESTClient(
+            baseURL: try XCTUnwrap(URL(string: "https://chat.mihaichiorean.com")),
+            session: session
+        ).fetchConnectorAccounts(identityToken: "clerk-session-token")
+
+        XCTAssertEqual(response.items.count, 1)
+        XCTAssertEqual(response.items.first?.id, "acct-google-1")
+        XCTAssertEqual(response.items.first?.email, "owner@example.com")
+        XCTAssertEqual(response.items.first?.status, "active")
+    }
+
+    func testGoogleConnectorStartUsesIdentityTokenAndAcceptsOnlyGoogleAuthorizationHost() async throws {
+        let session = makeSession()
+        URLProtocolStub.handler = { request in
+            XCTAssertEqual(request.url?.path, "/connectors/oauth/google/start")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer clerk-session-token")
+            return Self.response(
+                for: request,
+                body: #"{"authorization_url":"https://accounts.google.com/o/oauth2/v2/auth?state=opaque"}"#
+            )
+        }
+
+        let authorization = try await ZiggyRESTClient(
+            baseURL: try XCTUnwrap(URL(string: "https://chat.mihaichiorean.com")),
+            session: session
+        ).startGoogleConnector(identityToken: "clerk-session-token")
+
+        XCTAssertEqual(authorization.googleURL?.host, "accounts.google.com")
+        XCTAssertNil(ConnectorAuthorization(
+            authorizationURL: "https://accounts.google.com.attacker.example/oauth"
+        ).googleURL)
+    }
+
+    func testConnectorIdentityTokenRejectsAnUntrustedConfiguredHostBeforeNetworking() async throws {
+        let session = makeSession()
+        URLProtocolStub.handler = { _ in
+            XCTFail("a connector identity token request must not reach an untrusted host")
+            throw URLError(.badServerResponse)
+        }
+
+        do {
+            _ = try await ZiggyRESTClient(
+                baseURL: try XCTUnwrap(URL(string: "https://attacker.example")),
+                session: session
+            ).fetchConnectorAccounts(identityToken: "clerk-session-token")
+            XCTFail("expected untrusted host rejection")
+        } catch {
+            XCTAssertEqual(error as? ZiggyRESTError, .invalidURL)
+        }
+    }
+
     func testClerkCallbackValidationAcceptsOnlyTheRegisteredCallback() throws {
         XCTAssertTrue(ClerkCallbackValidation.accepts(try XCTUnwrap(
             URL(string: "com.mihaichiorean.ziggy://callback?code=example&state=opaque")

@@ -219,8 +219,29 @@ public struct ZiggyRESTClient: Sendable {
         try await request(path: ["api", "settings"])
     }
 
-    private func list<Value: Codable & Sendable>(path: [String], query: [URLQueryItem] = []) async throws -> RESTListResponse<Value> {
-        let data = try await data(path: path, query: query)
+    public func fetchConnectorAccounts(identityToken: String) async throws -> RESTListResponse<ConnectorAccount> {
+        guard ZiggyServerURLValidation.isTrustedForIdentityToken(baseURL) else {
+            throw ZiggyRESTError.invalidURL
+        }
+        return try await list(path: ["connectors", "accounts"], token: identityToken)
+    }
+
+    public func startGoogleConnector(identityToken: String) async throws -> ConnectorAuthorization {
+        guard ZiggyServerURLValidation.isTrustedForIdentityToken(baseURL) else {
+            throw ZiggyRESTError.invalidURL
+        }
+        return try await request(
+            path: ["connectors", "oauth", "google", "start"],
+            token: identityToken
+        )
+    }
+
+    private func list<Value: Codable & Sendable>(
+        path: [String],
+        query: [URLQueryItem] = [],
+        token: String? = nil
+    ) async throws -> RESTListResponse<Value> {
+        let data = try await data(path: path, query: query, token: token)
         return try decodeList(Value.self, from: data)
     }
 
@@ -295,7 +316,8 @@ public struct ZiggyRESTClient: Sendable {
         }
         guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw ZiggyRESTError.decoding }
         var itemsData: Data
-        if let value = object["sessions"] ?? object["messages"] ?? object["work"] ?? object["tasks"] ?? object["events"] ?? object["items"] ?? object["data"] {
+        if let value = object["sessions"] ?? object["messages"] ?? object["work"] ?? object["tasks"]
+            ?? object["events"] ?? object["accounts"] ?? object["items"] ?? object["data"] {
             itemsData = try JSONSerialization.data(withJSONObject: value)
         } else { throw ZiggyRESTError.decoding }
         if let nested = try? decoder.decode([Value].self, from: itemsData) {
@@ -304,7 +326,8 @@ public struct ZiggyRESTClient: Sendable {
             return RESTListResponse(items: nested, nextCursor: nextCursor, hasMore: hasMore)
         }
         if let nestedObject = try? JSONSerialization.jsonObject(with: itemsData) as? [String: Any],
-           let nestedValue = nestedObject["items"] ?? nestedObject["sessions"] ?? nestedObject["messages"] ?? nestedObject["data"] {
+           let nestedValue = nestedObject["items"] ?? nestedObject["sessions"] ?? nestedObject["messages"]
+            ?? nestedObject["accounts"] ?? nestedObject["data"] {
             itemsData = try JSONSerialization.data(withJSONObject: nestedValue)
         }
         let items = try decoder.decode([Value].self, from: itemsData)
