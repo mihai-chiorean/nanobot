@@ -3,11 +3,11 @@
 ## Deployment target
 
 - Swift 6 and SwiftUI.
-- iOS 17 minimum, tested primarily on iOS 26 and iPhone 17 Pro.
-- ClerkKit and ClerkKitUI provide native authentication. Textual 0.5.0 was
-  evaluated but its package manifest requires iOS 18, so iOS 17 keeps
-  Foundation's native AttributedString Markdown path with link/image safety
-  gates.
+- iOS 18 minimum, tested primarily on iOS 26 and iPhone 17 Pro.
+- ClerkKit and ClerkKitUI provide native authentication.
+- Textual `StructuredText` renders Markdown block structure, selection, and
+  dynamic type. Existing link, image, and HTML safety gates run before
+  structured rendering.
 - XcodeGen owns deterministic project generation through `project.yml`.
 
 ## Layers

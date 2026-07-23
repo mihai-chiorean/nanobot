@@ -6,7 +6,7 @@ Native SwiftUI client for the personal Ziggy deployment.
 
 - Xcode 26 or newer
 - XcodeGen (`brew install xcodegen`)
-- iOS 17 or newer
+- iOS 18 or newer
 
 ## Open and run
 

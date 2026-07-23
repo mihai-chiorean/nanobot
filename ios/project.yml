@@ -3,7 +3,7 @@ name: Ziggy
 options:
   bundleIdPrefix: com.mihaichiorean
   deploymentTarget:
-    iOS: "17.0"
+    iOS: "18.0"
   createIntermediateGroups: true
   groupSortPosition: top
 
@@ -15,6 +15,9 @@ packages:
   Clerk:
     url: https://github.com/clerk/clerk-ios.git
     from: 1.3.2
+  Textual:
+    url: https://github.com/gonzalezreal/textual.git
+    from: 0.5.0
 
 configFiles:
   Debug: Config/Base.xcconfig
@@ -39,6 +42,8 @@ targets:
         product: ClerkKit
       - package: Clerk
         product: ClerkKitUI
+      - package: Textual
+        product: Textual
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.mihaichiorean.ziggy

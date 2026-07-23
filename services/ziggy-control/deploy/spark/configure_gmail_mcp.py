@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Idempotently add the tenant-scoped Ziggy Gmail MCP server to a runtime."""
+"""Harden a runtime and add its tenant-scoped Ziggy Gmail MCP server."""
 
 from __future__ import annotations
 
@@ -26,11 +26,13 @@ def update_config(document: dict, url: str = DEFAULT_CONNECTOR_MCP_URL) -> bool:
     )
     expected = gmail_mcp_server(capability, url)
     tools = document.setdefault("tools", {})
+    changed = tools.get("restrictToWorkspace") is not True
+    tools["restrictToWorkspace"] = True
     servers = tools.setdefault("mcpServers", {})
-    if servers.get("ziggy_gmail") == expected:
-        return False
-    servers["ziggy_gmail"] = expected
-    return True
+    if servers.get("ziggy_gmail") != expected:
+        servers["ziggy_gmail"] = expected
+        changed = True
+    return changed
 
 
 def atomic_json(filename: Path, document: dict) -> None:

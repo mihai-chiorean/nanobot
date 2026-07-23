@@ -722,9 +722,9 @@ private enum RichContentStructuralValidation {
 }
 
 public enum RichContentSafety {
-    /// Foundation's Markdown parser is used only when the source contains neither
-    /// raw HTML nor Markdown image attachments. Those inputs stay literal text.
-    public static func allowsAttributedString(_ markdown: String) -> Bool {
+    /// Structured Markdown is used only when the source contains neither raw
+    /// HTML nor Markdown image attachments. Those inputs stay literal text.
+    public static func allowsStructuredMarkdown(_ markdown: String) -> Bool {
         let htmlPattern = #"(?is)<\s*(?:/\s*)?[a-z][^>]*>|<!--|<!DOCTYPE|<\?xml"#
         let imagePattern = #"!\s*\["#
         return markdown.range(of: htmlPattern, options: .regularExpression) == nil
