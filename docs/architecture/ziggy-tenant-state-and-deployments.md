@@ -51,9 +51,10 @@ For the pilot:
    tenants.
 4. Runtime configuration and connector capabilities remain outside the
    workspace and are not included in tenant workspace archives.
-5. Only one runtime may write a workspace at a time. The pilot enforces this
-   operationally through one systemd unit per allocation; database-backed
-   generation leases and write fencing are still required before automatic
+5. Only one runtime may write a workspace at a time. This is currently an
+   operator and runbook invariant, represented by one systemd unit per
+   allocation rather than enforced by the tenant registry. Database-backed
+   generation leases and write fencing are required before automatic
    relocation.
 6. Daily backups include the owner workspace, all tenant workspaces, the
    tenant-allocation manifest, Work state, and PostgreSQL dumps.
@@ -64,10 +65,10 @@ Owner archives exclude reproducible package environments and caches, plus the
 separated Omi Chroma archive. They retain Dream's `.git`, sessions, memory,
 skills, Work files, and user-authored artifacts. Tenant archives omit runtime
 configuration and capabilities but otherwise preserve the tenant workspace.
-These live archives are crash-consistent best efforts, not point-in-time
-filesystem snapshots. A file changing during `tar` fails the backup rather
-than publishing a known-partial snapshot. Quiesced or filesystem-level
-snapshots and a restore drill remain production hardening work.
+These are best-effort live archives, not point-in-time consistent filesystem
+snapshots. `tar` aborts on some observed file changes, but cannot provide
+cross-file or Git/session consistency. Quiesced or filesystem-level snapshots
+and a restore drill remain production hardening work.
 
 The current systemd runtimes still share one Unix account. Directory isolation
 prevents accidental mixing, not malicious cross-tenant reads by arbitrary
@@ -150,8 +151,8 @@ files, and database roles.
 That distinction keeps Google refresh-token encryption material out of the
 public process and narrows accidental credential exposure. It is defense in
 depth, not complete authorization isolation: control currently holds the HMAC
-signing authority used to call connectors for a routed tenant, so a compromised
-control process can impersonate a tenant to connector APIs. Connector-side
+signing authority used to call connectors, so a compromised control process
+can forge a principal for arbitrary known tenant IDs. Connector-side
 authorization must eventually verify an independently issued, short-lived,
 scope- and runtime-generation-bound capability. Even before that hardening,
 merging both into one process would expose raw token material for negligible
