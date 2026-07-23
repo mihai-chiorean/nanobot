@@ -72,9 +72,10 @@ if [[ -d "${tenant_root}" ]]; then
   )
   if (( ${#runtime_configs[@]} > 0 )); then
     printf '%s\0' "${runtime_configs[@]}" |
-      tar --create --gzip --null --files-from=- \
+      tar --create --gzip --null \
         --directory="${tenant_root}" \
-        --file="${staging}/ziggy-tenant-runtime-configs.tgz"
+        --file="${staging}/ziggy-tenant-runtime-configs.tgz" \
+        --files-from=-
   fi
 fi
 if [[ -d "${credential_store}" ]]; then
@@ -83,9 +84,10 @@ if [[ -d "${credential_store}" ]]; then
   )
   if (( ${#credential_files[@]} > 0 )); then
     printf '%s\0' "${credential_files[@]}" |
-      tar --create --gzip --null --files-from=- \
+      tar --create --gzip --null \
         --directory="${credential_store}" \
-        --file="${staging}/ziggy-runtime-credentials.tgz"
+        --file="${staging}/ziggy-runtime-credentials.tgz" \
+        --files-from=-
   fi
 fi
 if [[ -d "${user_systemd_dir}" ]]; then
@@ -114,9 +116,10 @@ if [[ -d "${binary_dir}" ]]; then
   )
   if (( ${#ziggy_binaries[@]} > 0 )); then
     printf '%s\0' "${ziggy_binaries[@]}" |
-      tar --create --gzip --null --files-from=- \
+      tar --create --gzip --null \
         --directory="${binary_dir}" \
-        --file="${staging}/ziggy-binaries.tgz"
+        --file="${staging}/ziggy-binaries.tgz" \
+        --files-from=-
   fi
 fi
 if [[ -d "${system_unit_dir}" ]]; then
@@ -126,9 +129,10 @@ if [[ -d "${system_unit_dir}" ]]; then
   )
   if (( ${#ziggy_system_units[@]} > 0 )); then
     printf '%s\0' "${ziggy_system_units[@]}" |
-      tar --create --gzip --null --files-from=- \
+      tar --create --gzip --null \
         --directory="${system_unit_dir}" \
-        --file="${staging}/ziggy-system-units.tgz"
+        --file="${staging}/ziggy-system-units.tgz" \
+        --files-from=-
   fi
 fi
 
