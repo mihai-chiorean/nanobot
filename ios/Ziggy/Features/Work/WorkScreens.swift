@@ -140,8 +140,11 @@ private struct WorkDetailView: View {
                 .background(ZiggyPalette.background)
             }
         }
-        .task {
+        .task(id: taskID) {
             if let task { await appModel.subscribe(to: task) }
+        }
+        .onDisappear {
+            appModel.stopWorkStream(taskID: taskID)
         }
     }
 }

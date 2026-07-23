@@ -52,9 +52,7 @@ def bus() -> MagicMock:
 
 
 @pytest.mark.asyncio
-async def test_work_rest_routes_and_isolated_inbounds(
-    bus: MagicMock, tmp_path: Path
-) -> None:
+async def test_work_rest_routes_and_isolated_inbounds(bus: MagicMock, tmp_path: Path) -> None:
     port = 29931
     channel = _channel(bus, tmp_path, port)
     server = asyncio.create_task(channel.start())
@@ -80,11 +78,16 @@ async def test_work_rest_routes_and_isolated_inbounds(
         assert inbound.chat_id == "visible-chat"
         assert inbound.session_key_override == f"work:{task_id}"
 
-        listing = await _request(
-            "GET", f"http://127.0.0.1:{port}/api/work", headers=headers
-        )
+        listing = await _request("GET", f"http://127.0.0.1:{port}/api/work", headers=headers)
         assert listing.status_code == 200
-        assert set(listing.json()) == {"tasks"}
+        assert set(listing.json()) == {
+            "tasks",
+            "has_more",
+            "next_offset",
+            "next_task_id",
+        }
+        assert listing.json()["has_more"] is False
+        assert listing.json()["next_offset"] == 1
         assert listing.json()["tasks"][0]["task_id"] == task_id
         detail = await _request(
             "GET", f"http://127.0.0.1:{port}/api/work/{task_id}", headers=headers
@@ -124,6 +127,112 @@ async def test_work_rest_routes_and_isolated_inbounds(
         )
         assert rejected.status_code == 409
         bus.publish_inbound.assert_not_awaited()
+    finally:
+        await channel.stop()
+        await server
+
+
+@pytest.mark.asyncio
+async def test_work_websocket_idempotency_keys_reuse_task_and_message(
+    bus: MagicMock, tmp_path: Path
+) -> None:
+    port = 29936
+    channel = _channel(bus, tmp_path, port)
+    server = asyncio.create_task(channel.start())
+    await asyncio.sleep(0.2)
+    try:
+        token = await _token(port)
+        async with websockets.connect(f"ws://127.0.0.1:{port}/?token={token}") as client:
+            assert json.loads(await client.recv())["event"] == "ready"
+            create = {
+                "type": "work.create",
+                "chat_id": "idempotent-chat",
+                "content": "One execution",
+                "idempotency_key": "work_" + "a" * 32,
+            }
+            await client.send(json.dumps(create))
+            first = json.loads(await client.recv())
+            await client.send(json.dumps(create))
+            duplicate = json.loads(await client.recv())
+            replay = json.loads(await client.recv())
+
+            assert duplicate["task_id"] == first["task_id"]
+            assert replay["type"] == "task.created"
+            assert bus.publish_inbound.await_count == 1
+
+            message = {
+                "type": "work.message",
+                "task_id": first["task_id"],
+                "content": "One follow-up",
+                "idempotency_key": "cmd_" + "b" * 32,
+            }
+            await client.send(json.dumps(message))
+            assert json.loads(await client.recv())["type"] == "message.received"
+            await client.send(json.dumps(message))
+            await client.send(
+                json.dumps(
+                    {
+                        "type": "work.subscribe",
+                        "task_id": first["task_id"],
+                        "after_seq": 1,
+                    }
+                )
+            )
+            assert json.loads(await client.recv())["event"] == "work.subscribed"
+            assert json.loads(await client.recv())["type"] == "message.received"
+            assert bus.publish_inbound.await_count == 2
+    finally:
+        await channel.stop()
+        await server
+
+
+@pytest.mark.asyncio
+async def test_work_message_idempotency_retries_after_publish_failure(
+    bus: MagicMock, tmp_path: Path
+) -> None:
+    port = 29937
+    channel = _channel(bus, tmp_path, port)
+    server = asyncio.create_task(channel.start())
+    await asyncio.sleep(0.2)
+    try:
+        token = await _token(port)
+        async with websockets.connect(f"ws://127.0.0.1:{port}/?token={token}") as client:
+            assert json.loads(await client.recv())["event"] == "ready"
+            await client.send(
+                json.dumps(
+                    {
+                        "type": "work.create",
+                        "chat_id": "retry-chat",
+                        "content": "Initial task",
+                    }
+                )
+            )
+            created = json.loads(await client.recv())
+            task_id = created["task_id"]
+            bus.publish_inbound.reset_mock()
+            bus.publish_inbound.side_effect = RuntimeError("queue unavailable")
+            message = {
+                "type": "work.message",
+                "task_id": task_id,
+                "content": "Retry this follow-up",
+                "idempotency_key": "cmd_" + "d" * 32,
+            }
+
+            await client.send(json.dumps(message))
+            failed = json.loads(await client.recv())
+            assert failed == {"event": "error", "detail": "failed to enqueue work message"}
+            assert bus.publish_inbound.await_count == 1
+
+            bus.publish_inbound.side_effect = None
+            await client.send(json.dumps(message))
+            retried = json.loads(await client.recv())
+            assert retried["type"] == "message.received"
+            assert bus.publish_inbound.await_count == 2
+
+            await client.send(json.dumps(message))
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(client.recv(), timeout=0.2)
+            assert bus.publish_inbound.await_count == 2
     finally:
         await channel.stop()
         await server
@@ -173,9 +282,7 @@ async def test_work_cancel_signals_agent_and_enqueue_failure_is_terminal(
         assert failed_create.status_code == 503
         assert channel._work_store is not None
         failed = next(
-            item
-            for item in channel._work_store.list_tasks()
-            if item["chat_id"] == "failed-chat"
+            item for item in channel._work_store.list_tasks() if item["chat_id"] == "failed-chat"
         )
         assert failed["status"] == "failed"
         assert failed["error"] == "Failed to enqueue Work task."
@@ -203,17 +310,12 @@ async def test_cancel_race_accepts_agent_cancel_and_publish_failure_keeps_state(
 
     second = channel._work_store.create_task(chat_id="race-chat", content="No queue")
     bus.publish_inbound.side_effect = RuntimeError("queue unavailable")
-    assert (
-        await channel._cancel_work_task(second, sender_id="rest")
-        == "publish_failed"
-    )
+    assert await channel._cancel_work_task(second, sender_id="rest") == "publish_failed"
     assert channel._work_store.get_task(second["task_id"])["status"] == "queued"
 
 
 @pytest.mark.asyncio
-async def test_work_artifact_auth_streaming_and_unknown_ids(
-    bus: MagicMock, tmp_path: Path
-) -> None:
+async def test_work_artifact_auth_streaming_and_unknown_ids(bus: MagicMock, tmp_path: Path) -> None:
     port = 29934
     channel = _channel(bus, tmp_path, port)
     assert channel._work_store is not None
@@ -230,9 +332,7 @@ async def test_work_artifact_auth_streaming_and_unknown_ids(
         downloaded = await _request("GET", url, headers=headers)
         assert downloaded.status_code == 200
         assert downloaded.content == b"streamed report"
-        assert downloaded.headers["content-disposition"] == (
-            'attachment; filename="report.txt"'
-        )
+        assert downloaded.headers["content-disposition"] == ('attachment; filename="report.txt"')
 
         unknown_task = "work_" + "0" * 32
         unknown_artifact = "artifact_" + "0" * 32
@@ -260,9 +360,7 @@ async def test_work_artifact_auth_streaming_and_unknown_ids(
 
 
 @pytest.mark.asyncio
-async def test_work_websocket_envelopes_and_stop_signal(
-    bus: MagicMock, tmp_path: Path
-) -> None:
+async def test_work_websocket_envelopes_and_stop_signal(bus: MagicMock, tmp_path: Path) -> None:
     port = 29935
     channel = _channel(bus, tmp_path, port)
     server = asyncio.create_task(channel.start())
@@ -287,9 +385,7 @@ async def test_work_websocket_envelopes_and_stop_signal(
             assert created["task"]["session_key"] == session_key
             assert bus.publish_inbound.await_args.args[0].session_key_override == session_key
 
-            await client.send(
-                json.dumps({"type": "work.subscribe", "task_id": task_id})
-            )
+            await client.send(json.dumps({"type": "work.subscribe", "task_id": task_id}))
             assert json.loads(await client.recv()) == {
                 "event": "work.subscribed",
                 "task_id": task_id,
@@ -300,9 +396,7 @@ async def test_work_websocket_envelopes_and_stop_signal(
 
             bus.publish_inbound.reset_mock()
             await client.send(
-                json.dumps(
-                    {"type": "work.message", "task_id": task_id, "content": "More detail"}
-                )
+                json.dumps({"type": "work.message", "task_id": task_id, "content": "More detail"})
             )
             message_event = json.loads(await client.recv())
             assert message_event["type"] == "message.received"
@@ -318,9 +412,7 @@ async def test_work_websocket_envelopes_and_stop_signal(
             assert stop.session_key_override == session_key
 
             await client.send(
-                json.dumps(
-                    {"type": "work.message", "task_id": task_id, "content": "Too late"}
-                )
+                json.dumps({"type": "work.message", "task_id": task_id, "content": "Too late"})
             )
             terminal = json.loads(await client.recv())
             assert terminal["event"] == "error"

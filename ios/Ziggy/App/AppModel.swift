@@ -119,6 +119,8 @@ final class AppModel {
     private var contentCapabilities = RichContentCapabilities.legacyOnly
     private var socket: ZiggyWebSocketClient?
     private var socketEventTask: Task<Void, Never>?
+    private var workStreamTasks: [String: Task<Void, Never>] = [:]
+    private var workStreamTokens: [String: UUID] = [:]
     private var configuredServerURL: URL?
     private var connectionAttempt = 0
     private var needsForegroundReconnect = false
@@ -194,6 +196,7 @@ final class AppModel {
 
         phase = .connecting
         bannerMessage = nil
+        stopWorkStreams()
         await stopSocket()
         invalidateBootstrapRefresh()
         restClient = nil
@@ -254,8 +257,10 @@ final class AppModel {
 
     func applicationDidEnterBackground() {
         connectionAttempt += 1
+        credentialGeneration += 1
         needsForegroundReconnect = true
         invalidateBootstrapRefresh()
+        stopWorkStreams()
         let socketToStop = detachSocket()
         Task { await socketToStop?.stop() }
     }
@@ -284,6 +289,7 @@ final class AppModel {
     private func clearConnectionState() async -> Bool {
         connectionAttempt += 1
         let attempt = connectionAttempt
+        stopWorkStreams()
         await stopSocket()
         guard attempt == connectionAttempt else { return false }
         restClient = nil
@@ -385,8 +391,26 @@ final class AppModel {
             ChatItem(chatID: chatID, role: .user, text: trimmed.isEmpty ? "Image attachment" : trimmed)
         )
         if asBackgroundWork {
-            await socket?.send(.workCreate(chatID: chatID, content: trimmed, title: nil, media: media))
-            selectedTab = .work
+            let idempotencyKey = UUID().uuidString
+            do {
+                let task = try await performAuthenticatedREST {
+                    try await $0.createWork(
+                        chatID: chatID,
+                        content: trimmed,
+                        media: media,
+                        idempotencyKey: idempotencyKey
+                    )
+                }
+                upsert(task: task)
+                selectedTab = .work
+            } catch ZiggyRESTError.http(let statusCode, _) where statusCode == 404 || statusCode == 501 {
+                await socket?.send(.workCreate(chatID: chatID, content: trimmed, title: nil, media: media))
+                selectedTab = .work
+            } catch is CancellationError {
+                return
+            } catch {
+                bannerMessage = Self.message(for: error)
+            }
         } else {
             await socket?.send(.message(chatID: chatID, content: trimmed, media: media))
         }
@@ -409,11 +433,36 @@ final class AppModel {
     }
 
     func subscribe(to task: WorkTask) async {
+        stopWorkStream(taskID: task.id)
+        let token = UUID()
+        workStreamTokens[task.id] = token
+        let streamTask = Task { [weak self] in
+            guard let self else { return }
+            await self.runWorkSubscription(to: task, token: token)
+        }
+        workStreamTasks[task.id] = streamTask
+        await withTaskCancellationHandler {
+            await streamTask.value
+        } onCancel: {
+            streamTask.cancel()
+        }
+        if workStreamTokens[task.id] == token {
+            workStreamTokens[task.id] = nil
+            workStreamTasks[task.id] = nil
+        }
+    }
+
+    func cancel(task: WorkTask) async {
+        let idempotencyKey = UUID().uuidString
         do {
-            let response = try await performAuthenticatedREST { try await $0.fetchWorkEvents(taskID: task.id) }
-            workEventsByTaskID[task.id] = response.items.sorted { ($0.sequence ?? 0) < ($1.sequence ?? 0) }
-            let after = response.items.compactMap(\.sequence).max()
-            await socket?.send(.workSubscribe(taskID: task.id, afterSequence: after))
+            let updated = try await performAuthenticatedREST {
+                try await $0.cancelWork(taskID: task.id, idempotencyKey: idempotencyKey)
+            }
+            upsert(task: updated)
+            stopWorkStream(taskID: task.id)
+            await loadWork(showSpinner: false)
+        } catch ZiggyRESTError.http(let statusCode, _) where statusCode == 404 || statusCode == 501 {
+            await socket?.send(.workCancel(taskID: task.id))
         } catch is CancellationError {
             return
         } catch {
@@ -421,14 +470,119 @@ final class AppModel {
         }
     }
 
-    func cancel(task: WorkTask) async {
-        await socket?.send(.workCancel(taskID: task.id))
-    }
-
     func sendFollowUp(_ content: String, to task: WorkTask) async {
         let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        await socket?.send(.workMessage(taskID: task.id, content: trimmed))
+        let idempotencyKey = UUID().uuidString
+        do {
+            try await performAuthenticatedREST {
+                try await $0.sendWorkFollowUp(
+                    taskID: task.id,
+                    content: trimmed,
+                    idempotencyKey: idempotencyKey
+                )
+            }
+        } catch ZiggyRESTError.http(let statusCode, _) where statusCode == 404 || statusCode == 501 {
+            await socket?.send(.workMessage(taskID: task.id, content: trimmed))
+        } catch is CancellationError {
+            return
+        } catch {
+            bannerMessage = Self.message(for: error)
+        }
+    }
+
+    private func runWorkSubscription(to task: WorkTask, token: UUID) async {
+        var afterSequence: Int?
+        do {
+            var initialEvents: [WorkEvent] = []
+            while true {
+                let page = try await performAuthenticatedREST {
+                    try await $0.fetchWorkEvents(taskID: task.id, afterSequence: afterSequence)
+                }
+                guard isCurrentWorkStream(taskID: task.id, token: token) else {
+                    throw CancellationError()
+                }
+                let pageMaximum = page.items.compactMap(\.sequence).max()
+                let previousSequence = afterSequence ?? 0
+                if let pageMaximum {
+                    afterSequence = max(previousSequence, pageMaximum)
+                }
+                initialEvents.append(contentsOf: page.items)
+                if initialEvents.count > ZiggyProtocolLimits.maxTrackedStreamSequences {
+                    initialEvents.removeFirst(initialEvents.count - ZiggyProtocolLimits.maxTrackedStreamSequences)
+                }
+                guard page.hasMore == true,
+                      let pageMaximum,
+                      pageMaximum > previousSequence else {
+                    break
+                }
+            }
+            initialEvents.sort { ($0.sequence ?? 0) < ($1.sequence ?? 0) }
+            workEventsByTaskID[task.id] = initialEvents
+
+            guard !task.status.isTerminal else { return }
+            var client = try await authenticatedRESTClient()
+            var didRefreshCredential = false
+            var streamGeneration = credentialGeneration
+
+            while isCurrentWorkStream(taskID: task.id, token: token), !Task.isCancelled {
+                do {
+                    let stream = client.streamWorkEvents(
+                        taskID: task.id,
+                        lastEventID: afterSequence.map(String.init)
+                    )
+                    for try await event in stream {
+                        guard isCurrentWorkStream(taskID: task.id, token: token),
+                              streamGeneration == credentialGeneration else {
+                            throw CancellationError()
+                        }
+                        afterSequence = max(afterSequence ?? 0, event.sequence ?? 0)
+                        handle(event)
+                        if Self.isTerminalWorkEvent(event) { return }
+                    }
+                    return
+                } catch ZiggyRESTError.http(let statusCode, _) where statusCode == 404 || statusCode == 501 {
+                    await socket?.send(.workSubscribe(taskID: task.id, afterSequence: afterSequence))
+                    return
+                } catch ZiggyRESTError.http(let statusCode, _) where statusCode == 401 && !didRefreshCredential {
+                    restClient = nil
+                    restTokenExpiresAt = nil
+                    currentBootstrap = nil
+                    _ = try await refreshBootstrap(force: true)
+                    guard isCurrentWorkStream(taskID: task.id, token: token) else { throw CancellationError() }
+                    client = try await authenticatedRESTClient()
+                    streamGeneration = credentialGeneration
+                    didRefreshCredential = true
+                } catch is CancellationError {
+                    return
+                } catch {
+                    bannerMessage = Self.message(for: error)
+                    return
+                }
+            }
+        } catch ZiggyRESTError.http(let statusCode, _) where statusCode == 404 || statusCode == 501 {
+            await socket?.send(.workSubscribe(taskID: task.id, afterSequence: afterSequence))
+        } catch is CancellationError {
+            return
+        } catch {
+            bannerMessage = Self.message(for: error)
+        }
+    }
+
+    func stopWorkStream(taskID: String) {
+        workStreamTasks[taskID]?.cancel()
+        workStreamTasks[taskID] = nil
+        workStreamTokens[taskID] = nil
+    }
+
+    private func stopWorkStreams() {
+        for task in workStreamTasks.values { task.cancel() }
+        workStreamTasks.removeAll()
+        workStreamTokens.removeAll()
+    }
+
+    private func isCurrentWorkStream(taskID: String, token: UUID) -> Bool {
+        workStreamTokens[taskID] == token && credentialGeneration > 0
     }
 
     private func observe(_ socket: ZiggyWebSocketClient) {
@@ -492,21 +646,40 @@ final class AppModel {
         case .workSubscribed:
             break
         case .workEvent(let event):
-            guard let taskID = event.taskID else { return }
-            if !workEventsByTaskID[taskID, default: []].contains(where: { $0.sequence == event.sequence }) {
-                workEventsByTaskID[taskID, default: []].append(event)
-            }
-            if Self.shouldRefreshWork(for: event)
-                || ["completed", "failed", "cancelled", "canceled"].contains(event.type.lowercased()) {
-                Task { await loadWork(showSpinner: false) }
-            }
+            handle(event)
         case .unknown:
             break
         }
     }
 
+    private func handle(_ event: WorkEvent) {
+        guard let taskID = event.taskID, appendWorkEvent(event, for: taskID) else { return }
+        if Self.isTerminalWorkEvent(event) {
+            Task { await loadWork(showSpinner: false) }
+        }
+    }
+
+    private func appendWorkEvent(_ event: WorkEvent, for taskID: String) -> Bool {
+        var events = workEventsByTaskID[taskID, default: []]
+        if let sequence = event.sequence, events.contains(where: { $0.sequence == sequence }) {
+            return false
+        }
+        events.append(event)
+        events.sort { ($0.sequence ?? 0) < ($1.sequence ?? 0) }
+        if events.count > ZiggyProtocolLimits.maxTrackedStreamSequences {
+            events.removeFirst(events.count - ZiggyProtocolLimits.maxTrackedStreamSequences)
+        }
+        workEventsByTaskID[taskID] = events
+        return true
+    }
+
     nonisolated static func shouldRefreshWork(for event: WorkEvent) -> Bool {
         event.type.lowercased() == "status.changed" && event.status?.isTerminal == true
+    }
+
+    nonisolated private static func isTerminalWorkEvent(_ event: WorkEvent) -> Bool {
+        shouldRefreshWork(for: event)
+            || ["completed", "failed", "cancelled", "canceled"].contains(event.type.lowercased())
     }
 
     private func selectLocalChat(chatID: String) {
@@ -691,6 +864,7 @@ final class AppModel {
             case .invalidURL: return "The Ziggy server URL is invalid."
             case .invalidResponse: return "Ziggy returned an invalid response."
             case .responseTooLarge: return "Ziggy returned more data than this app can safely display."
+            case .streamReconnectLimit: return "The Work event stream could not reconnect."
             case .decoding: return "Ziggy returned data this app could not read."
             }
         }

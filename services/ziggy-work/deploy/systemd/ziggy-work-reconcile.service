@@ -1,0 +1,30 @@
+[Unit]
+Description=Reconcile Nanobot runtime Work tasks into ziggy-work
+After=ziggy-work.service
+
+[Service]
+Type=oneshot
+User=ziggy-work
+Group=ziggy-work
+ExecStart=/usr/local/bin/reconcile-runtimes
+Environment=ZIGGY_WORK_ENV=production
+Environment=ZIGGY_WORK_DATABASE_URL_FILE=%d/work-database-url
+Environment=ZIGGY_WORK_TRUST_KEY_FILE=%d/work-trust-key
+Environment=ZIGGY_WORK_TENANTS_FILE=%d/work-runtimes.json
+Environment=ZIGGY_WORK_ARTIFACT_ROOT=/var/lib/ziggy-work/artifacts
+LoadCredential=work-database-url:/etc/ziggy/secrets/work-database-url
+LoadCredential=work-trust-key:/etc/ziggy/secrets/work-trust-key
+LoadCredential=work-runtimes.json:/etc/ziggy/secrets/work-runtimes.json
+ProtectHome=true
+ProtectSystem=strict
+PrivateTmp=true
+PrivateDevices=true
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+StateDirectory=ziggy-work
+StateDirectoryMode=0700
+ReadWritePaths=/var/lib/ziggy-work /var/lib/ziggy-work/artifacts

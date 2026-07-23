@@ -34,6 +34,66 @@ def test_reconcile_preserves_waiting_tasks(tmp_path: Path) -> None:
     assert restarted.get_task(running["task_id"])["status"] == "interrupted"
 
 
+def test_list_tasks_supports_stable_offset_pages(tmp_path: Path) -> None:
+    store = WorkStore(tmp_path)
+    first = _task(store)
+    second = _task(store)
+
+    assert [item["task_id"] for item in store.list_tasks(limit=1, offset=0)] == [second["task_id"]]
+    assert [item["task_id"] for item in store.list_tasks(limit=1, offset=1)] == [first["task_id"]]
+
+
+def test_create_and_message_command_ids_are_idempotent(tmp_path: Path) -> None:
+    store = WorkStore(tmp_path)
+    request_id = "work_" + "a" * 32
+    first = store.create_task(chat_id="chat-1", content="Prepare a report", request_id=request_id)
+    assert first.pop("_was_created") is True
+    assert first.pop("_was_dispatched") is False
+    store.mark_dispatched(first["task_id"], request_id)
+
+    duplicate = store.create_task(
+        chat_id="chat-1", content="Prepare a report", request_id=request_id
+    )
+    assert duplicate.pop("_was_created") is False
+    assert duplicate.pop("_was_dispatched") is True
+    assert duplicate["task_id"] == first["task_id"]
+    assert len(store.list_tasks()) == 1
+
+    command_id = "cmd_" + "b" * 32
+    assert store.reserve_command(command_id, first["task_id"], "message") == (
+        True,
+        False,
+    )
+    store.mark_command_dispatched(command_id)
+    assert store.reserve_command(command_id, first["task_id"], "message") == (
+        False,
+        True,
+    )
+
+
+def test_concurrent_duplicate_request_ids_insert_one_task(tmp_path: Path) -> None:
+    store = WorkStore(tmp_path)
+    request_id = "work_" + "c" * 32
+    barrier = Barrier(8)
+
+    def create(_: int) -> dict:
+        barrier.wait()
+        return store.create_task(
+            chat_id="chat-1",
+            content="Prepare one report",
+            request_id=request_id,
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(create, range(8)))
+
+    assert sum(result.pop("_was_created") for result in results) == 1
+    assert all(not result.pop("_was_dispatched") for result in results)
+    assert len({result["task_id"] for result in results}) == 1
+    assert len(store.list_tasks()) == 1
+    assert [event["type"] for event in store.list_events(results[0]["task_id"])] == ["task.created"]
+
+
 def test_terminal_status_transition_is_atomic(tmp_path: Path) -> None:
     store = WorkStore(tmp_path)
     task = _task(store)
