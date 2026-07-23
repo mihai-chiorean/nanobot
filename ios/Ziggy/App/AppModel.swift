@@ -139,7 +139,6 @@ final class AppModel {
     private var configuredServerURL: URL?
     private var connectionAttempt = 0
     private var needsForegroundReconnect = false
-    private var pendingNewChat = false
     private var hasStarted = false
     private var chatReconciler = ChatStreamReconciler()
 
@@ -333,7 +332,6 @@ final class AppModel {
         messagesByChatID = [:]
         selectedSessionKey = nil
         chatNavigationPath = []
-        pendingNewChat = false
         isRefreshing = false
         isSending = false
         isStartingGoogleConnector = false
@@ -404,9 +402,9 @@ final class AppModel {
         }
     }
 
-    func newChat() async {
-        pendingNewChat = true
-        await socket?.send(.newChat)
+    func newChat() {
+        let key = selectLocalChat(chatID: UUID().uuidString)
+        chatNavigationPath = [key]
     }
 
     func sendMessage(_ content: String, media: [OutboundMedia] = [], asBackgroundWork: Bool = false) async {
@@ -735,10 +733,8 @@ final class AppModel {
                 selectLocalChat(chatID: chatID)
             }
         case .attached(let chatID):
-            if pendingNewChat || selectedSessionKey == nil {
-                pendingNewChat = false
+            if selectedSessionKey == nil {
                 selectLocalChat(chatID: chatID)
-                Task { await loadSessions(showSpinner: false) }
             }
         case .message(let message):
             handle(chatReconciler.apply(
@@ -799,12 +795,11 @@ final class AppModel {
             || ["completed", "failed", "cancelled", "canceled"].contains(event.type.lowercased())
     }
 
-    private func selectLocalChat(chatID: String) {
+    @discardableResult
+    private func selectLocalChat(chatID: String) -> String {
         let key = "websocket:\(chatID)"
         selectedSessionKey = key
-        if !sessions.contains(where: { $0.key == key }) {
-            sessions.insert(SessionSummary(key: key, title: "New conversation", preview: "Ready for a prompt"), at: 0)
-        }
+        return key
     }
 
     private func upsert(task: WorkTask) {

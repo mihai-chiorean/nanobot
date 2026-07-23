@@ -29,7 +29,7 @@ struct ChatListView: View {
                     }
                     .buttonStyle(PWAIconButton(size: 34))
                     .accessibilityLabel("Toggle theme")
-                    Button { Task { await appModel.newChat() } } label: {
+                    Button { appModel.newChat() } label: {
                         Image(systemName: "square.and.pencil")
                     }
                     .buttonStyle(PWAIconButton(size: 34))
@@ -40,7 +40,7 @@ struct ChatListView: View {
                 .padding(.bottom, 8)
 
                 Button {
-                    Task { await appModel.newChat() }
+                    appModel.newChat()
                 } label: {
                     Label("New chat", systemImage: "square.and.pencil")
                         .font(.system(size: 14, weight: .medium))
