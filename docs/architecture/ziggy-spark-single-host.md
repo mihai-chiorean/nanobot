@@ -1,8 +1,9 @@
 # Ziggy Chat And Work On Spark
 
 Status: the Ziggy chat, Work, connector, model, and tenant-runtime path is in
-production on `spark-094a` as of 2026-07-22. The legacy Omi backend remains on
-Beelink pending an ARM64 dependency and client-endpoint migration.
+production on `spark-094a` as of 2026-07-22. Omi and mOmi remain a separate
+project on Beelink. Their transcript-ingest bridge into Ziggy memory is
+disabled.
 
 ## Decision
 
@@ -39,9 +40,7 @@ flowchart LR
     WORK -->|SSE| CONTROL
 
     ORB[Omi device and Flutter app] --> OMI[Omi backend and pusher<br/>Beelink]
-    OMI --> WHISPER[Whisper<br/>Spark]
-    OMI --> INGEST[Ziggy ingest<br/>Spark]
-    INGEST --> MEMORY[Memory store]
+    OMI --> WHISPER[Shared stateless Whisper<br/>Spark]
 ```
 
 All control-plane HTTP listeners and PostgreSQL are local to Spark. Cloudflare
@@ -79,10 +78,12 @@ attempt with 25 durable events and a result summary.
 | Whisper and ingest | Separate services | Independent protocols, scaling, and restart behavior |
 | Cloudflare Tunnel | Separate system service | Independent public transport lifecycle |
 
-Do not merge `ziggy-connectors` into the front door. Its restricted Gmail
-credential and egress boundary is materially more important than its small
-memory footprint. Revisit merging `ziggy-control` and `ziggy-work` only if
-operational evidence shows that two static binaries are a meaningful burden.
+Do not merge the `ziggy-connectors` process into the front door. Its restricted
+Gmail credential and egress boundary is materially more important than its
+small memory footprint. Lab should deploy control and connectors as one logical
+`ziggy-edge` release while preserving separate processes, OS accounts,
+environment files, and database roles. See
+[`ziggy-tenant-state-and-deployments.md`](./ziggy-tenant-state-and-deployments.md).
 
 The current Nanobot units share the `mihai` OS account. Workspace routing and
 systemd write restrictions prevent accidental cross-tenant writes, but they
@@ -129,8 +130,9 @@ artifacts remain present. The migration snapshot is stored at:
 
 Spark creates daily mode-`0700` snapshots under `/var/backups/ziggy` with
 14-day retention. Each snapshot includes both PostgreSQL databases, Work
-artifacts, control binding state, the tenant manifest, and checksums. The
-application encryption keys are not copied into the same backup.
+artifacts, control binding state, the tenant manifest, the owner workspace,
+all tenant workspaces, and checksums. Runtime configuration and application
+encryption keys are not copied into the tenant workspace archives.
 
 Rollback requires stopping Spark ingress and writers, copying the latest
 snapshot to the rollback host, and restoring it before starting Beelink.

@@ -405,6 +405,7 @@ class AgentLoop:
         self.provider_retry_mode = provider_retry_mode
         self.web_config = web_config or WebToolsConfig()
         self.exec_config = exec_config or ExecToolConfig()
+        self.rag_config = _tc.rag
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
         self._start_time = time.time()
@@ -577,12 +578,11 @@ class AgentLoop:
                     model_name=self.model,
                 )
             )
-        # Ziggy: recall/ingest tools for ChromaDB vector memory
-        try:
+        # Ziggy: opt-in semantic recall. Ingest is always workspace-bounded,
+        # independent of the broader filesystem tool policy.
+        if self.rag_config.enable:
             self.tools.register(RecallTool(workspace=self.workspace))
-            self.tools.register(IngestTool(workspace=self.workspace, allowed_dir=None))
-        except Exception as _e:
-            logger.debug("RecallTool/IngestTool registration skipped: {}", _e)
+            self.tools.register(IngestTool(workspace=self.workspace, allowed_dir=self.workspace))
 
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""

@@ -197,6 +197,7 @@ def tenant_config(
 
     tools = config.setdefault("tools", {})
     tools["restrictToWorkspace"] = True
+    tools["rag"] = {"enable": False}
     tools["mcpServers"] = (
         {
             "ziggy_gmail": gmail_mcp_server(bootstrap_secret, connector_mcp_url)
