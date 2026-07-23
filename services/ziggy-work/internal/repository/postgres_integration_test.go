@@ -156,3 +156,38 @@ func TestPostgresMutationsAreIdempotentWithRiverEnqueue(t *testing.T) {
 		t.Fatalf("tasks=%d requests=%d river_jobs=%d", taskCount, requestCount, riverJobCount)
 	}
 }
+
+func TestPostgresImportStoresMissingOptionalIDsAsNull(t *testing.T) {
+	databaseURL := os.Getenv("ZIGGY_WORK_TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("ZIGGY_WORK_TEST_DATABASE_URL is not set")
+	}
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	repo := NewPostgres(pool)
+	tenant := model.Tenant{UserID: "import-user", WorkspaceID: "import-workspace"}
+	_, _ = pool.Exec(ctx, `DELETE FROM ziggy_work_tasks WHERE user_id=$1 AND workspace_id=$2`, tenant.UserID, tenant.WorkspaceID)
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM ziggy_work_tasks WHERE user_id=$1 AND workspace_id=$2`, tenant.UserID, tenant.WorkspaceID)
+	})
+	now := time.Now().UTC()
+	input := LegacyImport{Tasks: []model.Task{
+		{TaskID: "work_20000000000000000000000000000001", Status: model.Succeeded, CreatedAt: now, UpdatedAt: now},
+		{TaskID: "work_20000000000000000000000000000002", Status: model.Succeeded, CreatedAt: now, UpdatedAt: now},
+	}}
+	result, err := repo.Import(ctx, tenant, input)
+	if err != nil || result.Tasks != 2 {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	var tasks, nullRuntimeIDs, nullRiverJobIDs int
+	if err := pool.QueryRow(ctx, `SELECT count(*),count(*) FILTER (WHERE runtime_task_id IS NULL),count(*) FILTER (WHERE river_job_id IS NULL) FROM ziggy_work_tasks WHERE user_id=$1 AND workspace_id=$2`, tenant.UserID, tenant.WorkspaceID).Scan(&tasks, &nullRuntimeIDs, &nullRiverJobIDs); err != nil {
+		t.Fatal(err)
+	}
+	if tasks != 2 || nullRuntimeIDs != 2 || nullRiverJobIDs != 2 {
+		t.Fatalf("tasks=%d null_runtime_ids=%d null_river_job_ids=%d", tasks, nullRuntimeIDs, nullRiverJobIDs)
+	}
+}
