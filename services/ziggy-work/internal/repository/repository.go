@@ -429,7 +429,7 @@ func (r *PostgresRepository) Import(ctx context.Context, tenant model.Tenant, in
 		if t.Status == model.Scheduled || t.Status.Terminal() {
 			t.RiverJobID = ""
 		}
-		tag, execErr := tx.Exec(ctx, `INSERT INTO ziggy_work_tasks (user_id,workspace_id,task_id,session_key,chat_id,title,prompt_preview,status,mode,model,created_at,updated_at,started_at,completed_at,last_seq,result_summary,error,artifact_count,version,runtime_task_id,river_job_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21) ON CONFLICT (user_id,workspace_id,task_id) DO NOTHING`, tenant.UserID, tenant.WorkspaceID, t.TaskID, t.SessionKey, t.ChatID, t.Title, t.PromptPreview, t.Status, t.Mode, t.Model, t.CreatedAt, t.UpdatedAt, t.StartedAt, t.CompletedAt, t.LastSeq, t.ResultSummary, t.Error, t.ArtifactCount, max64(t.Version, 1), t.RuntimeTaskID, t.RiverJobID)
+		tag, execErr := tx.Exec(ctx, `INSERT INTO ziggy_work_tasks (user_id,workspace_id,task_id,session_key,chat_id,title,prompt_preview,status,mode,model,created_at,updated_at,started_at,completed_at,last_seq,result_summary,error,artifact_count,version,runtime_task_id,river_job_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21) ON CONFLICT (user_id,workspace_id,task_id) DO NOTHING`, tenant.UserID, tenant.WorkspaceID, t.TaskID, t.SessionKey, t.ChatID, t.Title, t.PromptPreview, t.Status, t.Mode, t.Model, t.CreatedAt, t.UpdatedAt, t.StartedAt, t.CompletedAt, t.LastSeq, t.ResultSummary, t.Error, t.ArtifactCount, max64(t.Version, 1), nullableString(t.RuntimeTaskID), nullableString(t.RiverJobID))
 		err = execErr
 		if err != nil {
 			return ImportResult{}, err
@@ -492,6 +492,13 @@ func max64(a, b int64) int64 {
 		return a
 	}
 	return b
+}
+
+func nullableString(value string) *string {
+	if value == "" {
+		return nil
+	}
+	return &value
 }
 
 func appendEventTx(ctx context.Context, tx pgx.Tx, tenant model.Tenant, id, typ string, payload map[string]any, actor string, now time.Time) (model.Event, error) {
