@@ -14,6 +14,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 EMAIL_RE = re.compile(r"^[^@\s]{1,128}@[^@\s]{1,190}\.[^@\s]{2,63}$")
+DEFAULT_CONNECTOR_MCP_URL = "http://127.0.0.1:8788/runtime/connectors/mcp"
 
 
 def parse_args() -> argparse.Namespace:
@@ -25,6 +26,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--websocket-host", required=True)
     parser.add_argument("--websocket-port", type=int, required=True)
     parser.add_argument("--bootstrap-secret-file", type=Path, required=True)
+    parser.add_argument("--connector-mcp-url", default=DEFAULT_CONNECTOR_MCP_URL)
+    parser.add_argument("--enable-gmail-mcp", action="store_true")
     parser.add_argument("--force", action="store_true")
     return parser.parse_args()
 
@@ -77,6 +80,48 @@ def valid_websocket_bind_host(value: str) -> bool:
     return address in ipaddress.ip_network("fc00::/7")
 
 
+def valid_connector_mcp_url(value: str) -> bool:
+    parsed = urlparse(value)
+    try:
+        port = parsed.port
+    except ValueError:
+        return False
+    if (
+        parsed.scheme != "http"
+        or parsed.username is not None
+        or parsed.password is not None
+        or not parsed.netloc
+        or (port is not None and not (1 <= port <= 65535))
+        or parsed.query
+        or parsed.fragment
+        or parsed.path != "/runtime/connectors/mcp"
+    ):
+        return False
+    try:
+        return ipaddress.ip_address(parsed.hostname or "").is_loopback
+    except ValueError:
+        return (parsed.hostname or "").lower() == "localhost"
+
+
+def gmail_mcp_server(capability: str, url: str) -> dict:
+    capability = capability.strip()
+    if len(capability) < 32:
+        raise ValueError("runtime connector capability must contain at least 32 characters")
+    if not valid_connector_mcp_url(url):
+        raise ValueError("connector MCP URL must be loopback HTTP at /runtime/connectors/mcp")
+    return {
+        "type": "streamableHttp",
+        "url": url,
+        "headers": {"Authorization": f"Bearer {capability}"},
+        "enabledTools": [
+            "gmail_connection_status",
+            "gmail_search",
+            "gmail_get_message",
+        ],
+        "toolTimeout": 30,
+    }
+
+
 def tenant_config(
     source: dict,
     tenant_root: Path,
@@ -85,6 +130,8 @@ def tenant_config(
     websocket_host: str,
     websocket_port: int,
     bootstrap_secret: str = "",
+    connector_mcp_url: str = DEFAULT_CONNECTOR_MCP_URL,
+    enable_gmail_mcp: bool = False,
 ) -> dict:
     normalized_email = email.strip().lower()
     if not EMAIL_RE.fullmatch(normalized_email):
@@ -98,7 +145,6 @@ def tenant_config(
     bootstrap_secret = bootstrap_secret.strip()
     if len(bootstrap_secret) < 32:
         raise ValueError("bootstrap secret must contain at least 32 characters")
-
     config = copy.deepcopy(source)
     workspace = tenant_root / "workspace"
     defaults = config.setdefault("agents", {}).setdefault("defaults", {})
@@ -151,7 +197,13 @@ def tenant_config(
 
     tools = config.setdefault("tools", {})
     tools["restrictToWorkspace"] = True
-    tools["mcpServers"] = {}
+    tools["mcpServers"] = (
+        {
+            "ziggy_gmail": gmail_mcp_server(bootstrap_secret, connector_mcp_url)
+        }
+        if enable_gmail_mcp
+        else {}
+    )
     execution = tools.setdefault("exec", {})
     execution["enable"] = False
     execution["allowedEnvKeys"] = []
@@ -201,6 +253,8 @@ def main() -> None:
         args.websocket_host,
         args.websocket_port,
         read_bootstrap_secret(args.bootstrap_secret_file.expanduser().resolve()),
+        args.connector_mcp_url,
+        args.enable_gmail_mcp,
     )
     for directory in (tenant_root, tenant_root / "runtime", tenant_root / "workspace"):
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)

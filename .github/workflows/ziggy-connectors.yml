@@ -1,0 +1,32 @@
+name: Ziggy Connectors
+
+on:
+  push:
+    paths:
+      - "services/ziggy-connectors/**"
+      - ".github/workflows/ziggy-connectors.yml"
+  pull_request:
+    paths:
+      - "services/ziggy-connectors/**"
+      - ".github/workflows/ziggy-connectors.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/ziggy-connectors
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: services/ziggy-connectors/go.mod
+          cache-dependency-path: services/ziggy-connectors/go.sum
+      - run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+          make verify linux-amd64 linux-arm64

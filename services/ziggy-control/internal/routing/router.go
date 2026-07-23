@@ -31,6 +31,7 @@ type credentialRoute struct {
 type Router struct {
 	registry *tenant.Registry
 	byUserID map[string]httpapi.TenantRoute
+	runtimes map[[sha256.Size]byte]httpapi.TenantRoute
 	fallback httpapi.TenantRoute
 	now      func() time.Time
 	entries  sync.Map
@@ -48,6 +49,7 @@ func New(registry *tenant.Registry, logger *slog.Logger, observability *telemetr
 	router := &Router{
 		registry: registry,
 		byUserID: make(map[string]httpapi.TenantRoute),
+		runtimes: make(map[[sha256.Size]byte]httpapi.TenantRoute),
 		now:      time.Now,
 		capacity: defaultCredentialCapacity,
 	}
@@ -75,6 +77,9 @@ func New(registry *tenant.Registry, logger *slog.Logger, observability *telemetr
 			Proxy:                   httpapi.NewReverseProxy(upstream, logger, observability),
 		}
 		router.byUserID[allocation.UserID] = route
+		if allocation.Status == "active" {
+			router.runtimes[sha256.Sum256([]byte(allocation.UpstreamBootstrapSecret))] = route
+		}
 		if allocation.LegacyDefault {
 			router.fallback = route
 		}
@@ -83,6 +88,15 @@ func New(registry *tenant.Registry, logger *slog.Logger, observability *telemetr
 		return nil, errors.New("tenant default runtime is required")
 	}
 	return router, nil
+}
+
+func (router *Router) ResolveRuntimeCredential(credential string) (httpapi.TenantRoute, bool) {
+	credential = strings.TrimSpace(credential)
+	if credential == "" {
+		return httpapi.TenantRoute{}, false
+	}
+	route, ok := router.runtimes[sha256.Sum256([]byte(credential))]
+	return route, ok
 }
 
 func (router *Router) ResolvePrincipal(ctx context.Context, principal identity.Principal) (httpapi.TenantRoute, error) {

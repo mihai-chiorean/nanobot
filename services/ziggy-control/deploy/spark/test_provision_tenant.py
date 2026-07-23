@@ -48,6 +48,7 @@ def test_tenant_config_isolates_state_and_scrubs_nonlocal_credentials(tmp_path: 
         "100.86.74.94",
         18802,
         BOOTSTRAP_SECRET,
+        enable_gmail_mcp=True,
     )
 
     assert generated["agents"]["defaults"]["workspace"] == str(root / "workspace")
@@ -63,7 +64,19 @@ def test_tenant_config_isolates_state_and_scrubs_nonlocal_credentials(tmp_path: 
     assert generated["channels"]["websocket"]["pingIntervalS"] is None
     assert generated["tools"]["restrictToWorkspace"] is True
     assert generated["tools"]["exec"]["enable"] is False
-    assert generated["tools"]["mcpServers"] == {}
+    assert generated["tools"]["mcpServers"] == {
+        "ziggy_gmail": {
+            "type": "streamableHttp",
+            "url": "http://127.0.0.1:8788/runtime/connectors/mcp",
+            "headers": {"Authorization": f"Bearer {BOOTSTRAP_SECRET}"},
+            "enabledTools": [
+                "gmail_connection_status",
+                "gmail_search",
+                "gmail_get_message",
+            ],
+            "toolTimeout": 30,
+        }
+    }
     assert generated["providers"]["custom"]["apiKey"] == "local-placeholder"
     assert generated["providers"]["openai"] == {}
     assert source["channels"]["discord"]["token"] == "owner-secret"
@@ -88,6 +101,40 @@ def test_tenant_config_rejects_incomplete_clerk_auth(tmp_path: Path):
         assert "authJwksUrl" in str(exc)
     else:
         raise AssertionError("incomplete Clerk auth must be rejected")
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://127.0.0.1:8788/runtime/connectors/mcp",
+        "http://10.0.0.2:8788/runtime/connectors/mcp",
+        "http://127.0.0.1:99999/runtime/connectors/mcp",
+        "http://user:password@127.0.0.1:8788/runtime/connectors/mcp",
+        "http://127.0.0.1:8788/other",
+        "http://127.0.0.1:8788/runtime/connectors/mcp?tenant=other",
+    ],
+)
+def test_tenant_config_rejects_unsafe_connector_mcp_url(tmp_path: Path, url: str):
+    with pytest.raises(ValueError, match="connector MCP URL"):
+        MODULE.tenant_config(
+            {
+                "channels": {
+                    "websocket": {
+                        "authIssuer": "https://clerk.test",
+                        "authJwksUrl": "https://clerk.test/.well-known/jwks.json",
+                        "authAuthorizedParties": ["https://chat.example.com"],
+                    }
+                }
+            },
+            tmp_path / "tenant",
+            "tester@example.com",
+            18800,
+            "100.86.74.94",
+            18802,
+            BOOTSTRAP_SECRET,
+            url,
+            True,
+        )
 
 
 @pytest.mark.parametrize(

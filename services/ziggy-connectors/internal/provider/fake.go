@@ -7,9 +7,11 @@ import (
 )
 
 type Fake struct {
-	Token   Token
-	Profile Profile
-	Err     error
+	Token    Token
+	Profile  Profile
+	Messages []MessageSummary
+	Message  Message
+	Err      error
 }
 
 func (f Fake) AuthorizationURL(redirectURI, state, verifier string, scopes []string) (string, error) {
@@ -38,6 +40,31 @@ func (f Fake) ValidateProfile(context.Context, string) (Profile, error) {
 		return Profile{}, errors.New("fake profile is incomplete")
 	}
 	return f.Profile, nil
+}
+
+func (f Fake) RefreshAccessToken(context.Context, string) (Token, error) {
+	if f.Err != nil {
+		return Token{}, f.Err
+	}
+	token := f.Token
+	if token.AccessToken == "" {
+		token.AccessToken = "fake-access-token"
+	}
+	return token, nil
+}
+
+func (f Fake) SearchMessages(context.Context, string, string, int) ([]MessageSummary, error) {
+	if f.Err != nil {
+		return nil, f.Err
+	}
+	return append([]MessageSummary(nil), f.Messages...), nil
+}
+
+func (f Fake) GetMessage(context.Context, string, string) (Message, error) {
+	if f.Err != nil {
+		return Message{}, f.Err
+	}
+	return f.Message, nil
 }
 
 var _ Gmail = Fake{}

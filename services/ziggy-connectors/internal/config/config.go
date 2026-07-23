@@ -20,6 +20,7 @@ const (
 	defaultGoogleTokenURL  = "https://oauth2.googleapis.com/token"
 	defaultGoogleUserInfo  = "https://openidconnect.googleapis.com/v1/userinfo"
 	defaultGoogleProfile   = "https://gmail.googleapis.com/gmail/v1/users/me/profile"
+	defaultGoogleGmailAPI  = "https://gmail.googleapis.com/gmail/v1"
 )
 
 type Config struct {
@@ -35,6 +36,7 @@ type Config struct {
 	GoogleTokenURL     string
 	GoogleUserInfoURL  string
 	GoogleProfileURL   string
+	GoogleGmailAPIURL  string
 	GoogleScopes       []string
 	StateSigningKey    []byte
 	TokenEncryptionKey []byte
@@ -121,6 +123,7 @@ func LoadFrom(lookup LookupEnv, readFile ReadFile) (Config, error) {
 		GoogleTokenURL:     valueOr(lookup, "ZIGGY_CONNECTORS_GOOGLE_TOKEN_URL", defaultGoogleTokenURL),
 		GoogleUserInfoURL:  valueOr(lookup, "ZIGGY_CONNECTORS_GOOGLE_USERINFO_URL", defaultGoogleUserInfo),
 		GoogleProfileURL:   valueOr(lookup, "ZIGGY_CONNECTORS_GOOGLE_PROFILE_URL", defaultGoogleProfile),
+		GoogleGmailAPIURL:  valueOr(lookup, "ZIGGY_CONNECTORS_GOOGLE_GMAIL_URL", defaultGoogleGmailAPI),
 		GoogleScopes:       []string{"openid", "email", "https://www.googleapis.com/auth/gmail.readonly"},
 		StateSigningKey:    stateKey,
 		TokenEncryptionKey: tokenKey,

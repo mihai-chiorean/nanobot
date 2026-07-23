@@ -1,8 +1,8 @@
 # ziggy-connectors
 
-`ziggy-connectors` is the product-owned foundation for tenant-scoped Google
-Gmail account linking. Phase 0/1 is read-only: it validates a Google identity,
-stores only an encrypted refresh token, and exposes account status. It does not
+`ziggy-connectors` owns tenant-scoped Google Gmail account linking and
+read-only inference access. It validates a Google identity, stores only an
+encrypted refresh token, and exposes bounded Gmail tools over MCP. It does not
 send, modify, archive, trash, or delete Gmail messages.
 
 ## Trust boundary
@@ -41,6 +41,7 @@ containing secrets. Non-secret environment variables are:
 | `ZIGGY_CONNECTORS_GOOGLE_TOKEN_URL` | Optional Google token endpoint override for tests |
 | `ZIGGY_CONNECTORS_GOOGLE_USERINFO_URL` | Optional Google userinfo endpoint override for tests |
 | `ZIGGY_CONNECTORS_GOOGLE_PROFILE_URL` | Optional Gmail profile endpoint override for tests |
+| `ZIGGY_CONNECTORS_GOOGLE_GMAIL_URL` | Optional Gmail API base URL override for tests |
 | `ZIGGY_CONNECTORS_SHUTDOWN_TIMEOUT` | Optional positive Go duration; default `10s` |
 | `ZIGGY_CONNECTORS_STATE_TTL` | Optional positive Go duration; default `10m` |
 
@@ -66,6 +67,24 @@ openssl rand -base64 32 | tr -d '\\n' > /run/secrets/ziggy-connectors/private-ga
 
 The service requests only `openid`, `email`, and
 `https://www.googleapis.com/auth/gmail.readonly`.
+
+## Inference tools
+
+Authenticated `POST /mcp` is a Streamable HTTP MCP endpoint. `ziggy-control`
+authenticates the tenant runtime, removes its capability, and signs a
+one-minute tenant principal before forwarding. Google access and refresh tokens
+never reach Nanobot.
+
+The server publishes three read-only tools:
+
+- `gmail_connection_status`
+- `gmail_search`
+- `gmail_get_message`
+
+Search is capped at 20 messages per call. Message reads omit attachments and
+cap the extracted text body at 64 KiB. Access tokens are cached only until
+shortly before expiry, refreshes are coalesced, and Gmail calls are limited per
+tenant. Every result labels email content as untrusted external data.
 
 ## Local commands
 
@@ -95,6 +114,5 @@ The PostgreSQL repository uses `database/sql` with the `pgx/v5` driver. Every
 account and OAuth transaction key and query includes both `user_id` and
 `workspace_id`. AES-GCM associated data also binds PKCE verifiers and refresh
 tokens to their tenant and object ID, so moving ciphertext to another tenant
-row fails authentication. Refresh-token decryption is intentionally not exposed through
-the HTTP API. A later Gmail sync worker will own refresh, bounded read-only
-message retrieval, sanitization, cursors, and audit records.
+row fails authentication. Refresh-token decryption is not exposed through the
+HTTP or MCP APIs.

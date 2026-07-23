@@ -198,7 +198,7 @@ func New(config Config) (http.Handler, error) {
 	if api.telemetry == nil {
 		api.telemetry = telemetry.Noop()
 	}
-	for _, reserved := range []string{"/auth/bootstrap", "/auth/token", "/webui/guest/bootstrap", "/api/guest", "/healthz", "/readyz", "/connectors"} {
+	for _, reserved := range []string{"/auth/bootstrap", "/auth/token", "/webui/guest/bootstrap", "/api/guest", "/healthz", "/readyz", "/connectors", "/runtime/connectors"} {
 		api.blockedPaths[reserved] = struct{}{}
 	}
 
@@ -208,6 +208,7 @@ func New(config Config) (http.Handler, error) {
 	mux.Handle("/auth/bootstrap", config.Authenticate(api.admit(http.HandlerFunc(api.bootstrap))))
 	mux.Handle("/connectors/oauth/google/callback", api.admit(http.HandlerFunc(api.connectorCallback)))
 	mux.Handle("/connectors/", config.Authenticate(api.admit(http.HandlerFunc(api.connectors))))
+	mux.Handle("/runtime/connectors/mcp", api.admit(http.HandlerFunc(api.runtimeConnectors)))
 	if config.WorkProxy != nil {
 		workHandler := api.admit(http.HandlerFunc(api.work))
 		mux.Handle("/api/work", workHandler)
@@ -307,8 +308,14 @@ func (api *API) admissionTenant(r *http.Request) string {
 		return anonymousTenant
 	}
 	if api.tenantRouter != nil {
-		if route, ok := api.tenantRouter.ResolveCredential(requestCredential(r)); ok && strings.TrimSpace(route.UserID) != "" {
+		credential := requestCredential(r)
+		if route, ok := api.tenantRouter.ResolveCredential(credential); ok && strings.TrimSpace(route.UserID) != "" {
 			return route.UserID
+		}
+		if router, ok := api.tenantRouter.(runtimeCredentialRouter); ok {
+			if route, ok := router.ResolveRuntimeCredential(credential); ok && strings.TrimSpace(route.UserID) != "" {
+				return route.UserID
+			}
 		}
 	}
 	return anonymousTenant
