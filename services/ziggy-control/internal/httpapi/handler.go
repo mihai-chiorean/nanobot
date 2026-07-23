@@ -208,7 +208,6 @@ func New(config Config) (http.Handler, error) {
 	mux.Handle("/auth/bootstrap", config.Authenticate(api.admit(http.HandlerFunc(api.bootstrap))))
 	mux.Handle("/connectors/oauth/google/callback", api.admit(http.HandlerFunc(api.connectorCallback)))
 	mux.Handle("/connectors/", config.Authenticate(api.admit(http.HandlerFunc(api.connectors))))
-	mux.Handle("/runtime/connectors/mcp", api.admit(http.HandlerFunc(api.runtimeConnectors)))
 	if config.WorkProxy != nil {
 		workHandler := api.admit(http.HandlerFunc(api.work))
 		mux.Handle("/api/work", workHandler)

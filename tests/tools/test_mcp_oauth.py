@@ -76,6 +76,7 @@ async def test_oauth_auth_posts_basic_client_credentials_and_caches_token(tmp_pa
             ).decode()
             assert parse_qs(request.content.decode()) == {
                 "grant_type": ["client_credentials"],
+                "resource": ["http://127.0.0.1:8790/mcp"],
                 "scope": ["mcp:read mcp:write"],
             }
             token_requests += 1
@@ -85,6 +86,7 @@ async def test_oauth_auth_posts_basic_client_credentials_and_caches_token(tmp_pa
     transport = httpx.MockTransport(handler)
     auth = OAuthClientCredentialsAuth(
         config.oauth_client_credentials,
+        config.url,
         token_client_factory=lambda: httpx.AsyncClient(transport=transport),
     )
 
@@ -119,6 +121,7 @@ async def test_oauth_auth_refreshes_once_after_401(tmp_path) -> None:
     transport = httpx.MockTransport(handler)
     auth = OAuthClientCredentialsAuth(
         config.oauth_client_credentials,
+        config.url,
         token_client_factory=lambda: httpx.AsyncClient(transport=transport),
     )
 
@@ -149,6 +152,7 @@ async def test_oauth_auth_serializes_concurrent_refreshes(tmp_path) -> None:
     transport = httpx.MockTransport(handler)
     auth = OAuthClientCredentialsAuth(
         config.oauth_client_credentials,
+        config.url,
         token_client_factory=lambda: httpx.AsyncClient(transport=transport),
     )
     first = asyncio.create_task(auth._get_access_token())
@@ -180,6 +184,7 @@ async def test_oauth_auth_refreshes_before_token_expiry(tmp_path, monkeypatch) -
     transport = httpx.MockTransport(handler)
     auth = OAuthClientCredentialsAuth(
         config.oauth_client_credentials,
+        config.url,
         token_client_factory=lambda: httpx.AsyncClient(transport=transport),
     )
 

@@ -162,10 +162,11 @@ instructions reduce mistakes; they do not change that trust decision.
 ### Current secrets and audit behavior
 
 - The per-runtime bootstrap secret is stored in generated Nanobot config and in
-  the `ziggy-control` tenant manifest. When Gmail MCP is enabled, the same
-  runtime value is also used as the capability presented to
-  `/runtime/connectors/mcp`. The control service replaces it with a one-minute
-  signed tenant principal before the connector sees the request.
+  the `ziggy-control` tenant manifest only for Nanobot transport bootstrap.
+  Gmail MCP uses a separate OAuth client per runtime generation. Its raw secret
+  is delivered through systemd credentials, and `ziggy-connectors` exchanges
+  it for a five-minute tenant- and audience-scoped access token. The runtime
+  MCP path no longer passes through `ziggy-control`.
 - Local model providers do not require a cloud provider key in each tenant
   config. Connector refresh/access tokens remain in `ziggy-connectors`, and
   Work/database credentials remain in their own system services

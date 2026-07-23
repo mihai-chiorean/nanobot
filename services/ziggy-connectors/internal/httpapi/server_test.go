@@ -2,13 +2,21 @@ package httpapi
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
+	"math/big"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -188,6 +196,93 @@ func TestServeStopsOnContextCancellation(t *testing.T) {
 	}
 }
 
+func TestServeTLSGracefullyServesAndStops(t *testing.T) {
+	certFile, keyFile, roots := testTLSFiles(t)
+	address := availableLoopbackAddress(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	server := &http.Server{Addr: address, Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})}
+	done := make(chan error, 1)
+	go func() { done <- ServeTLS(ctx, server, time.Second, certFile, keyFile) }()
+
+	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: roots}}, Timeout: time.Second}
+	deadline := time.Now().Add(time.Second)
+	for {
+		response, err := client.Get("https://" + address + "/healthz")
+		if err == nil {
+			response.Body.Close()
+			if response.StatusCode != http.StatusNoContent {
+				t.Fatalf("TLS response status = %d", response.StatusCode)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("TLS server did not become ready: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("ServeTLS() error = %v", err)
+	}
+}
+
+func availableLoopbackAddress(t *testing.T) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return address
+}
+
+func testTLSFiles(t *testing.T) (string, string, *x509.CertPool) {
+	t.Helper()
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	template := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		NotBefore:             now.Add(-time.Minute),
+		NotAfter:              now.Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
+	}
+	certificate, err := x509.CreateCertificate(rand.Reader, template, template, publicKey, privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	privateKeyBytes, err := x509.MarshalPKCS8PrivateKey(privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certificate})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: privateKeyBytes})
+	certFile := t.TempDir() + "/cert.pem"
+	keyFile := t.TempDir() + "/key.pem"
+	if err := os.WriteFile(certFile, certPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyFile, keyPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(certPEM) {
+		t.Fatal("failed to add test certificate to root pool")
+	}
+	return certFile, keyFile, roots
+}
+
 func TestProtectedRouteHasNoAuthBypass(t *testing.T) {
 	key := []byte("01234567890123456789012345678901")
 	cipher, _ := crypto.NewAESGCM(key)
@@ -213,12 +308,9 @@ func TestRuntimeClientCredentialsDiscoveryAndResourceValidation(t *testing.T) {
 	repo := store.NewMemoryRepository()
 	oldSecret := "old-high-entropy-client-secret"
 	oldClient := store.RuntimeOAuthClient{ClientID: "runtime-client-generation-6", Tenant: store.Tenant{UserID: "persisted-user", WorkspaceID: "persisted-workspace"}, RuntimeID: "runtime-a", RuntimeGeneration: 6, SecretHash: clientSecretHash(key, oldSecret), Scopes: append([]string(nil), runtimeMCPScopes...)}
-	if err := repo.UpsertRuntimeOAuthClient(context.Background(), oldClient); err != nil {
-		t.Fatal(err)
-	}
 	secret := "a-high-entropy-client-secret"
 	client := store.RuntimeOAuthClient{ClientID: "runtime-client", Tenant: store.Tenant{UserID: "persisted-user", WorkspaceID: "persisted-workspace"}, RuntimeID: "runtime-a", RuntimeGeneration: 7, SecretHash: clientSecretHash(key, secret), Scopes: append([]string(nil), runtimeMCPScopes...)}
-	if err := repo.UpsertRuntimeOAuthClient(context.Background(), client); err != nil {
+	if _, created, err := repo.RegisterRuntimeOAuthClient(context.Background(), client); err != nil || !created {
 		t.Fatal(err)
 	}
 	api, err := New(Config{GoogleRedirectURI: "https://gateway.test/callback", GoogleScopes: []string{"scope"}, StateTTL: time.Minute, StateSigner: crypto.NewStateSigner(key), TokenCipher: cipher, Accounts: repo, OAuthTransactions: repo, RuntimeOAuthClients: repo, Google: provider.Fake{}, PrincipalVerifier: principal.NewVerifier(key), ClientCredentialPepper: key, MCPAccessTokens: runtimeTokenManager(t, key), OAuthIssuerURL: testOAuthIssuerURL, MCPResourceURL: testMCPResourceURL, Now: func() time.Time { return now }})
@@ -258,7 +350,7 @@ func TestRuntimeClientCredentialsDiscoveryAndResourceValidation(t *testing.T) {
 	if err != nil || len(tools.Tools) != 3 {
 		t.Fatalf("MCP tools from issued token = %#v, error = %v", tools, err)
 	}
-	stale := httptest.NewRequest(http.MethodPost, "/oauth/token", strings.NewReader("grant_type=client_credentials"))
+	stale := httptest.NewRequest(http.MethodPost, "/oauth/token", strings.NewReader("grant_type=client_credentials&resource="+url.QueryEscape(testMCPResourceURL)))
 	stale.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	stale.SetBasicAuth(oldClient.ClientID, oldSecret)
 	staleResponse := httptest.NewRecorder()
@@ -274,6 +366,14 @@ func TestRuntimeClientCredentialsDiscoveryAndResourceValidation(t *testing.T) {
 	api.ServeHTTP(mismatchResponse, mismatch)
 	if mismatchResponse.Code != http.StatusBadRequest || !strings.Contains(mismatchResponse.Body.String(), "invalid_target") {
 		t.Fatalf("mismatched resource response = %d, %s", mismatchResponse.Code, mismatchResponse.Body)
+	}
+	missingResource := httptest.NewRequest(http.MethodPost, "/oauth/token", strings.NewReader("grant_type=client_credentials"))
+	missingResource.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	missingResource.SetBasicAuth(client.ClientID, secret)
+	missingResourceResponse := httptest.NewRecorder()
+	api.ServeHTTP(missingResourceResponse, missingResource)
+	if missingResourceResponse.Code != http.StatusBadRequest || !strings.Contains(missingResourceResponse.Body.String(), "invalid_target") {
+		t.Fatalf("missing resource response = %d, %s", missingResourceResponse.Code, missingResourceResponse.Body)
 	}
 
 	unauthorized := httptest.NewRecorder()

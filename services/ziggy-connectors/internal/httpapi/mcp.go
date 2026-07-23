@@ -177,6 +177,7 @@ func (api *API) gmailAccess(ctx context.Context, tenant store.Tenant, accountID 
 	if !api.gmailLimiter(tenant).Allow() {
 		return store.Account{}, "", errors.New("Gmail request rate exceeded; retry shortly")
 	}
+	api.pruneExpiredAccessTokens()
 	account, err := api.activeGmailAccount(ctx, tenant, strings.TrimSpace(accountID))
 	if err != nil {
 		return store.Account{}, "", err
@@ -222,6 +223,17 @@ func (api *API) gmailAccess(ctx context.Context, tenant store.Tenant, accountID 
 		return store.Account{}, "", errors.New("Gmail connection must be repaired")
 	}
 	return account, accessToken, nil
+}
+
+func (api *API) pruneExpiredAccessTokens() {
+	now := api.config.Now()
+	api.accessTokens.Range(func(key, value any) bool {
+		cached, ok := value.(cachedGoogleAccessToken)
+		if !ok || cached.value == "" || !now.Before(cached.expiresAt) {
+			api.accessTokens.Delete(key)
+		}
+		return true
+	})
 }
 
 type cachedGoogleAccessToken struct {

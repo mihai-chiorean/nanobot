@@ -69,8 +69,14 @@ func run() error {
 	server := &http.Server{Addr: cfg.ListenAddr, Handler: api, ReadHeaderTimeout: 10 * time.Second}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	if err := httpapi.Serve(ctx, server, cfg.ShutdownTimeout); err != nil {
-		return classify("runtime_http", err)
+	var serveErr error
+	if cfg.Environment == "production" {
+		serveErr = httpapi.ServeTLS(ctx, server, cfg.ShutdownTimeout, cfg.TLSCertFile, cfg.TLSKeyFile)
+	} else {
+		serveErr = httpapi.Serve(ctx, server, cfg.ShutdownTimeout)
+	}
+	if serveErr != nil {
+		return classify("runtime_http", serveErr)
 	}
 	return nil
 }

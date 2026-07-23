@@ -13,16 +13,18 @@ import (
 )
 
 const (
-	defaultListenAddr      = "127.0.0.1:8790"
-	defaultShutdownTimeout = 10 * time.Second
-	defaultStateTTL        = 10 * time.Minute
-	defaultGoogleAuthURL   = "https://accounts.google.com/o/oauth2/v2/auth"
-	defaultGoogleTokenURL  = "https://oauth2.googleapis.com/token"
-	defaultGoogleUserInfo  = "https://openidconnect.googleapis.com/v1/userinfo"
-	defaultGoogleProfile   = "https://gmail.googleapis.com/gmail/v1/users/me/profile"
-	defaultGoogleGmailAPI  = "https://gmail.googleapis.com/gmail/v1"
-	defaultOAuthIssuerURL  = "http://127.0.0.1:8790"
-	defaultMCPResourceURL  = "http://127.0.0.1:8790/mcp"
+	defaultListenAddr        = "127.0.0.1:8790"
+	defaultShutdownTimeout   = 10 * time.Second
+	defaultStateTTL          = 10 * time.Minute
+	defaultGoogleAuthURL     = "https://accounts.google.com/o/oauth2/v2/auth"
+	defaultGoogleTokenURL    = "https://oauth2.googleapis.com/token"
+	defaultGoogleUserInfo    = "https://openidconnect.googleapis.com/v1/userinfo"
+	defaultGoogleProfile     = "https://gmail.googleapis.com/gmail/v1/users/me/profile"
+	defaultGoogleGmailAPI    = "https://gmail.googleapis.com/gmail/v1"
+	defaultOAuthIssuerURL    = "http://127.0.0.1:8790"
+	defaultMCPResourceURL    = "http://127.0.0.1:8790/mcp"
+	productionOAuthIssuerURL = "https://127.0.0.1:8790"
+	productionMCPResourceURL = "https://127.0.0.1:8790/mcp"
 )
 
 type Config struct {
@@ -47,6 +49,8 @@ type Config struct {
 	MCPAccessSigningKey    []byte
 	OAuthIssuerURL         string
 	MCPResourceURL         string
+	TLSCertFile            string
+	TLSKeyFile             string
 	DatabaseURL            string
 }
 
@@ -88,13 +92,21 @@ func LoadFrom(lookup LookupEnv, readFile ReadFile) (Config, error) {
 	if environment == "production" && !isLoopbackHost(host) {
 		return Config{}, errors.New("ZIGGY_CONNECTORS_LISTEN_ADDR must bind to loopback in production")
 	}
-	oauthIssuerURL := valueOr(lookup, "ZIGGY_CONNECTORS_OAUTH_ISSUER_URL", defaultOAuthIssuerURL)
-	if err := validateLoopbackURL(oauthIssuerURL, ""); err != nil {
+	oauthIssuerURL := valueOr(lookup, "ZIGGY_CONNECTORS_OAUTH_ISSUER_URL", defaultOAuthIssuerURLFor(environment))
+	if err := validateLoopbackURL(oauthIssuerURL, environment, ""); err != nil {
 		return Config{}, fmt.Errorf("ZIGGY_CONNECTORS_OAUTH_ISSUER_URL: %w", err)
 	}
-	mcpResourceURL := valueOr(lookup, "ZIGGY_CONNECTORS_MCP_RESOURCE_URL", defaultMCPResourceURL)
-	if err := validateLoopbackURL(mcpResourceURL, "/mcp"); err != nil {
+	mcpResourceURL := valueOr(lookup, "ZIGGY_CONNECTORS_MCP_RESOURCE_URL", defaultMCPResourceURLFor(environment))
+	if err := validateLoopbackURL(mcpResourceURL, environment, "/mcp"); err != nil {
 		return Config{}, fmt.Errorf("ZIGGY_CONNECTORS_MCP_RESOURCE_URL: %w", err)
+	}
+	tlsCertFile := strings.TrimSpace(valueOr(lookup, "ZIGGY_CONNECTORS_TLS_CERT_FILE", ""))
+	tlsKeyFile := strings.TrimSpace(valueOr(lookup, "ZIGGY_CONNECTORS_TLS_KEY_FILE", ""))
+	if environment == "production" && tlsCertFile == "" {
+		return Config{}, errors.New("ZIGGY_CONNECTORS_TLS_CERT_FILE is required in production")
+	}
+	if environment == "production" && tlsKeyFile == "" {
+		return Config{}, errors.New("ZIGGY_CONNECTORS_TLS_KEY_FILE is required in production")
 	}
 	clientID, err := required(lookup, "ZIGGY_CONNECTORS_GOOGLE_CLIENT_ID")
 	if err != nil {
@@ -174,8 +186,24 @@ func LoadFrom(lookup LookupEnv, readFile ReadFile) (Config, error) {
 		MCPAccessSigningKey:    mcpAccessSigningKey,
 		OAuthIssuerURL:         oauthIssuerURL,
 		MCPResourceURL:         mcpResourceURL,
+		TLSCertFile:            tlsCertFile,
+		TLSKeyFile:             tlsKeyFile,
 		DatabaseURL:            databaseURL,
 	}, nil
+}
+
+func defaultOAuthIssuerURLFor(environment string) string {
+	if environment == "production" {
+		return productionOAuthIssuerURL
+	}
+	return defaultOAuthIssuerURL
+}
+
+func defaultMCPResourceURLFor(environment string) string {
+	if environment == "production" {
+		return productionMCPResourceURL
+	}
+	return defaultMCPResourceURL
 }
 
 func isLoopbackHost(host string) bool {
@@ -197,10 +225,14 @@ func validateRedirect(raw, environment string) error {
 	return nil
 }
 
-func validateLoopbackURL(raw, requiredPath string) error {
+func validateLoopbackURL(raw, environment, requiredPath string) error {
 	u, err := url.Parse(strings.TrimSpace(raw))
-	if err != nil || u.Scheme != "http" || u.Host == "" || u.RawQuery != "" || u.Fragment != "" || u.User != nil || (requiredPath != "" && u.Path != requiredPath) || (requiredPath == "" && u.Path != "") || !isLoopbackHost(u.Hostname()) {
-		return errors.New("must be an absolute loopback HTTP URL")
+	scheme := "http"
+	if environment == "production" {
+		scheme = "https"
+	}
+	if err != nil || u.Scheme != scheme || u.Host == "" || u.RawQuery != "" || u.Fragment != "" || u.User != nil || (requiredPath != "" && u.Path != requiredPath) || (requiredPath == "" && u.Path != "") || !isLoopbackHost(u.Hostname()) {
+		return fmt.Errorf("must be an absolute loopback %s URL", strings.ToUpper(scheme))
 	}
 	return nil
 }

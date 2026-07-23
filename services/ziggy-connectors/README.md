@@ -34,8 +34,8 @@ containing secrets. Non-secret environment variables are:
 | --- | --- |
 | `ZIGGY_CONNECTORS_ENV` | `development`, `test`, `staging`, or `production` |
 | `ZIGGY_CONNECTORS_LISTEN_ADDR` | HTTP listen address; default `127.0.0.1:8790` |
-| `ZIGGY_CONNECTORS_OAUTH_ISSUER_URL` | Loopback OAuth authorization-server issuer; default `http://127.0.0.1:8790` |
-| `ZIGGY_CONNECTORS_MCP_RESOURCE_URL` | Canonical loopback MCP resource URL; default `http://127.0.0.1:8790/mcp` |
+| `ZIGGY_CONNECTORS_OAUTH_ISSUER_URL` | Loopback OAuth authorization-server issuer; production default `https://127.0.0.1:8790` |
+| `ZIGGY_CONNECTORS_MCP_RESOURCE_URL` | Canonical loopback MCP resource URL; production default `https://127.0.0.1:8790/mcp` |
 | `ZIGGY_CONNECTORS_VERSION` | Health response version; default `dev` |
 | `ZIGGY_CONNECTORS_GOOGLE_CLIENT_ID` | Google OAuth client ID |
 | `ZIGGY_CONNECTORS_GOOGLE_REDIRECT_URI` | Exact registered callback URI; no query/fragment, HTTPS in production |
@@ -58,6 +58,8 @@ Secret values are read from files, with trailing whitespace removed:
 | `ZIGGY_CONNECTORS_CLIENT_CREDENTIAL_PEPPER_FILE` | At least 32 random bytes used to hash persisted runtime client secrets |
 | `ZIGGY_CONNECTORS_MCP_ACCESS_SIGNING_KEY_FILE` | At least 32 random bytes used to sign five-minute MCP access tokens |
 | `ZIGGY_CONNECTORS_DATABASE_URL_FILE` | PostgreSQL URL; required in production, optional for local memory storage |
+| `ZIGGY_CONNECTORS_TLS_CERT_FILE` | Loopback TLS server certificate; required in production |
+| `ZIGGY_CONNECTORS_TLS_KEY_FILE` | Loopback TLS private key; required in production |
 
 Do not put secrets in logs or command-line arguments. Generate keys into the
 deployment secret mechanism, for example:
@@ -80,13 +82,15 @@ only HTTP Basic runtime client credentials and `grant_type=client_credentials`.
 The service derives the user, workspace, runtime ID, and runtime generation
 from the persisted client record; it rejects tenant identity request fields.
 
-The direct production endpoints are `http://127.0.0.1:8790/oauth/token` and
-`http://127.0.0.1:8790/mcp`. The server publishes RFC 9728 protected-resource
+The direct production endpoints are `https://127.0.0.1:8790/oauth/token` and
+`https://127.0.0.1:8790/mcp`. Run `deploy/generate-local-tls.sh` once on the
+Spark host to create the loopback certificate and install its local CA in the
+system trust store. The server publishes RFC 9728 protected-resource
 metadata at `/.well-known/oauth-protected-resource/mcp` and OAuth authorization
 server metadata at `/.well-known/oauth-authorization-server`. An unauthenticated
 MCP request returns the `resource_metadata` bearer challenge and scope guidance
-expected by MCP OAuth clients. Optional RFC 8707 `resource` token-request
-parameters must equal the configured MCP resource URL.
+expected by MCP OAuth clients. The RFC 8707 `resource` token-request parameter
+is required and must equal the configured MCP resource URL.
 
 MCP access tokens are connector-only HS256 JWTs with the configured issuer,
 the MCP resource URL as audience, `iat`, `exp`, random `jti`, and granted
@@ -112,27 +116,49 @@ message-read tools.
 ### Provision a runtime client
 
 Apply both connector migrations, then provision one client per
-`(user_id, workspace_id, runtime_id, runtime_generation)`. The command creates
-or replaces a mode-`0600` secret file and prints only the client ID, secret file
-path, scopes, and loopback endpoints. Re-running it for the same runtime fence
-keeps the client ID and rotates its secret.
+`(user_id, workspace_id, runtime_id, runtime_generation)`. Create the
+mode-`0600` source credential as the runtime's Unix user before invoking the
+provisioner. The provisioner reads it, persists only its peppered hash, and
+prints no secret. Re-running it for the same runtime fence is idempotent.
+Generation replacement and secret rotation deliberately fail closed until the
+orchestrator can stage and health-check a second credential.
 
 ```sh
-go run ./cmd/provision-runtime-oauth-client \
-  --database-url-file /home/mihai/.config/credstore/ziggy-connectors/database-url \
-  --client-credential-pepper-file /home/mihai/.config/credstore/ziggy-connectors/client-credential-pepper \
+install -d -m 0700 /home/mihai/.config/credstore
+umask 077
+openssl rand -base64 48 > "/home/mihai/.config/credstore/ziggy-mcp-${ZIGGY_RUNTIME_INSTANCE}"
+
+sudo /usr/local/bin/provision-runtime-oauth-client \
+  --database-url-file /run/credentials/ziggy-connectors.service/database-url \
+  --client-credential-pepper-file /run/credentials/ziggy-connectors.service/client-credential-pepper \
   --user-id "$ZIGGY_USER_ID" \
   --workspace-id "$ZIGGY_WORKSPACE_ID" \
   --runtime-id "$ZIGGY_RUNTIME_ID" \
   --runtime-generation "$ZIGGY_RUNTIME_GENERATION" \
-  --secret-file "/home/mihai/.config/credstore/ziggy-mcp-owner/${ZIGGY_WORKSPACE_ID}/gmail-mcp-client-secret"
+  --secret-file "/home/mihai/.config/credstore/ziggy-mcp-${ZIGGY_RUNTIME_INSTANCE}"
 ```
 
-Use the emitted `client_id`, `secret_file`, and scopes
-`gmail.status gmail.search gmail.read` in the Spark Nanobot configuration.
-The provisioner writes source credentials under the owner-controlled credential
-store; the tenant unit must load that source file with `LoadCredential` into its
-read-only `/run/credentials/...` mount for Nanobot to consume.
+Use the emitted `client_id` and scopes `gmail.status gmail.search gmail.read`
+in the Spark Nanobot configuration. The owner instance name is `owner`; tenant
+instance names are their systemd `%i` workspace IDs. The corresponding unit
+loads the flat `ziggy-mcp-<instance>` source file with `LoadCredential` into
+its read-only `/run/credentials/...` mount for Nanobot to consume.
+
+For the owner runtime, install the checked-in credential drop-in before
+writing a config that references `${ZIGGY_MCP_CLIENT_SECRET_FILE}`:
+
+```sh
+install -d -m 0700 /home/mihai/.config/systemd/user/nanobot-gateway.service.d
+install -m 0600 \
+  services/ziggy-control/deploy/systemd/spark/nanobot-gateway.service.d/40-mcp-client-credential.conf \
+  /home/mihai/.config/systemd/user/nanobot-gateway.service.d/
+systemctl --user daemon-reload
+systemctl --user cat nanobot-gateway.service
+```
+
+The final command must show `LoadCredential=mcp-client-secret:ziggy-mcp-owner`
+and `ZIGGY_MCP_CLIENT_SECRET_FILE=%d/mcp-client-secret`. Tenant runtimes get
+the equivalent wiring from the checked-in `nanobot-tenant@.service` template.
 
 ## Local commands
 

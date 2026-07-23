@@ -9,22 +9,40 @@ import os
 import tempfile
 from pathlib import Path
 
-from provision_tenant import DEFAULT_CONNECTOR_MCP_URL, gmail_mcp_server
+from provision_tenant import (
+    DEFAULT_CONNECTOR_MCP_URL,
+    DEFAULT_CONNECTOR_TOKEN_URL,
+    DEFAULT_MCP_CLIENT_SECRET_FILE,
+    gmail_mcp_server,
+)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--client-id", required=True)
     parser.add_argument("--connector-mcp-url", default=DEFAULT_CONNECTOR_MCP_URL)
+    parser.add_argument("--connector-token-url", default=DEFAULT_CONNECTOR_TOKEN_URL)
+    parser.add_argument(
+        "--client-secret-file",
+        default=DEFAULT_MCP_CLIENT_SECRET_FILE,
+    )
     return parser.parse_args()
 
 
-def update_config(document: dict, url: str = DEFAULT_CONNECTOR_MCP_URL) -> bool:
-    websocket = (document.get("channels") or {}).get("websocket") or {}
-    capability = str(
-        websocket.get("tokenIssueSecret") or websocket.get("token_issue_secret") or ""
+def update_config(
+    document: dict,
+    client_id: str,
+    url: str = DEFAULT_CONNECTOR_MCP_URL,
+    token_url: str = DEFAULT_CONNECTOR_TOKEN_URL,
+    client_secret_file: str = DEFAULT_MCP_CLIENT_SECRET_FILE,
+) -> bool:
+    expected = gmail_mcp_server(
+        client_id,
+        url,
+        token_url,
+        client_secret_file,
     )
-    expected = gmail_mcp_server(capability, url)
     tools = document.setdefault("tools", {})
     changed = tools.get("restrictToWorkspace") is not True
     tools["restrictToWorkspace"] = True
@@ -61,7 +79,13 @@ def main() -> None:
     args = parse_args()
     filename = args.config.expanduser().resolve()
     document = json.loads(filename.read_text(encoding="utf-8"))
-    changed = update_config(document, args.connector_mcp_url)
+    changed = update_config(
+        document,
+        args.client_id,
+        args.connector_mcp_url,
+        args.connector_token_url,
+        args.client_secret_file,
+    )
     if changed:
         atomic_json(filename, document)
     print(f"{filename}: {'updated' if changed else 'unchanged'}")

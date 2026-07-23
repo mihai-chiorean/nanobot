@@ -33,8 +33,8 @@ func TestNewAPIWiresLoadedConfiguration(t *testing.T) {
 		TrustKey:               key,
 		ClientCredentialPepper: key,
 		MCPAccessSigningKey:    key,
-		OAuthIssuerURL:         "http://127.0.0.1:8790",
-		MCPResourceURL:         "http://127.0.0.1:8790/mcp",
+		OAuthIssuerURL:         "https://127.0.0.1:8790",
+		MCPResourceURL:         "https://127.0.0.1:8790/mcp",
 	}
 
 	tokens, err := runtimeauth.New(key, cfg.OAuthIssuerURL, cfg.MCPResourceURL)

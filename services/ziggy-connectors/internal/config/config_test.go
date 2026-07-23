@@ -2,6 +2,58 @@ package config
 
 import "testing"
 
+func TestLoadProductionDefaultsUseLoopbackHTTPS(t *testing.T) {
+	env, files := validEnv("production")
+	setProductionRequirements(env, files)
+	cfg, err := LoadFrom(mapLookup(env), mapRead(files))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.OAuthIssuerURL != "https://127.0.0.1:8790" || cfg.MCPResourceURL != "https://127.0.0.1:8790/mcp" {
+		t.Fatalf("production connector URLs = %q, %q", cfg.OAuthIssuerURL, cfg.MCPResourceURL)
+	}
+}
+
+func TestLoadRejectsProductionHTTPConnectorURLs(t *testing.T) {
+	for name, value := range map[string]string{
+		"ZIGGY_CONNECTORS_OAUTH_ISSUER_URL": "http://127.0.0.1:8790",
+		"ZIGGY_CONNECTORS_MCP_RESOURCE_URL": "http://127.0.0.1:8790/mcp",
+	} {
+		t.Run(name, func(t *testing.T) {
+			env, files := validEnv("production")
+			setProductionRequirements(env, files)
+			env[name] = value
+			if _, err := LoadFrom(mapLookup(env), mapRead(files)); err == nil {
+				t.Fatalf("accepted insecure production %s", name)
+			}
+		})
+	}
+}
+
+func TestLoadRejectsMissingProductionTLSFiles(t *testing.T) {
+	for _, name := range []string{"ZIGGY_CONNECTORS_TLS_CERT_FILE", "ZIGGY_CONNECTORS_TLS_KEY_FILE"} {
+		t.Run(name, func(t *testing.T) {
+			env, files := validEnv("production")
+			setProductionRequirements(env, files)
+			delete(env, name)
+			if _, err := LoadFrom(mapLookup(env), mapRead(files)); err == nil {
+				t.Fatalf("accepted production configuration without %s", name)
+			}
+		})
+	}
+}
+
+func TestLoadAllowsDevelopmentHTTPConnectorURLs(t *testing.T) {
+	env, files := validEnv("development")
+	cfg, err := LoadFrom(mapLookup(env), mapRead(files))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.OAuthIssuerURL != "http://127.0.0.1:8790" || cfg.MCPResourceURL != "http://127.0.0.1:8790/mcp" {
+		t.Fatalf("development connector URLs = %q, %q", cfg.OAuthIssuerURL, cfg.MCPResourceURL)
+	}
+}
+
 func TestLoadRejectsProductionHTTPRedirect(t *testing.T) {
 	env, files := validEnv("production")
 	env["ZIGGY_CONNECTORS_GOOGLE_REDIRECT_URI"] = "http://localhost/callback"
@@ -29,11 +81,17 @@ func TestLoadRejectsInvalidListenAddress(t *testing.T) {
 func TestLoadRejectsPublicProductionListener(t *testing.T) {
 	env, files := validEnv("production")
 	env["ZIGGY_CONNECTORS_LISTEN_ADDR"] = "0.0.0.0:8790"
-	env["ZIGGY_CONNECTORS_DATABASE_URL_FILE"] = "/database"
-	files["/database"] = []byte("postgres://example")
+	setProductionRequirements(env, files)
 	if _, err := LoadFrom(mapLookup(env), mapRead(files)); err == nil {
 		t.Fatal("accepted public production listener")
 	}
+}
+
+func setProductionRequirements(env map[string]string, files map[string][]byte) {
+	env["ZIGGY_CONNECTORS_DATABASE_URL_FILE"] = "/database"
+	env["ZIGGY_CONNECTORS_TLS_CERT_FILE"] = "/tls-cert"
+	env["ZIGGY_CONNECTORS_TLS_KEY_FILE"] = "/tls-key"
+	files["/database"] = []byte("postgres://example")
 }
 
 func validEnv(environment string) (map[string]string, map[string][]byte) {

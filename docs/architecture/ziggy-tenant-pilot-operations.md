@@ -105,17 +105,89 @@ owner's cloud provider credentials.
 `--enable-gmail-mcp` adds only Ziggy's read-only Gmail MCP server. Do not enable
 it for untrusted testers while tenant runtimes share the `mihai` Unix account;
 the same-account pilot boundary does not defend against a compromised runtime
-reading another runtime's config. Existing trusted runtimes can be patched
-without replacing the rest of their config:
+reading another runtime's host files.
+
+First provision a connector OAuth client for the runtime generation. Write its
+secret to the per-user systemd credential store, not into Nanobot config:
+
+```sh
+install -d -m 0700 /home/mihai/.config/credstore
+umask 077
+openssl rand -base64 48 > "/home/mihai/.config/credstore/ziggy-mcp-<workspace-id>"
+
+sudo /usr/local/bin/provision-runtime-oauth-client \
+  --database-url-file /run/credentials/ziggy-connectors.service/database-url \
+  --client-credential-pepper-file /run/credentials/ziggy-connectors.service/client-credential-pepper \
+  --user-id "<user-id>" \
+  --workspace-id "<workspace-id>" \
+  --runtime-id "<runtime-id>" \
+  --runtime-generation 1 \
+  --secret-file "/home/mihai/.config/credstore/ziggy-mcp-<workspace-id>"
+```
+
+Then add `--enable-gmail-mcp --gmail-mcp-client-id <client-id>` to the tenant
+generator command above. Existing trusted runtimes can be patched without
+replacing the rest of their config:
 
 ```sh
 python3 configure_gmail_mcp.py \
-  --config /path/to/runtime/config.json
+  --config /path/to/runtime/config.json \
+  --client-id "<client-id>"
 systemctl --user restart <runtime-unit>
 ```
 
 The migration is idempotent, writes atomically, preserves file ownership and
-mode, and never prints the capability.
+mode, and never prints either secret.
+
+The owner runtime uses a separate drop-in and credential source name. Install
+it before patching the owner config:
+
+```sh
+install -d -m 0700 /home/mihai/.config/systemd/user/nanobot-gateway.service.d
+install -m 0600 \
+  services/ziggy-control/deploy/systemd/spark/nanobot-gateway.service.d/40-mcp-client-credential.conf \
+  /home/mihai/.config/systemd/user/nanobot-gateway.service.d/
+systemctl --user daemon-reload
+systemctl --user cat nanobot-gateway.service
+```
+
+The rendered owner unit must load `ziggy-mcp-owner` and export its mounted path
+as `ZIGGY_MCP_CLIENT_SECRET_FILE`; otherwise the environment reference in the
+Nanobot config remains unresolved and startup fails.
+
+Run the live smoke through a transient user unit so it receives the same
+systemd credential mount and CA trust as the owner gateway:
+
+```sh
+systemd-run --user --wait --pipe --collect \
+  --unit=ziggy-gmail-mcp-smoke \
+  --property=LoadCredential=mcp-client-secret:ziggy-mcp-owner \
+  --property=Environment=ZIGGY_MCP_CLIENT_SECRET_FILE=%d/mcp-client-secret \
+  --property=Environment=SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
+  /home/mihai/workspace/ziggy/.venv/bin/python3 \
+  /home/mihai/workspace/ziggy/current-nanobot/services/ziggy-control/deploy/spark/smoke_gmail_mcp.py \
+  --config /home/mihai/.nanobot/config.json
+```
+
+Success prints only `Gmail MCP smoke passed`. The smoke performs the real
+CA-verified HTTPS connection, client-credentials token exchange, MCP
+initialization, tool discovery, and tenant-scoped Gmail connection-status call.
+
+Roll out this boundary in dependency order:
+
+1. Install the connector migration, signing/pepper/TLS credentials, local CA,
+   connector binary, and runtime OAuth client registration without restarting.
+2. Install the Nanobot release, systemd credential drop-in, and OAuth-based MCP
+   config.
+3. Restart `ziggy-connectors`, verify HTTPS readiness and token issuance, then
+   restart the Nanobot runtime and execute a Gmail MCP smoke test.
+4. Only after that smoke succeeds, deploy `ziggy-control` with the legacy
+   `/runtime/connectors/mcp` route removed.
+
+Rollback must reverse the same boundary as one unit: restore the prior control
+route, prior connector binary/unit, prior Nanobot release/config, and restart
+connector then runtime. Do not roll back only one component of the auth
+contract.
 
 The systemd template presents home and system paths read-only and permits
 writes only below that tenant root. `UnsetEnvironment=CLERK_SECRET_KEY

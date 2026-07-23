@@ -65,6 +65,40 @@ class TestResolveConfig:
         resolved = resolve_config_env_vars(raw)
         assert resolved.providers.groq.api_key == "resolved-key"
 
+    def test_resolves_systemd_credential_path_for_mcp(self, tmp_path, monkeypatch):
+        credential_path = "/run/credentials/unit/mcp-client-secret"
+        monkeypatch.setenv("ZIGGY_MCP_CLIENT_SECRET_FILE", credential_path)
+        config_path = tmp_path / "config.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "tools": {
+                        "mcpServers": {
+                            "ziggy_gmail": {
+                                "type": "streamableHttp",
+                                "url": "https://127.0.0.1:8790/mcp",
+                                "oauthClientCredentials": {
+                                    "tokenUrl": "https://127.0.0.1:8790/oauth/token",
+                                    "clientId": "runtime-client",
+                                    "clientSecretFile": "${ZIGGY_MCP_CLIENT_SECRET_FILE}",
+                                    "scopes": ["gmail.read"],
+                                },
+                            }
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        resolved = resolve_config_env_vars(load_config(config_path))
+
+        assert (
+            resolved.tools.mcp_servers["ziggy_gmail"]
+            .oauth_client_credentials.client_secret_file
+            == credential_path
+        )
+
     def test_save_preserves_templates(self, tmp_path, monkeypatch):
         monkeypatch.setenv("MY_TOKEN", "real-token")
         config_path = tmp_path / "config.json"

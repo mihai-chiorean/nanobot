@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"crypto/hmac"
-	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
@@ -12,7 +11,7 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,6 +21,7 @@ import (
 )
 
 const defaultScopes = "gmail.status gmail.search gmail.read"
+const provisionTimeout = 30 * time.Second
 
 type options struct {
 	databaseURLFile            string
@@ -60,54 +60,49 @@ func run(args []string, output *os.File) error {
 	if err != nil {
 		return err
 	}
-	return provision(context.Background(), options, cfg, repository, output)
+	ctx, cancel := context.WithTimeout(context.Background(), provisionTimeout)
+	defer cancel()
+	return provision(ctx, options, cfg, repository, output)
 }
 
 func provision(ctx context.Context, options options, cfg config.ProvisioningConfig, repository store.RuntimeOAuthClientRepository, output io.Writer) error {
 	tenant := store.Tenant{UserID: options.userID, WorkspaceID: options.workspaceID}
-	existing, lookupErr := repository.GetRuntimeOAuthClientForRuntime(ctx, tenant, options.runtimeID, options.runtimeGeneration)
-	hasExisting := lookupErr == nil
-	if lookupErr != nil && !errors.Is(lookupErr, store.ErrNotFound) {
-		return lookupErr
+	secret, err := readSecretFile(options.secretFile)
+	if err != nil {
+		return err
 	}
+	secretHash := hashSecret(cfg.ClientCredentialPepper, secret)
 	clientID := options.clientID
-	if clientID == "" && hasExisting {
-		clientID = existing.ClientID
-	}
 	if clientID == "" {
-		generatedID, err := randomValue(18)
-		if err != nil {
-			return err
-		}
-		clientID = "zrc_" + generatedID
-	}
-	secret, err := randomValue(32)
-	if err != nil {
-		return err
-	}
-	stagedSecret, err := stageSecretFile(options.secretFile, secret)
-	if err != nil {
-		return err
+		clientID = derivedClientID(tenant, options.runtimeID, options.runtimeGeneration)
 	}
 	scopes := strings.Fields(options.scopes)
 	client := store.RuntimeOAuthClient{
 		ClientID: clientID, Tenant: tenant, RuntimeID: options.runtimeID, RuntimeGeneration: options.runtimeGeneration,
-		SecretHash: hashSecret(cfg.ClientCredentialPepper, secret), Scopes: scopes, CreatedAt: time.Now().UTC(),
+		SecretHash: secretHash, Scopes: scopes, CreatedAt: time.Now().UTC(),
 	}
-	if err := repository.UpsertRuntimeOAuthClient(ctx, client); err != nil {
-		_ = stagedSecret.Discard()
+	active, _, err := repository.RegisterRuntimeOAuthClient(ctx, client)
+	if err != nil {
 		return err
 	}
-	if err := stagedSecret.Commit(); err != nil {
-		if hasExisting {
-			if restoreErr := repository.UpsertRuntimeOAuthClient(ctx, existing); restoreErr != nil {
-				return fmt.Errorf("activate staged client secret %q: %w; restore previous client: %v", stagedSecret.stagedPath, err, restoreErr)
-			}
-		}
-		return fmt.Errorf("activate staged client secret %q: %w", stagedSecret.stagedPath, err)
+	if active.RuntimeGeneration != options.runtimeGeneration {
+		return errors.New("runtime generation replacement requires a separately staged credential rollout")
 	}
-	fmt.Fprintf(output, "client_id=%s\nsecret_file=%s\nscopes=%s\ntoken_url=http://127.0.0.1:8790/oauth/token\nmcp_url=http://127.0.0.1:8790/mcp\n", clientID, options.secretFile, strings.Join(scopes, " "))
+	if options.clientID != "" && options.clientID != active.ClientID {
+		return errors.New("client-id does not match the active runtime client")
+	}
+	if !hmac.Equal(active.SecretHash, secretHash) {
+		return errors.New("secret file does not match the active runtime client; refusing unsafe rotation")
+	}
+	if !sameScopes(active.Scopes, scopes) {
+		return errors.New("scopes do not match the active runtime client")
+	}
+	printProvisioning(output, active.ClientID, options.secretFile, active.Scopes)
 	return nil
+}
+
+func printProvisioning(output io.Writer, clientID, secretFile string, scopes []string) {
+	fmt.Fprintf(output, "client_id=%s\nsecret_file=%s\nscopes=%s\n", clientID, secretFile, strings.Join(scopes, " "))
 }
 
 func parseOptions(args []string) (options, error) {
@@ -169,12 +164,9 @@ func sameScopes(actual, expected []string) bool {
 	return true
 }
 
-func randomValue(size int) (string, error) {
-	bytes := make([]byte, size)
-	if _, err := rand.Read(bytes); err != nil {
-		return "", err
-	}
-	return base64.RawURLEncoding.EncodeToString(bytes), nil
+func derivedClientID(tenant store.Tenant, runtimeID string, generation int64) string {
+	sum := sha256.Sum256([]byte(tenant.UserID + "\x00" + tenant.WorkspaceID + "\x00" + runtimeID + "\x00" + strconv.FormatInt(generation, 10)))
+	return "zrc_" + base64.RawURLEncoding.EncodeToString(sum[:18])
 }
 
 func hashSecret(pepper []byte, secret string) []byte {
@@ -183,75 +175,24 @@ func hashSecret(pepper []byte, secret string) []byte {
 	return mac.Sum(nil)
 }
 
-type stagedSecretFile struct {
-	path       string
-	stagedPath string
-}
-
-func stageSecretFile(path, secret string) (*stagedSecretFile, error) {
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return nil, err
-	}
-	if info, err := os.Lstat(path); err == nil && !info.Mode().IsRegular() {
-		return nil, errors.New("secret-file must be a regular file")
-	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return nil, err
-	}
-	file, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".new-*")
+func readSecretFile(path string) (string, error) {
+	info, err := os.Lstat(path)
 	if err != nil {
-		return nil, err
+		return "", fmt.Errorf("read secret file: %w", err)
 	}
-	stagedPath := file.Name()
-	cleanup := func(err error) (*stagedSecretFile, error) {
-		_ = file.Close()
-		_ = os.Remove(stagedPath)
-		return nil, err
+	if !info.Mode().IsRegular() {
+		return "", errors.New("secret-file must be a regular file")
 	}
-	if err := file.Chmod(0o600); err != nil {
-		return cleanup(err)
+	if info.Mode().Perm()&0o077 != 0 {
+		return "", errors.New("secret-file must not be accessible by group or others")
 	}
-	if _, err := file.WriteString(secret + "\n"); err != nil {
-		return cleanup(err)
-	}
-	if err := file.Sync(); err != nil {
-		return cleanup(err)
-	}
-	if err := file.Close(); err != nil {
-		return cleanup(err)
-	}
-	return &stagedSecretFile{path: path, stagedPath: stagedPath}, nil
-}
-
-func (s *stagedSecretFile) Commit() error {
-	if s == nil || s.stagedPath == "" {
-		return errors.New("staged secret file is unavailable")
-	}
-	if err := os.Rename(s.stagedPath, s.path); err != nil {
-		return err
-	}
-	s.stagedPath = ""
-	return nil
-}
-
-func (s *stagedSecretFile) Discard() error {
-	if s == nil || s.stagedPath == "" {
-		return nil
-	}
-	err := os.Remove(s.stagedPath)
-	s.stagedPath = ""
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	return err
-}
-
-func writeSecretFile(path, secret string) error {
-	staged, err := stageSecretFile(path, secret)
+	contents, err := os.ReadFile(path)
 	if err != nil {
-		return err
+		return "", fmt.Errorf("read secret file: %w", err)
 	}
-	if err := staged.Commit(); err != nil {
-		return err
+	secret := strings.TrimSpace(string(contents))
+	if len(secret) < 32 {
+		return "", errors.New("secret-file must contain at least 32 characters")
 	}
-	return nil
+	return secret, nil
 }

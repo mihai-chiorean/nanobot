@@ -8,10 +8,14 @@ Requires=anti-sycophancy-proxy.service
 Type=simple
 WorkingDirectory=/home/mihai/workspace/ziggy/current-nanobot
 ExecStartPre=/usr/bin/curl --fail --silent --show-error http://127.0.0.1:8001/health
+ExecStartPre=/usr/bin/curl --fail --silent --show-error --cacert /etc/ssl/certs/ca-certificates.crt https://127.0.0.1:8790/readyz
 ExecStart=/home/mihai/workspace/ziggy/.venv/bin/python3 -m nanobot gateway --config /home/mihai/.local/share/ziggy/tenants/%i/runtime/config.json
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
 EnvironmentFile=-/home/mihai/.config/ziggy/tenants/%i.env
+LoadCredential=mcp-client-secret:ziggy-mcp-%i
+Environment=ZIGGY_MCP_CLIENT_SECRET_FILE=%d/mcp-client-secret
+Environment=SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 UnsetEnvironment=CLERK_SECRET_KEY CLERK_SECRET_KEY_FILE
 Restart=on-failure
 RestartSec=10s

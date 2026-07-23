@@ -92,6 +92,7 @@ class OAuthClientCredentialsAuth(httpx.Auth):
     def __init__(
         self,
         config,
+        resource_url: str,
         *,
         token_client_factory: Callable[[], httpx.AsyncClient] | None = None,
     ) -> None:
@@ -99,6 +100,7 @@ class OAuthClientCredentialsAuth(httpx.Auth):
         self._client_id = config.client_id
         self._client_secret_file = config.client_secret_file
         self._scopes = tuple(config.scopes)
+        self._resource_url = resource_url
         self._token_client_factory = token_client_factory or httpx.AsyncClient
         self._access_token: str | None = None
         self._token_valid_until = 0.0
@@ -121,7 +123,10 @@ class OAuthClientCredentialsAuth(httpx.Auth):
 
             secret = _read_oauth_client_secret(self._client_secret_file)
 
-            form = {"grant_type": "client_credentials"}
+            form = {
+                "grant_type": "client_credentials",
+                "resource": self._resource_url,
+            }
             if self._scopes:
                 form["scope"] = " ".join(self._scopes)
 
@@ -607,7 +612,7 @@ async def connect_mcp_servers(
                 if transport_type in {"sse", "streamableHttp"}:
                     oauth_provider = _build_official_oauth_provider(oauth_config, cfg.url)
                 if oauth_provider is None:
-                    oauth_auth = OAuthClientCredentialsAuth(oauth_config)
+                    oauth_auth = OAuthClientCredentialsAuth(oauth_config, cfg.url)
 
             if transport_type == "stdio":
                 command, args, env = _normalize_windows_stdio_command(

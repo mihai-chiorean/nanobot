@@ -1,12 +1,15 @@
 [Unit]
 Description=Ziggy tenant connector service
-After=network-online.target postgresql.service
+After=network-online.target postgresql@16-main.service
 Wants=network-online.target
+Requires=postgresql@16-main.service
 
 [Service]
 Type=simple
 User=ziggy-connectors
 Group=ziggy-connectors
+EnvironmentFile=/etc/ziggy/ziggy-connectors.env
+Environment=ZIGGY_CONNECTORS_ENV=production
 LoadCredential=google-client-secret:/etc/ziggy/secrets/google-client-secret
 LoadCredential=state-signing-key:/etc/ziggy/secrets/connectors-state-signing-key
 LoadCredential=token-encryption-key:/etc/ziggy/secrets/connectors-token-encryption-key
@@ -14,6 +17,8 @@ LoadCredential=connector-trust-key:/etc/ziggy/secrets/connector-trust-key
 LoadCredential=client-credential-pepper:/etc/ziggy/secrets/connectors-client-credential-pepper
 LoadCredential=mcp-access-signing-key:/etc/ziggy/secrets/connectors-mcp-access-signing-key
 LoadCredential=database-url:/etc/ziggy/secrets/connectors-database-url
+LoadCredential=tls-cert:/etc/ziggy/secrets/connectors-tls-cert
+LoadCredential=tls-key:/etc/ziggy/secrets/connectors-tls-key
 Environment=ZIGGY_CONNECTORS_GOOGLE_CLIENT_SECRET_FILE=%d/google-client-secret
 Environment=ZIGGY_CONNECTORS_STATE_SIGNING_KEY_FILE=%d/state-signing-key
 Environment=ZIGGY_CONNECTORS_TOKEN_ENCRYPTION_KEY_FILE=%d/token-encryption-key
@@ -21,7 +26,8 @@ Environment=ZIGGY_CONNECTORS_TRUST_KEY_FILE=%d/connector-trust-key
 Environment=ZIGGY_CONNECTORS_CLIENT_CREDENTIAL_PEPPER_FILE=%d/client-credential-pepper
 Environment=ZIGGY_CONNECTORS_MCP_ACCESS_SIGNING_KEY_FILE=%d/mcp-access-signing-key
 Environment=ZIGGY_CONNECTORS_DATABASE_URL_FILE=%d/database-url
-EnvironmentFile=/etc/ziggy/ziggy-connectors.env
+Environment=ZIGGY_CONNECTORS_TLS_CERT_FILE=%d/tls-cert
+Environment=ZIGGY_CONNECTORS_TLS_KEY_FILE=%d/tls-key
 ExecStart=/usr/local/bin/ziggy-connectors
 Restart=on-failure
 RestartSec=2s

@@ -175,7 +175,7 @@ func (api *API) oauthToken(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unsupported_grant_type"})
 		return
 	}
-	if resource := strings.TrimSpace(r.Form.Get("resource")); resource != "" && resource != api.config.MCPResourceURL {
+	if resource := strings.TrimSpace(r.Form.Get("resource")); resource != api.config.MCPResourceURL {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_target"})
 		return
 	}
@@ -469,6 +469,33 @@ func Serve(ctx context.Context, server *http.Server, shutdownTimeout time.Durati
 	}
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- server.Serve(listener) }()
+	select {
+	case err := <-serveErr:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			return fmt.Errorf("graceful shutdown: %w", err)
+		}
+		return nil
+	}
+}
+
+func ServeTLS(ctx context.Context, server *http.Server, shutdownTimeout time.Duration, certFile, keyFile string) error {
+	if server == nil || server.Handler == nil || shutdownTimeout <= 0 || strings.TrimSpace(certFile) == "" || strings.TrimSpace(keyFile) == "" {
+		return errors.New("server, handler, positive shutdown timeout, TLS certificate file, and TLS key file are required")
+	}
+	listener, err := (&netListen{}).Listen(server.Addr)
+	if err != nil {
+		return fmt.Errorf("listen: %w", err)
+	}
+	defer listener.Close()
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- server.ServeTLS(listener, certFile, keyFile) }()
 	select {
 	case err := <-serveErr:
 		if errors.Is(err, http.ErrServerClosed) {

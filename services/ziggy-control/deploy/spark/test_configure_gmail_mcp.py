@@ -13,18 +13,18 @@ assert SPEC and SPEC.loader
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 
-CAPABILITY = "runtime-capability-012345678901234567890"
+CLIENT_ID = "mcp_owner_runtime"
 
 
 def test_update_hardens_workspace_and_adds_only_managed_gmail_server():
     document = {
-        "channels": {"websocket": {"tokenIssueSecret": CAPABILITY}},
+        "channels": {"websocket": {"tokenIssueSecret": "bootstrap-only-secret"}},
         "tools": {
             "web": {"enable": True},
             "mcpServers": {"other": {"url": "https://example.test/mcp"}},
         },
     }
-    assert MODULE.update_config(document) is True
+    assert MODULE.update_config(document, CLIENT_ID) is True
     assert document["tools"]["restrictToWorkspace"] is True
     assert document["tools"]["web"] == {"enable": True}
     assert document["tools"]["mcpServers"]["other"] == {
@@ -32,8 +32,13 @@ def test_update_hardens_workspace_and_adds_only_managed_gmail_server():
     }
     assert document["tools"]["mcpServers"]["ziggy_gmail"] == {
         "type": "streamableHttp",
-        "url": "http://127.0.0.1:8788/runtime/connectors/mcp",
-        "headers": {"Authorization": f"Bearer {CAPABILITY}"},
+        "url": "https://127.0.0.1:8790/mcp",
+        "oauthClientCredentials": {
+            "tokenUrl": "https://127.0.0.1:8790/oauth/token",
+            "clientId": CLIENT_ID,
+            "clientSecretFile": "${ZIGGY_MCP_CLIENT_SECRET_FILE}",
+            "scopes": ["gmail.status", "gmail.search", "gmail.read"],
+        },
         "enabledTools": [
             "gmail_connection_status",
             "gmail_search",
@@ -41,12 +46,12 @@ def test_update_hardens_workspace_and_adds_only_managed_gmail_server():
         ],
         "toolTimeout": 30,
     }
-    assert MODULE.update_config(document) is False
+    assert MODULE.update_config(document, CLIENT_ID) is False
 
 
-def test_update_rejects_missing_runtime_capability():
-    with pytest.raises(ValueError, match="runtime connector capability"):
-        MODULE.update_config({"channels": {"websocket": {}}, "tools": {}})
+def test_update_rejects_missing_runtime_client_id():
+    with pytest.raises(ValueError, match="client ID"):
+        MODULE.update_config({"channels": {"websocket": {}}, "tools": {}}, "")
 
 
 def test_main_updates_atomically_without_printing_capability(tmp_path, monkeypatch, capsys):
@@ -54,7 +59,7 @@ def test_main_updates_atomically_without_printing_capability(tmp_path, monkeypat
     filename.write_text(
         json.dumps(
             {
-                "channels": {"websocket": {"tokenIssueSecret": CAPABILITY}},
+                "channels": {"websocket": {"tokenIssueSecret": "bootstrap-only-secret"}},
                 "tools": {"mcpServers": {}},
             }
         ),
@@ -64,11 +69,17 @@ def test_main_updates_atomically_without_printing_capability(tmp_path, monkeypat
     monkeypatch.setattr(
         sys,
         "argv",
-        ["configure_gmail_mcp.py", "--config", str(filename)],
+        [
+            "configure_gmail_mcp.py",
+            "--config",
+            str(filename),
+            "--client-id",
+            CLIENT_ID,
+        ],
     )
     MODULE.main()
     output = capsys.readouterr().out
     assert "updated" in output
-    assert CAPABILITY not in output
+    assert CLIENT_ID not in output
     assert filename.stat().st_mode & 0o777 == 0o600
     assert "ziggy_gmail" in json.loads(filename.read_text())["tools"]["mcpServers"]

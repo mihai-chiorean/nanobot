@@ -3,9 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
-	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/mihai-chiorean/nanobot/services/ziggy-connectors/internal/config"
@@ -23,52 +23,80 @@ func TestParseOptionsRequiresRuntimeFenceAndExactScopes(t *testing.T) {
 	}
 }
 
-func TestWriteSecretFileRestrictsPermissions(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "runtime", "oauth-client-secret")
-	if err := writeSecretFile(path, "secret-value"); err != nil {
+func TestReadSecretFileRequiresRestrictedHighEntropyFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "oauth-client-secret")
+	secret := "01234567890123456789012345678901"
+	if err := os.WriteFile(path, []byte(secret+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	info, err := os.Stat(path)
-	if err != nil {
+	if got, err := readSecretFile(path); err != nil || got != secret {
+		t.Fatalf("readSecretFile() = %q, %v", got, err)
+	}
+	if err := os.Chmod(path, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm() != 0o600 {
-		t.Fatalf("secret mode = %o", info.Mode().Perm())
-	}
-	contents, err := os.ReadFile(path)
-	if err != nil || string(contents) != "secret-value\n" {
-		t.Fatalf("secret file = %q, %v", contents, err)
+	if _, err := readSecretFile(path); err == nil {
+		t.Fatal("accepted broadly readable secret")
 	}
 }
 
-func TestProvisionKeepsExistingSecretWhenDatabaseUpsertFails(t *testing.T) {
+func TestProvisionIsIdempotentAndRefusesUnsafeRotation(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "oauth-client-secret")
-	if err := os.WriteFile(path, []byte("previous-secret\n"), 0o600); err != nil {
+	secret := "01234567890123456789012345678901"
+	if err := os.WriteFile(path, []byte(secret+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	tenant := store.Tenant{UserID: "user", WorkspaceID: "workspace"}
-	repository := &failingClientRepository{existing: store.RuntimeOAuthClient{ClientID: "existing-client", Tenant: tenant, RuntimeID: "runtime", RuntimeGeneration: 2, SecretHash: []byte("previous-hash"), Scopes: []string{"gmail.status", "gmail.search", "gmail.read"}}, upsertErr: errors.New("database unavailable")}
+	pepper := []byte("01234567890123456789012345678901")
+	repository := &failingClientRepository{existing: store.RuntimeOAuthClient{ClientID: "existing-client", Tenant: tenant, RuntimeID: "runtime", RuntimeGeneration: 2, SecretHash: hashSecret(pepper, secret), Scopes: []string{"gmail.status", "gmail.search", "gmail.read"}}}
 	options := options{userID: tenant.UserID, workspaceID: tenant.WorkspaceID, runtimeID: "runtime", runtimeGeneration: 2, scopes: defaultScopes, secretFile: path}
-	if err := provision(context.Background(), options, config.ProvisioningConfig{ClientCredentialPepper: []byte("01234567890123456789012345678901")}, repository, &bytes.Buffer{}); err == nil {
-		t.Fatal("provision succeeded despite database failure")
+	if err := provision(context.Background(), options, config.ProvisioningConfig{ClientCredentialPepper: pepper}, repository, &bytes.Buffer{}); err != nil {
+		t.Fatalf("idempotent provision failed: %v", err)
 	}
-	contents, err := os.ReadFile(path)
-	if err != nil || string(contents) != "previous-secret\n" {
-		t.Fatalf("credential after database failure = %q, %v", contents, err)
+	if repository.registrations != 1 {
+		t.Fatalf("idempotent provision performed %d registrations", repository.registrations)
 	}
-	staged, err := filepath.Glob(filepath.Join(filepath.Dir(path), ".oauth-client-secret.new-*"))
-	if err != nil || len(staged) != 0 {
-		t.Fatalf("staged files after database failure = %v, %v", staged, err)
+	if err := os.WriteFile(path, []byte("different-secret-0123456789012345\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := provision(context.Background(), options, config.ProvisioningConfig{ClientCredentialPepper: pepper}, repository, &bytes.Buffer{}); err == nil {
+		t.Fatal("unsafe secret rotation succeeded")
+	}
+}
+
+func TestProvisionCreatesDeterministicClientFromExistingSecret(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "oauth-client-secret")
+	secret := "01234567890123456789012345678901"
+	if err := os.WriteFile(path, []byte(secret+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	repository := &failingClientRepository{}
+	options := options{userID: "user", workspaceID: "workspace", runtimeID: "runtime", runtimeGeneration: 1, scopes: defaultScopes, secretFile: path}
+	var output bytes.Buffer
+	if err := provision(context.Background(), options, config.ProvisioningConfig{ClientCredentialPepper: []byte("01234567890123456789012345678901")}, repository, &output); err != nil {
+		t.Fatal(err)
+	}
+	if repository.registrations != 1 || !strings.Contains(output.String(), "client_id=zrc_") {
+		t.Fatalf("registrations = %d, output = %q", repository.registrations, output.String())
 	}
 }
 
 type failingClientRepository struct {
-	existing  store.RuntimeOAuthClient
-	upsertErr error
+	existing      store.RuntimeOAuthClient
+	registerErr   error
+	registrations int
 }
 
-func (r *failingClientRepository) UpsertRuntimeOAuthClient(context.Context, store.RuntimeOAuthClient) error {
-	return r.upsertErr
+func (r *failingClientRepository) RegisterRuntimeOAuthClient(_ context.Context, client store.RuntimeOAuthClient) (store.RuntimeOAuthClient, bool, error) {
+	r.registrations++
+	if r.registerErr != nil {
+		return store.RuntimeOAuthClient{}, false, r.registerErr
+	}
+	if r.existing.ClientID != "" {
+		return r.existing, false, nil
+	}
+	r.existing = client
+	return client, true, nil
 }
 
 func (r *failingClientRepository) GetRuntimeOAuthClient(context.Context, string) (store.RuntimeOAuthClient, error) {
@@ -76,5 +104,12 @@ func (r *failingClientRepository) GetRuntimeOAuthClient(context.Context, string)
 }
 
 func (r *failingClientRepository) GetRuntimeOAuthClientForRuntime(context.Context, store.Tenant, string, int64) (store.RuntimeOAuthClient, error) {
+	return r.existing, nil
+}
+
+func (r *failingClientRepository) GetActiveRuntimeOAuthClient(context.Context, store.Tenant, string) (store.RuntimeOAuthClient, error) {
+	if r.existing.ClientID == "" {
+		return store.RuntimeOAuthClient{}, store.ErrNotFound
+	}
 	return r.existing, nil
 }

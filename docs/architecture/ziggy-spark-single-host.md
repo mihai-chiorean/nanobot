@@ -131,8 +131,11 @@ artifacts remain present. The migration snapshot is stored at:
 Spark creates daily mode-`0700` snapshots under `/var/backups/ziggy` with
 14-day retention. Each snapshot includes both PostgreSQL databases, Work
 artifacts, control binding state, the tenant manifest, the owner workspace,
-all tenant workspaces, and checksums. Runtime configuration and application
-encryption keys are not copied into the tenant workspace archives.
+all tenant workspaces, runtime configs, runtime credential sources, user
+systemd units, `/etc/ziggy` application configuration and credentials, and
+checksums. It also captures the active Nanobot release, deployed Ziggy
+binaries, and Ziggy system units so application rollback does not depend on a
+network fetch or rebuild.
 
 Rollback requires stopping Spark ingress and writers, copying the latest
 snapshot to the rollback host, and restoring it before starting Beelink.
@@ -140,6 +143,26 @@ Never run both Work/connector writer sets against independent databases. The
 local timer protects application rollback but not Spark disk loss; copy
 snapshots to an encrypted off-host target and perform restore drills before
 calling the installation recoverable.
+
+For an application rollback on Spark, stop `ziggy-cloudflared`,
+`ziggy-control`, `ziggy-connectors`, and `ziggy-work` plus the user Nanobot
+units, then verify `sha256sum -c SHA256SUMS` inside the selected snapshot.
+Restore `ziggy-binaries.tgz` below `/usr/local/bin`,
+`ziggy-system-units.tgz` below `/etc/systemd/system`, the Nanobot release
+archive below `/home/mihai/workspace/ziggy/releases`, `ziggy-etc.tgz` below
+`/`, and `ziggy-user-systemd.tgz` below
+`/home/mihai/.config/systemd`, `ziggy-runtime-credentials.tgz` below
+`/home/mihai/.config/credstore`, `ziggy-owner-config.json` to
+`/home/mihai/.nanobot/config.json`, and the tenant runtime-config archive below
+the tenant root. Atomically repoint
+`/home/mihai/workspace/ziggy/current-nanobot` to the restored
+`releases/nanobot-release` directory and verify that
+`current-nanobot/nanobot/__init__.py` exists before starting a runtime.
+Restore the two database dumps with `pg_restore --clean
+--if-exists` while all writers remain stopped. Reload both systemd managers,
+start PostgreSQL and the application services in dependency order, then run
+the readiness and Gmail MCP smoke checks before re-enabling ingress. Preserve
+the mode and ownership recorded by the root-only snapshot.
 
 OpenTelemetry remains disabled for the Go services on Spark until the local
 collector and credentials are installed. Journal and systemd health checks are

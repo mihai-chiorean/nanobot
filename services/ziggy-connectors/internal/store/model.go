@@ -68,9 +68,10 @@ type OAuthTransactionRepository interface {
 }
 
 type RuntimeOAuthClientRepository interface {
-	UpsertRuntimeOAuthClient(context.Context, RuntimeOAuthClient) error
+	RegisterRuntimeOAuthClient(context.Context, RuntimeOAuthClient) (RuntimeOAuthClient, bool, error)
 	GetRuntimeOAuthClient(context.Context, string) (RuntimeOAuthClient, error)
 	GetRuntimeOAuthClientForRuntime(context.Context, Tenant, string, int64) (RuntimeOAuthClient, error)
+	GetActiveRuntimeOAuthClient(context.Context, Tenant, string) (RuntimeOAuthClient, error)
 }
 
 type Readiness interface{ Ready(context.Context) error }
@@ -153,25 +154,27 @@ func (r *MemoryRepository) ConsumeOAuthTransaction(_ context.Context, tenant Ten
 	return tx, nil
 }
 
-func (r *MemoryRepository) UpsertRuntimeOAuthClient(_ context.Context, client RuntimeOAuthClient) error {
-	if !client.Tenant.Valid() || client.ClientID == "" || client.RuntimeID == "" || client.RuntimeGeneration < 1 || len(client.SecretHash) == 0 {
-		return errors.New("runtime OAuth client is invalid")
+func (r *MemoryRepository) RegisterRuntimeOAuthClient(_ context.Context, client RuntimeOAuthClient) (RuntimeOAuthClient, bool, error) {
+	if !validRuntimeOAuthClient(client) {
+		return RuntimeOAuthClient{}, false, errors.New("runtime OAuth client is invalid")
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	for id, existing := range r.runtimeOAuthClients {
-		if id != client.ClientID && existing.Tenant == client.Tenant && existing.RuntimeID == client.RuntimeID {
-			delete(r.runtimeOAuthClients, id)
+	for _, existing := range r.runtimeOAuthClients {
+		if existing.Tenant == client.Tenant && existing.RuntimeID == client.RuntimeID {
+			return cloneRuntimeOAuthClient(existing), false, nil
 		}
+	}
+	if _, exists := r.runtimeOAuthClients[client.ClientID]; exists {
+		return RuntimeOAuthClient{}, false, errors.New("runtime OAuth client ID already exists")
 	}
 	if client.CreatedAt.IsZero() {
 		client.CreatedAt = time.Now()
 	}
 	client.UpdatedAt = time.Now()
-	client.SecretHash = append([]byte(nil), client.SecretHash...)
-	client.Scopes = append([]string(nil), client.Scopes...)
+	client = cloneRuntimeOAuthClient(client)
 	r.runtimeOAuthClients[client.ClientID] = client
-	return nil
+	return cloneRuntimeOAuthClient(client), true, nil
 }
 
 func (r *MemoryRepository) GetRuntimeOAuthClient(_ context.Context, clientID string) (RuntimeOAuthClient, error) {
@@ -199,7 +202,30 @@ func (r *MemoryRepository) GetRuntimeOAuthClientForRuntime(_ context.Context, te
 	return RuntimeOAuthClient{}, ErrNotFound
 }
 
+func (r *MemoryRepository) GetActiveRuntimeOAuthClient(_ context.Context, tenant Tenant, runtimeID string) (RuntimeOAuthClient, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, client := range r.runtimeOAuthClients {
+		if client.Tenant == tenant && client.RuntimeID == runtimeID {
+			client.SecretHash = append([]byte(nil), client.SecretHash...)
+			client.Scopes = append([]string(nil), client.Scopes...)
+			return client, nil
+		}
+	}
+	return RuntimeOAuthClient{}, ErrNotFound
+}
+
 func (r *MemoryRepository) Ready(context.Context) error { return nil }
+
+func validRuntimeOAuthClient(client RuntimeOAuthClient) bool {
+	return client.Tenant.Valid() && client.ClientID != "" && client.RuntimeID != "" && client.RuntimeGeneration > 0 && len(client.SecretHash) > 0
+}
+
+func cloneRuntimeOAuthClient(client RuntimeOAuthClient) RuntimeOAuthClient {
+	client.SecretHash = append([]byte(nil), client.SecretHash...)
+	client.Scopes = append([]string(nil), client.Scopes...)
+	return client
+}
 
 var _ AccountRepository = (*MemoryRepository)(nil)
 var _ OAuthTransactionRepository = (*MemoryRepository)(nil)

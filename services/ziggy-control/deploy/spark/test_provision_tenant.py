@@ -12,6 +12,7 @@ MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 
 BOOTSTRAP_SECRET = "bootstrap-secret-012345678901234567890"
+MCP_CLIENT_ID = "mcp_owner_runtime"
 
 
 def test_tenant_config_isolates_state_and_scrubs_nonlocal_credentials(tmp_path: Path):
@@ -50,6 +51,7 @@ def test_tenant_config_isolates_state_and_scrubs_nonlocal_credentials(tmp_path: 
         18802,
         BOOTSTRAP_SECRET,
         enable_gmail_mcp=True,
+        gmail_mcp_client_id=MCP_CLIENT_ID,
     )
 
     assert generated["agents"]["defaults"]["workspace"] == str(root / "workspace")
@@ -69,8 +71,13 @@ def test_tenant_config_isolates_state_and_scrubs_nonlocal_credentials(tmp_path: 
     assert generated["tools"]["mcpServers"] == {
         "ziggy_gmail": {
             "type": "streamableHttp",
-            "url": "http://127.0.0.1:8788/runtime/connectors/mcp",
-            "headers": {"Authorization": f"Bearer {BOOTSTRAP_SECRET}"},
+            "url": "https://127.0.0.1:8790/mcp",
+            "oauthClientCredentials": {
+                "tokenUrl": "https://127.0.0.1:8790/oauth/token",
+                "clientId": MCP_CLIENT_ID,
+                "clientSecretFile": "${ZIGGY_MCP_CLIENT_SECRET_FILE}",
+                "scopes": ["gmail.status", "gmail.search", "gmail.read"],
+            },
             "enabledTools": [
                 "gmail_connection_status",
                 "gmail_search",
@@ -108,12 +115,12 @@ def test_tenant_config_rejects_incomplete_clerk_auth(tmp_path: Path):
 @pytest.mark.parametrize(
     "url",
     [
-        "https://127.0.0.1:8788/runtime/connectors/mcp",
-        "http://10.0.0.2:8788/runtime/connectors/mcp",
-        "http://127.0.0.1:99999/runtime/connectors/mcp",
-        "http://user:password@127.0.0.1:8788/runtime/connectors/mcp",
-        "http://127.0.0.1:8788/other",
-        "http://127.0.0.1:8788/runtime/connectors/mcp?tenant=other",
+        "http://127.0.0.1:8790/mcp",
+        "http://10.0.0.2:8790/mcp",
+        "http://127.0.0.1:99999/mcp",
+        "http://user:password@127.0.0.1:8790/mcp",
+        "http://127.0.0.1:8790/other",
+        "http://127.0.0.1:8790/mcp?tenant=other",
     ],
 )
 def test_tenant_config_rejects_unsafe_connector_mcp_url(tmp_path: Path, url: str):
@@ -136,6 +143,46 @@ def test_tenant_config_rejects_unsafe_connector_mcp_url(tmp_path: Path, url: str
             BOOTSTRAP_SECRET,
             url,
             True,
+            MCP_CLIENT_ID,
+        )
+
+
+@pytest.mark.parametrize(
+    "token_url",
+    [
+        "http://127.0.0.1:8790/oauth/token",
+        "https://10.0.0.2:8790/oauth/token",
+        "https://127.0.0.1:8790/other",
+    ],
+)
+def test_gmail_mcp_server_rejects_unsafe_connector_token_url(token_url: str):
+    with pytest.raises(ValueError, match="connector token URL"):
+        MODULE.gmail_mcp_server(
+            MCP_CLIENT_ID,
+            "https://127.0.0.1:8790/mcp",
+            token_url,
+        )
+
+
+def test_tenant_config_rejects_gmail_without_runtime_client(tmp_path: Path):
+    with pytest.raises(ValueError, match="client ID"):
+        MODULE.tenant_config(
+            {
+                "channels": {
+                    "websocket": {
+                        "authIssuer": "https://clerk.test",
+                        "authJwksUrl": "https://clerk.test/.well-known/jwks.json",
+                        "authAuthorizedParties": ["https://chat.example.com"],
+                    }
+                }
+            },
+            tmp_path / "tenant",
+            "tester@example.com",
+            18800,
+            "100.86.74.94",
+            18802,
+            BOOTSTRAP_SECRET,
+            enable_gmail_mcp=True,
         )
 
 
@@ -248,6 +295,9 @@ def test_main_writes_bootstrap_secret_to_config_but_not_stdout(tmp_path: Path, m
             "18802",
             "--bootstrap-secret-file",
             str(secret_file),
+            "--enable-gmail-mcp",
+            "--gmail-mcp-client-id",
+            MCP_CLIENT_ID,
         ],
     )
 
@@ -258,3 +308,6 @@ def test_main_writes_bootstrap_secret_to_config_but_not_stdout(tmp_path: Path, m
     assert BOOTSTRAP_SECRET not in output
     generated = json.loads((tenant_root / "runtime" / "config.json").read_text(encoding="utf-8"))
     assert generated["channels"]["websocket"]["tokenIssueSecret"] == BOOTSTRAP_SECRET
+    gmail = generated["tools"]["mcpServers"]["ziggy_gmail"]
+    assert gmail["oauthClientCredentials"]["clientId"] == MCP_CLIENT_ID
+    assert BOOTSTRAP_SECRET not in json.dumps(gmail)
