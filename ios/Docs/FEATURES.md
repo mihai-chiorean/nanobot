@@ -6,6 +6,8 @@
 
 - Native Clerk sign-in with the authentication methods enabled for the
   deployment.
+- Native Sign in with Apple capability; Clerk's `AuthView` exposes it when the
+  production Apple social connection is configured.
 - Server-owned admission and user-to-workspace resolution through
   `GET /auth/bootstrap`.
 - Connection to a configurable HTTPS Ziggy server; only the server URL is
@@ -47,8 +49,6 @@
 
 ## Next
 
-- Sign in with Apple alongside Google before enabling Google for an external
-  pilot, unless the build qualifies for Apple's login-service exception.
 - APNs notifications for completed or waiting work.
 - Share extension for URLs, text, and images.
 - App Intent for Ask Ziggy and Action Button integration.
