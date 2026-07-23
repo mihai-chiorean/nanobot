@@ -49,6 +49,7 @@ targets:
         product: Textual
     settings:
       base:
+        CODE_SIGN_ENTITLEMENTS: Ziggy/Resources/Ziggy.entitlements
         PRODUCT_BUNDLE_IDENTIFIER: com.mihaichiorean.ziggy
         PRODUCT_NAME: Ziggy
         GENERATE_INFOPLIST_FILE: false

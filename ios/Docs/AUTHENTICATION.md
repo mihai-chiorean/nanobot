@@ -36,6 +36,11 @@ The Clerk Native API application must register:
 - Bundle ID: `com.mihaichiorean.ziggy`
 - Callback: `com.mihaichiorean.ziggy://callback`
 
+Production builds also carry the Associated Domains entitlement
+`webcredentials:clerk.mihaichiorean.com`. Keep it in
+`Ziggy/Resources/Ziggy.entitlements` and register the same associated domain
+for the production native application in Clerk.
+
 `ZiggyApp` forwards callback URLs to Clerk and observes Clerk session changes
 so sign-in, sign-out, expiry, and account switching rebuild the Ziggy
 connection. Initial launch is handled once by `AppModel.start()` to avoid
