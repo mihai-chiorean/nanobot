@@ -58,6 +58,7 @@ final class SmokeTests: XCTestCase {
 @MainActor
 private final class SmokeAuthSession: AuthSessionProviding {
     var isSignedIn = true
+    var sessionIdentifier: String? = "smoke-session"
     var identity: ZiggyIdentity? = ZiggyIdentity(name: "Test user", email: "test@example.test")
     var didSignOut = false
 
@@ -66,6 +67,7 @@ private final class SmokeAuthSession: AuthSessionProviding {
     func signOut() async throws {
         didSignOut = true
         isSignedIn = false
+        sessionIdentifier = nil
         identity = nil
     }
 }

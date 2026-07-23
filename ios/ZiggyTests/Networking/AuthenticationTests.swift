@@ -97,6 +97,15 @@ final class AuthenticationTests: XCTestCase {
         XCTAssertNil(ConnectorAuthorization(
             authorizationURL: "https://accounts.google.com.attacker.example/oauth"
         ).googleURL)
+        XCTAssertNil(ConnectorAuthorization(
+            authorizationURL: "https://accounts.google.com/not-oauth?state=opaque"
+        ).googleURL)
+        XCTAssertNil(ConnectorAuthorization(
+            authorizationURL: "https://accounts.google.com/o/oauth2/v2/auth?state=opaque#fragment"
+        ).googleURL)
+        XCTAssertNil(ConnectorAuthorization(
+            authorizationURL: "https://accounts.google.com/o/oauth2/v2/auth?state=one&state=two"
+        ).googleURL)
     }
 
     func testConnectorIdentityTokenRejectsAnUntrustedConfiguredHostBeforeNetworking() async throws {

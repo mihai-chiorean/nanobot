@@ -468,9 +468,15 @@ public struct ConnectorAuthorization: Codable, Hashable, Sendable {
         guard let components = URLComponents(string: authorizationURL),
               components.scheme?.lowercased() == "https",
               components.host?.lowercased() == "accounts.google.com",
+              components.path == "/o/oauth2/v2/auth",
+              components.fragment == nil,
               components.user == nil,
               components.password == nil,
               components.port == nil else {
+            return nil
+        }
+        let states = components.queryItems?.filter { $0.name == "state" } ?? []
+        guard states.count == 1, !(states[0].value ?? "").isEmpty else {
             return nil
         }
         return components.url

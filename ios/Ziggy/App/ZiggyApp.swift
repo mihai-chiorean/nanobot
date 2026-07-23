@@ -42,6 +42,7 @@ struct ZiggyApp: App {
                             }
                         }
                         .onChange(of: clerk.session?.id) { _, _ in
+                            appModel.authenticationWillChange()
                             Task { await appModel.authenticationDidChange() }
                         }
                 } else {

@@ -41,7 +41,7 @@ struct IntegrationsView: View {
                     Image(systemName: "arrow.clockwise")
                 }
             }
-            .buttonStyle(PWAIconButton(size: 32))
+            .buttonStyle(PWAIconButton(size: 44))
             .disabled(appModel.isLoadingConnectors)
             .accessibilityLabel("Refresh integrations")
         }
@@ -52,17 +52,25 @@ struct IntegrationsView: View {
             ZiggySectionLabel(title: "Google").padding(.leading, 8)
             PWAGroup {
                 googleHeader
-                if !appModel.connectorAccounts.isEmpty {
+                if !googleAccounts.isEmpty {
                     IntegrationDivider()
-                    ForEach(Array(appModel.connectorAccounts.enumerated()), id: \.element.id) { index, account in
+                    ForEach(Array(googleAccounts.enumerated()), id: \.element.id) { index, account in
                         ConnectorAccountRow(account: account)
-                        if index < appModel.connectorAccounts.count - 1 {
+                        if index < googleAccounts.count - 1 {
                             IntegrationDivider()
                         }
                     }
                 }
+                if case .failed(let message) = appModel.connectorLoadState {
+                    IntegrationDivider()
+                    connectorFailure(message)
+                }
             }
         }
+    }
+
+    private var googleAccounts: [ConnectorAccount] {
+        appModel.connectorAccounts.filter { $0.provider.lowercased() == "google" }
     }
 
     private var googleHeader: some View {
@@ -78,7 +86,7 @@ struct IntegrationsView: View {
                 Text("Gmail")
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(ZiggyPalette.foreground)
-                Text(appModel.connectorAccounts.isEmpty ? "Not connected" : "Email access")
+                Text(googleStatusLabel)
                     .font(.caption)
                     .foregroundStyle(ZiggyPalette.mutedForeground)
             }
@@ -88,7 +96,11 @@ struct IntegrationsView: View {
             Button {
                 Task {
                     guard let url = await appModel.googleConnectorAuthorizationURL() else { return }
-                    openURL(url)
+                    openURL(url) { accepted in
+                        if !accepted {
+                            appModel.bannerMessage = "Google sign-in could not be opened."
+                        }
+                    }
                 }
             } label: {
                 if appModel.isStartingGoogleConnector {
@@ -96,17 +108,55 @@ struct IntegrationsView: View {
                         .controlSize(.small)
                         .frame(width: 72)
                 } else {
-                    Text(appModel.connectorAccounts.isEmpty ? "Connect" : "Reconnect")
+                    Text(googleAccounts.isEmpty ? "Connect" : "Reconnect")
                         .font(.caption.weight(.semibold))
                         .frame(minWidth: 72)
                 }
             }
             .buttonStyle(.bordered)
-            .controlSize(.small)
-            .disabled(appModel.isStartingGoogleConnector)
+            .frame(minHeight: 44)
+            .disabled(
+                appModel.isStartingGoogleConnector
+                    || appModel.connectorLoadState == .idle
+                    || appModel.connectorLoadState == .loading
+            )
+            .accessibilityLabel(googleAccounts.isEmpty ? "Connect Gmail" : "Reconnect Gmail")
         }
         .padding(.horizontal, 13)
         .frame(minHeight: 62)
+    }
+
+    private var googleStatusLabel: String {
+        if !googleAccounts.isEmpty {
+            return "Email access"
+        }
+        switch appModel.connectorLoadState {
+        case .idle, .loading:
+            return "Checking connection"
+        case .loaded:
+            return "Not connected"
+        case .failed:
+            return "Unavailable"
+        }
+    }
+
+    private func connectorFailure(_ message: String) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: "exclamationmark.triangle")
+                .foregroundStyle(ZiggyPalette.destructive)
+            Text(message)
+                .font(.caption)
+                .foregroundStyle(ZiggyPalette.mutedForeground)
+                .lineLimit(2)
+            Spacer(minLength: 8)
+            Button("Retry") {
+                Task { await appModel.loadConnectors() }
+            }
+            .buttonStyle(.bordered)
+            .frame(minHeight: 44)
+        }
+        .padding(.horizontal, 13)
+        .frame(minHeight: 58)
     }
 }
 
