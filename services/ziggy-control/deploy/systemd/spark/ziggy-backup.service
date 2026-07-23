@@ -1,0 +1,37 @@
+[Unit]
+Description=Back up Ziggy databases and durable state
+After=postgresql@16-main.service
+Requires=postgresql@16-main.service
+ConditionPathIsDirectory=/var/backups/ziggy
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+Environment=ZIGGY_BACKUP_ROOT=/var/backups/ziggy
+Environment=ZIGGY_BACKUP_RETENTION_DAYS=14
+ExecStart=/usr/bin/flock --nonblock /run/lock/ziggy-backup.lock /usr/local/libexec/ziggy-backup
+
+# The root process must drop to each peer-authenticated database role for
+# pg_dump; NoNewPrivileges would block those setresuid calls.
+NoNewPrivileges=false
+PrivateDevices=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ReadWritePaths=/var/backups/ziggy /run/lock
+RestrictAddressFamilies=AF_UNIX
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+UMask=0077
+
+Nice=10
+IOSchedulingClass=idle
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ziggy-backup

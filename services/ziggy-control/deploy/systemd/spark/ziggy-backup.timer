@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily Ziggy durable-state backup
+
+[Timer]
+OnCalendar=*-*-* 03:15:00
+RandomizedDelaySec=15m
+Persistent=true
+Unit=ziggy-backup.service
+
+[Install]
+WantedBy=timers.target

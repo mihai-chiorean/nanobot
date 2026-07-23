@@ -1,14 +1,16 @@
-# Ziggy Spark Single-Host Topology
+# Ziggy Chat And Work On Spark
 
-Status: production on `spark-094a` as of 2026-07-22.
+Status: the Ziggy chat, Work, connector, model, and tenant-runtime path is in
+production on `spark-094a` as of 2026-07-22. The legacy Omi backend remains on
+Beelink pending an ARM64 dependency and client-endpoint migration.
 
 ## Decision
 
-Run the complete Ziggy production path on Spark, but preserve process and
-credential boundaries. Consolidating placement removes a machine and network
-hop from every authenticated request. Combining the services into one binary
-would save only a few megabytes while widening the public-front-door,
-connector-token, queue, and database failure domains.
+Run the complete Ziggy chat and Work production path on Spark, but preserve
+process and credential boundaries. Consolidating placement removes a machine
+and network hop from every authenticated request. Combining the services into
+one binary would save only a few megabytes while widening the
+public-front-door, connector-token, queue, and database failure domains.
 
 Spark currently runs the model and every Nanobot runtime, so keeping the
 control plane on Beelink did not provide useful application availability when
@@ -36,13 +38,18 @@ flowchart LR
     RUNTIME --> WORK
     WORK -->|SSE| CONTROL
 
-    OMI[Omi ingest] --> WHISPER[Whisper]
-    OMI --> MEMORY[Memory store]
+    ORB[Omi device and Flutter app] --> OMI[Omi backend and pusher<br/>Beelink]
+    OMI --> WHISPER[Whisper<br/>Spark]
+    OMI --> INGEST[Ziggy ingest<br/>Spark]
+    INGEST --> MEMORY[Memory store]
 ```
 
 All control-plane HTTP listeners and PostgreSQL are local to Spark. Cloudflare
-is the only public ingress. The public hostname and Google OAuth callback
-remain `chat.mihaichiorean.com`.
+is the only public ingress for Ziggy chat and Work. The public hostname and
+Google OAuth callback remain `chat.mihaichiorean.com`. Several model,
+transcription, ingest, and observability ports remain directly reachable on
+the LAN or Tailscale; they are not Internet ingress, but they still require
+host-level filtering or tighter listener bindings.
 
 ## River
 
@@ -67,7 +74,7 @@ attempt with 25 durable events and a result summary.
 | `ziggy-connectors` | Separate system service and OS account | Sole owner of Google OAuth and token-encryption credentials |
 | `ziggy-work` | Separate system service and OS account | Durable queue, Work state, artifacts, and tenant runtime dispatch |
 | PostgreSQL 16 | One server, separate databases and roles | Consolidated operations without cross-service database authority |
-| Tenant Nanobot | One process and workspace per tenant | Memory, files, sessions, tools, and failure isolation |
+| Tenant Nanobot | One process and workspace per tenant | Application-level memory, files, sessions, tools, and failure isolation |
 | Qwen vLLM | Separate container | GPU lifecycle and dependency isolation |
 | Whisper and ingest | Separate services | Independent protocols, scaling, and restart behavior |
 | Cloudflare Tunnel | Separate system service | Independent public transport lifecycle |
@@ -77,6 +84,12 @@ credential and egress boundary is materially more important than its small
 memory footprint. Revisit merging `ziggy-control` and `ziggy-work` only if
 operational evidence shows that two static binaries are a meaningful burden.
 
+The current Nanobot units share the `mihai` OS account. Workspace routing and
+systemd write restrictions prevent accidental cross-tenant writes, but they
+do not provide a confidentiality boundary against arbitrary local or MCP code.
+Before untrusted testers receive tool execution, move tenant runtimes to
+per-tenant UIDs, rootless containers, or an equivalent mount/user namespace.
+
 ## Spark Services
 
 System services:
@@ -85,6 +98,7 @@ System services:
 - `ziggy-connectors.service`, loopback `8790`
 - `ziggy-work.service`, loopback `8791`
 - `ziggy-work-reconcile.timer`
+- `ziggy-backup.timer`
 - `ziggy-control.service`, loopback `8788`
 - `ziggy-cloudflared.service`
 
@@ -97,6 +111,12 @@ their lifecycle. Keep static Go binaries and PostgreSQL under systemd; moving
 them into Docker or Kubernetes would add overhead without improving the
 single-host failure model.
 
+The Omi backend, pusher, and Redis remain on Beelink. An ARM64 build attempted
+on Spark fails because the pinned `onnxruntime` and `lc3py` releases do not
+provide compatible wheels. The Flutter dev build also points at
+`edge-builder-1:8088`. Complete that dependency and endpoint migration before
+calling the wearable ingestion path single-hosted.
+
 ## Rollback And Backups
 
 Beelink's Ziggy control, Work, connector, reconciliation, and Cloudflare units
@@ -107,10 +127,21 @@ artifacts remain present. The migration snapshot is stored at:
 /var/backups/ziggy/migration-204c6d8-20260723T0454Z
 ```
 
-Rollback requires stopping Spark ingress and writers before restoring or
-starting Beelink. Never run both Work/connector writer sets against independent
-databases. Keep encrypted periodic PostgreSQL dumps and artifact backups
-off-host; a single Spark installation is intentionally not highly available.
+Spark creates daily mode-`0700` snapshots under `/var/backups/ziggy` with
+14-day retention. Each snapshot includes both PostgreSQL databases, Work
+artifacts, control binding state, the tenant manifest, and checksums. The
+application encryption keys are not copied into the same backup.
+
+Rollback requires stopping Spark ingress and writers, copying the latest
+snapshot to the rollback host, and restoring it before starting Beelink.
+Never run both Work/connector writer sets against independent databases. The
+local timer protects application rollback but not Spark disk loss; copy
+snapshots to an encrypted off-host target and perform restore drills before
+calling the installation recoverable.
+
+OpenTelemetry remains disabled for the Go services on Spark until the local
+collector and credentials are installed. Journal and systemd health checks are
+the current operational fallback, not the intended final observability state.
 
 ## Remaining Product Work
 
