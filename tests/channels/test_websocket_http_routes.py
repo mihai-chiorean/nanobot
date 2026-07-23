@@ -117,6 +117,8 @@ async def test_sessions_routes_require_bearer_token(bus: MagicMock, tmp_path: Pa
         assert listing.status_code == 200
         keys = [s["key"] for s in listing.json()["sessions"]]
         assert "websocket:abc" in keys
+        summary = next(s for s in listing.json()["sessions"] if s["key"] == "websocket:abc")
+        assert summary["preview"] == "hi"
         # Server stays an opaque source: filesystem paths must not leak to the wire.
         assert all("path" not in s for s in listing.json()["sessions"])
 

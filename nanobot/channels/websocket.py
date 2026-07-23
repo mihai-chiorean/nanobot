@@ -650,7 +650,7 @@ class WebSocketChannel(BaseChannel):
         if got == "/api/sessions":
             if method != "GET":
                 return _http_error(405, "Method Not Allowed")
-            return self._handle_sessions_list(request)
+            return await self._handle_sessions_list(request)
 
         if got == "/api/activity":
             if method != "GET":
@@ -829,22 +829,32 @@ class WebSocketChannel(BaseChannel):
             }
         )
 
-    def _handle_sessions_list(self, request: WsRequest) -> Response:
+    async def _handle_sessions_list(self, request: WsRequest) -> Response:
         if not self._check_api_token(request):
             return _http_error(401, "Unauthorized")
         if self._session_manager is None:
             return _http_error(503, "session manager unavailable")
+        cleaned = await asyncio.to_thread(self._webui_session_summaries)
+        return _http_json_response({"sessions": cleaned})
+
+    def _webui_session_summaries(self) -> list[dict[str, Any]]:
+        assert self._session_manager is not None
         sessions = self._session_manager.list_sessions()
         # The webui is only meaningful for websocket-channel chats — CLI /
         # Slack / Lark / Discord sessions can't be resumed from the browser,
         # so leaking them into the sidebar is just noise. Filter to the
         # ``websocket:`` prefix and strip absolute paths on the way out.
-        cleaned = [
-            {k: v for k, v in s.items() if k != "path"}
-            for s in sessions
-            if isinstance(s.get("key"), str) and s["key"].startswith("websocket:")
-        ]
-        return _http_json_response({"sessions": cleaned})
+        cleaned: list[dict[str, Any]] = []
+        for session in sessions:
+            key = session.get("key")
+            if not isinstance(key, str) or not key.startswith("websocket:"):
+                continue
+            summary = {k: v for k, v in session.items() if k != "path"}
+            preview = self._session_manager.read_session_preview(key)
+            if preview:
+                summary["preview"] = preview
+            cleaned.append(summary)
+        return cleaned
 
     @staticmethod
     def _message_text(content: Any) -> str:

@@ -21,6 +21,9 @@ from nanobot.utils.helpers import (
 )
 
 FILE_MAX_MESSAGES = 2000
+SESSION_PREVIEW_MAX_BYTES = 256 * 1024
+SESSION_PREVIEW_MAX_LINES = 128
+SESSION_PREVIEW_MAX_CHARS = 160
 
 
 @dataclass
@@ -548,6 +551,46 @@ class SessionManager:
                 logger.info("Recovered read-only session view {} from corrupt file", key)
                 return self._session_payload(repaired)
             return None
+
+    def read_session_preview(self, key: str) -> str:
+        """Read a bounded first-user-message preview without loading session history."""
+        path = self._get_session_path(key)
+        if not path.exists():
+            return ""
+        scanned = 0
+        try:
+            with open(path, "rb") as f:
+                for _ in range(SESSION_PREVIEW_MAX_LINES):
+                    remaining = SESSION_PREVIEW_MAX_BYTES - scanned
+                    if remaining <= 0:
+                        break
+                    line = f.readline(remaining + 1)
+                    if not line or len(line) > remaining:
+                        break
+                    scanned += len(line)
+                    data = json.loads(line)
+                    if data.get("_type") == "metadata" or data.get("role") != "user":
+                        continue
+                    content = data.get("content", "")
+                    if isinstance(content, str):
+                        text = content
+                    elif isinstance(content, list):
+                        text = " ".join(
+                            item["text"]
+                            for item in content
+                            if isinstance(item, dict) and isinstance(item.get("text"), str)
+                        )
+                    else:
+                        text = ""
+                    preview = " ".join(text.split())
+                    if preview:
+                        return preview[:SESSION_PREVIEW_MAX_CHARS]
+                    media = data.get("media")
+                    if isinstance(media, list) and media:
+                        return "Media attachment"
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError) as e:
+            logger.warning("Failed to read session preview {}: {}", key, e)
+        return ""
 
     def list_sessions(self) -> list[dict[str, Any]]:
         """
