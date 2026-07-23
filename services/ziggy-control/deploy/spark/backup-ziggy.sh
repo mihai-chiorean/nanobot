@@ -5,6 +5,8 @@ umask 077
 
 backup_root="${ZIGGY_BACKUP_ROOT:-/var/backups/ziggy}"
 retention_days="${ZIGGY_BACKUP_RETENTION_DAYS:-14}"
+owner_workspace="${ZIGGY_OWNER_WORKSPACE:-/home/mihai/.nanobot/workspace}"
+tenant_root="${ZIGGY_TENANT_ROOT:-/home/mihai/.local/share/ziggy/tenants}"
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
 snapshot_name="snapshot-${timestamp}"
 staging="$(mktemp -d "${backup_root}/.${snapshot_name}.XXXXXX")"
@@ -32,24 +34,28 @@ fi
 if [[ -f /etc/ziggy/tenants.json ]]; then
   install --mode=0600 /etc/ziggy/tenants.json "${staging}/tenants.json"
 fi
-if [[ -d /home/mihai/.nanobot/workspace ]]; then
+if [[ -d "${owner_workspace}" ]]; then
+  owner_parent="$(dirname -- "${owner_workspace}")"
+  owner_name="$(basename -- "${owner_workspace}")"
   tar --create --gzip --file="${staging}/ziggy-owner-workspace.tgz" \
-    --directory=/home/mihai/.nanobot \
-    --exclude='workspace/.cache' \
-    --exclude='workspace/.venv' \
-    --exclude='workspace/venv' \
-    --exclude='workspace/node_modules' \
-    --exclude='workspace/*/node_modules' \
-    --exclude='workspace/rag' \
-    --exclude='workspace/rag.bak-*' \
-    workspace
+    --directory="${owner_parent}" \
+    --exclude="${owner_name}/.cache" \
+    --exclude="${owner_name}/.venv" \
+    --exclude="${owner_name}/venv" \
+    --exclude="${owner_name}/node_modules" \
+    --exclude="${owner_name}/*/node_modules" \
+    --exclude="${owner_name}/rag" \
+    --exclude="${owner_name}/rag.bak-*" \
+    "${owner_name}"
 fi
-if [[ -d /home/mihai/.local/share/ziggy/tenants ]]; then
+if [[ -d "${tenant_root}" ]]; then
+  tenant_parent="$(dirname -- "${tenant_root}")"
+  tenant_name="$(basename -- "${tenant_root}")"
   tar --create --gzip --file="${staging}/ziggy-tenant-workspaces.tgz" \
-    --directory=/home/mihai/.local/share/ziggy \
-    --exclude='tenants/*/runtime' \
-    --exclude='tenants/*/runtime/**' \
-    tenants
+    --directory="${tenant_parent}" \
+    --exclude="${tenant_name}/*/runtime" \
+    --exclude="${tenant_name}/*/runtime/**" \
+    "${tenant_name}"
 fi
 
 printf 'created_at=%s\nhost=%s\nrelease=%s\n' \
