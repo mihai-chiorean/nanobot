@@ -88,6 +88,7 @@ public actor ZiggyWebSocketClient {
     private var assistantContinuations: [UUID: AsyncStream<AssistantStreamEvent>.Continuation] = [:]
     private var socket: (any ZiggyWebSocketConnection)?
     private var connectionTask: Task<Void, Never>?
+    private var outboundDrainTask: Task<Void, Never>?
     private var outboundQueue: [OutboundWebSocketEnvelope] = []
     private var attachedChatIDs: Set<String> = []
     private var shouldRun = false
@@ -106,9 +107,9 @@ public actor ZiggyWebSocketClient {
         self.connectionFactory = { request in
             URLSessionWebSocketConnection(task: session.webSocketTask(with: request))
         }
-        var continuation: AsyncStream<ZiggyWebSocketEvent>.Continuation!
-        self.events = AsyncStream { continuation = $0 }
-        self.eventContinuation = continuation
+        let eventStream = AsyncStream<ZiggyWebSocketEvent>.makeStream()
+        self.events = eventStream.stream
+        self.eventContinuation = eventStream.continuation
     }
 
     public init(baseURL: URL, session: URLSession = .shared, maxOutboundQueue: Int = 100,
@@ -121,9 +122,9 @@ public actor ZiggyWebSocketClient {
         self.connectionFactory = { request in
             URLSessionWebSocketConnection(task: session.webSocketTask(with: request))
         }
-        var continuation: AsyncStream<ZiggyWebSocketEvent>.Continuation!
-        self.events = AsyncStream { continuation = $0 }
-        self.eventContinuation = continuation
+        let eventStream = AsyncStream<ZiggyWebSocketEvent>.makeStream()
+        self.events = eventStream.stream
+        self.eventContinuation = eventStream.continuation
     }
 
     init(baseURL: URL, maxOutboundQueue: Int = 100,
@@ -136,9 +137,9 @@ public actor ZiggyWebSocketClient {
         self.heartbeatInterval = heartbeatInterval
         self.credentialProvider = credentialProvider
         self.connectionFactory = connectionFactory
-        var continuation: AsyncStream<ZiggyWebSocketEvent>.Continuation!
-        self.events = AsyncStream { continuation = $0 }
-        self.eventContinuation = continuation
+        let eventStream = AsyncStream<ZiggyWebSocketEvent>.makeStream()
+        self.events = eventStream.stream
+        self.eventContinuation = eventStream.continuation
     }
 
     public func start() {
@@ -151,6 +152,8 @@ public actor ZiggyWebSocketClient {
         shouldRun = false
         connectionTask?.cancel()
         connectionTask = nil
+        outboundDrainTask?.cancel()
+        outboundDrainTask = nil
         socket?.cancel(with: .goingAway, reason: nil)
         socket = nil
         emit(.state(.stopped))
@@ -173,13 +176,12 @@ public actor ZiggyWebSocketClient {
 
     public func makeAssistantStream() -> BufferedAssistantStream {
         let id = UUID()
-        var continuation: AsyncStream<AssistantStreamEvent>.Continuation!
-        let stream = AsyncStream<AssistantStreamEvent> { continuation = $0 }
-        assistantContinuations[id] = continuation
-        continuation.onTermination = { [weak self] _ in
+        let assistantStream = AsyncStream<AssistantStreamEvent>.makeStream()
+        assistantContinuations[id] = assistantStream.continuation
+        assistantStream.continuation.onTermination = { [weak self] _ in
             Task { await self?.removeAssistantContinuation(id) }
         }
-        return BufferedAssistantStream(events: stream) { [weak self] in
+        return BufferedAssistantStream(events: assistantStream.stream) { [weak self] in
             Task { await self?.removeAssistantContinuation(id) }
         }
     }
@@ -196,7 +198,6 @@ public actor ZiggyWebSocketClient {
                 let request = try Self.makeWebSocketRequest(baseURL: baseURL, credential: credential)
                 let task = connectionFactory(request)
                 connection = task
-                socket = task
                 task.resume()
                 let firstMessage = try await task.receive()
                 guard try await handle(firstMessage, capabilities: credential.capabilities) else {
@@ -208,8 +209,11 @@ public actor ZiggyWebSocketClient {
                 publishAssistant(.connected(nil))
                 try await flushAttachedChats(on: task)
                 try await flushQueue(on: task)
+                socket = task
+                startOutboundDrainIfNeeded()
                 try await maintainConnection(on: task, capabilities: credential.capabilities)
             } catch is CancellationError {
+                connection?.cancel(with: .goingAway, reason: nil)
                 break
             } catch {
                 let message = Self.failureMessage(for: error, response: connection?.response)
@@ -301,23 +305,33 @@ public actor ZiggyWebSocketClient {
     }
 
     private func enqueueOrSend(_ envelope: OutboundWebSocketEnvelope) {
-        guard let task = socket else {
-            enqueue(envelope)
-            return
-        }
-        Task { [weak self] in
-            do {
-                try await task.send(.string(try Self.encode(envelope)))
-            } catch {
-                await self?.enqueueAfterSendFailure(envelope, task: task)
-            }
+        enqueue(envelope)
+        startOutboundDrainIfNeeded()
+    }
+
+    private func startOutboundDrainIfNeeded() {
+        guard socket != nil, outboundDrainTask == nil, !outboundQueue.isEmpty else { return }
+        outboundDrainTask = Task { [weak self] in
+            await self?.drainOutboundQueue()
         }
     }
 
-    private func enqueueAfterSendFailure(_ envelope: OutboundWebSocketEnvelope,
-                                         task: any ZiggyWebSocketConnection) {
-        if socket === task { socket = nil; task.cancel(with: .abnormalClosure, reason: nil) }
-        enqueue(envelope)
+    private func drainOutboundQueue() async {
+        while let task = socket, !outboundQueue.isEmpty, !Task.isCancelled {
+            let envelope = outboundQueue.removeFirst()
+            do {
+                try await task.send(.string(try Self.encode(envelope)))
+            } catch {
+                outboundQueue.insert(envelope, at: 0)
+                if socket === task {
+                    socket = nil
+                    task.cancel(with: .abnormalClosure, reason: nil)
+                }
+                break
+            }
+        }
+        outboundDrainTask = nil
+        startOutboundDrainIfNeeded()
     }
 
     private func enqueue(_ envelope: OutboundWebSocketEnvelope) {
@@ -388,7 +402,7 @@ public actor ZiggyWebSocketClient {
     }
 
     private func sleepBackoff() async {
-        do { try await Task.sleep(nanoseconds: backoffNanoseconds) } catch { }
+        do { try await Task.sleep(for: .nanoseconds(backoffNanoseconds)) } catch { }
     }
 
     private func emit(_ event: ZiggyWebSocketEvent) { eventContinuation.yield(event) }
