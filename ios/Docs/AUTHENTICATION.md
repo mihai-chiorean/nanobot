@@ -26,6 +26,9 @@ code, or reuse the Clerk JWT as a long-lived Ziggy socket credential.
 The Xcode build setting `CLERK_PUBLISHABLE_KEY` is injected into Info.plist as
 `ZiggyClerkPublishableKey`. Put the publishable key in the ignored
 `Config/Local.xcconfig`; do not commit deployment-specific configuration.
+Local builds may use a `pk_test_` development instance. TestFlight builds must
+use the matching `pk_live_` production instance configured for the public web
+domain and native application.
 
 The Clerk Native API application must register:
 

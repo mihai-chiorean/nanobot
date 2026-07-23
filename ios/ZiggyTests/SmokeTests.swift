@@ -1,49 +1,52 @@
-import XCTest
+import Testing
 @testable import Ziggy
 
-final class SmokeTests: XCTestCase {
+@Suite
+struct SmokeTests {
+    @Test
     @MainActor
-    func testAppModelStartsOnChats() {
-        XCTAssertEqual(AppModel().selectedTab, .chats)
+    func `app model starts on chats`() {
+        #expect(AppModel().selectedTab == .chats)
     }
 
+    @Test
     @MainActor
-    func testAppModelStartsSignedOutWithoutLegacyAccess() {
+    func `app model starts signed out without legacy access`() {
         let model = AppModel()
-        XCTAssertEqual(model.identity, .signedOut)
-        XCTAssertEqual(model.phase, .launching)
+        #expect(model.identity == .signedOut)
+        #expect(model.phase == .launching)
     }
 
+    @Test
     @MainActor
-    func testNewChatImmediatelyOpensAnEphemeralDraft() {
+    func `new chat immediately opens an ephemeral draft`() throws {
         let model = AppModel()
 
         model.newChat()
 
-        guard let sessionKey = model.selectedSessionKey else {
-            XCTFail("Expected the draft to become the selected conversation")
-            return
-        }
-        XCTAssertEqual(model.chatNavigationPath, [sessionKey])
-        XCTAssertTrue(sessionKey.hasPrefix("websocket:"))
-        XCTAssertTrue(model.sessions.isEmpty)
-        XCTAssertTrue(model.messagesByChatID.isEmpty)
+        let sessionKey = try #require(model.selectedSessionKey)
+        #expect(model.chatNavigationPath == [sessionKey])
+        #expect(sessionKey.hasPrefix("websocket:"))
+        #expect(model.sessions.isEmpty)
+        #expect(model.messagesByChatID.isEmpty)
     }
 
+    @Test
     @MainActor
-    func testBackgroundTransitionImmediatelyMarksSocketIdle() async {
+    func `background transition immediately marks socket idle`() async {
         let model = AppModel()
         model.connectionState = .connected
 
         model.applicationDidEnterBackground()
 
-        XCTAssertEqual(model.connectionState, .idle)
+        #expect(model.connectionState == .idle)
         await model.applicationDidBecomeActive()
-        XCTAssertEqual(model.phase, .launching)
+        #expect(model.phase == .launching)
     }
 
+    @Test
     @MainActor
-    func testSignOutClearsTenantDerivedStateBeforeProviderCompletes() async {
+    func `sign out clears tenant derived state before provider completes`() async {
         let authSession = SmokeAuthSession()
         let model = AppModel(
             credentialStore: InMemoryCredentialStore(),
@@ -60,14 +63,14 @@ final class SmokeTests: XCTestCase {
 
         await model.signOut()
 
-        XCTAssertTrue(authSession.didSignOut)
-        XCTAssertEqual(model.identity, .signedOut)
-        XCTAssertTrue(model.sessions.isEmpty)
-        XCTAssertTrue(model.messagesByChatID.isEmpty)
-        XCTAssertTrue(model.workEventsByTaskID.isEmpty)
-        XCTAssertNil(model.selectedSessionKey)
-        XCTAssertTrue(model.chatNavigationPath.isEmpty)
-        XCTAssertEqual(model.phase, .needsEnrollment)
+        #expect(authSession.didSignOut)
+        #expect(model.identity == .signedOut)
+        #expect(model.sessions.isEmpty)
+        #expect(model.messagesByChatID.isEmpty)
+        #expect(model.workEventsByTaskID.isEmpty)
+        #expect(model.selectedSessionKey == nil)
+        #expect(model.chatNavigationPath.isEmpty)
+        #expect(model.phase == .needsEnrollment)
     }
 }
 

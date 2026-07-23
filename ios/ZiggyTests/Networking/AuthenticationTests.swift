@@ -1,55 +1,58 @@
 import Foundation
-import XCTest
+import Testing
 @testable import Ziggy
 
-final class AuthenticationTests: XCTestCase {
-    override func tearDown() {
-        URLProtocolStub.handler = nil
-        super.tearDown()
-    }
-
-    func testAuthenticatedBootstrapUsesBearerTokenAndNoURLCredential() async throws {
+@Suite(.serialized)
+struct AuthenticationTests {
+    @Test
+    func `authenticated bootstrap uses bearer token and no URL credential`() async throws {
         let session = makeSession()
         URLProtocolStub.handler = { request in
-            XCTAssertEqual(request.httpMethod, "GET")
-            XCTAssertNil(URLComponents(url: try XCTUnwrap(request.url), resolvingAgainstBaseURL: false)?.query)
-            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer clerk-session-token")
-            XCTAssertFalse(try XCTUnwrap(request.url).absoluteString.contains("clerk-session-token"))
+            let url = try #require(request.url)
+            #expect(request.httpMethod == "GET")
+            #expect(URLComponents(
+                url: url,
+                resolvingAgainstBaseURL: false
+            )?.query == nil)
+            #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer clerk-session-token")
+            #expect(!url.absoluteString.contains("clerk-session-token"))
             return Self.response(for: request, body: #"{"token":"short","expires_in":300}"#)
         }
+        defer { URLProtocolStub.handler = nil }
 
         let result = try await ZiggyRESTClient(
-            baseURL: try XCTUnwrap(URL(string: "https://chat.mihaichiorean.com")),
+            baseURL: try #require(URL(string: "https://chat.mihaichiorean.com")),
             session: session
         ).bootstrapAuthenticated(identityToken: "clerk-session-token")
-        XCTAssertEqual(result.restToken, "short")
+        #expect(result.restToken == "short")
     }
 
-    func testAuthenticatedBootstrapRejectsAnUntrustedConfiguredHostBeforeNetworking() async throws {
+    @Test
+    func `authenticated bootstrap rejects an untrusted configured host before networking`() async throws {
         let session = makeSession()
         URLProtocolStub.handler = { _ in
-            XCTFail("an identity token request must not reach an untrusted host")
+            Issue.record("an identity token request must not reach an untrusted host")
             throw URLError(.badServerResponse)
         }
+        defer { URLProtocolStub.handler = nil }
 
-        do {
-            _ = try await ZiggyRESTClient(
-                baseURL: try XCTUnwrap(URL(string: "https://attacker.example")),
+        await #expect(throws: ZiggyRESTError.invalidURL) {
+            try await ZiggyRESTClient(
+                baseURL: try #require(URL(string: "https://attacker.example")),
                 session: session
             ).bootstrapAuthenticated(identityToken: "clerk-session-token")
-            XCTFail("expected untrusted host rejection")
-        } catch {
-            XCTAssertEqual(error as? ZiggyRESTError, .invalidURL)
         }
     }
 
-    func testConnectorAccountsUseFreshIdentityTokenAndDecodeTenantEnvelope() async throws {
+    @Test
+    func `connector accounts use fresh identity token and decode tenant envelope`() async throws {
         let session = makeSession()
         URLProtocolStub.handler = { request in
-            XCTAssertEqual(request.httpMethod, "GET")
-            XCTAssertEqual(request.url?.path, "/connectors/accounts")
-            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer clerk-session-token")
-            XCTAssertFalse(try XCTUnwrap(request.url).absoluteString.contains("clerk-session-token"))
+            let url = try #require(request.url)
+            #expect(request.httpMethod == "GET")
+            #expect(request.url?.path == "/connectors/accounts")
+            #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer clerk-session-token")
+            #expect(!url.absoluteString.contains("clerk-session-token"))
             return Self.response(
                 for: request,
                 body: """
@@ -65,133 +68,135 @@ final class AuthenticationTests: XCTestCase {
                 """
             )
         }
+        defer { URLProtocolStub.handler = nil }
 
         let response = try await ZiggyRESTClient(
-            baseURL: try XCTUnwrap(URL(string: "https://chat.mihaichiorean.com")),
+            baseURL: try #require(URL(string: "https://chat.mihaichiorean.com")),
             session: session
         ).fetchConnectorAccounts(identityToken: "clerk-session-token")
 
-        XCTAssertEqual(response.items.count, 1)
-        XCTAssertEqual(response.items.first?.id, "acct-google-1")
-        XCTAssertEqual(response.items.first?.email, "owner@example.com")
-        XCTAssertEqual(response.items.first?.status, "active")
+        #expect(response.items.count == 1)
+        #expect(response.items.first?.id == "acct-google-1")
+        #expect(response.items.first?.email == "owner@example.com")
+        #expect(response.items.first?.status == "active")
     }
 
-    func testGoogleConnectorStartUsesIdentityTokenAndAcceptsOnlyGoogleAuthorizationHost() async throws {
+    @Test
+    func `Google connector start uses identity token and accepts only Google authorization host`() async throws {
         let session = makeSession()
         URLProtocolStub.handler = { request in
-            XCTAssertEqual(request.url?.path, "/connectors/oauth/google/start")
-            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer clerk-session-token")
+            #expect(request.url?.path == "/connectors/oauth/google/start")
+            #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer clerk-session-token")
             return Self.response(
                 for: request,
                 body: #"{"authorization_url":"https://accounts.google.com/o/oauth2/v2/auth?state=opaque"}"#
             )
         }
+        defer { URLProtocolStub.handler = nil }
 
         let authorization = try await ZiggyRESTClient(
-            baseURL: try XCTUnwrap(URL(string: "https://chat.mihaichiorean.com")),
+            baseURL: try #require(URL(string: "https://chat.mihaichiorean.com")),
             session: session
         ).startGoogleConnector(identityToken: "clerk-session-token")
 
-        XCTAssertEqual(authorization.googleURL?.host, "accounts.google.com")
-        XCTAssertNil(ConnectorAuthorization(
+        #expect(authorization.googleURL?.host == "accounts.google.com")
+        #expect(ConnectorAuthorization(
             authorizationURL: "https://accounts.google.com.attacker.example/oauth"
-        ).googleURL)
-        XCTAssertNil(ConnectorAuthorization(
+        ).googleURL == nil)
+        #expect(ConnectorAuthorization(
             authorizationURL: "https://accounts.google.com/not-oauth?state=opaque"
-        ).googleURL)
-        XCTAssertNil(ConnectorAuthorization(
+        ).googleURL == nil)
+        #expect(ConnectorAuthorization(
             authorizationURL: "https://accounts.google.com/o/oauth2/v2/auth?state=opaque#fragment"
-        ).googleURL)
-        XCTAssertNil(ConnectorAuthorization(
+        ).googleURL == nil)
+        #expect(ConnectorAuthorization(
             authorizationURL: "https://accounts.google.com/o/oauth2/v2/auth?state=one&state=two"
-        ).googleURL)
+        ).googleURL == nil)
     }
 
-    func testConnectorIdentityTokenRejectsAnUntrustedConfiguredHostBeforeNetworking() async throws {
+    @Test
+    func `connector identity token rejects an untrusted configured host before networking`() async throws {
         let session = makeSession()
         URLProtocolStub.handler = { _ in
-            XCTFail("a connector identity token request must not reach an untrusted host")
+            Issue.record("a connector identity token request must not reach an untrusted host")
             throw URLError(.badServerResponse)
         }
+        defer { URLProtocolStub.handler = nil }
 
-        do {
-            _ = try await ZiggyRESTClient(
-                baseURL: try XCTUnwrap(URL(string: "https://attacker.example")),
+        await #expect(throws: ZiggyRESTError.invalidURL) {
+            try await ZiggyRESTClient(
+                baseURL: try #require(URL(string: "https://attacker.example")),
                 session: session
             ).fetchConnectorAccounts(identityToken: "clerk-session-token")
-            XCTFail("expected untrusted host rejection")
-        } catch {
-            XCTAssertEqual(error as? ZiggyRESTError, .invalidURL)
         }
     }
 
-    func testClerkCallbackValidationAcceptsOnlyTheRegisteredCallback() throws {
-        XCTAssertTrue(ClerkCallbackValidation.accepts(try XCTUnwrap(
+    @Test
+    func `Clerk callback validation accepts only the registered callback`() throws {
+        #expect(ClerkCallbackValidation.accepts(try #require(
             URL(string: "com.mihaichiorean.ziggy://callback?code=example&state=opaque")
         )))
-        XCTAssertFalse(ClerkCallbackValidation.accepts(try XCTUnwrap(
+        #expect(!ClerkCallbackValidation.accepts(try #require(
             URL(string: "com.mihaichiorean.ziggy://attacker/callback?code=example")
         )))
-        XCTAssertFalse(ClerkCallbackValidation.accepts(try XCTUnwrap(
+        #expect(!ClerkCallbackValidation.accepts(try #require(
             URL(string: "https://chat.mihaichiorean.com/callback?code=example")
         )))
-        XCTAssertFalse(ClerkCallbackValidation.accepts(try XCTUnwrap(
+        #expect(!ClerkCallbackValidation.accepts(try #require(
             URL(string: "com.mihaichiorean.ziggy://callback/extra?code=example")
         )))
     }
 
-    func testRESTResponseLimitUsesContentLengthPrecheck() async throws {
+    @Test
+    func `REST response limit uses content length precheck`() async throws {
         let session = makeSession()
         URLProtocolStub.handler = { request in
             Self.response(for: request, body: String(repeating: "x", count: 65))
         }
+        defer { URLProtocolStub.handler = nil }
         let client = ZiggyRESTClient(
-            baseURL: try XCTUnwrap(URL(string: "https://chat.mihaichiorean.com")),
+            baseURL: try #require(URL(string: "https://chat.mihaichiorean.com")),
             session: session,
             maxResponseBytes: 64
         )
-        do {
-            _ = try await client.fetchSessions()
-            XCTFail("expected response limit")
-        } catch {
-            XCTAssertEqual(error as? ZiggyRESTError, .responseTooLarge(limit: 64))
+        await #expect(throws: ZiggyRESTError.responseTooLarge(limit: 64)) {
+            try await client.fetchSessions()
         }
     }
 
-    func testRESTResponseLimitAppliesWhileReadingChunkedBody() async throws {
+    @Test
+    func `REST response limit applies while reading chunked body`() async throws {
         let session = makeSession()
         URLProtocolStub.handler = { request in
             Self.response(for: request, body: String(repeating: "x", count: 65), includeContentLength: false)
         }
+        defer { URLProtocolStub.handler = nil }
         let client = ZiggyRESTClient(
-            baseURL: try XCTUnwrap(URL(string: "https://chat.mihaichiorean.com")),
+            baseURL: try #require(URL(string: "https://chat.mihaichiorean.com")),
             session: session,
             maxResponseBytes: 64
         )
 
-        do {
-            _ = try await client.fetchSessions()
-            XCTFail("expected response limit")
-        } catch {
-            XCTAssertEqual(error as? ZiggyRESTError, .responseTooLarge(limit: 64))
+        await #expect(throws: ZiggyRESTError.responseTooLarge(limit: 64)) {
+            try await client.fetchSessions()
         }
     }
 
+    @Test
     @MainActor
-    func testAbsoluteAndRelativeExpiryUseEarliestDeadline() throws {
+    func `absolute and relative expiry use earliest deadline`() throws {
         let now = Date(timeIntervalSince1970: 1_000)
         let absolute = ZiggyTimestamp(now.addingTimeInterval(30))
         let response = BootstrapResponse(restToken: "t", expiresIn: 300, expiresAt: absolute)
-        XCTAssertEqual(response.expirationDate(relativeTo: now), absolute.date)
-        XCTAssertEqual(AppModel.credentialRefreshDate(for: response, now: now), now.addingTimeInterval(27))
+        #expect(response.expirationDate(relativeTo: now) == absolute.date)
+        #expect(AppModel.credentialRefreshDate(for: response, now: now) == now.addingTimeInterval(27))
 
         let expired = BootstrapResponse(
             restToken: "t",
             expiresIn: 300,
             expiresAt: ZiggyTimestamp(now.addingTimeInterval(-1))
         )
-        XCTAssertLessThan(try XCTUnwrap(AppModel.credentialRefreshDate(for: expired, now: now)), now)
+        #expect(try #require(AppModel.credentialRefreshDate(for: expired, now: now)) < now)
     }
 
     private func makeSession() -> URLSession {
