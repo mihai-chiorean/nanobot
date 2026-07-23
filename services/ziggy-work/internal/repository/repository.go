@@ -465,7 +465,11 @@ func (r *PostgresRepository) Import(ctx context.Context, tenant model.Tenant, in
 		}
 	}
 	for _, e := range in.Events {
-		tag, execErr := tx.Exec(ctx, `INSERT INTO ziggy_work_events (user_id,workspace_id,task_id,seq,type,actor,step_id,created_at,payload) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT DO NOTHING`, tenant.UserID, tenant.WorkspaceID, e.TaskID, e.Seq, e.Type, e.Actor, e.StepID, e.CreatedAt, e.Payload)
+		var runtimeSeq *int64
+		if e.RuntimeTaskID != "" && e.RuntimeSeq > 0 {
+			runtimeSeq = &e.RuntimeSeq
+		}
+		tag, execErr := tx.Exec(ctx, `INSERT INTO ziggy_work_events (user_id,workspace_id,task_id,seq,type,actor,step_id,created_at,payload,runtime_task_id,runtime_seq) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT DO NOTHING`, tenant.UserID, tenant.WorkspaceID, e.TaskID, e.Seq, e.Type, e.Actor, e.StepID, e.CreatedAt, e.Payload, nullableString(e.RuntimeTaskID), runtimeSeq)
 		err = execErr
 		if err != nil {
 			return ImportResult{}, err
