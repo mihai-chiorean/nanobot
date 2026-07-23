@@ -12,6 +12,7 @@ import (
 	"github.com/mihai-chiorean/nanobot/services/ziggy-connectors/internal/crypto"
 	"github.com/mihai-chiorean/nanobot/services/ziggy-connectors/internal/principal"
 	"github.com/mihai-chiorean/nanobot/services/ziggy-connectors/internal/provider"
+	"github.com/mihai-chiorean/nanobot/services/ziggy-connectors/internal/runtimeauth"
 	"github.com/mihai-chiorean/nanobot/services/ziggy-connectors/internal/store"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -47,14 +48,15 @@ func TestGmailMCPDiscoversToolsAndKeepsAccountsTenantScoped(t *testing.T) {
 		t.Fatal(err)
 	}
 	handler, err := New(Config{
-		Version:           "test",
-		GoogleRedirectURI: "https://gateway.test/callback",
-		GoogleScopes:      []string{"openid", "email", googleGmailReadonlyScope},
-		StateTTL:          time.Minute,
-		StateSigner:       crypto.NewStateSigner(key),
-		TokenCipher:       cipher,
-		Accounts:          repository,
-		OAuthTransactions: repository,
+		Version:             "test",
+		GoogleRedirectURI:   "https://gateway.test/callback",
+		GoogleScopes:        []string{"openid", "email", googleGmailReadonlyScope},
+		StateTTL:            time.Minute,
+		StateSigner:         crypto.NewStateSigner(key),
+		TokenCipher:         cipher,
+		Accounts:            repository,
+		OAuthTransactions:   repository,
+		RuntimeOAuthClients: repository,
 		Google: provider.Fake{
 			Token: provider.Token{AccessToken: "access-token"},
 			Messages: []provider.MessageSummary{{
@@ -65,7 +67,11 @@ func TestGmailMCPDiscoversToolsAndKeepsAccountsTenantScoped(t *testing.T) {
 				Body:           "Useful body",
 			},
 		},
-		PrincipalVerifier: principal.NewVerifier(key),
+		PrincipalVerifier:      principal.NewVerifier(key),
+		ClientCredentialPepper: key,
+		MCPAccessTokens:        runtimeTokenManager(t, key),
+		OAuthIssuerURL:         testOAuthIssuerURL,
+		MCPResourceURL:         testMCPResourceURL,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -73,9 +79,7 @@ func TestGmailMCPDiscoversToolsAndKeepsAccountsTenantScoped(t *testing.T) {
 	server := httptest.NewServer(handler)
 	defer server.Close()
 
-	session := connectMCP(t, server.URL+"/mcp", principal.Principal{
-		UserID: "user-a", WorkspaceID: "workspace-a", ExpiresAt: time.Now().Add(time.Hour).Unix(),
-	}, key)
+	session := connectMCP(t, server.URL+"/mcp", issueRuntimeToken(t, key, "user-a", "workspace-a", []string{"gmail.status", "gmail.search", "gmail.read"}))
 	defer session.Close()
 
 	tools, err := session.ListTools(context.Background(), nil)
@@ -110,10 +114,12 @@ func TestGmailMCPDiscoversToolsAndKeepsAccountsTenantScoped(t *testing.T) {
 		t.Fatalf("message result = %#v, error = %v", message, err)
 	}
 
-	foreign := connectMCP(t, server.URL+"/mcp", principal.Principal{
-		UserID: "user-b", WorkspaceID: "workspace-b", ExpiresAt: time.Now().Add(time.Hour).Unix(),
-	}, key)
+	foreign := connectMCP(t, server.URL+"/mcp", issueRuntimeToken(t, key, "user-b", "workspace-b", []string{"gmail.search"}))
 	defer foreign.Close()
+	foreignTools, err := foreign.ListTools(context.Background(), nil)
+	if err != nil || len(foreignTools.Tools) != 1 || foreignTools.Tools[0].Name != "gmail_search" {
+		t.Fatalf("scope-limited tools = %#v, error = %v", foreignTools, err)
+	}
 	foreignSearch, err := foreign.CallTool(context.Background(), &mcp.CallToolParams{
 		Name: "gmail_search", Arguments: map[string]any{"query": "in:inbox"},
 	})
@@ -123,21 +129,24 @@ func TestGmailMCPDiscoversToolsAndKeepsAccountsTenantScoped(t *testing.T) {
 	if !foreignSearch.IsError || structuredContains(foreignSearch, "owner@example.test", "message-1") {
 		t.Fatalf("foreign result exposed tenant data: %#v", foreignSearch)
 	}
+	capabilities := session.InitializeResult().Capabilities.Extensions
+	if _, ok := capabilities["io.modelcontextprotocol/oauth-client-credentials"]; !ok {
+		t.Fatalf("initialize capabilities = %#v", capabilities)
+	}
 }
 
 type principalTransport struct {
-	base      http.RoundTripper
-	principal principal.Principal
-	key       []byte
+	base  http.RoundTripper
+	token string
 }
 
 func (transport principalTransport) RoundTrip(request *http.Request) (*http.Response, error) {
 	clone := request.Clone(request.Context())
-	withPrincipal(clone, transport.principal, transport.key)
+	clone.Header.Set("Authorization", "Bearer "+transport.token)
 	return transport.base.RoundTrip(clone)
 }
 
-func connectMCP(t *testing.T, endpoint string, p principal.Principal, key []byte) *mcp.ClientSession {
+func connectMCP(t *testing.T, endpoint, token string) *mcp.ClientSession {
 	t.Helper()
 	client := mcp.NewClient(&mcp.Implementation{Name: "ziggy-connectors-test", Version: "test"}, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -145,7 +154,7 @@ func connectMCP(t *testing.T, endpoint string, p principal.Principal, key []byte
 	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{
 		Endpoint: endpoint,
 		HTTPClient: &http.Client{Transport: principalTransport{
-			base: http.DefaultTransport, principal: p, key: key,
+			base: http.DefaultTransport, token: token,
 		}},
 		DisableStandaloneSSE: true,
 	}, nil)
@@ -153,6 +162,17 @@ func connectMCP(t *testing.T, endpoint string, p principal.Principal, key []byte
 		t.Fatal(err)
 	}
 	return session
+}
+
+func issueRuntimeToken(t *testing.T, key []byte, userID, workspaceID string, scopes []string) string {
+	t.Helper()
+	manager := runtimeTokenManager(t, key)
+	now := time.Now()
+	token, err := manager.Issue(runtimeauth.Claims{Issuer: testOAuthIssuerURL, Audience: testMCPResourceURL, IssuedAt: now.Unix(), ExpiresAt: now.Add(runtimeauth.TTL).Unix(), JWTID: "test-jti-" + userID, ClientID: "test-client", UserID: userID, WorkspaceID: workspaceID, RuntimeID: "runtime", RuntimeGeneration: 1, Scopes: scopes})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return token
 }
 
 func hasTool(result *mcp.ListToolsResult, name string) bool {

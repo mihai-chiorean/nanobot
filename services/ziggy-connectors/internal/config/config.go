@@ -13,41 +13,71 @@ import (
 )
 
 const (
-	defaultListenAddr      = "127.0.0.1:8790"
-	defaultShutdownTimeout = 10 * time.Second
-	defaultStateTTL        = 10 * time.Minute
-	defaultGoogleAuthURL   = "https://accounts.google.com/o/oauth2/v2/auth"
-	defaultGoogleTokenURL  = "https://oauth2.googleapis.com/token"
-	defaultGoogleUserInfo  = "https://openidconnect.googleapis.com/v1/userinfo"
-	defaultGoogleProfile   = "https://gmail.googleapis.com/gmail/v1/users/me/profile"
-	defaultGoogleGmailAPI  = "https://gmail.googleapis.com/gmail/v1"
+	defaultListenAddr        = "127.0.0.1:8790"
+	defaultShutdownTimeout   = 10 * time.Second
+	defaultStateTTL          = 10 * time.Minute
+	defaultGoogleAuthURL     = "https://accounts.google.com/o/oauth2/v2/auth"
+	defaultGoogleTokenURL    = "https://oauth2.googleapis.com/token"
+	defaultGoogleUserInfo    = "https://openidconnect.googleapis.com/v1/userinfo"
+	defaultGoogleProfile     = "https://gmail.googleapis.com/gmail/v1/users/me/profile"
+	defaultGoogleGmailAPI    = "https://gmail.googleapis.com/gmail/v1"
+	defaultOAuthIssuerURL    = "http://127.0.0.1:8790"
+	defaultMCPResourceURL    = "http://127.0.0.1:8790/mcp"
+	productionOAuthIssuerURL = "https://127.0.0.1:8790"
+	productionMCPResourceURL = "https://127.0.0.1:8790/mcp"
 )
 
 type Config struct {
-	Environment        string
-	Version            string
-	ListenAddr         string
-	ShutdownTimeout    time.Duration
-	StateTTL           time.Duration
-	GoogleClientID     string
-	GoogleClientSecret string
-	GoogleRedirectURI  string
-	GoogleAuthURL      string
-	GoogleTokenURL     string
-	GoogleUserInfoURL  string
-	GoogleProfileURL   string
-	GoogleGmailAPIURL  string
-	GoogleScopes       []string
-	StateSigningKey    []byte
-	TokenEncryptionKey []byte
-	TrustKey           []byte
-	DatabaseURL        string
+	Environment            string
+	Version                string
+	ListenAddr             string
+	ShutdownTimeout        time.Duration
+	StateTTL               time.Duration
+	GoogleClientID         string
+	GoogleClientSecret     string
+	GoogleRedirectURI      string
+	GoogleAuthURL          string
+	GoogleTokenURL         string
+	GoogleUserInfoURL      string
+	GoogleProfileURL       string
+	GoogleGmailAPIURL      string
+	GoogleScopes           []string
+	StateSigningKey        []byte
+	TokenEncryptionKey     []byte
+	TrustKey               []byte
+	ClientCredentialPepper []byte
+	MCPAccessSigningKey    []byte
+	OAuthIssuerURL         string
+	MCPResourceURL         string
+	TLSCertFile            string
+	TLSKeyFile             string
+	DatabaseURL            string
 }
 
 type LookupEnv func(string) (string, bool)
 type ReadFile func(string) ([]byte, error)
 
+type ProvisioningConfig struct {
+	DatabaseURL            string
+	ClientCredentialPepper []byte
+}
+
 func Load() (Config, error) { return LoadFrom(os.LookupEnv, os.ReadFile) }
+
+func LoadProvisioningFrom(lookup LookupEnv, readFile ReadFile) (ProvisioningConfig, error) {
+	databaseURL, err := secretOptional(lookup, readFile, "ZIGGY_CONNECTORS_DATABASE_URL")
+	if err != nil {
+		return ProvisioningConfig{}, err
+	}
+	if databaseURL == "" {
+		return ProvisioningConfig{}, errors.New("ZIGGY_CONNECTORS_DATABASE_URL_FILE is required")
+	}
+	pepper, err := keyFile(lookup, readFile, "ZIGGY_CONNECTORS_CLIENT_CREDENTIAL_PEPPER_FILE", 32)
+	if err != nil {
+		return ProvisioningConfig{}, err
+	}
+	return ProvisioningConfig{DatabaseURL: databaseURL, ClientCredentialPepper: pepper}, nil
+}
 
 func LoadFrom(lookup LookupEnv, readFile ReadFile) (Config, error) {
 	environment := strings.ToLower(valueOr(lookup, "ZIGGY_CONNECTORS_ENV", "development"))
@@ -61,6 +91,22 @@ func LoadFrom(lookup LookupEnv, readFile ReadFile) (Config, error) {
 	}
 	if environment == "production" && !isLoopbackHost(host) {
 		return Config{}, errors.New("ZIGGY_CONNECTORS_LISTEN_ADDR must bind to loopback in production")
+	}
+	oauthIssuerURL := valueOr(lookup, "ZIGGY_CONNECTORS_OAUTH_ISSUER_URL", defaultOAuthIssuerURLFor(environment))
+	if err := validateLoopbackURL(oauthIssuerURL, environment, ""); err != nil {
+		return Config{}, fmt.Errorf("ZIGGY_CONNECTORS_OAUTH_ISSUER_URL: %w", err)
+	}
+	mcpResourceURL := valueOr(lookup, "ZIGGY_CONNECTORS_MCP_RESOURCE_URL", defaultMCPResourceURLFor(environment))
+	if err := validateLoopbackURL(mcpResourceURL, environment, "/mcp"); err != nil {
+		return Config{}, fmt.Errorf("ZIGGY_CONNECTORS_MCP_RESOURCE_URL: %w", err)
+	}
+	tlsCertFile := strings.TrimSpace(valueOr(lookup, "ZIGGY_CONNECTORS_TLS_CERT_FILE", ""))
+	tlsKeyFile := strings.TrimSpace(valueOr(lookup, "ZIGGY_CONNECTORS_TLS_KEY_FILE", ""))
+	if environment == "production" && tlsCertFile == "" {
+		return Config{}, errors.New("ZIGGY_CONNECTORS_TLS_CERT_FILE is required in production")
+	}
+	if environment == "production" && tlsKeyFile == "" {
+		return Config{}, errors.New("ZIGGY_CONNECTORS_TLS_KEY_FILE is required in production")
 	}
 	clientID, err := required(lookup, "ZIGGY_CONNECTORS_GOOGLE_CLIENT_ID")
 	if err != nil {
@@ -89,6 +135,14 @@ func LoadFrom(lookup LookupEnv, readFile ReadFile) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	credentialPepper, err := keyFile(lookup, readFile, "ZIGGY_CONNECTORS_CLIENT_CREDENTIAL_PEPPER_FILE", 32)
+	if err != nil {
+		return Config{}, err
+	}
+	mcpAccessSigningKey, err := keyFile(lookup, readFile, "ZIGGY_CONNECTORS_MCP_ACCESS_SIGNING_KEY_FILE", 32)
+	if err != nil {
+		return Config{}, err
+	}
 	shutdown := defaultShutdownTimeout
 	if value := strings.TrimSpace(valueOr(lookup, "ZIGGY_CONNECTORS_SHUTDOWN_TIMEOUT", "")); value != "" {
 		shutdown, err = time.ParseDuration(value)
@@ -111,25 +165,45 @@ func LoadFrom(lookup LookupEnv, readFile ReadFile) (Config, error) {
 		return Config{}, errors.New("ZIGGY_CONNECTORS_DATABASE_URL_FILE is required in production")
 	}
 	return Config{
-		Environment:        environment,
-		Version:            valueOr(lookup, "ZIGGY_CONNECTORS_VERSION", "dev"),
-		ListenAddr:         listenAddr,
-		ShutdownTimeout:    shutdown,
-		StateTTL:           stateTTL,
-		GoogleClientID:     clientID,
-		GoogleClientSecret: clientSecret,
-		GoogleRedirectURI:  redirect,
-		GoogleAuthURL:      valueOr(lookup, "ZIGGY_CONNECTORS_GOOGLE_AUTH_URL", defaultGoogleAuthURL),
-		GoogleTokenURL:     valueOr(lookup, "ZIGGY_CONNECTORS_GOOGLE_TOKEN_URL", defaultGoogleTokenURL),
-		GoogleUserInfoURL:  valueOr(lookup, "ZIGGY_CONNECTORS_GOOGLE_USERINFO_URL", defaultGoogleUserInfo),
-		GoogleProfileURL:   valueOr(lookup, "ZIGGY_CONNECTORS_GOOGLE_PROFILE_URL", defaultGoogleProfile),
-		GoogleGmailAPIURL:  valueOr(lookup, "ZIGGY_CONNECTORS_GOOGLE_GMAIL_URL", defaultGoogleGmailAPI),
-		GoogleScopes:       []string{"openid", "email", "https://www.googleapis.com/auth/gmail.readonly"},
-		StateSigningKey:    stateKey,
-		TokenEncryptionKey: tokenKey,
-		TrustKey:           trustKey,
-		DatabaseURL:        databaseURL,
+		Environment:            environment,
+		Version:                valueOr(lookup, "ZIGGY_CONNECTORS_VERSION", "dev"),
+		ListenAddr:             listenAddr,
+		ShutdownTimeout:        shutdown,
+		StateTTL:               stateTTL,
+		GoogleClientID:         clientID,
+		GoogleClientSecret:     clientSecret,
+		GoogleRedirectURI:      redirect,
+		GoogleAuthURL:          valueOr(lookup, "ZIGGY_CONNECTORS_GOOGLE_AUTH_URL", defaultGoogleAuthURL),
+		GoogleTokenURL:         valueOr(lookup, "ZIGGY_CONNECTORS_GOOGLE_TOKEN_URL", defaultGoogleTokenURL),
+		GoogleUserInfoURL:      valueOr(lookup, "ZIGGY_CONNECTORS_GOOGLE_USERINFO_URL", defaultGoogleUserInfo),
+		GoogleProfileURL:       valueOr(lookup, "ZIGGY_CONNECTORS_GOOGLE_PROFILE_URL", defaultGoogleProfile),
+		GoogleGmailAPIURL:      valueOr(lookup, "ZIGGY_CONNECTORS_GOOGLE_GMAIL_URL", defaultGoogleGmailAPI),
+		GoogleScopes:           []string{"openid", "email", "https://www.googleapis.com/auth/gmail.readonly"},
+		StateSigningKey:        stateKey,
+		TokenEncryptionKey:     tokenKey,
+		TrustKey:               trustKey,
+		ClientCredentialPepper: credentialPepper,
+		MCPAccessSigningKey:    mcpAccessSigningKey,
+		OAuthIssuerURL:         oauthIssuerURL,
+		MCPResourceURL:         mcpResourceURL,
+		TLSCertFile:            tlsCertFile,
+		TLSKeyFile:             tlsKeyFile,
+		DatabaseURL:            databaseURL,
 	}, nil
+}
+
+func defaultOAuthIssuerURLFor(environment string) string {
+	if environment == "production" {
+		return productionOAuthIssuerURL
+	}
+	return defaultOAuthIssuerURL
+}
+
+func defaultMCPResourceURLFor(environment string) string {
+	if environment == "production" {
+		return productionMCPResourceURL
+	}
+	return defaultMCPResourceURL
 }
 
 func isLoopbackHost(host string) bool {
@@ -147,6 +221,18 @@ func validateRedirect(raw, environment string) error {
 	}
 	if environment == "production" && u.Scheme != "https" {
 		return errors.New("must use https in production")
+	}
+	return nil
+}
+
+func validateLoopbackURL(raw, environment, requiredPath string) error {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	scheme := "http"
+	if environment == "production" {
+		scheme = "https"
+	}
+	if err != nil || u.Scheme != scheme || u.Host == "" || u.RawQuery != "" || u.Fragment != "" || u.User != nil || (requiredPath != "" && u.Path != requiredPath) || (requiredPath == "" && u.Path != "") || !isLoopbackHost(u.Hostname()) {
+		return fmt.Errorf("must be an absolute loopback %s URL", strings.ToUpper(scheme))
 	}
 	return nil
 }

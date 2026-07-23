@@ -7,7 +7,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -102,60 +101,4 @@ func (api *API) connectors(w http.ResponseWriter, r *http.Request) {
 	}
 	request := r.Clone(withConnectorPrincipal(r.Context(), signed))
 	api.connectorProxy.ServeHTTP(w, request)
-}
-
-func (api *API) runtimeConnectors(w http.ResponseWriter, r *http.Request) {
-	if api.connectorProxy == nil || api.connectorSigner == nil || api.tenantRouter == nil {
-		http.NotFound(w, r)
-		return
-	}
-	if !localRuntimeConnectorRequest(r) {
-		http.NotFound(w, r)
-		return
-	}
-	credential, _, valid := bearerCredential(r.Header.Get("Authorization"))
-	router, ok := api.tenantRouter.(runtimeCredentialRouter)
-	if !valid || !ok {
-		writeError(w, http.StatusUnauthorized, "runtime capability required")
-		return
-	}
-	route, ok := router.ResolveRuntimeCredential(credential)
-	if !ok || strings.TrimSpace(route.UserID) == "" || strings.TrimSpace(route.WorkspaceID) == "" {
-		writeError(w, http.StatusUnauthorized, "runtime capability unavailable")
-		return
-	}
-	if r.Body != nil {
-		if r.ContentLength > api.maxRequestBody {
-			writeError(w, http.StatusRequestEntityTooLarge, "request body too large")
-			return
-		}
-		r.Body = http.MaxBytesReader(w, r.Body, api.maxRequestBody)
-	}
-	signed, err := api.connectorSigner.sign(route.UserID, route.WorkspaceID)
-	if err != nil {
-		api.logger.ErrorContext(r.Context(), "runtime connector identity unavailable", "route", "runtime_connectors", "error_class", "signing")
-		writeError(w, http.StatusInternalServerError, "connector identity unavailable")
-		return
-	}
-	request := r.Clone(withConnectorPrincipal(r.Context(), signed))
-	request.URL.Path = "/connectors/mcp"
-	request.URL.RawPath = ""
-	api.connectorProxy.ServeHTTP(w, request)
-}
-
-func localRuntimeConnectorRequest(request *http.Request) bool {
-	host, _, err := net.SplitHostPort(request.RemoteAddr)
-	if err != nil {
-		return false
-	}
-	address := net.ParseIP(host)
-	if address == nil || !address.IsLoopback() {
-		return false
-	}
-	for _, name := range []string{"CF-Connecting-IP", "CF-Ray", "Forwarded", "X-Forwarded-For"} {
-		if strings.TrimSpace(request.Header.Get(name)) != "" {
-			return false
-		}
-	}
-	return true
 }

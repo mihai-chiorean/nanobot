@@ -38,78 +38,6 @@ func (router connectorTenantRouter) RememberCredentials(TenantRoute, []string, t
 	return nil
 }
 
-func TestRuntimeConnectorMCPUsesRuntimeCapabilityAndDoesNotForwardIt(t *testing.T) {
-	key := []byte("01234567890123456789012345678901")
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/mcp" {
-			t.Errorf("connector path = %q", r.URL.Path)
-		}
-		if r.Header.Get("Authorization") != "" {
-			t.Error("runtime capability reached connector service")
-		}
-		payload, err := base64.RawURLEncoding.DecodeString(r.Header.Get("X-Ziggy-Principal"))
-		if err != nil || !containsAll(string(payload), "usr_tester", "ws_tester") {
-			t.Errorf("connector principal = %q, error = %v", payload, err)
-		}
-		w.WriteHeader(http.StatusNoContent)
-	}))
-	defer upstream.Close()
-	target, _ := url.Parse(upstream.URL)
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	signer, _ := NewConnectorSigner(key)
-	route := TenantRoute{UserID: "usr_tester", WorkspaceID: "ws_tester", Proxy: http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})}
-	handler, err := New(Config{
-		Authenticate:    principalMiddleware(identity.Principal{}),
-		Proxy:           route.Proxy,
-		TenantRouter:    connectorTenantRouter{route: route, runtimeCredential: "runtime-secret"},
-		ConnectorProxy:  NewConnectorReverseProxy(target, logger, nil),
-		ConnectorSigner: signer,
-		Readiness:       checkerFunc(func(context.Context) error { return nil }),
-		Logger:          logger,
-		OwnerEmail:      "owner@example.com",
-		MaxRequestBody:  1 << 20,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	request := httptest.NewRequest(http.MethodPost, "/runtime/connectors/mcp", strings.NewReader("{}"))
-	request.Header.Set("Authorization", "Bearer runtime-secret")
-	request.RemoteAddr = "127.0.0.1:42000"
-	response := httptest.NewRecorder()
-	handler.ServeHTTP(response, request)
-	if response.Code != http.StatusNoContent {
-		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
-	}
-
-	rejected := httptest.NewRecorder()
-	badRequest := httptest.NewRequest(http.MethodPost, "/runtime/connectors/mcp", strings.NewReader("{}"))
-	badRequest.Header.Set("Authorization", "Bearer wrong-secret")
-	badRequest.RemoteAddr = "127.0.0.1:42001"
-	handler.ServeHTTP(rejected, badRequest)
-	if rejected.Code != http.StatusUnauthorized {
-		t.Fatalf("rejected status = %d", rejected.Code)
-	}
-}
-
-func TestRuntimeConnectorMCPIsNotReachableThroughPublicProxyHeaders(t *testing.T) {
-	route := TenantRoute{UserID: "usr_tester", WorkspaceID: "ws_tester"}
-	api := &API{
-		tenantRouter:    connectorTenantRouter{route: route, runtimeCredential: "runtime-secret"},
-		connectorProxy:  http.HandlerFunc(func(http.ResponseWriter, *http.Request) { t.Fatal("connector proxy called") }),
-		connectorSigner: &ConnectorSigner{key: []byte("01234567890123456789012345678901"), now: time.Now},
-	}
-	request := httptest.NewRequest(http.MethodPost, "/runtime/connectors/mcp", strings.NewReader("{}"))
-	request.RemoteAddr = "127.0.0.1:42000"
-	request.Header.Set("Authorization", "Bearer runtime-secret")
-	request.Header.Set("CF-Connecting-IP", "203.0.113.10")
-	response := httptest.NewRecorder()
-	api.runtimeConnectors(response, request)
-	if response.Code != http.StatusNotFound {
-		t.Fatalf("status = %d", response.Code)
-	}
-}
-
 func (router connectorTenantRouter) Default() TenantRoute { return router.route }
 
 func TestConnectorProxySignsServerResolvedTenantAndStripsPrefix(t *testing.T) {
@@ -168,16 +96,6 @@ func TestConnectorProxySignsServerResolvedTenantAndStripsPrefix(t *testing.T) {
 	handler.ServeHTTP(response, request)
 	if response.Code != http.StatusNoContent {
 		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
-	}
-}
-
-func TestRuntimeConnectorAdmissionIsTenantScoped(t *testing.T) {
-	route := TenantRoute{UserID: "usr_tester", WorkspaceID: "ws_tester"}
-	api := &API{tenantRouter: connectorTenantRouter{route: route, runtimeCredential: "runtime-secret"}}
-	request := httptest.NewRequest(http.MethodPost, "/runtime/connectors/mcp", strings.NewReader("{}"))
-	request.Header.Set("Authorization", "Bearer runtime-secret")
-	if tenant := api.admissionTenant(request); tenant != route.UserID {
-		t.Fatalf("admission tenant = %q", tenant)
 	}
 }
 

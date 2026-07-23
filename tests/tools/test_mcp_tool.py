@@ -12,6 +12,7 @@ from nanobot.agent.tools.mcp import (
     MCPPromptWrapper,
     MCPResourceWrapper,
     MCPToolWrapper,
+    OAuthClientCredentialsAuth,
     _normalize_windows_stdio_command,
     _sanitize_name,
     connect_mcp_servers,
@@ -375,6 +376,62 @@ async def test_connect_mcp_servers_enabled_tools_supports_raw_names(
         await stack.aclose()
 
     assert registry.tool_names == ["mcp_test_demo"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport_type", ["sse", "streamableHttp"])
+async def test_connect_mcp_servers_passes_oauth_to_http_transports(
+    fake_mcp_runtime: dict[str, object | None],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    transport_type: str,
+) -> None:
+    fake_mcp_runtime["session"] = _make_fake_session(["demo"])
+    secret_file = tmp_path / "client-secret"
+    secret_file.write_text("super-secret", encoding="utf-8")
+    captured: dict[str, object] = {}
+
+    if transport_type == "sse":
+
+        @asynccontextmanager
+        async def _capturing_sse(_url: str, httpx_client_factory=None, auth=None):
+            captured["auth"] = auth
+            yield object(), object()
+
+        monkeypatch.setattr(sys.modules["mcp.client.sse"], "sse_client", _capturing_sse)
+    else:
+
+        @asynccontextmanager
+        async def _capturing_streamable(_url: str, http_client=None):
+            captured["auth"] = http_client._auth
+            yield object(), object(), object()
+
+        monkeypatch.setattr(
+            sys.modules["mcp.client.streamable_http"],
+            "streamable_http_client",
+            _capturing_streamable,
+        )
+
+    monkeypatch.setattr(mcp_mod, "_build_official_oauth_provider", lambda *_args: None)
+    registry = ToolRegistry()
+    stacks = await connect_mcp_servers(
+        {
+            "test": MCPServerConfig(
+                type=transport_type,
+                url="http://127.0.0.1:8790/mcp",
+                oauthClientCredentials={
+                    "tokenUrl": "http://127.0.0.1:8790/oauth/token",
+                    "clientId": "connector-client",
+                    "clientSecretFile": str(secret_file),
+                },
+            )
+        },
+        registry,
+    )
+    for stack in stacks.values():
+        await stack.aclose()
+
+    assert isinstance(captured["auth"], OAuthClientCredentialsAuth)
 
 
 @pytest.mark.asyncio

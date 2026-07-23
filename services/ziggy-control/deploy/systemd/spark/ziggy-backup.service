@@ -11,7 +11,14 @@ Group=root
 Environment=ZIGGY_BACKUP_ROOT=/var/backups/ziggy
 Environment=ZIGGY_BACKUP_RETENTION_DAYS=14
 Environment=ZIGGY_OWNER_WORKSPACE=/run/ziggy-backup-input/workspace
+Environment=ZIGGY_OWNER_CONFIG=/run/ziggy-backup-input/owner-config.json
 Environment=ZIGGY_TENANT_ROOT=/run/ziggy-backup-input/tenants
+Environment=ZIGGY_CREDENTIAL_STORE=/run/ziggy-backup-input/credstore
+Environment=ZIGGY_USER_SYSTEMD_DIR=/run/ziggy-backup-input/user-systemd
+Environment=ZIGGY_CONFIG_DIR=/etc/ziggy
+Environment=ZIGGY_NANOBOT_RELEASE=/run/ziggy-backup-input/nanobot-release
+Environment=ZIGGY_BINARY_DIR=/usr/local/bin
+Environment=ZIGGY_SYSTEM_UNIT_DIR=/etc/systemd/system
 ExecStart=/usr/bin/flock --nonblock /run/lock/ziggy-backup.lock /usr/local/libexec/ziggy-backup
 
 # The root process must drop to each peer-authenticated database role for
@@ -24,7 +31,11 @@ ProtectHome=true
 RuntimeDirectory=ziggy-backup-input
 RuntimeDirectoryMode=0700
 BindReadOnlyPaths=/home/mihai/.nanobot/workspace:/run/ziggy-backup-input/workspace
+BindReadOnlyPaths=-/home/mihai/.nanobot/config.json:/run/ziggy-backup-input/owner-config.json
 BindReadOnlyPaths=/home/mihai/.local/share/ziggy/tenants:/run/ziggy-backup-input/tenants
+BindReadOnlyPaths=-/home/mihai/.config/credstore:/run/ziggy-backup-input/credstore
+BindReadOnlyPaths=-/home/mihai/.config/systemd/user:/run/ziggy-backup-input/user-systemd
+BindReadOnlyPaths=-/home/mihai/workspace/ziggy/current-nanobot:/run/ziggy-backup-input/nanobot-release
 ProtectKernelLogs=true
 ProtectKernelModules=true
 ProtectKernelTunables=true

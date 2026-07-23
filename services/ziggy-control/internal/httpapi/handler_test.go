@@ -178,6 +178,7 @@ func TestPrivateRoutesAreNotProxied(t *testing.T) {
 		"/auth/token",
 		"/auth/token/private",
 		"/auth/bootstrap/",
+		"/runtime/connectors/mcp",
 		"/healthz/",
 		"/readyz/",
 	} {

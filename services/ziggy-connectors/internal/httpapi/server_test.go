@@ -2,12 +2,21 @@ package httpapi
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
+	"math/big"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -15,8 +24,12 @@ import (
 	"github.com/mihai-chiorean/nanobot/services/ziggy-connectors/internal/crypto"
 	"github.com/mihai-chiorean/nanobot/services/ziggy-connectors/internal/principal"
 	"github.com/mihai-chiorean/nanobot/services/ziggy-connectors/internal/provider"
+	"github.com/mihai-chiorean/nanobot/services/ziggy-connectors/internal/runtimeauth"
 	"github.com/mihai-chiorean/nanobot/services/ziggy-connectors/internal/store"
 )
+
+const testOAuthIssuerURL = "http://127.0.0.1:8790"
+const testMCPResourceURL = testOAuthIssuerURL + "/mcp"
 
 func TestOAuthFlowIsTenantBoundAndOneUse(t *testing.T) {
 	now := time.Now()
@@ -27,18 +40,23 @@ func TestOAuthFlowIsTenantBoundAndOneUse(t *testing.T) {
 	}
 	repo := store.NewMemoryRepository()
 	api, err := New(Config{
-		Environment:       "test",
-		Version:           "test",
-		GoogleRedirectURI: "https://gateway.test/oauth/google/callback",
-		GoogleScopes:      []string{"openid", "email", googleGmailReadonlyScope},
-		StateTTL:          time.Minute,
-		StateSigner:       crypto.NewStateSigner(key),
-		TokenCipher:       cipher,
-		Accounts:          repo,
-		OAuthTransactions: repo,
-		Google:            provider.Fake{Token: provider.Token{AccessToken: "access", RefreshToken: "refresh", Scopes: []string{"openid", "email", googleGmailReadonlyScope}}, Profile: provider.Profile{Provider: "google", Subject: "google-sub", Email: "a@example.test"}},
-		PrincipalVerifier: principal.NewVerifier(key),
-		Now:               func() time.Time { return now },
+		Environment:            "test",
+		Version:                "test",
+		GoogleRedirectURI:      "https://gateway.test/oauth/google/callback",
+		GoogleScopes:           []string{"openid", "email", googleGmailReadonlyScope},
+		StateTTL:               time.Minute,
+		StateSigner:            crypto.NewStateSigner(key),
+		TokenCipher:            cipher,
+		Accounts:               repo,
+		OAuthTransactions:      repo,
+		RuntimeOAuthClients:    repo,
+		Google:                 provider.Fake{Token: provider.Token{AccessToken: "access", RefreshToken: "refresh", Scopes: []string{"openid", "email", googleGmailReadonlyScope}}, Profile: provider.Profile{Provider: "google", Subject: "google-sub", Email: "a@example.test"}},
+		PrincipalVerifier:      principal.NewVerifier(key),
+		ClientCredentialPepper: key,
+		MCPAccessTokens:        runtimeTokenManager(t, key),
+		OAuthIssuerURL:         testOAuthIssuerURL,
+		MCPResourceURL:         testMCPResourceURL,
+		Now:                    func() time.Time { return now },
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -94,19 +112,24 @@ func TestOAuthRejectsPartialGrantWithoutPersistingAccount(t *testing.T) {
 	}
 	repo := store.NewMemoryRepository()
 	api, err := New(Config{
-		GoogleRedirectURI: "https://gateway.test/oauth/google/callback",
-		GoogleScopes:      []string{"openid", "email", googleGmailReadonlyScope},
-		StateTTL:          time.Minute,
-		StateSigner:       crypto.NewStateSigner(key),
-		TokenCipher:       cipher,
-		Accounts:          repo,
-		OAuthTransactions: repo,
+		GoogleRedirectURI:   "https://gateway.test/oauth/google/callback",
+		GoogleScopes:        []string{"openid", "email", googleGmailReadonlyScope},
+		StateTTL:            time.Minute,
+		StateSigner:         crypto.NewStateSigner(key),
+		TokenCipher:         cipher,
+		Accounts:            repo,
+		OAuthTransactions:   repo,
+		RuntimeOAuthClients: repo,
 		Google: provider.Fake{
 			Token:   provider.Token{AccessToken: "access", RefreshToken: "refresh", Scopes: []string{"openid", "email"}},
 			Profile: provider.Profile{Provider: "google", Subject: "google-sub", Email: "a@example.test"},
 		},
-		PrincipalVerifier: principal.NewVerifier(key),
-		Now:               func() time.Time { return now },
+		PrincipalVerifier:      principal.NewVerifier(key),
+		ClientCredentialPepper: key,
+		MCPAccessTokens:        runtimeTokenManager(t, key),
+		OAuthIssuerURL:         testOAuthIssuerURL,
+		MCPResourceURL:         testMCPResourceURL,
+		Now:                    func() time.Time { return now },
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -143,7 +166,7 @@ func TestOAuthRejectsTamperedAndExpiredState(t *testing.T) {
 	key := []byte("01234567890123456789012345678901")
 	cipher, _ := crypto.NewAESGCM(key)
 	repo := store.NewMemoryRepository()
-	api, _ := New(Config{GoogleRedirectURI: "https://gateway.test/callback", GoogleScopes: []string{"scope"}, StateTTL: time.Minute, StateSigner: crypto.NewStateSigner(key), TokenCipher: cipher, Accounts: repo, OAuthTransactions: repo, Google: provider.Fake{Token: provider.Token{AccessToken: "a", RefreshToken: "r"}, Profile: provider.Profile{Provider: "google", Subject: "s", Email: "e@example.test"}}, PrincipalVerifier: principal.NewVerifier(key), Now: func() time.Time { return now }})
+	api, _ := New(Config{GoogleRedirectURI: "https://gateway.test/callback", GoogleScopes: []string{"scope"}, StateTTL: time.Minute, StateSigner: crypto.NewStateSigner(key), TokenCipher: cipher, Accounts: repo, OAuthTransactions: repo, RuntimeOAuthClients: repo, Google: provider.Fake{Token: provider.Token{AccessToken: "a", RefreshToken: "r"}, Profile: provider.Profile{Provider: "google", Subject: "s", Email: "e@example.test"}}, PrincipalVerifier: principal.NewVerifier(key), ClientCredentialPepper: key, MCPAccessTokens: runtimeTokenManager(t, key), OAuthIssuerURL: testOAuthIssuerURL, MCPResourceURL: testMCPResourceURL, Now: func() time.Time { return now }})
 	start := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodGet, "/oauth/google/start", nil)
 	withPrincipal(request, principal.Principal{UserID: "u", WorkspaceID: "w", ExpiresAt: now.Add(time.Hour).Unix()}, key)
@@ -173,11 +196,98 @@ func TestServeStopsOnContextCancellation(t *testing.T) {
 	}
 }
 
+func TestServeTLSGracefullyServesAndStops(t *testing.T) {
+	certFile, keyFile, roots := testTLSFiles(t)
+	address := availableLoopbackAddress(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	server := &http.Server{Addr: address, Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})}
+	done := make(chan error, 1)
+	go func() { done <- ServeTLS(ctx, server, time.Second, certFile, keyFile) }()
+
+	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: roots}}, Timeout: time.Second}
+	deadline := time.Now().Add(time.Second)
+	for {
+		response, err := client.Get("https://" + address + "/healthz")
+		if err == nil {
+			response.Body.Close()
+			if response.StatusCode != http.StatusNoContent {
+				t.Fatalf("TLS response status = %d", response.StatusCode)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("TLS server did not become ready: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("ServeTLS() error = %v", err)
+	}
+}
+
+func availableLoopbackAddress(t *testing.T) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return address
+}
+
+func testTLSFiles(t *testing.T) (string, string, *x509.CertPool) {
+	t.Helper()
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	template := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		NotBefore:             now.Add(-time.Minute),
+		NotAfter:              now.Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
+	}
+	certificate, err := x509.CreateCertificate(rand.Reader, template, template, publicKey, privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	privateKeyBytes, err := x509.MarshalPKCS8PrivateKey(privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certificate})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: privateKeyBytes})
+	certFile := t.TempDir() + "/cert.pem"
+	keyFile := t.TempDir() + "/key.pem"
+	if err := os.WriteFile(certFile, certPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyFile, keyPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(certPEM) {
+		t.Fatal("failed to add test certificate to root pool")
+	}
+	return certFile, keyFile, roots
+}
+
 func TestProtectedRouteHasNoAuthBypass(t *testing.T) {
 	key := []byte("01234567890123456789012345678901")
 	cipher, _ := crypto.NewAESGCM(key)
 	repo := store.NewMemoryRepository()
-	api, err := New(Config{GoogleRedirectURI: "https://gateway.test/callback", GoogleScopes: []string{"scope"}, StateTTL: time.Minute, StateSigner: crypto.NewStateSigner(key), TokenCipher: cipher, Accounts: repo, OAuthTransactions: repo, Google: provider.Fake{}, PrincipalVerifier: principal.NewVerifier(key)})
+	api, err := New(Config{GoogleRedirectURI: "https://gateway.test/callback", GoogleScopes: []string{"scope"}, StateTTL: time.Minute, StateSigner: crypto.NewStateSigner(key), TokenCipher: cipher, Accounts: repo, OAuthTransactions: repo, RuntimeOAuthClients: repo, Google: provider.Fake{}, PrincipalVerifier: principal.NewVerifier(key), ClientCredentialPepper: key, MCPAccessTokens: runtimeTokenManager(t, key), OAuthIssuerURL: testOAuthIssuerURL, MCPResourceURL: testMCPResourceURL})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -185,6 +295,104 @@ func TestProtectedRouteHasNoAuthBypass(t *testing.T) {
 	api.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/accounts", nil))
 	if response.Code != http.StatusUnauthorized {
 		t.Fatalf("unauthenticated status = %d", response.Code)
+	}
+}
+
+func TestRuntimeClientCredentialsDiscoveryAndResourceValidation(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	key := []byte("01234567890123456789012345678901")
+	cipher, err := crypto.NewAESGCM(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo := store.NewMemoryRepository()
+	oldSecret := "old-high-entropy-client-secret"
+	oldClient := store.RuntimeOAuthClient{ClientID: "runtime-client-generation-6", Tenant: store.Tenant{UserID: "persisted-user", WorkspaceID: "persisted-workspace"}, RuntimeID: "runtime-a", RuntimeGeneration: 6, SecretHash: clientSecretHash(key, oldSecret), Scopes: append([]string(nil), runtimeMCPScopes...)}
+	secret := "a-high-entropy-client-secret"
+	client := store.RuntimeOAuthClient{ClientID: "runtime-client", Tenant: store.Tenant{UserID: "persisted-user", WorkspaceID: "persisted-workspace"}, RuntimeID: "runtime-a", RuntimeGeneration: 7, SecretHash: clientSecretHash(key, secret), Scopes: append([]string(nil), runtimeMCPScopes...)}
+	if _, created, err := repo.RegisterRuntimeOAuthClient(context.Background(), client); err != nil || !created {
+		t.Fatal(err)
+	}
+	api, err := New(Config{GoogleRedirectURI: "https://gateway.test/callback", GoogleScopes: []string{"scope"}, StateTTL: time.Minute, StateSigner: crypto.NewStateSigner(key), TokenCipher: cipher, Accounts: repo, OAuthTransactions: repo, RuntimeOAuthClients: repo, Google: provider.Fake{}, PrincipalVerifier: principal.NewVerifier(key), ClientCredentialPepper: key, MCPAccessTokens: runtimeTokenManager(t, key), OAuthIssuerURL: testOAuthIssuerURL, MCPResourceURL: testMCPResourceURL, Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	form := url.Values{"grant_type": {"client_credentials"}, "scope": {"gmail.status gmail.search gmail.read"}, "resource": {testMCPResourceURL}}
+	request := httptest.NewRequest(http.MethodPost, "/oauth/token", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.SetBasicAuth(client.ClientID, secret)
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("token status = %d, body = %s", response.Code, response.Body)
+	}
+	if response.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("token Cache-Control = %q", response.Header().Get("Cache-Control"))
+	}
+	var tokenResponse struct {
+		AccessToken string `json:"access_token"`
+		ExpiresIn   int    `json:"expires_in"`
+		Scope       string `json:"scope"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &tokenResponse); err != nil {
+		t.Fatal(err)
+	}
+	claims, err := runtimeTokenManager(t, key).Verify(tokenResponse.AccessToken, now)
+	if err != nil || claims.UserID != client.Tenant.UserID || claims.WorkspaceID != client.Tenant.WorkspaceID || claims.RuntimeID != client.RuntimeID || claims.RuntimeGeneration != client.RuntimeGeneration || claims.Audience != testMCPResourceURL || tokenResponse.ExpiresIn != 300 || tokenResponse.Scope != strings.Join(runtimeMCPScopes, " ") {
+		t.Fatalf("token claims = %#v, response = %#v, error = %v", claims, tokenResponse, err)
+	}
+	mcpServer := httptest.NewServer(api)
+	defer mcpServer.Close()
+	session := connectMCP(t, mcpServer.URL+"/mcp", tokenResponse.AccessToken)
+	defer session.Close()
+	tools, err := session.ListTools(context.Background(), nil)
+	if err != nil || len(tools.Tools) != 3 {
+		t.Fatalf("MCP tools from issued token = %#v, error = %v", tools, err)
+	}
+	stale := httptest.NewRequest(http.MethodPost, "/oauth/token", strings.NewReader("grant_type=client_credentials&resource="+url.QueryEscape(testMCPResourceURL)))
+	stale.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	stale.SetBasicAuth(oldClient.ClientID, oldSecret)
+	staleResponse := httptest.NewRecorder()
+	api.ServeHTTP(staleResponse, stale)
+	if staleResponse.Code != http.StatusUnauthorized || !strings.Contains(staleResponse.Body.String(), "invalid_client") || staleResponse.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("stale client response = %d, headers = %#v, body = %s", staleResponse.Code, staleResponse.Header(), staleResponse.Body)
+	}
+
+	mismatch := httptest.NewRequest(http.MethodPost, "/oauth/token", strings.NewReader("grant_type=client_credentials&resource=http%3A%2F%2F127.0.0.1%3A8790%2Fother"))
+	mismatch.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	mismatch.SetBasicAuth(client.ClientID, secret)
+	mismatchResponse := httptest.NewRecorder()
+	api.ServeHTTP(mismatchResponse, mismatch)
+	if mismatchResponse.Code != http.StatusBadRequest || !strings.Contains(mismatchResponse.Body.String(), "invalid_target") {
+		t.Fatalf("mismatched resource response = %d, %s", mismatchResponse.Code, mismatchResponse.Body)
+	}
+	missingResource := httptest.NewRequest(http.MethodPost, "/oauth/token", strings.NewReader("grant_type=client_credentials"))
+	missingResource.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	missingResource.SetBasicAuth(client.ClientID, secret)
+	missingResourceResponse := httptest.NewRecorder()
+	api.ServeHTTP(missingResourceResponse, missingResource)
+	if missingResourceResponse.Code != http.StatusBadRequest || !strings.Contains(missingResourceResponse.Body.String(), "invalid_target") {
+		t.Fatalf("missing resource response = %d, %s", missingResourceResponse.Code, missingResourceResponse.Body)
+	}
+
+	unauthorized := httptest.NewRecorder()
+	unauthorizedRequest := httptest.NewRequest(http.MethodPost, "/mcp", nil)
+	withPrincipal(unauthorizedRequest, principal.Principal{UserID: "forged", WorkspaceID: "forged", ExpiresAt: now.Add(time.Hour).Unix()}, key)
+	api.ServeHTTP(unauthorized, unauthorizedRequest)
+	if unauthorized.Code != http.StatusUnauthorized || unauthorized.Header().Get("WWW-Authenticate") != `Bearer resource_metadata="http://127.0.0.1:8790/.well-known/oauth-protected-resource/mcp", scope="gmail.status gmail.search gmail.read"` {
+		t.Fatalf("MCP challenge = %d, %q", unauthorized.Code, unauthorized.Header().Get("WWW-Authenticate"))
+	}
+
+	metadata := httptest.NewRecorder()
+	api.ServeHTTP(metadata, httptest.NewRequest(http.MethodGet, "/.well-known/oauth-protected-resource/mcp", nil))
+	if metadata.Code != http.StatusOK || !strings.Contains(metadata.Body.String(), `"resource":"http://127.0.0.1:8790/mcp"`) || !strings.Contains(metadata.Body.String(), `"authorization_servers":["http://127.0.0.1:8790"]`) {
+		t.Fatalf("protected resource metadata = %d, %s", metadata.Code, metadata.Body)
+	}
+	authorizationServer := httptest.NewRecorder()
+	api.ServeHTTP(authorizationServer, httptest.NewRequest(http.MethodGet, "/.well-known/oauth-authorization-server", nil))
+	if authorizationServer.Code != http.StatusOK || !strings.Contains(authorizationServer.Body.String(), `"token_endpoint":"http://127.0.0.1:8790/oauth/token"`) || !strings.Contains(authorizationServer.Body.String(), `"client_credentials"`) {
+		t.Fatalf("authorization server metadata = %d, %s", authorizationServer.Code, authorizationServer.Body)
 	}
 }
 
@@ -200,4 +408,13 @@ func withPrincipal(request *http.Request, p principal.Principal, key []byte) {
 func queryValue(raw, name string) string {
 	request := httptest.NewRequest(http.MethodGet, raw, nil)
 	return request.URL.Query().Get(name)
+}
+
+func runtimeTokenManager(t *testing.T, key []byte) *runtimeauth.TokenManager {
+	t.Helper()
+	manager, err := runtimeauth.New(key, testOAuthIssuerURL, testMCPResourceURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return manager
 }

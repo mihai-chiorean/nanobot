@@ -3,7 +3,7 @@
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
 from pydantic.alias_generators import to_camel
 from pydantic_settings import BaseSettings
 
@@ -233,6 +233,15 @@ class ExecToolConfig(Base):
     # Langfuse at edge-builder-1:3000, etc.) should flip this.
     allow_loopback: bool = False
 
+class OAuthClientCredentialsConfig(Base):
+    """OAuth 2.0 client-credentials settings for an HTTP MCP server."""
+
+    token_url: str
+    client_id: str
+    client_secret_file: str
+    scopes: list[str] = Field(default_factory=list)
+
+
 class MCPServerConfig(Base):
     """MCP server connection configuration (stdio or HTTP)."""
 
@@ -242,8 +251,24 @@ class MCPServerConfig(Base):
     env: dict[str, str] = Field(default_factory=dict)  # Stdio: extra env vars
     url: str = ""  # HTTP/SSE: endpoint URL
     headers: dict[str, str] = Field(default_factory=dict)  # HTTP/SSE: custom headers
+    oauth_client_credentials: OAuthClientCredentialsConfig | None = Field(
+        default=None,
+        validation_alias=AliasChoices("oauthClientCredentials", "oauth_client_credentials"),
+        serialization_alias="oauthClientCredentials",
+    )
     tool_timeout: int = 30  # seconds before a tool call is cancelled
     enabled_tools: list[str] = Field(default_factory=lambda: ["*"])  # Only register these tools; accepts raw MCP names or wrapped mcp_<server>_<tool> names; ["*"] = all tools; [] = no tools
+
+    @model_validator(mode="after")
+    def reject_conflicting_oauth_headers(self) -> "MCPServerConfig":
+        """Prevent static credentials from overriding the OAuth auth flow."""
+        if self.oauth_client_credentials and any(
+            name.lower() == "authorization" for name in self.headers
+        ):
+            raise ValueError(
+                "headers.Authorization cannot be configured with oauthClientCredentials"
+            )
+        return self
 
 class MyToolConfig(Base):
     """Self-inspection tool configuration."""

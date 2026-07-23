@@ -2,7 +2,9 @@ package httpapi
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -17,25 +19,31 @@ import (
 	"github.com/mihai-chiorean/nanobot/services/ziggy-connectors/internal/crypto"
 	"github.com/mihai-chiorean/nanobot/services/ziggy-connectors/internal/principal"
 	"github.com/mihai-chiorean/nanobot/services/ziggy-connectors/internal/provider"
+	"github.com/mihai-chiorean/nanobot/services/ziggy-connectors/internal/runtimeauth"
 	"github.com/mihai-chiorean/nanobot/services/ziggy-connectors/internal/store"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"golang.org/x/sync/singleflight"
 )
 
 type Config struct {
-	Environment       string
-	Version           string
-	GoogleRedirectURI string
-	GoogleScopes      []string
-	StateTTL          time.Duration
-	StateSigner       *crypto.StateSigner
-	TokenCipher       crypto.Cipher
-	Accounts          store.AccountRepository
-	OAuthTransactions store.OAuthTransactionRepository
-	Google            provider.Gmail
-	PrincipalVerifier *principal.Verifier
-	Logger            *slog.Logger
-	Now               func() time.Time
+	Environment            string
+	Version                string
+	GoogleRedirectURI      string
+	GoogleScopes           []string
+	StateTTL               time.Duration
+	StateSigner            *crypto.StateSigner
+	TokenCipher            crypto.Cipher
+	Accounts               store.AccountRepository
+	OAuthTransactions      store.OAuthTransactionRepository
+	RuntimeOAuthClients    store.RuntimeOAuthClientRepository
+	Google                 provider.Gmail
+	PrincipalVerifier      *principal.Verifier
+	ClientCredentialPepper []byte
+	MCPAccessTokens        *runtimeauth.TokenManager
+	OAuthIssuerURL         string
+	MCPResourceURL         string
+	Logger                 *slog.Logger
+	Now                    func() time.Time
 }
 
 type API struct {
@@ -48,15 +56,18 @@ type API struct {
 }
 
 type principalContextKey struct{}
+type runtimeClaimsContextKey struct{}
 
 const googleGmailReadonlyScope = "https://www.googleapis.com/auth/gmail.readonly"
 const maximumMCPRequestBytes = 1 << 20
+
+var runtimeMCPScopes = []string{"gmail.status", "gmail.search", "gmail.read"}
 
 func New(config Config) (http.Handler, error) {
 	if strings.TrimSpace(config.GoogleRedirectURI) == "" || config.StateTTL <= 0 || len(config.GoogleScopes) == 0 {
 		return nil, errors.New("OAuth redirect URI, scopes, and state TTL are required")
 	}
-	if config.StateSigner == nil || config.TokenCipher == nil || config.Accounts == nil || config.OAuthTransactions == nil || config.Google == nil || config.PrincipalVerifier == nil {
+	if config.StateSigner == nil || config.TokenCipher == nil || config.Accounts == nil || config.OAuthTransactions == nil || config.RuntimeOAuthClients == nil || config.Google == nil || config.PrincipalVerifier == nil || len(config.ClientCredentialPepper) < 32 || config.MCPAccessTokens == nil || strings.TrimSpace(config.OAuthIssuerURL) == "" || strings.TrimSpace(config.MCPResourceURL) == "" {
 		return nil, errors.New("all connector dependencies are required")
 	}
 	if config.Logger == nil {
@@ -69,11 +80,176 @@ func New(config Config) (http.Handler, error) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", api.health)
 	mux.HandleFunc("/readyz", api.ready)
+	mux.HandleFunc("/.well-known/oauth-protected-resource", api.protectedResourceMetadata)
+	mux.HandleFunc("/.well-known/oauth-protected-resource/mcp", api.protectedResourceMetadata)
+	mux.HandleFunc("/.well-known/oauth-authorization-server", api.authorizationServerMetadata)
 	mux.Handle("/oauth/google/start", api.auth(http.HandlerFunc(api.oauthStart)))
 	mux.HandleFunc("/oauth/google/callback", api.oauthCallback)
 	mux.Handle("/accounts", api.auth(http.HandlerFunc(api.accounts)))
-	mux.Handle("/mcp", http.MaxBytesHandler(api.auth(api.newMCPHandler()), maximumMCPRequestBytes))
+	mux.Handle("/oauth/token", http.MaxBytesHandler(http.HandlerFunc(api.oauthToken), 16<<10))
+	mux.Handle("/mcp", http.MaxBytesHandler(api.mcpAuth(api.newMCPHandler()), maximumMCPRequestBytes))
 	return mux, nil
+}
+
+func (api *API) mcpAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authorization := strings.TrimSpace(r.Header.Get("Authorization"))
+		parts := strings.Fields(authorization)
+		if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
+			api.mcpUnauthorized(w)
+			return
+		}
+		claims, err := api.config.MCPAccessTokens.Verify(parts[1], api.config.Now())
+		if err != nil {
+			api.mcpUnauthorized(w)
+			return
+		}
+		ctx := context.WithValue(r.Context(), runtimeClaimsContextKey{}, claims)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+func runtimeClaimsFromContext(ctx context.Context) (runtimeauth.Claims, bool) {
+	claims, ok := ctx.Value(runtimeClaimsContextKey{}).(runtimeauth.Claims)
+	return claims, ok
+}
+
+func (api *API) mcpUnauthorized(w http.ResponseWriter) {
+	w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Bearer resource_metadata=%q, scope=%q`, api.protectedResourceMetadataURL(), strings.Join(runtimeMCPScopes, " ")))
+	writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "runtime bearer token required"})
+}
+
+func (api *API) protectedResourceMetadata(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	writeJSON(w, http.StatusOK, map[string]any{
+		"resource":                 api.config.MCPResourceURL,
+		"authorization_servers":    []string{api.config.OAuthIssuerURL},
+		"scopes_supported":         runtimeMCPScopes,
+		"bearer_methods_supported": []string{"header"},
+		"resource_name":            "Ziggy Gmail MCP",
+	})
+}
+
+func (api *API) authorizationServerMetadata(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	writeJSON(w, http.StatusOK, map[string]any{
+		"issuer":                                api.config.OAuthIssuerURL,
+		"token_endpoint":                        api.config.OAuthIssuerURL + "/oauth/token",
+		"grant_types_supported":                 []string{"client_credentials"},
+		"token_endpoint_auth_methods_supported": []string{"client_secret_basic"},
+		"scopes_supported":                      runtimeMCPScopes,
+		"response_types_supported":              []string{},
+	})
+}
+
+func (api *API) protectedResourceMetadataURL() string {
+	return api.config.OAuthIssuerURL + "/.well-known/oauth-protected-resource/mcp"
+}
+
+func (api *API) oauthToken(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	clientID, clientSecret, ok := r.BasicAuth()
+	if !ok || strings.TrimSpace(clientID) == "" || clientSecret == "" {
+		oauthInvalidClient(w)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request"})
+		return
+	}
+	if r.PostForm.Get("grant_type") != "client_credentials" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unsupported_grant_type"})
+		return
+	}
+	if resource := strings.TrimSpace(r.Form.Get("resource")); resource != api.config.MCPResourceURL {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_target"})
+		return
+	}
+	for _, field := range []string{"user_id", "workspace_id", "runtime_id", "runtime_generation"} {
+		if strings.TrimSpace(r.Form.Get(field)) != "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request"})
+			return
+		}
+	}
+	client, err := api.config.RuntimeOAuthClients.GetRuntimeOAuthClient(r.Context(), clientID)
+	if err != nil || !hmac.Equal(client.SecretHash, clientSecretHash(api.config.ClientCredentialPepper, clientSecret)) {
+		oauthInvalidClient(w)
+		return
+	}
+	scopes, err := requestedScopes(r.PostForm.Get("scope"), client.Scopes)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_scope"})
+		return
+	}
+	jti, err := randomID()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "server_error"})
+		return
+	}
+	now := api.config.Now().UTC()
+	accessToken, err := api.config.MCPAccessTokens.Issue(runtimeauth.Claims{
+		Issuer: api.config.OAuthIssuerURL, Audience: api.config.MCPResourceURL, IssuedAt: now.Unix(), ExpiresAt: now.Add(runtimeauth.TTL).Unix(), JWTID: jti,
+		ClientID: client.ClientID, UserID: client.Tenant.UserID, WorkspaceID: client.Tenant.WorkspaceID, RuntimeID: client.RuntimeID, RuntimeGeneration: client.RuntimeGeneration, Scopes: scopes,
+	})
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "server_error"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"access_token": accessToken, "token_type": "Bearer", "expires_in": int(runtimeauth.TTL / time.Second), "scope": strings.Join(scopes, " ")})
+}
+
+func oauthInvalidClient(w http.ResponseWriter) {
+	w.Header().Set("WWW-Authenticate", `Basic realm="ziggy-connectors"`)
+	writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid_client"})
+}
+
+func clientSecretHash(pepper []byte, secret string) []byte {
+	mac := hmac.New(sha256.New, pepper)
+	_, _ = mac.Write([]byte(secret))
+	return mac.Sum(nil)
+}
+
+func requestedScopes(raw string, allowed []string) ([]string, error) {
+	requested := strings.Fields(raw)
+	if len(requested) == 0 {
+		requested = append([]string(nil), allowed...)
+	}
+	if len(requested) == 0 {
+		return nil, errors.New("no client scopes")
+	}
+	seen := make(map[string]struct{}, len(requested))
+	result := make([]string, 0, len(requested))
+	for _, scope := range requested {
+		if _, duplicate := seen[scope]; duplicate || !containsScope(allowed, scope) {
+			return nil, errors.New("invalid client scope")
+		}
+		seen[scope] = struct{}{}
+		result = append(result, scope)
+	}
+	return result, nil
+}
+
+func containsScope(scopes []string, wanted string) bool {
+	for _, scope := range scopes {
+		if scope == wanted {
+			return true
+		}
+	}
+	return false
 }
 
 func (api *API) auth(next http.Handler) http.Handler {
@@ -293,6 +469,33 @@ func Serve(ctx context.Context, server *http.Server, shutdownTimeout time.Durati
 	}
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- server.Serve(listener) }()
+	select {
+	case err := <-serveErr:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			return fmt.Errorf("graceful shutdown: %w", err)
+		}
+		return nil
+	}
+}
+
+func ServeTLS(ctx context.Context, server *http.Server, shutdownTimeout time.Duration, certFile, keyFile string) error {
+	if server == nil || server.Handler == nil || shutdownTimeout <= 0 || strings.TrimSpace(certFile) == "" || strings.TrimSpace(keyFile) == "" {
+		return errors.New("server, handler, positive shutdown timeout, TLS certificate file, and TLS key file are required")
+	}
+	listener, err := (&netListen{}).Listen(server.Addr)
+	if err != nil {
+		return fmt.Errorf("listen: %w", err)
+	}
+	defer listener.Close()
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- server.ServeTLS(listener, certFile, keyFile) }()
 	select {
 	case err := <-serveErr:
 		if errors.Is(err, http.ErrServerClosed) {

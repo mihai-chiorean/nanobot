@@ -30,11 +30,9 @@ iOS / web -> Cloudflare -> ziggy-control -> private Nanobot -> Spark models
   Client-supplied principal headers are stripped. The Google callback remains
   public but receives no principal envelope and is authorized by one-use OAuth
   state.
-- Proxy `/runtime/connectors/mcp` for Nanobot using the tenant runtime's unique
-  bootstrap capability. The capability is stripped and replaced with the same
-  signed, one-minute tenant principal before the request reaches connectors.
-  Gmail MCP is opt-in while pilot runtimes share one Unix account; wider use
-  requires per-tenant process or container isolation.
+- Keep runtime MCP traffic off the public control plane. Each Nanobot runtime
+  authenticates directly to `ziggy-connectors` with its own OAuth client
+  credential and receives a five-minute, tenant-scoped access token.
 - Optionally proxy `/api/work` to the private durable Work service. Work
   requests use the remembered Nanobot transport bearer only for tenant lookup;
   Clerk is not run on this iOS transport route. The proxy strips the client
@@ -104,7 +102,9 @@ first verified matching email binds the subject atomically in
 blocks new bootstraps after restart.
 
 Set `ZIGGY_CONNECTORS_URL` to enable `/connectors/*`. The URL must pass the same
-private-network validation as Nanobot. The systemd unit discovers the shared
+private-network validation as Nanobot; production uses
+`https://127.0.0.1:8790` with the connector's local CA installed in the host
+trust store. The systemd unit discovers the shared
 `connector-trust-key` through `CREDENTIALS_DIRECTORY`; outside systemd, also set
 `ZIGGY_CONNECTORS_TRUST_KEY_FILE`. The key is shared only with
 `ziggy-connectors`.
@@ -126,7 +126,7 @@ the global limits remain hard caps. Override the global limits with
 `ZIGGY_MAX_WEBSOCKET_IN_FLIGHT`. `/healthz` and `/readyz` bypass these limits.
 
 Startup first requires the configured readiness path to return 2xx, then
-requires the private Nanobot contract: unauthenticated `GET /auth/bootstrap`
+requires the private Nanobot contract: unauthenticated `GET /auth/token`
 must return `401`. A missing or incompatible upstream blocks deployment before
 the listener starts. `ZIGGY_UPSTREAM_PREFLIGHT` may be disabled only outside
 production when deliberately testing against an incomplete runtime.
@@ -256,8 +256,9 @@ as `/usr/local/bin/ziggy-control.previous`, then:
 ```sh
 systemctl daemon-reload
 systemctl restart ziggy-control
-curl --fail http://127.0.0.1:8787/healthz
-curl --fail http://127.0.0.1:8787/readyz
+control_port=8788 # Spark override; the generic unit defaults to 8787
+curl --fail "http://127.0.0.1:${control_port}/healthz"
+curl --fail "http://127.0.0.1:${control_port}/readyz"
 ```
 
 Rollback is an artifact swap followed by `systemctl restart ziggy-control`;
