@@ -10,6 +10,8 @@ User=root
 Group=root
 Environment=ZIGGY_BACKUP_ROOT=/var/backups/ziggy
 Environment=ZIGGY_BACKUP_RETENTION_DAYS=14
+Environment=ZIGGY_OWNER_WORKSPACE=/run/ziggy-backup-input/workspace
+Environment=ZIGGY_TENANT_ROOT=/run/ziggy-backup-input/tenants
 ExecStart=/usr/bin/flock --nonblock /run/lock/ziggy-backup.lock /usr/local/libexec/ziggy-backup
 
 # The root process must drop to each peer-authenticated database role for
@@ -19,8 +21,10 @@ PrivateDevices=true
 PrivateTmp=true
 ProtectControlGroups=true
 ProtectHome=true
-BindReadOnlyPaths=-/home/mihai/.nanobot/workspace
-BindReadOnlyPaths=-/home/mihai/.local/share/ziggy/tenants
+RuntimeDirectory=ziggy-backup-input
+RuntimeDirectoryMode=0700
+BindReadOnlyPaths=/home/mihai/.nanobot/workspace:/run/ziggy-backup-input/workspace
+BindReadOnlyPaths=/home/mihai/.local/share/ziggy/tenants:/run/ziggy-backup-input/tenants
 ProtectKernelLogs=true
 ProtectKernelModules=true
 ProtectKernelTunables=true
