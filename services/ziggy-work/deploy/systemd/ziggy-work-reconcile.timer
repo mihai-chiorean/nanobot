@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodic Nanobot runtime Work reconciliation
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=60s
+RandomizedDelaySec=10s
+Unit=ziggy-work-reconcile.service
+
+[Install]
+WantedBy=timers.target

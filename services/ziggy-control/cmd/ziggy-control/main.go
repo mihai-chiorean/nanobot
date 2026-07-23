@@ -115,6 +115,19 @@ func run() error {
 		connectorProxy = httpapi.NewConnectorReverseProxy(cfg.ConnectorsURL, logger, observability)
 		logger.Info("connector routing enabled")
 	}
+	var workProxy http.Handler
+	var workSigner *httpapi.WorkSigner
+	if cfg.WorkURL != nil {
+		if tenantRouter == nil {
+			return fmt.Errorf("work proxy requires tenant routing")
+		}
+		workSigner, err = httpapi.NewWorkSigner(cfg.WorkTrustKey)
+		if err != nil {
+			return err
+		}
+		workProxy = httpapi.NewWorkProxy(cfg.WorkURL, logger, observability)
+		logger.Info("work routing enabled")
+	}
 
 	readiness := httpapi.NewHTTPReadinessChecker(cfg.UpstreamURL, cfg.UpstreamReadyPath, cfg.ReadinessTimeout, cfg.ReadinessCacheTTL, observability)
 	if cfg.UpstreamPreflight {
@@ -132,6 +145,8 @@ func run() error {
 		TenantRouter:      tenantRouter,
 		ConnectorProxy:    connectorProxy,
 		ConnectorSigner:   connectorSigner,
+		WorkProxy:         workProxy,
+		WorkSigner:        workSigner,
 		Readiness:         readiness,
 		Logger:            logger,
 		Telemetry:         observability,

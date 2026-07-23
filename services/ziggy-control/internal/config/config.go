@@ -46,6 +46,8 @@ type Config struct {
 	TenantBindings    string
 	ConnectorsURL     *url.URL
 	ConnectorTrustKey []byte
+	WorkURL           *url.URL
+	WorkTrustKey      []byte
 	BlockedPaths      map[string]struct{}
 	ShutdownTimeout   time.Duration
 	ReadinessTimeout  time.Duration
@@ -159,6 +161,10 @@ func loadFrom(lookup LookupEnv, readFile ReadFile) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	workURL, workTrustKey, err := workConfig(lookup, readFile)
+	if err != nil {
+		return Config{}, err
+	}
 	upstreamPreflight, err := boolean(lookup, "ZIGGY_UPSTREAM_PREFLIGHT", defaultUpstreamPreflight)
 	if err != nil {
 		return Config{}, err
@@ -186,6 +192,8 @@ func loadFrom(lookup LookupEnv, readFile ReadFile) (Config, error) {
 		TenantBindings:    tenantBindings,
 		ConnectorsURL:     connectorsURL,
 		ConnectorTrustKey: connectorTrustKey,
+		WorkURL:           workURL,
+		WorkTrustKey:      workTrustKey,
 		BlockedPaths:      blockedPaths(lookup),
 		ShutdownTimeout:   shutdownTimeout,
 		ReadinessTimeout:  readinessTimeout,
@@ -202,6 +210,38 @@ func loadFrom(lookup LookupEnv, readFile ReadFile) (Config, error) {
 		OTelTraceSample:   otelTraceSample,
 		DeploymentEnv:     deploymentEnv,
 	}, nil
+}
+
+func workConfig(lookup LookupEnv, readFile ReadFile) (*url.URL, []byte, error) {
+	rawURL := optional(lookup, "ZIGGY_WORK_URL")
+	keyFile := optional(lookup, "ZIGGY_WORK_TRUST_KEY_FILE")
+	if rawURL == "" {
+		if keyFile != "" {
+			return nil, nil, fmt.Errorf("ZIGGY_WORK_URL and ZIGGY_WORK_TRUST_KEY_FILE must be set together")
+		}
+		return nil, nil, nil
+	}
+	if keyFile == "" {
+		if credentialsDirectory := optional(lookup, "CREDENTIALS_DIRECTORY"); credentialsDirectory != "" {
+			keyFile = filepath.Join(credentialsDirectory, "work-trust-key")
+		}
+	}
+	if keyFile == "" {
+		return nil, nil, fmt.Errorf("ZIGGY_WORK_URL and ZIGGY_WORK_TRUST_KEY_FILE must be set together")
+	}
+	parsed, err := parseUpstream(rawURL)
+	if err != nil {
+		return nil, nil, fmt.Errorf("ZIGGY_WORK_URL: %w", err)
+	}
+	contents, err := readFile(keyFile)
+	if err != nil {
+		return nil, nil, fmt.Errorf("ZIGGY_WORK_TRUST_KEY_FILE: %w", err)
+	}
+	key := decodeKeyMaterial(contents)
+	if len(key) < 32 {
+		return nil, nil, fmt.Errorf("ZIGGY_WORK_TRUST_KEY_FILE must contain at least 32 bytes")
+	}
+	return parsed, key, nil
 }
 
 func connectorConfig(lookup LookupEnv, readFile ReadFile) (*url.URL, []byte, error) {
@@ -247,7 +287,7 @@ func decodeKeyMaterial(contents []byte) []byte {
 			return decoded
 		}
 	}
-	return contents
+	return []byte(trimmed)
 }
 
 func absolutePath(lookup LookupEnv, key, fallback string) (string, error) {

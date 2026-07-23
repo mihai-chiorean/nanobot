@@ -1,0 +1,60 @@
+name: Ziggy Work
+
+on:
+  push:
+    paths:
+      - "services/ziggy-work/**"
+      - ".github/workflows/ziggy-work.yml"
+  pull_request:
+    paths:
+      - "services/ziggy-work/**"
+      - ".github/workflows/ziggy-work.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: ziggy_work_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d ziggy_work_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      ZIGGY_WORK_ENV: test
+      ZIGGY_WORK_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/ziggy_work_test?sslmode=disable
+      ZIGGY_WORK_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/ziggy_work_test?sslmode=disable
+    defaults:
+      run:
+        working-directory: services/ziggy-work
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: services/ziggy-work/go.mod
+          cache-dependency-path: services/ziggy-work/go.sum
+
+      - name: Verify module
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+          test -z "$(git status --short -- go.mod go.sum)"
+          go run ./cmd/migrate-river
+          psql "$ZIGGY_WORK_DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/001_work_foundation.sql
+          go test ./...
+          go test -race ./...
+          go vet ./...
+          go build ./...

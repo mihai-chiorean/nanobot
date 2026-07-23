@@ -1,0 +1,40 @@
+[Unit]
+Description=Ziggy durable Work service
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ziggy-work
+Group=ziggy-work
+WorkingDirectory=/var/lib/ziggy-work
+StateDirectory=ziggy-work
+StateDirectoryMode=0700
+ExecStart=/usr/local/bin/ziggy-work
+Restart=on-failure
+RestartSec=5s
+Environment=ZIGGY_WORK_ENV=production
+Environment=ZIGGY_WORK_LISTEN_ADDR=127.0.0.1:8791
+Environment=ZIGGY_WORK_DATABASE_URL_FILE=%d/work-database-url
+Environment=ZIGGY_WORK_TRUST_KEY_FILE=%d/work-trust-key
+Environment=ZIGGY_WORK_TENANTS_FILE=%d/work-runtimes.json
+Environment=ZIGGY_WORK_ARTIFACT_ROOT=/var/lib/ziggy-work/artifacts
+LoadCredential=work-database-url:/etc/ziggy/secrets/work-database-url
+LoadCredential=work-trust-key:/etc/ziggy/secrets/work-trust-key
+LoadCredential=work-runtimes.json:/etc/ziggy/secrets/work-runtimes.json
+ProtectHome=true
+ProtectSystem=strict
+PrivateTmp=true
+PrivateDevices=true
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/ziggy-work /var/lib/ziggy-work/artifacts
+UMask=0077
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target

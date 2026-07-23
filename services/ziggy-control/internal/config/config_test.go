@@ -29,6 +29,9 @@ func TestLoadFromDefaults(t *testing.T) {
 	if config.OwnerEmail != "" || config.OwnerSubject != "" {
 		t.Errorf("tenant mode loaded legacy owner config: %+v", config)
 	}
+	if config.WorkURL != nil || len(config.WorkTrustKey) != 0 {
+		t.Errorf("Work defaults = URL %v, key length %d", config.WorkURL, len(config.WorkTrustKey))
+	}
 	if config.TenantManifest != "/etc/ziggy/tenants.json" || config.TenantBindings != "/var/lib/ziggy-control/tenant-bindings.json" {
 		t.Errorf("tenant files not loaded: %+v", config)
 	}
@@ -163,6 +166,100 @@ func TestLoadFromConnectorTrustSystemdCredential(t *testing.T) {
 	}
 	if loaded.ConnectorsURL.String() != "http://127.0.0.1:8790" || len(loaded.ConnectorTrustKey) != 32 {
 		t.Fatalf("connector config = %+v", loaded)
+	}
+}
+
+func TestLoadFromWorkTrustFile(t *testing.T) {
+	environment := map[string]string{
+		"ZIGGY_UPSTREAM_URL":           "http://127.0.0.1:8765",
+		"ZIGGY_OWNER_EMAIL":            "owner@example.com",
+		"ZIGGY_WORK_URL":               "http://127.0.0.1:8800/work",
+		"ZIGGY_WORK_TRUST_KEY_FILE":    "/run/credentials/work-trust-key",
+		"CLERK_SECRET_KEY":             "secret",
+		"ZIGGY_DEPLOYMENT_ENVIRONMENT": "development",
+	}
+	readFile := func(filename string) ([]byte, error) {
+		if filename != environment["ZIGGY_WORK_TRUST_KEY_FILE"] {
+			t.Fatalf("read filename = %q", filename)
+		}
+		return []byte("01234567890123456789012345678901"), nil
+	}
+
+	loaded, err := loadFrom(mapLookup(environment), readFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.WorkURL.String() != "http://127.0.0.1:8800/work" || len(loaded.WorkTrustKey) != 32 {
+		t.Fatalf("work config = %+v", loaded)
+	}
+}
+
+func TestLoadFromWorkTrustSystemdCredential(t *testing.T) {
+	environment := map[string]string{
+		"ZIGGY_UPSTREAM_URL":           "http://127.0.0.1:8765",
+		"ZIGGY_OWNER_EMAIL":            "owner@example.com",
+		"ZIGGY_WORK_URL":               "http://127.0.0.1:8800",
+		"CREDENTIALS_DIRECTORY":        "/run/credentials/ziggy-control.service",
+		"CLERK_SECRET_KEY":             "secret",
+		"ZIGGY_DEPLOYMENT_ENVIRONMENT": "development",
+	}
+	readFile := func(filename string) ([]byte, error) {
+		if filename != "/run/credentials/ziggy-control.service/work-trust-key" {
+			t.Fatalf("read filename = %q", filename)
+		}
+		return []byte("01234567890123456789012345678901"), nil
+	}
+
+	loaded, err := loadFrom(mapLookup(environment), readFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.WorkURL.String() != "http://127.0.0.1:8800" || len(loaded.WorkTrustKey) != 32 {
+		t.Fatalf("work config = %+v", loaded)
+	}
+}
+
+func TestDecodeKeyMaterialTrimsRawSecretFileWhitespace(t *testing.T) {
+	const key = "01234567890123456789012345678901"
+	if got := string(decodeKeyMaterial([]byte(key + "\n"))); got != key {
+		t.Fatalf("decodeKeyMaterial() = %q, want %q", got, key)
+	}
+}
+
+func TestLoadFromRejectsInvalidWorkConfiguration(t *testing.T) {
+	base := map[string]string{
+		"ZIGGY_UPSTREAM_URL":           "http://127.0.0.1:8765",
+		"ZIGGY_OWNER_EMAIL":            "owner@example.com",
+		"CLERK_SECRET_KEY":             "secret",
+		"ZIGGY_DEPLOYMENT_ENVIRONMENT": "development",
+	}
+	for name, values := range map[string]map[string]string{
+		"url without key": {"ZIGGY_WORK_URL": "http://127.0.0.1:8800"},
+		"key without url": {"ZIGGY_WORK_TRUST_KEY_FILE": "/tmp/work-key"},
+		"public url": {
+			"ZIGGY_WORK_URL":            "https://8.8.8.8:443",
+			"ZIGGY_WORK_TRUST_KEY_FILE": "/tmp/work-key",
+		},
+		"short key": {
+			"ZIGGY_WORK_URL":            "http://127.0.0.1:8800",
+			"ZIGGY_WORK_TRUST_KEY_FILE": "/tmp/work-key",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			environment := make(map[string]string, len(base)+len(values))
+			for key, value := range base {
+				environment[key] = value
+			}
+			for key, value := range values {
+				environment[key] = value
+			}
+			readFile := func(string) ([]byte, error) {
+				return []byte("short"), nil
+			}
+			if _, err := loadFrom(mapLookup(environment), readFile); err == nil {
+				t.Fatal("loadFrom() error = nil, want error")
+			}
+		})
 	}
 }
 

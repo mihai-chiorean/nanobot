@@ -144,12 +144,34 @@ class WorkStore:
                     FOREIGN KEY(task_id) REFERENCES work_tasks(task_id) ON DELETE CASCADE
                 );
 
+                CREATE TABLE IF NOT EXISTS work_commands (
+                    command_id TEXT PRIMARY KEY,
+                    task_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    dispatched_at TEXT,
+                    FOREIGN KEY(task_id) REFERENCES work_tasks(task_id) ON DELETE CASCADE
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_work_tasks_updated
                     ON work_tasks(updated_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_work_events_task_seq
                     ON work_events(task_id, seq);
                 CREATE INDEX IF NOT EXISTS idx_work_artifacts_task
                     ON work_artifacts(task_id);
+                """
+            )
+            task_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(work_tasks)").fetchall()
+            }
+            if "request_id" not in task_columns:
+                connection.execute("ALTER TABLE work_tasks ADD COLUMN request_id TEXT")
+            if "dispatched_at" not in task_columns:
+                connection.execute("ALTER TABLE work_tasks ADD COLUMN dispatched_at TEXT")
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_work_tasks_request_id
+                    ON work_tasks(request_id) WHERE request_id IS NOT NULL
                 """
             )
 
@@ -164,6 +186,8 @@ class WorkStore:
             return None
         item = dict(row)
         item.pop("scope", None)
+        item.pop("request_id", None)
+        item.pop("dispatched_at", None)
         return item
 
     @staticmethod
@@ -180,6 +204,7 @@ class WorkStore:
         title: str | None = None,
         model: str = "",
         status: str = "queued",
+        request_id: str | None = None,
     ) -> dict[str, Any]:
         now = utc_now()
         task_id = f"work_{uuid.uuid4().hex}"
@@ -213,6 +238,9 @@ class WorkStore:
             now,
             0,
         ]
+        if request_id:
+            columns.append("request_id")
+            values.append(request_id)
         # Production builds predating single-tenant Clerk auth stored a scope
         # column. Populate it only to keep those existing databases writable;
         # it is never returned or used for authorization.
@@ -221,6 +249,17 @@ class WorkStore:
             values.insert(1, "tenant")
         placeholders = ", ".join("?" for _ in columns)
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if request_id:
+                existing = connection.execute(
+                    "SELECT * FROM work_tasks WHERE request_id = ?", (request_id,)
+                ).fetchone()
+                if existing is not None:
+                    task = self._task_row(existing)
+                    assert task is not None
+                    task["_was_created"] = False
+                    task["_was_dispatched"] = existing["dispatched_at"] is not None
+                    return task
             connection.execute(
                 f"INSERT INTO work_tasks ({', '.join(columns)}) VALUES ({placeholders})",
                 values,
@@ -232,7 +271,55 @@ class WorkStore:
         )
         task = self.get_task(task_id)
         assert task is not None
+        if request_id:
+            task["_was_created"] = True
+            task["_was_dispatched"] = False
         return task
+
+    def mark_dispatched(self, task_id: str, request_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE work_tasks SET dispatched_at = COALESCE(dispatched_at, ?)
+                WHERE task_id = ? AND request_id = ?
+                """,
+                (utc_now(), task_id, request_id),
+            )
+
+    def reserve_command(self, command_id: str, task_id: str, kind: str) -> tuple[bool, bool]:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT task_id, kind, dispatched_at FROM work_commands WHERE command_id = ?",
+                (command_id,),
+            ).fetchone()
+            if existing is not None:
+                if existing["task_id"] != task_id or existing["kind"] != kind:
+                    raise ValueError("Work command id is already bound")
+                return False, existing["dispatched_at"] is not None
+            connection.execute(
+                "INSERT INTO work_commands (command_id, task_id, kind) VALUES (?, ?, ?)",
+                (command_id, task_id, kind),
+            )
+            return True, False
+
+    def mark_command_dispatched(self, command_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE work_commands SET dispatched_at = COALESCE(dispatched_at, ?) WHERE command_id = ?",
+                (utc_now(), command_id),
+            )
+
+    def release_command(self, command_id: str, task_id: str, kind: str) -> None:
+        """Release a reservation that was not published so the caller can retry it."""
+        with self._connect() as connection:
+            connection.execute(
+                """
+                DELETE FROM work_commands
+                WHERE command_id = ? AND task_id = ? AND kind = ? AND dispatched_at IS NULL
+                """,
+                (command_id, task_id, kind),
+            )
 
     def get_task(self, task_id: str) -> dict[str, Any] | None:
         with self._connect() as connection:
@@ -241,17 +328,31 @@ class WorkStore:
             ).fetchone()
         return self._task_row(row)
 
-    def list_tasks(self, *, limit: int = 50, status: str | None = None) -> list[dict[str, Any]]:
+    def list_tasks(
+        self,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+        status: str | None = None,
+        after_task_id: str | None = None,
+        order_by_task_id: bool = False,
+    ) -> list[dict[str, Any]]:
         limit = max(1, min(limit, 200))
+        offset = max(0, offset)
         params: list[Any] = []
-        where = ""
+        conditions: list[str] = []
         if status:
-            where = "WHERE status = ?"
+            conditions.append("status = ?")
             params.append(status)
-        params.append(limit)
+        if order_by_task_id and after_task_id:
+            conditions.append("task_id > ?")
+            params.append(after_task_id)
+        where = "WHERE " + " AND ".join(conditions) if conditions else ""
+        order = "task_id ASC" if order_by_task_id else "updated_at DESC, task_id DESC"
+        params.extend((limit, offset))
         with self._connect() as connection:
             rows = connection.execute(
-                f"SELECT * FROM work_tasks {where} ORDER BY updated_at DESC LIMIT ?",
+                f"SELECT * FROM work_tasks {where} ORDER BY {order} LIMIT ? OFFSET ?",
                 params,
             ).fetchall()
         return [item for row in rows if (item := self._task_row(row)) is not None]

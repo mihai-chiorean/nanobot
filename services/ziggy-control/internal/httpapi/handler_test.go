@@ -28,6 +28,23 @@ func (write writerFunc) Write(body []byte) (int, error) {
 	return write(body)
 }
 
+func TestWorkEventStreamAdmissionDoesNotDependOnAcceptHeader(t *testing.T) {
+	for _, test := range []struct {
+		method string
+		path   string
+		want   bool
+	}{
+		{method: http.MethodGet, path: "/api/work/work_0123456789abcdef0123456789abcdef/events/stream", want: true},
+		{method: http.MethodPost, path: "/api/work/work_0123456789abcdef0123456789abcdef/events/stream", want: false},
+		{method: http.MethodGet, path: "/api/work/work_0123456789abcdef0123456789abcdef/events", want: false},
+	} {
+		req := httptest.NewRequest(test.method, test.path, nil)
+		if got := isWorkEventStream(req); got != test.want {
+			t.Fatalf("%s %s: got %v want %v", test.method, test.path, got, test.want)
+		}
+	}
+}
+
 func (check checkerFunc) Check(ctx context.Context) error {
 	return check(ctx)
 }

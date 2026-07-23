@@ -27,6 +27,7 @@
 		6302DB9B3A8BDEC75A926F35 /* RichContentAccessibility.swift in Sources */ = {isa = PBXBuildFile; fileRef = E117060C8616E25AD9600815 /* RichContentAccessibility.swift */; };
 		69C1B1E4A4E0E2DB12BD1EEE /* ProtocolSafety.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9ADCE502C3B7E8CE9CC6FABC /* ProtocolSafety.swift */; };
 		6A22683F52DB7B8557122F9F /* WebSocketLifecycleTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 87D2F295C288C18C7BE61F3B /* WebSocketLifecycleTests.swift */; };
+		6B4C2A7D6F0B4E4FA7F7D4A1 /* WorkRESTTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6C1E6A2F7B374C43A3C2C4D8 /* WorkRESTTests.swift */; };
 		6A8523335D0517CF03EB8736 /* AssistantStream.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2F5D4EA172625DA573F5B53 /* AssistantStream.swift */; };
 		7A0CA52019F3709CEE2037B5 /* ChatComponents.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7AFDD21F8C0E3A00356AEC74 /* ChatComponents.swift */; };
 		7DAE336409C3746763F28424 /* ZiggyModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3642AFA2A1895E491056D601 /* ZiggyModels.swift */; };
@@ -94,6 +95,7 @@
 		51C529E3547CE9F0BD41F4BC /* ChatStreamReconciler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatStreamReconciler.swift; sourceTree = "<group>"; };
 		51FBEBFEA0833768FB479AFA /* AuthenticationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuthenticationTests.swift; sourceTree = "<group>"; };
 		648B873E42505C33C6E6B537 /* EnrollmentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EnrollmentView.swift; sourceTree = "<group>"; };
+		6C1E6A2F7B374C43A3C2C4D8 /* WorkRESTTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkRESTTests.swift; sourceTree = "<group>"; };
 		7AFDD21F8C0E3A00356AEC74 /* ChatComponents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatComponents.swift; sourceTree = "<group>"; };
 		87D2F295C288C18C7BE61F3B /* WebSocketLifecycleTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebSocketLifecycleTests.swift; sourceTree = "<group>"; };
 		8AD060FBFAE9915E439160CB /* RichTransportTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RichTransportTests.swift; sourceTree = "<group>"; };
@@ -279,6 +281,7 @@
 				8AD060FBFAE9915E439160CB /* RichTransportTests.swift */,
 				1B8789ADDC58AA46846BB54E /* ServerURLValidationTests.swift */,
 				F0870FE38F48CE4E75F496D5 /* SSEParserTests.swift */,
+				6C1E6A2F7B374C43A3C2C4D8 /* WorkRESTTests.swift */,
 				87D2F295C288C18C7BE61F3B /* WebSocketLifecycleTests.swift */,
 			);
 			path = Networking;
@@ -533,6 +536,7 @@
 				9F1AE6DB1DAD9D5D15EAC681 /* SmokeTests.swift in Sources */,
 				32BA33A3CB76A15B63BC1868 /* SpeechDictationTests.swift in Sources */,
 				6A22683F52DB7B8557122F9F /* WebSocketLifecycleTests.swift in Sources */,
+				6B4C2A7D6F0B4E4FA7F7D4A1 /* WorkRESTTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

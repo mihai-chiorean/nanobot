@@ -28,6 +28,8 @@ type Config struct {
 	TenantRouter      TenantRouter
 	ConnectorProxy    http.Handler
 	ConnectorSigner   *ConnectorSigner
+	WorkProxy         http.Handler
+	WorkSigner        *WorkSigner
 	Readiness         ReadinessChecker
 	Logger            *slog.Logger
 	Telemetry         *telemetry.Recorder
@@ -47,6 +49,8 @@ type API struct {
 	tenantRouter    TenantRouter
 	connectorProxy  http.Handler
 	connectorSigner *ConnectorSigner
+	workProxy       http.Handler
+	workSigner      *WorkSigner
 	readiness       ReadinessChecker
 	logger          *slog.Logger
 	telemetry       *telemetry.Recorder
@@ -146,8 +150,14 @@ func New(config Config) (http.Handler, error) {
 	if (config.ConnectorProxy == nil) != (config.ConnectorSigner == nil) {
 		return nil, errors.New("connector proxy and signer must be configured together")
 	}
+	if (config.WorkProxy == nil) != (config.WorkSigner == nil) {
+		return nil, errors.New("work proxy and signer must be configured together")
+	}
 	if config.ConnectorProxy != nil && config.TenantRouter == nil {
 		return nil, errors.New("tenant routing is required for connectors")
+	}
+	if config.WorkProxy != nil && config.TenantRouter == nil {
+		return nil, errors.New("work proxy requires tenant routing")
 	}
 	if config.Readiness == nil {
 		return nil, errors.New("readiness checker is required")
@@ -173,6 +183,8 @@ func New(config Config) (http.Handler, error) {
 		tenantRouter:    config.TenantRouter,
 		connectorProxy:  config.ConnectorProxy,
 		connectorSigner: config.ConnectorSigner,
+		workProxy:       config.WorkProxy,
+		workSigner:      config.WorkSigner,
 		readiness:       config.Readiness,
 		logger:          config.Logger,
 		telemetry:       config.Telemetry,
@@ -196,6 +208,11 @@ func New(config Config) (http.Handler, error) {
 	mux.Handle("/auth/bootstrap", config.Authenticate(api.admit(http.HandlerFunc(api.bootstrap))))
 	mux.Handle("/connectors/oauth/google/callback", api.admit(http.HandlerFunc(api.connectorCallback)))
 	mux.Handle("/connectors/", config.Authenticate(api.admit(http.HandlerFunc(api.connectors))))
+	if config.WorkProxy != nil {
+		workHandler := api.admit(http.HandlerFunc(api.work))
+		mux.Handle("/api/work", workHandler)
+		mux.Handle("/api/work/", workHandler)
+	}
 	mux.Handle("/", api.admit(http.HandlerFunc(api.forward)))
 	return api.assignRequestID(api.observe(mux)), nil
 }
@@ -211,7 +228,7 @@ func (api *API) admit(next http.Handler) http.Handler {
 		switch {
 		case isWebSocketUpgrade(r):
 			class = admissionWebSocket
-		case acceptsSSE(r):
+		case isWorkEventStream(r), acceptsSSE(r):
 			class = admissionSSE
 		}
 		release, acquired := api.admission.tryAcquire(class, api.admissionTenant(r))
@@ -299,6 +316,14 @@ func (api *API) admissionTenant(r *http.Request) string {
 
 func acceptsSSE(r *http.Request) bool {
 	return strings.Contains(strings.ToLower(r.Header.Get("Accept")), "text/event-stream")
+}
+
+func isWorkEventStream(r *http.Request) bool {
+	if r.Method != http.MethodGet {
+		return false
+	}
+	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	return len(parts) == 5 && parts[0] == "api" && parts[1] == "work" && parts[2] != "" && parts[3] == "events" && parts[4] == "stream"
 }
 
 func (api *API) health(w http.ResponseWriter, r *http.Request) {
@@ -392,6 +417,34 @@ func (api *API) forward(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	proxy.ServeHTTP(w, r)
+}
+
+func (api *API) work(w http.ResponseWriter, r *http.Request) {
+	credential, _, valid := bearerCredential(r.Header.Get("Authorization"))
+	if !valid || api.tenantRouter == nil || api.workProxy == nil || api.workSigner == nil {
+		writeError(w, http.StatusUnauthorized, "transport credential required")
+		return
+	}
+	route, ok := api.tenantRouter.ResolveCredential(credential)
+	if !ok || strings.TrimSpace(route.UserID) == "" || strings.TrimSpace(route.WorkspaceID) == "" {
+		writeError(w, http.StatusUnauthorized, "transport credential expired or unknown")
+		return
+	}
+	if r.Body != nil {
+		if r.ContentLength > api.maxRequestBody {
+			writeError(w, http.StatusRequestEntityTooLarge, "request body too large")
+			return
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, api.maxRequestBody)
+	}
+	signed, err := api.workSigner.sign(route.UserID, route.WorkspaceID)
+	if err != nil {
+		api.logger.ErrorContext(r.Context(), "work identity unavailable", "route", "work", "error_class", "signing")
+		writeError(w, http.StatusInternalServerError, "work identity unavailable")
+		return
+	}
+	request := r.Clone(withWorkPrincipal(r.Context(), signed))
+	api.workProxy.ServeHTTP(w, request)
 }
 
 func (api *API) proxyTenantBootstrap(w http.ResponseWriter, r *http.Request, route TenantRoute) {
@@ -582,16 +635,19 @@ func (w *observedResponseWriter) statusCode() int {
 }
 
 func routeName(requestPath string) string {
-	switch requestPath {
+	cleaned := path.Clean("/" + strings.TrimPrefix(requestPath, "/"))
+	switch cleaned {
 	case "/healthz":
 		return "health"
 	case "/readyz":
 		return "readiness"
 	case "/auth/bootstrap":
 		return "bootstrap"
-	default:
-		return "proxy"
 	}
+	if cleaned == "/api/work" || strings.HasPrefix(cleaned, "/api/work/") {
+		return "work"
+	}
+	return "proxy"
 }
 
 func RequestID(ctx context.Context) string {

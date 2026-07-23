@@ -13,6 +13,7 @@ Environment=CLERK_SECRET_KEY=
 Environment=CLERK_SECRET_KEY_FILE=%d/clerk-secret-key
 Environment=ZIGGY_OTEL_AUTH_FILE=
 Environment=ZIGGY_CONNECTORS_TRUST_KEY_FILE=
+Environment=ZIGGY_WORK_TRUST_KEY_FILE=
 StateDirectory=ziggy-control
 StateDirectoryMode=0700
 ExecStart=/usr/local/bin/ziggy-control

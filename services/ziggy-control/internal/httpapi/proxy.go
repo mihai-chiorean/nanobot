@@ -13,14 +13,22 @@ import (
 )
 
 func NewReverseProxy(target *url.URL, logger *slog.Logger, observability *telemetry.Recorder) *httputil.ReverseProxy {
-	return newReverseProxy(target, logger, observability, false)
+	return newReverseProxy(target, logger, observability, proxyKindNanobot)
 }
 
 func NewConnectorReverseProxy(target *url.URL, logger *slog.Logger, observability *telemetry.Recorder) *httputil.ReverseProxy {
-	return newReverseProxy(target, logger, observability, true)
+	return newReverseProxy(target, logger, observability, proxyKindConnector)
 }
 
-func newReverseProxy(target *url.URL, logger *slog.Logger, observability *telemetry.Recorder, connector bool) *httputil.ReverseProxy {
+type proxyKind uint8
+
+const (
+	proxyKindNanobot proxyKind = iota
+	proxyKindConnector
+	proxyKindWork
+)
+
+func newReverseProxy(target *url.URL, logger *slog.Logger, observability *telemetry.Recorder, kind proxyKind) *httputil.ReverseProxy {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.MaxIdleConns = 100
 	transport.MaxIdleConnsPerHost = 32
@@ -41,7 +49,7 @@ func newReverseProxy(target *url.URL, logger *slog.Logger, observability *teleme
 		FlushInterval: -1,
 		Rewrite: func(request *httputil.ProxyRequest) {
 			request.SetURL(target)
-			if connector {
+			if kind == proxyKindConnector {
 				request.Out.URL.Path = strings.TrimPrefix(request.In.URL.Path, "/connectors")
 				if request.Out.URL.Path == "" {
 					request.Out.URL.Path = "/"
@@ -49,7 +57,15 @@ func newReverseProxy(target *url.URL, logger *slog.Logger, observability *teleme
 				request.Out.URL.RawPath = ""
 			}
 			stripUntrustedUpstreamHeaders(request.Out.Header)
-			if connector {
+			if kind == proxyKindWork {
+				stripUntrustedWorkHeaders(request.Out.Header)
+				request.Out.Header.Del("Authorization")
+				if principal, ok := workPrincipalFromContext(request.In.Context()); ok {
+					request.Out.Header.Set("X-Ziggy-Principal", principal.payload)
+					request.Out.Header.Set("X-Ziggy-Principal-Signature", principal.signature)
+				}
+			}
+			if kind == proxyKindConnector {
 				if principal, ok := connectorPrincipalFromContext(request.In.Context()); ok {
 					request.Out.Header.Set("X-Ziggy-Principal", principal.payload)
 					request.Out.Header.Set("X-Ziggy-Principal-Signature", principal.signature)
@@ -88,5 +104,13 @@ func stripUntrustedUpstreamHeaders(headers http.Header) {
 		"X-User-Subject",
 	} {
 		headers.Del(key)
+	}
+}
+
+func stripUntrustedWorkHeaders(headers http.Header) {
+	for key := range headers {
+		if strings.HasPrefix(strings.ToLower(key), "x-ziggy-") {
+			headers.Del(key)
+		}
 	}
 }

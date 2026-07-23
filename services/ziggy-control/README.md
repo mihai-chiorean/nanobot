@@ -30,6 +30,11 @@ iOS / web -> Cloudflare -> ziggy-control -> private Nanobot -> Spark models
   Client-supplied principal headers are stripped. The Google callback remains
   public but receives no principal envelope and is authorized by one-use OAuth
   state.
+- Optionally proxy `/api/work` to the private durable Work service. Work
+  requests use the remembered Nanobot transport bearer only for tenant lookup;
+  Clerk is not run on this iOS transport route. The proxy strips the client
+  bearer, cookies, and all client `X-Ziggy-*` headers, then adds a fresh
+  one-minute signed tenant principal.
 - Keep `/webui/bootstrap`, `/auth/token`, and configured private paths out of
   the public proxy.
 - Expose `/healthz` and upstream-aware `/readyz` endpoints.
@@ -98,6 +103,15 @@ private-network validation as Nanobot. The systemd unit discovers the shared
 `connector-trust-key` through `CREDENTIALS_DIRECTORY`; outside systemd, also set
 `ZIGGY_CONNECTORS_TRUST_KEY_FILE`. The key is shared only with
 `ziggy-connectors`.
+
+Set `ZIGGY_WORK_URL` and `ZIGGY_WORK_TRUST_KEY_FILE` together to enable the
+durable Work proxy. The URL must pass the same private-network validation as
+Nanobot, and the trust key must contain at least 32 bytes. When the explicit
+file variable is empty, systemd discovery uses
+`CREDENTIALS_DIRECTORY/work-trust-key`; outside systemd, set the file path
+explicitly. Work configuration requires tenant routing. There is no public Work
+health endpoint. With no Work configuration, `/api/work` retains the exact
+legacy Nanobot fallback and bearer behavior.
 
 The default global admission limits are 64 ordinary HTTP requests, 8 SSE
 streams, and 8 WebSocket connections. Each configured tenant receives an
@@ -191,6 +205,8 @@ The checked-in unit expects:
 - optional connector trust credential: `/etc/ziggy/secrets/connector-trust-key`,
   shared with `ziggy-connectors`, owned by root and mode `0400`; it is loaded
   only by the connector drop-in
+- optional Work trust credential: `/etc/ziggy/secrets/work-trust-key`, owned by
+  root and mode `0400`; it is loaded only by the Work drop-in
 - unprivileged system account: `ziggy-control`
 
 Install the base unit and only the optional credential drop-ins that are
@@ -211,6 +227,10 @@ sudo install -o root -g root -m 0644 \
 sudo install -o root -g root -m 0644 \
   services/ziggy-control/deploy/systemd/ziggy-control.service.d/20-connector-credential.conf \
   /etc/systemd/system/ziggy-control.service.d/20-connector-credential.conf
+# Install when ZIGGY_WORK_URL is configured:
+sudo install -o root -g root -m 0644 \
+  services/ziggy-control/deploy/systemd/ziggy-control.service.d/30-work-credential.conf \
+  /etc/systemd/system/ziggy-control.service.d/30-work-credential.conf
 ```
 
 The base unit loads only Clerk. Its `EnvironmentFile` is read before the

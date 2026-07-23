@@ -54,9 +54,7 @@ def bus() -> MagicMock:
     return b
 
 
-async def _http_get(
-    url: str, headers: dict[str, str] | None = None
-) -> httpx.Response:
+async def _http_get(url: str, headers: dict[str, str] | None = None) -> httpx.Response:
     return await asyncio.to_thread(
         functools.partial(httpx.get, url, headers=headers or {}, timeout=5.0)
     )
@@ -81,9 +79,7 @@ def _seed_many(workspace: Path, keys: list[str]) -> SessionManager:
 
 
 @pytest.mark.asyncio
-async def test_bootstrap_returns_token_for_localhost(
-    bus: MagicMock, tmp_path: Path
-) -> None:
+async def test_bootstrap_returns_token_for_localhost(bus: MagicMock, tmp_path: Path) -> None:
     sm = _seed_session(tmp_path)
     channel = _ch(bus, session_manager=sm, port=29901)
     server_task = asyncio.create_task(channel.start())
@@ -102,9 +98,7 @@ async def test_bootstrap_returns_token_for_localhost(
 
 
 @pytest.mark.asyncio
-async def test_sessions_routes_require_bearer_token(
-    bus: MagicMock, tmp_path: Path
-) -> None:
+async def test_sessions_routes_require_bearer_token(bus: MagicMock, tmp_path: Path) -> None:
     sm = _seed_session(tmp_path, key="websocket:abc")
     channel = _ch(bus, session_manager=sm, port=29902)
     server_task = asyncio.create_task(channel.start())
@@ -163,9 +157,7 @@ async def test_sessions_list_only_returns_websocket_sessions_by_default(
         token = boot.json()["token"]
         auth = {"Authorization": f"Bearer {token}"}
 
-        listing = await _http_get(
-            "http://127.0.0.1:29906/api/sessions", headers=auth
-        )
+        listing = await _http_get("http://127.0.0.1:29906/api/sessions", headers=auth)
         assert listing.status_code == 200
         keys = {s["key"] for s in listing.json()["sessions"]}
         # Only websocket-channel sessions are part of the webui surface; CLI /
@@ -177,9 +169,7 @@ async def test_sessions_list_only_returns_websocket_sessions_by_default(
 
 
 @pytest.mark.asyncio
-async def test_activity_route_matches_webui_contract(
-    bus: MagicMock, tmp_path: Path
-) -> None:
+async def test_activity_route_matches_webui_contract(bus: MagicMock, tmp_path: Path) -> None:
     sm = _seed_many(tmp_path, ["websocket:active", "websocket:waiting", "cli:hidden"])
     waiting = sm.get_or_create("websocket:waiting")
     waiting.add_message("assistant", "Choose one", buttons=[["Continue"]])
@@ -200,9 +190,7 @@ async def test_activity_route_matches_webui_contract(
         boot = await _http_get("http://127.0.0.1:29911/webui/bootstrap")
         auth = {"Authorization": f"Bearer {boot.json()['token']}"}
 
-        response = await _http_get(
-            "http://127.0.0.1:29911/api/activity", headers=auth
-        )
+        response = await _http_get("http://127.0.0.1:29911/api/activity", headers=auth)
 
         assert response.status_code == 200
         rows = {row["key"]: row for row in response.json()["activity"]}
@@ -279,9 +267,7 @@ async def test_session_routes_accept_percent_encoded_websocket_keys(
 
 
 @pytest.mark.asyncio
-async def test_session_routes_reject_non_websocket_keys(
-    bus: MagicMock, tmp_path: Path
-) -> None:
+async def test_session_routes_reject_non_websocket_keys(bus: MagicMock, tmp_path: Path) -> None:
     sm = _seed_many(
         tmp_path,
         [
@@ -320,9 +306,7 @@ async def test_session_routes_reject_non_websocket_keys(
 
 
 @pytest.mark.asyncio
-async def test_session_routes_reject_invalid_key(
-    bus: MagicMock, tmp_path: Path
-) -> None:
+async def test_session_routes_reject_invalid_key(bus: MagicMock, tmp_path: Path) -> None:
     sm = _seed_session(tmp_path)
     channel = _ch(bus, session_manager=sm, port=29904)
     server_task = asyncio.create_task(channel.start())
@@ -345,9 +329,7 @@ async def test_session_routes_reject_invalid_key(
 
 
 @pytest.mark.asyncio
-async def test_static_serves_index_when_dist_present(
-    bus: MagicMock, tmp_path: Path
-) -> None:
+async def test_static_serves_index_when_dist_present(bus: MagicMock, tmp_path: Path) -> None:
     dist = tmp_path / "dist"
     dist.mkdir()
     (dist / "index.html").write_text("<!doctype html><title>nbweb</title>")
@@ -375,9 +357,7 @@ async def test_static_serves_index_when_dist_present(
 
 
 @pytest.mark.asyncio
-async def test_static_rejects_path_traversal(
-    bus: MagicMock, tmp_path: Path
-) -> None:
+async def test_static_rejects_path_traversal(bus: MagicMock, tmp_path: Path) -> None:
     dist = tmp_path / "dist"
     dist.mkdir()
     (dist / "index.html").write_text("ok")
@@ -414,6 +394,7 @@ async def test_api_token_pool_purges_expired(bus: MagicMock, tmp_path: Path) -> 
     channel = _ch(bus, session_manager=sm, port=29908)
     # Don't start a server — directly inject and validate.
     import time as _time
+
     channel._api_tokens["expired"] = _time.monotonic() - 1
     channel._api_tokens["live"] = _time.monotonic() + 60
 
@@ -479,9 +460,7 @@ async def test_clerk_bootstrap_token_serves_rest_and_one_websocket(
     server_task = asyncio.create_task(channel.start())
     await asyncio.sleep(0.3)
     try:
-        local_bootstrap = await _http_get(
-            "http://127.0.0.1:29921/webui/bootstrap"
-        )
+        local_bootstrap = await _http_get("http://127.0.0.1:29921/webui/bootstrap")
         assert local_bootstrap.status_code == 404
 
         missing = await _http_get("http://127.0.0.1:29921/auth/bootstrap")
@@ -499,22 +478,97 @@ async def test_clerk_bootstrap_token_serves_rest_and_one_websocket(
         assert bootstrap.status_code == 200
         token = bootstrap.json()["token"]
         rest_headers = {"Authorization": f"Bearer {token}"}
-        rest = await _http_get(
-            "http://127.0.0.1:29921/api/sessions", headers=rest_headers
-        )
+        rest = await _http_get("http://127.0.0.1:29921/api/sessions", headers=rest_headers)
         assert rest.status_code == 200
 
         async with websockets.connect(f"ws://127.0.0.1:29921/?token={token}") as client:
             assert json.loads(await client.recv())["event"] == "ready"
 
-        rest_after_ws = await _http_get(
-            "http://127.0.0.1:29921/api/sessions", headers=rest_headers
-        )
+        rest_after_ws = await _http_get("http://127.0.0.1:29921/api/sessions", headers=rest_headers)
         assert rest_after_ws.status_code == 200
         with pytest.raises(websockets.exceptions.InvalidStatus) as reused:
             async with websockets.connect(f"ws://127.0.0.1:29921/?token={token}"):
                 pass
         assert reused.value.response.status_code == 401
+    finally:
+        await channel.stop()
+        await server_task
+
+
+@pytest.mark.asyncio
+async def test_private_issue_token_serves_rest_before_and_after_one_websocket(
+    bus: MagicMock, tmp_path: Path
+) -> None:
+    channel = _ch(
+        bus,
+        session_manager=_seed_session(tmp_path, key="websocket:private-route"),
+        port=29922,
+        tokenIssuePath="/auth/token",
+        tokenIssueSecret="server-only-secret",
+        websocketRequiresToken=True,
+    )
+    server_task = asyncio.create_task(channel.start())
+    await asyncio.sleep(0.3)
+    try:
+        issue = await _http_get(
+            "http://127.0.0.1:29922/auth/token",
+            headers={"Authorization": "Bearer server-only-secret"},
+        )
+        assert issue.status_code == 200
+        token = issue.json()["token"]
+        assert channel._issued_tokens[token] == channel._api_tokens[token]
+
+        rest_headers = {"Authorization": f"Bearer {token}"}
+        assert (
+            await _http_get("http://127.0.0.1:29922/api/sessions", headers=rest_headers)
+        ).status_code == 200
+
+        async with websockets.connect(f"ws://127.0.0.1:29922/?token={token}") as client:
+            assert json.loads(await client.recv())["event"] == "ready"
+
+        assert token not in channel._issued_tokens
+        assert token in channel._api_tokens
+        assert (
+            await _http_get("http://127.0.0.1:29922/api/sessions", headers=rest_headers)
+        ).status_code == 200
+    finally:
+        await channel.stop()
+        await server_task
+
+
+@pytest.mark.asyncio
+async def test_private_issue_token_expires_from_both_pools(bus: MagicMock, tmp_path: Path) -> None:
+    channel = _ch(
+        bus,
+        session_manager=_seed_session(tmp_path, key="websocket:private-expiry"),
+        port=29923,
+        tokenIssuePath="/auth/token",
+        tokenIssueSecret="server-only-secret",
+        websocketRequiresToken=True,
+    )
+    server_task = asyncio.create_task(channel.start())
+    await asyncio.sleep(0.3)
+    try:
+        issue = await _http_get(
+            "http://127.0.0.1:29923/auth/token",
+            headers={"Authorization": "Bearer server-only-secret"},
+        )
+        token = issue.json()["token"]
+        expiry = time.monotonic() - 1
+        channel._issued_tokens[token] = expiry
+        channel._api_tokens[token] = expiry
+
+        rest = await _http_get(
+            "http://127.0.0.1:29923/api/sessions",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert rest.status_code == 401
+        with pytest.raises(websockets.exceptions.InvalidStatus) as expired:
+            async with websockets.connect(f"ws://127.0.0.1:29923/?token={token}"):
+                pass
+        assert expired.value.response.status_code == 401
+        assert token not in channel._issued_tokens
+        assert token not in channel._api_tokens
     finally:
         await channel.stop()
         await server_task

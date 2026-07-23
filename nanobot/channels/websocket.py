@@ -274,18 +274,22 @@ _MAX_VIDEO_BYTES = 20 * 1024 * 1024
 
 # Image MIME whitelist — matches the Composer's ``accept`` list. SVG is
 # explicitly excluded to avoid the XSS surface inside embedded scripts.
-_IMAGE_MIME_ALLOWED: frozenset[str] = frozenset({
-    "image/png",
-    "image/jpeg",
-    "image/webp",
-    "image/gif",
-})
+_IMAGE_MIME_ALLOWED: frozenset[str] = frozenset(
+    {
+        "image/png",
+        "image/jpeg",
+        "image/webp",
+        "image/gif",
+    }
+)
 
-_VIDEO_MIME_ALLOWED: frozenset[str] = frozenset({
-    "video/mp4",
-    "video/webm",
-    "video/quicktime",
-})
+_VIDEO_MIME_ALLOWED: frozenset[str] = frozenset(
+    {
+        "video/mp4",
+        "video/webm",
+        "video/quicktime",
+    }
+)
 
 _UPLOAD_MIME_ALLOWED: frozenset[str] = _IMAGE_MIME_ALLOWED | _VIDEO_MIME_ALLOWED
 
@@ -308,6 +312,7 @@ _LOCALHOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 # so the API can address sessions whose keys came from non-WebSocket channels.
 _API_KEY_RE = re.compile(r"^[A-Za-z0-9_:.-]{1,128}$")
 _WORK_ID_RE = re.compile(r"^work_[0-9a-f]{32}$")
+_COMMAND_ID_RE = re.compile(r"^cmd_[0-9a-f]{32}$")
 _ARTIFACT_ID_RE = re.compile(r"^artifact_[0-9a-f]{32}$")
 
 
@@ -407,15 +412,17 @@ def _b64url_decode(s: str) -> bytes:
 # outside this set is degraded to ``application/octet-stream`` so an
 # attacker who somehow gets a signed URL for an unexpected file type can't
 # trick the browser into sniffing executable content.
-_MEDIA_ALLOWED_MIMES: frozenset[str] = frozenset({
-    "image/png",
-    "image/jpeg",
-    "image/webp",
-    "image/gif",
-    "video/mp4",
-    "video/webm",
-    "video/quicktime",
-})
+_MEDIA_ALLOWED_MIMES: frozenset[str] = frozenset(
+    {
+        "image/png",
+        "image/jpeg",
+        "image/webp",
+        "image/gif",
+        "video/mp4",
+        "video/webm",
+        "video/quicktime",
+    }
+)
 
 
 def _issue_route_secret_matches(headers: Any, configured_secret: str) -> bool:
@@ -587,14 +594,23 @@ class WebSocketChannel(BaseChannel):
                 "any client can obtain connection tokens — set token_issue_secret for production."
             )
         self._purge_expired_issued_tokens()
-        if len(self._issued_tokens) >= self._MAX_ISSUED_TOKENS:
+        self._purge_expired_api_tokens()
+        if (
+            len(self._issued_tokens) >= self._MAX_ISSUED_TOKENS
+            or len(self._api_tokens) >= self._MAX_ISSUED_TOKENS
+        ):
             logger.error(
-                "websocket: too many outstanding issued tokens ({}), rejecting issuance",
+                "websocket: too many outstanding tokens (issued={}, api={}), rejecting issuance",
                 len(self._issued_tokens),
+                len(self._api_tokens),
             )
             return _http_json_response({"error": "too many outstanding tokens"}, status=429)
         token_value = f"nbwt_{secrets.token_urlsafe(32)}"
-        self._issued_tokens[token_value] = time.monotonic() + float(self.config.token_ttl_s)
+        expiry = time.monotonic() + float(self.config.token_ttl_s)
+        # Keep one token in each pool: WS consumes its copy, while REST keeps
+        # accepting the same token until the shared TTL expires.
+        self._issued_tokens[token_value] = expiry
+        self._api_tokens[token_value] = expiry
 
         return _http_json_response(
             {
@@ -782,9 +798,7 @@ class WebSocketChannel(BaseChannel):
             return _http_json_response({"error": "forbidden"}, status=403)
         except ClerkUnavailableError:
             logger.warning("websocket: Clerk bootstrap verification unavailable")
-            return _http_json_response(
-                {"error": "identity verification unavailable"}, status=503
-            )
+            return _http_json_response({"error": "identity verification unavailable"}, status=503)
         return self._mint_transport_token()
 
     def _mint_transport_token(self) -> Response:
@@ -920,10 +934,31 @@ class WebSocketChannel(BaseChannel):
             limit = int(_query_first(query, "limit") or "50")
         except ValueError:
             limit = 50
+        limit = max(1, min(limit, 200))
+        try:
+            offset = max(0, int(_query_first(query, "offset") or "0"))
+        except ValueError:
+            return _http_error(400, "offset must be an integer")
+        order_by_task_id = _query_first(query, "order") == "task_id"
+        after_task_id = _query_first(query, "after_task_id")
+        if after_task_id is not None and _WORK_ID_RE.fullmatch(after_task_id) is None:
+            return _http_error(400, "after_task_id must be a Work task id")
         tasks = await self._work_store.run_io(
-            self._work_store.list_tasks, status=status, limit=limit
+            self._work_store.list_tasks,
+            status=status,
+            limit=limit,
+            offset=offset,
+            after_task_id=after_task_id,
+            order_by_task_id=order_by_task_id,
         )
-        return _http_json_response({"tasks": tasks})
+        return _http_json_response(
+            {
+                "tasks": tasks,
+                "has_more": len(tasks) == limit,
+                "next_offset": offset + len(tasks),
+                "next_task_id": tasks[-1]["task_id"] if tasks else after_task_id,
+            }
+        )
 
     async def _handle_work_create(self, request: WsRequest) -> Response:
         if not self._check_api_token(request):
@@ -964,9 +999,7 @@ class WebSocketChannel(BaseChannel):
             return _http_error(503, "failed to enqueue work")
         return _http_json_response({"task": task}, status=201)
 
-    async def _handle_work_detail(
-        self, request: WsRequest, raw_task_id: str
-    ) -> Response:
+    async def _handle_work_detail(self, request: WsRequest, raw_task_id: str) -> Response:
         if not self._check_api_token(request):
             return _http_error(401, "Unauthorized")
         if self._work_store is None:
@@ -980,9 +1013,7 @@ class WebSocketChannel(BaseChannel):
         self._augment_work_artifact_urls(task)
         return _http_json_response({"task": task})
 
-    async def _handle_work_events(
-        self, request: WsRequest, raw_task_id: str
-    ) -> Response:
+    async def _handle_work_events(self, request: WsRequest, raw_task_id: str) -> Response:
         if not self._check_api_token(request):
             return _http_error(401, "Unauthorized")
         if self._work_store is None:
@@ -1020,9 +1051,7 @@ class WebSocketChannel(BaseChannel):
             }
         )
 
-    async def _handle_work_cancel(
-        self, request: WsRequest, raw_task_id: str
-    ) -> Response:
+    async def _handle_work_cancel(self, request: WsRequest, raw_task_id: str) -> Response:
         if not self._check_api_token(request):
             return _http_error(401, "Unauthorized")
         if self._work_store is None:
@@ -1041,9 +1070,7 @@ class WebSocketChannel(BaseChannel):
         current = await self._work_store.run_io(self._work_store.get_task, task_id)
         return _http_json_response({"task": current})
 
-    async def _handle_work_message(
-        self, request: WsRequest, raw_task_id: str
-    ) -> Response:
+    async def _handle_work_message(self, request: WsRequest, raw_task_id: str) -> Response:
         if not self._check_api_token(request):
             return _http_error(401, "Unauthorized")
         if self._work_store is None:
@@ -1131,9 +1158,7 @@ class WebSocketChannel(BaseChannel):
         if event is not None:
             await self._broadcast_work_event(event)
 
-    async def _cancel_work_task(
-        self, task: dict[str, Any], *, sender_id: str
-    ) -> str | None:
+    async def _cancel_work_task(self, task: dict[str, Any], *, sender_id: str) -> str | None:
         assert self._work_store is not None
         if task.get("status") not in ACTIVE_STATUSES:
             return "terminal"
@@ -1147,9 +1172,7 @@ class WebSocketChannel(BaseChannel):
             logger.exception("failed to signal cancellation for Work task {}", task["task_id"])
             return "publish_failed"
         task_id = str(task["task_id"])
-        event = await self._work_store.run_io(
-            self._work_store.update_status, task_id, "cancelled"
-        )
+        event = await self._work_store.run_io(self._work_store.update_status, task_id, "cancelled")
         if event is None:
             current = await self._work_store.run_io(self._work_store.get_task, task_id)
             if current is not None and current.get("status") == "cancelled":
@@ -1158,9 +1181,7 @@ class WebSocketChannel(BaseChannel):
         await self._broadcast_work_event(event)
         return None
 
-    async def _handle_work_artifact(
-        self, request: WsRequest, raw_artifact_id: str
-    ) -> Any:
+    async def _handle_work_artifact(self, request: WsRequest, raw_artifact_id: str) -> Any:
         if not self._check_api_token(request):
             return _http_error(401, "Unauthorized")
         if self._work_store is None:
@@ -1168,9 +1189,7 @@ class WebSocketChannel(BaseChannel):
         artifact_id = _decode_id(raw_artifact_id, _ARTIFACT_ID_RE)
         if artifact_id is None:
             return _http_error(400, "invalid artifact id")
-        item = await self._work_store.run_io(
-            self._work_store.artifact_path, artifact_id
-        )
+        item = await self._work_store.run_io(self._work_store.artifact_path, artifact_id)
         if item is None:
             return _http_error(404, "artifact not found")
         path, metadata = item
@@ -1218,12 +1237,8 @@ class WebSocketChannel(BaseChannel):
                 "resolved_provider": provider_name,
                 "has_api_key": bool(provider and provider.api_key),
             },
-            "providers": [
-                {"name": "auto", "label": "Auto"}
-            ] + [
-                {"name": spec.name, "label": spec.label}
-                for spec in PROVIDERS
-            ],
+            "providers": [{"name": "auto", "label": "Auto"}]
+            + [{"name": spec.name, "label": spec.label} for spec in PROVIDERS],
             "runtime": {
                 "config_path": str(get_config_path().expanduser()),
             },
@@ -1422,9 +1437,7 @@ class WebSocketChannel(BaseChannel):
         except (OSError, ValueError):
             return None
         payload = _b64url_encode(rel.as_posix().encode("utf-8"))
-        mac = hmac.new(
-            self._media_secret, payload.encode("ascii"), hashlib.sha256
-        ).digest()[:16]
+        mac = hmac.new(self._media_secret, payload.encode("ascii"), hashlib.sha256).digest()[:16]
         return f"/api/media/{_b64url_encode(mac)}/{payload}"
 
     def _allowed_outbound_media(self, path: Path) -> Path | None:
@@ -1476,9 +1489,10 @@ class WebSocketChannel(BaseChannel):
                 staged_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
                 staged_fd = os.open(staged, staged_flags, 0o600)
                 try:
-                    with os.fdopen(source_fd, "rb", closefd=False) as source, os.fdopen(
-                        staged_fd, "wb", closefd=False
-                    ) as destination:
+                    with (
+                        os.fdopen(source_fd, "rb", closefd=False) as source,
+                        os.fdopen(staged_fd, "wb", closefd=False) as destination,
+                    ):
                         shutil.copyfileobj(source, destination)
                 finally:
                     os.close(staged_fd)
@@ -1736,7 +1750,9 @@ class WebSocketChannel(BaseChannel):
         image_count = 0
         video_count = 0
         for item in media:
-            mime = _extract_data_url_mime(item.get("data_url", "")) if isinstance(item, dict) else None
+            mime = (
+                _extract_data_url_mime(item.get("data_url", "")) if isinstance(item, dict) else None
+            )
             if mime in _VIDEO_MIME_ALLOWED:
                 video_count += 1
             elif mime in _IMAGE_MIME_ALLOWED:
@@ -1754,9 +1770,7 @@ class WebSocketChannel(BaseChannel):
                 try:
                     Path(p).unlink(missing_ok=True)
                 except OSError as exc:
-                    logger.warning(
-                        "websocket: failed to unlink partial media {}: {}", p, exc
-                    )
+                    logger.warning("websocket: failed to unlink partial media {}: {}", p, exc)
             return [], reason
 
         for item in media:
@@ -1774,7 +1788,9 @@ class WebSocketChannel(BaseChannel):
             max_bytes = _MAX_VIDEO_BYTES if is_video else _MAX_IMAGE_BYTES
             try:
                 saved = save_base64_data_url(
-                    data_url, media_dir, max_bytes=max_bytes,
+                    data_url,
+                    media_dir,
+                    max_bytes=max_bytes,
                 )
             except FileSizeExceeded:
                 return _abort("size")
@@ -1822,15 +1838,19 @@ class WebSocketChannel(BaseChannel):
             if raw_media is not None:
                 if not isinstance(raw_media, list):
                     await self._send_event(
-                        connection, "error",
-                        detail="image_rejected", reason="malformed",
+                        connection,
+                        "error",
+                        detail="image_rejected",
+                        reason="malformed",
                     )
                     return
                 media_paths, reason = self._save_envelope_media(raw_media)
                 if reason is not None:
                     await self._send_event(
-                        connection, "error",
-                        detail="image_rejected", reason=reason,
+                        connection,
+                        "error",
+                        detail="image_rejected",
+                        reason=reason,
                     )
                     return
 
@@ -1874,11 +1894,17 @@ class WebSocketChannel(BaseChannel):
             return
         chat_id = envelope.get("chat_id")
         content = envelope.get("content")
+        request_id = envelope.get("idempotency_key")
         if not _is_valid_chat_id(chat_id):
             await self._send_event(connection, "error", detail="invalid chat_id")
             return
         if not isinstance(content, str) or not content.strip():
             await self._send_event(connection, "error", detail="missing content")
+            return
+        if request_id is not None and (
+            not isinstance(request_id, str) or _WORK_ID_RE.fullmatch(request_id) is None
+        ):
+            await self._send_event(connection, "error", detail="invalid idempotency key")
             return
         media_paths, media_error = self._work_media(envelope.get("media"))
         if media_error is not None:
@@ -1894,13 +1920,12 @@ class WebSocketChannel(BaseChannel):
             chat_id=chat_id,
             content=content,
             mode="background",
-            title=(
-                envelope.get("title")
-                if isinstance(envelope.get("title"), str)
-                else None
-            ),
+            title=(envelope.get("title") if isinstance(envelope.get("title"), str) else None),
             model=_read_webui_model_name() or "",
+            request_id=request_id,
         )
+        was_created = bool(task.pop("_was_created", True))
+        was_dispatched = bool(task.pop("_was_dispatched", False))
         task_id = str(task["task_id"])
         self._attach(connection, chat_id)
         self._attach_work(connection, task_id)
@@ -1910,6 +1935,10 @@ class WebSocketChannel(BaseChannel):
             task_id=task_id,
             task=task,
         )
+        if not was_created:
+            if was_dispatched:
+                await self._replay_work_events(connection, task_id, after_seq=0)
+            return
         try:
             await self._publish_work_inbound(
                 task,
@@ -1918,6 +1947,8 @@ class WebSocketChannel(BaseChannel):
                 media=media_paths,
                 remote=getattr(connection, "remote_address", None),
             )
+            if request_id is not None:
+                await self._work_store.run_io(self._work_store.mark_dispatched, task_id, request_id)
         except Exception:
             logger.exception("failed to enqueue WebSocket Work task {}", task_id)
             await self._fail_work_enqueue(task_id)
@@ -1948,6 +1979,9 @@ class WebSocketChannel(BaseChannel):
             return
         self._attach_work(connection, task_id)
         await self._send_event(connection, "work.subscribed", task_id=task_id)
+        await self._replay_work_events(connection, task_id, after_seq=after_seq)
+
+    async def _replay_work_events(self, connection: Any, task_id: str, *, after_seq: int) -> None:
         cursor = after_seq
         while True:
             events = await self._work_store.run_io(
@@ -1963,9 +1997,7 @@ class WebSocketChannel(BaseChannel):
             cursor = int(events[-1]["seq"])
             await asyncio.sleep(0)
 
-    async def _handle_work_cancel_envelope(
-        self, connection: Any, envelope: dict[str, Any]
-    ) -> None:
+    async def _handle_work_cancel_envelope(self, connection: Any, envelope: dict[str, Any]) -> None:
         if self._work_store is None:
             await self._send_event(connection, "error", detail="work unavailable")
             return
@@ -1984,9 +2016,7 @@ class WebSocketChannel(BaseChannel):
             await self._send_event(connection, "error", detail="task already complete")
             return
         if error is not None:
-            await self._send_event(
-                connection, "error", detail="failed to signal cancellation"
-            )
+            await self._send_event(connection, "error", detail="failed to signal cancellation")
 
     async def _handle_work_message_envelope(
         self,
@@ -1999,6 +2029,7 @@ class WebSocketChannel(BaseChannel):
             return
         task_id = envelope.get("task_id")
         content = envelope.get("content")
+        command_id = envelope.get("idempotency_key")
         if not isinstance(task_id, str) or _WORK_ID_RE.fullmatch(task_id) is None:
             await self._send_event(connection, "error", detail="task not found")
             return
@@ -2012,11 +2043,29 @@ class WebSocketChannel(BaseChannel):
         if not isinstance(content, str) or not content.strip():
             await self._send_event(connection, "error", detail="missing content")
             return
+        if command_id is not None and (
+            not isinstance(command_id, str) or _COMMAND_ID_RE.fullmatch(command_id) is None
+        ):
+            await self._send_event(connection, "error", detail="invalid idempotency key")
+            return
         chat_id = str(task.get("chat_id") or "")
         if not _is_valid_chat_id(chat_id):
             await self._send_event(connection, "error", detail="invalid task chat")
             return
         self._attach_work(connection, task_id)
+        if command_id is not None:
+            try:
+                reserved, _ = await self._work_store.run_io(
+                    self._work_store.reserve_command,
+                    command_id,
+                    task_id,
+                    "message",
+                )
+            except ValueError:
+                await self._send_event(connection, "error", detail="invalid idempotency key")
+                return
+            if not reserved:
+                return
         try:
             await self._publish_work_inbound(
                 task,
@@ -2026,11 +2075,21 @@ class WebSocketChannel(BaseChannel):
             )
         except Exception:
             logger.exception("failed to enqueue message for Work task {}", task_id)
-            await self._send_event(
-                connection, "error", detail="failed to enqueue work message"
-            )
+            if command_id is not None:
+                try:
+                    await self._work_store.run_io(
+                        self._work_store.release_command,
+                        command_id,
+                        task_id,
+                        "message",
+                    )
+                except Exception:
+                    logger.exception("failed to release Work command {}", command_id)
+            await self._send_event(connection, "error", detail="failed to enqueue work message")
             return
         await self._record_work_message(task_id, content)
+        if command_id is not None:
+            await self._work_store.run_io(self._work_store.mark_command_dispatched, command_id)
 
     async def _send_work_event(self, connection: Any, event: Any) -> None:
         data = event.to_api() if hasattr(event, "to_api") else event
@@ -2133,9 +2192,7 @@ class WebSocketChannel(BaseChannel):
                 payload["media"] = accepted_media
             if urls:
                 payload["media_urls"] = urls
-        artifact_urls = self._work_artifact_media_urls(
-            msg.metadata.get("_work_artifacts")
-        )
+        artifact_urls = self._work_artifact_media_urls(msg.metadata.get("_work_artifacts"))
         if artifact_urls:
             payload["media_urls"] = [
                 *(payload.get("media_urls") or []),
