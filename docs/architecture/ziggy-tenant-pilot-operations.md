@@ -161,12 +161,14 @@ systemd credential mount and CA trust as the owner gateway:
 ```sh
 systemd-run --user --wait --pipe --collect \
   --unit=ziggy-gmail-mcp-smoke \
-  --property=LoadCredential=mcp-client-secret:ziggy-mcp-owner \
-  --property=Environment=ZIGGY_MCP_CLIENT_SECRET_FILE=%d/mcp-client-secret \
+  --property=LoadCredential=mcp-client-secret:/home/mihai/.config/credstore/ziggy-mcp-owner \
   --property=Environment=SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
-  /home/mihai/workspace/ziggy/.venv/bin/python3 \
-  /home/mihai/workspace/ziggy/current-nanobot/services/ziggy-control/deploy/spark/smoke_gmail_mcp.py \
-  --config /home/mihai/.nanobot/config.json
+  --property=Environment=PYTHONPATH=/home/mihai/workspace/ziggy/current-nanobot \
+  /bin/sh -c \
+  'export ZIGGY_MCP_CLIENT_SECRET_FILE="$CREDENTIALS_DIRECTORY/mcp-client-secret";
+   exec /home/mihai/workspace/ziggy/.venv/bin/python3 \
+   /home/mihai/workspace/ziggy/current-nanobot/services/ziggy-control/deploy/spark/smoke_gmail_mcp.py \
+   --config /home/mihai/.nanobot/config.json'
 ```
 
 Success prints only `Gmail MCP smoke passed`. The smoke performs the real
