@@ -184,10 +184,31 @@ private extension WorkEvent {
         ZiggyWorkTimelineEvent(
             id: id ?? "\(taskID ?? "task")-\(sequence ?? order)",
             order: order,
-            title: type.replacingOccurrences(of: "_", with: " ").capitalized,
+            title: presentationTitle,
             detail: message ?? actor.map { "Actor: \($0)" } ?? "Update received",
             timestamp: createdAt?.date.formatted(date: .omitted, time: .shortened) ?? "",
             isFailure: type.lowercased().contains("fail")
         )
+    }
+
+    private var presentationTitle: String {
+        let normalized = type.lowercased()
+        let payloadName = data?.objectString(for: ["name", "title"])
+        if normalized.hasPrefix("tool."), let payloadName {
+            return "Tool: \(payloadName)"
+        }
+        if normalized == "step.started", let payloadName {
+            return payloadName
+        }
+        if normalized == "artifact.created", let payloadName {
+            return "Artifact: \(payloadName)"
+        }
+        if normalized == "status.changed", let status {
+            return status.presentation.title
+        }
+        return type
+            .replacingOccurrences(of: ".", with: " ")
+            .replacingOccurrences(of: "_", with: " ")
+            .capitalized
     }
 }

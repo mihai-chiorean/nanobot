@@ -65,6 +65,32 @@ final class ModelAndEnvelopeTests: XCTestCase {
         XCTAssertTrue(AppModel.shouldRefreshWork(for: workEvent))
     }
 
+    func testDurableWorkTaskUsesPromptPreview() throws {
+        let data = Data(#"{"task_id":"work_123","title":"Backend health","prompt_preview":"Check every service","status":"succeeded","created_at":"2026-07-22T18:00:00Z","updated_at":"2026-07-22T18:01:00Z"}"#.utf8)
+        let task = try JSONDecoder().decode(WorkTask.self, from: data)
+
+        XCTAssertEqual(task.id, "work_123")
+        XCTAssertEqual(task.title, "Backend health")
+        XCTAssertEqual(task.description, "Check every service")
+        XCTAssertEqual(task.status, .succeeded)
+    }
+
+    func testDurableWorkEventSurfacesResultAndToolDetail() throws {
+        let completed = try JSONDecoder().decode(
+            WorkEvent.self,
+            from: Data(#"{"task_id":"work_123","seq":9,"type":"status.changed","payload":{"status":"succeeded","result_summary":"All services healthy"}}"#.utf8)
+        )
+        let tool = try JSONDecoder().decode(
+            WorkEvent.self,
+            from: Data(#"{"task_id":"work_123","seq":4,"type":"tool.finished","payload":{"name":"shell","detail":"Checked four services"}}"#.utf8)
+        )
+
+        XCTAssertEqual(completed.status, .succeeded)
+        XCTAssertEqual(completed.message, "All services healthy")
+        XCTAssertEqual(tool.message, "Checked four services")
+        XCTAssertEqual(tool.data?.objectString(for: ["name"]), "shell")
+    }
+
     func testOnlyTerminalStatusChangedEventsRefreshWork() {
         for status in [ZiggyStatus.succeeded, .failed, .cancelled, .interrupted] {
             XCTAssertTrue(status.isTerminal)
