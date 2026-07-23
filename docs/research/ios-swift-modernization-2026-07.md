@@ -67,4 +67,3 @@ generated-plist settings must not duplicate it.
 5. Use a Clerk production instance and `pk_live_` publishable key for
    TestFlight. The current Clerk development instance is not a release
    identity environment.
-
