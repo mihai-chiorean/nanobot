@@ -191,3 +191,35 @@ func TestPostgresImportStoresMissingOptionalIDsAsNull(t *testing.T) {
 		t.Fatalf("tasks=%d null_runtime_ids=%d null_river_job_ids=%d", tasks, nullRuntimeIDs, nullRiverJobIDs)
 	}
 }
+
+func TestPostgresImportPersistsRuntimeCursor(t *testing.T) {
+	databaseURL := os.Getenv("ZIGGY_WORK_TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("ZIGGY_WORK_TEST_DATABASE_URL is not set")
+	}
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	repo := NewPostgres(pool)
+	tenant := model.Tenant{UserID: "cursor-user", WorkspaceID: "cursor-workspace"}
+	taskID := "work_30000000000000000000000000000001"
+	_, _ = pool.Exec(ctx, `DELETE FROM ziggy_work_tasks WHERE user_id=$1 AND workspace_id=$2`, tenant.UserID, tenant.WorkspaceID)
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM ziggy_work_tasks WHERE user_id=$1 AND workspace_id=$2`, tenant.UserID, tenant.WorkspaceID)
+	})
+	now := time.Now().UTC()
+	_, err = repo.Import(ctx, tenant, LegacyImport{
+		Tasks:  []model.Task{{TaskID: taskID, RuntimeTaskID: taskID, Status: model.Succeeded, CreatedAt: now, UpdatedAt: now}},
+		Events: []model.Event{{TaskID: taskID, RuntimeTaskID: taskID, RuntimeSeq: 9, Seq: 9, Type: "status.changed", Actor: "nanobot", CreatedAt: now, Payload: map[string]any{"status": "succeeded"}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cursor, err := repo.RuntimeCursor(ctx, tenant, taskID)
+	if err != nil || cursor != 9 {
+		t.Fatalf("cursor=%d err=%v", cursor, err)
+	}
+}

@@ -201,6 +201,17 @@ func parse(r io.Reader) (parsed, error) {
 		}
 		return p.data.Events[i].TaskID < p.data.Events[j].TaskID
 	})
+	runtimeTaskIDs := make(map[string]string, len(p.data.Tasks))
+	for i := range p.data.Tasks {
+		if p.data.Tasks[i].RuntimeTaskID == "" {
+			p.data.Tasks[i].RuntimeTaskID = p.data.Tasks[i].TaskID
+		}
+		runtimeTaskIDs[p.data.Tasks[i].TaskID] = p.data.Tasks[i].RuntimeTaskID
+	}
+	for i := range p.data.Events {
+		p.data.Events[i].RuntimeTaskID = runtimeTaskIDs[p.data.Events[i].TaskID]
+		p.data.Events[i].RuntimeSeq = p.data.Events[i].Seq
+	}
 	return p, nil
 }
 

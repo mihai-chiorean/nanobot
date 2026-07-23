@@ -22,6 +22,20 @@ func TestImportRejectsTrailingAndDuplicateRecordsBeforeWrites(t *testing.T) {
 	}
 }
 
+func TestParseBindsLegacyRecordsToRuntimeCursor(t *testing.T) {
+	document := `{"tasks":[{"task_id":"work_00000000000000000000000000000001","runtime_task_id":"work_00000000000000000000000000000002","status":"succeeded"}],"events":[{"task_id":"work_00000000000000000000000000000001","seq":7,"type":"status.changed","payload":{"status":"succeeded"}}]}`
+	parsed, err := Parse(strings.NewReader(document))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.Tasks[0].RuntimeTaskID != "work_00000000000000000000000000000002" {
+		t.Fatalf("runtime task id=%q", parsed.Tasks[0].RuntimeTaskID)
+	}
+	if parsed.Events[0].RuntimeTaskID != parsed.Tasks[0].RuntimeTaskID || parsed.Events[0].RuntimeSeq != 7 {
+		t.Fatalf("runtime event=%+v", parsed.Events[0])
+	}
+}
+
 func TestImportVerifiesArtifactHashAndTraversal(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "ok.bin"), []byte("bytes"), 0600); err != nil {
@@ -68,5 +82,8 @@ func TestImportAddsIdempotentTerminalEventForActiveTask(t *testing.T) {
 	last := events[len(events)-1]
 	if last.Type != "status.changed" || last.Payload["status"] != model.Interrupted {
 		t.Fatalf("terminal event=%+v", last)
+	}
+	if last.RuntimeTaskID != "" || last.RuntimeSeq != 0 {
+		t.Fatalf("migration event must not advance runtime cursor: %+v", last)
 	}
 }
