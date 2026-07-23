@@ -366,12 +366,21 @@ class RAGStore:
 
         Returns the number of files successfully ingested.
         """
-        if not dir_path.is_dir():
-            logger.warning("RAG: ingest_directory path is not a directory: {}", dir_path)
+        root = dir_path.resolve()
+        if not root.is_dir():
+            logger.warning("RAG: ingest_directory path is not a directory: {}", root)
             return 0
 
         count = 0
-        for file_path in sorted(dir_path.glob(glob)):
+        for candidate in sorted(root.glob(glob)):
+            file_path = candidate.resolve()
+            try:
+                file_path.relative_to(root)
+            except ValueError:
+                logger.warning("RAG: skipping path outside ingest root: {}", candidate)
+                continue
+            if not file_path.is_file():
+                continue
             if file_path.suffix not in _SUPPORTED_SUFFIXES:
                 continue
             try:
@@ -388,7 +397,7 @@ class RAGStore:
             except Exception:
                 logger.exception("RAG: failed to ingest file {}", file_path)
 
-        logger.info("RAG: ingest_directory ingested {} file(s) from {}", count, dir_path)
+        logger.info("RAG: ingest_directory ingested {} file(s) from {}", count, root)
         return count
 
     # ------------------------------------------------------------------

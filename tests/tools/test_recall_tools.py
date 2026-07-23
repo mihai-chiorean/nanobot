@@ -4,6 +4,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from nanobot.agent.loop import AgentLoop
+from nanobot.agent.rag import RAGStore
 from nanobot.agent.tools.recall import IngestTool
 from nanobot.bus.queue import MessageBus
 from nanobot.config.schema import RAGToolsConfig, ToolsConfig
@@ -52,3 +53,31 @@ async def test_ingest_rejects_paths_outside_workspace_before_opening_rag(
     assert result.startswith("Error: path")
     assert "outside the allowed directory" in result
     tool._get_rag.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_ingest_rejects_parent_glob_before_opening_rag(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    tool = IngestTool(workspace=workspace, allowed_dir=workspace)
+    tool._get_rag = MagicMock(side_effect=AssertionError("RAG must stay unopened"))
+
+    result = await tool.execute(path=".", glob="../outside/*.md")
+
+    assert result == "Error: glob must be a relative pattern without parent traversal"
+    tool._get_rag.assert_not_called()
+
+
+def test_rag_directory_ingest_skips_symlinks_outside_root(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside.md"
+    outside.write_text("private", encoding="utf-8")
+    (workspace / "linked.md").symlink_to(outside)
+    rag = object.__new__(RAGStore)
+    rag.add_document = MagicMock()
+
+    count = rag.ingest_directory(workspace)
+
+    assert count == 0
+    rag.add_document.assert_not_called()

@@ -188,6 +188,10 @@ class IngestTool(Tool):
         if not target.exists():
             return f"Error: path does not exist: {path}"
 
+        glob_path = Path(glob)
+        if glob_path.is_absolute() or ".." in glob_path.parts:
+            return "Error: glob must be a relative pattern without parent traversal"
+
         try:
             rag = self._get_rag()
         except RuntimeError as exc:
