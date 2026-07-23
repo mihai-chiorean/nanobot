@@ -4,8 +4,10 @@ import asyncio
 import os
 import re
 import shutil
+import time
 from contextlib import AsyncExitStack, suppress
-from typing import Any
+from pathlib import Path
+from typing import Any, Callable
 
 import httpx
 from loguru import logger
@@ -32,6 +34,133 @@ _WINDOWS_SHELL_LAUNCHERS: frozenset[str] = frozenset(("npx", "npm", "pnpm", "yar
 # Characters allowed in tool names by model providers (Anthropic, OpenAI, etc.).
 # Replace anything outside [a-zA-Z0-9_-] with underscore and collapse runs.
 _SANITIZE_RE = re.compile(r"_+")
+
+
+class _OAuthTokenStorage:
+    """In-memory token storage for the MCP SDK's official OAuth provider."""
+
+    def __init__(self) -> None:
+        self._tokens = None
+        self._client_info = None
+
+    async def get_tokens(self):
+        return self._tokens
+
+    async def set_tokens(self, tokens) -> None:
+        self._tokens = tokens
+
+    async def get_client_info(self):
+        return self._client_info
+
+    async def set_client_info(self, client_info) -> None:
+        self._client_info = client_info
+
+
+def _read_oauth_client_secret(secret_file: str) -> str:
+    """Read the OAuth secret without exposing its contents to logs or errors."""
+    secret = Path(secret_file).read_text(encoding="utf-8").strip()
+    if not secret:
+        raise ValueError("OAuth client secret file is empty")
+    return secret
+
+
+def _build_official_oauth_provider(config, server_url: str):
+    """Build the SDK provider when the pinned SDK exposes it."""
+    try:
+        from mcp.client.auth.extensions.client_credentials import ClientCredentialsOAuthProvider
+    except ImportError:
+        return None
+
+    secret = _read_oauth_client_secret(config.client_secret_file)
+    try:
+        return ClientCredentialsOAuthProvider(
+            server_url=server_url,
+            storage=_OAuthTokenStorage(),
+            client_id=config.client_id,
+            client_secret=secret,
+            scopes=" ".join(config.scopes) or None,
+        )
+    except TypeError:
+        return None
+
+
+class OAuthClientCredentialsAuth(httpx.Auth):
+    """Async OAuth 2.0 client-credentials auth for MCP HTTP transports."""
+
+    _REFRESH_WINDOW_SECONDS = 60.0
+
+    def __init__(
+        self,
+        config,
+        *,
+        token_client_factory: Callable[[], httpx.AsyncClient] | None = None,
+    ) -> None:
+        self._token_url = config.token_url
+        self._client_id = config.client_id
+        self._client_secret_file = config.client_secret_file
+        self._scopes = tuple(config.scopes)
+        self._token_client_factory = token_client_factory or httpx.AsyncClient
+        self._access_token: str | None = None
+        self._token_valid_until = 0.0
+        self._refresh_lock = asyncio.Lock()
+
+    async def _get_access_token(self, rejected_token: str | None = None) -> str:
+        """Return a cached token or serialize a refresh through the token endpoint."""
+        async with self._refresh_lock:
+            now = time.monotonic()
+            if (
+                self._access_token
+                and self._access_token != rejected_token
+                and now < self._token_valid_until
+            ):
+                return self._access_token
+
+            if rejected_token is not None and self._access_token == rejected_token:
+                self._access_token = None
+                self._token_valid_until = 0.0
+
+            secret = _read_oauth_client_secret(self._client_secret_file)
+
+            form = {"grant_type": "client_credentials"}
+            if self._scopes:
+                form["scope"] = " ".join(self._scopes)
+
+            async with self._token_client_factory() as client:
+                response = await client.post(
+                    self._token_url,
+                    data=form,
+                    auth=httpx.BasicAuth(self._client_id, secret),
+                )
+                response.raise_for_status()
+                payload = response.json()
+
+            if not isinstance(payload, dict):
+                raise ValueError("OAuth token response was not a JSON object")
+            access_token = payload.get("access_token")
+            if not isinstance(access_token, str) or not access_token:
+                raise ValueError("OAuth token response did not contain an access_token")
+
+            try:
+                expires_in = float(payload.get("expires_in", 300))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("OAuth token response contained an invalid expires_in") from exc
+
+            self._access_token = access_token
+            self._token_valid_until = time.monotonic() + max(
+                0.0, expires_in - self._REFRESH_WINDOW_SECONDS
+            )
+            return access_token
+
+    async def async_auth_flow(self, request):
+        """Attach a bearer token and retry one time after an unauthorized response."""
+        access_token = await self._get_access_token()
+        request.headers["Authorization"] = f"Bearer {access_token}"
+        response = yield request
+
+        if response.status_code == 401:
+            access_token = await self._get_access_token(rejected_token=access_token)
+            request.headers["Authorization"] = f"Bearer {access_token}"
+            yield request
 
 
 def _sanitize_name(name: str) -> str:
@@ -452,6 +581,15 @@ async def connect_mcp_servers(
         await server_stack.__aenter__()
 
         try:
+            oauth_auth = None
+            oauth_provider = None
+            oauth_config = cfg.oauth_client_credentials
+            if oauth_config is not None:
+                if any(header.lower() == "authorization" for header in (cfg.headers or {})):
+                    raise ValueError(
+                        "headers.Authorization cannot be configured with oauthClientCredentials"
+                    )
+
             transport_type = cfg.type
             if not transport_type:
                 if cfg.command:
@@ -464,6 +602,12 @@ async def connect_mcp_servers(
                     logger.warning("MCP server '{}': no command or url configured, skipping", name)
                     await server_stack.aclose()
                     return name, None
+
+            if oauth_config is not None:
+                if transport_type in {"sse", "streamableHttp"}:
+                    oauth_provider = _build_official_oauth_provider(oauth_config, cfg.url)
+                if oauth_provider is None:
+                    oauth_auth = OAuthClientCredentialsAuth(oauth_config)
 
             if transport_type == "stdio":
                 command, args, env = _normalize_windows_stdio_command(
@@ -496,15 +640,19 @@ async def connect_mcp_servers(
                         auth=auth,
                     )
 
-                read, write = await server_stack.enter_async_context(
-                    sse_client(cfg.url, httpx_client_factory=httpx_client_factory)
-                )
+                sse_kwargs = {"httpx_client_factory": httpx_client_factory}
+                if oauth_provider is not None:
+                    sse_kwargs["auth"] = oauth_provider
+                elif oauth_auth is not None:
+                    sse_kwargs["auth"] = oauth_auth
+                read, write = await server_stack.enter_async_context(sse_client(cfg.url, **sse_kwargs))
             elif transport_type == "streamableHttp":
                 http_client = await server_stack.enter_async_context(
                     httpx.AsyncClient(
                         headers=cfg.headers or None,
                         follow_redirects=True,
                         timeout=None,
+                        auth=oauth_provider or oauth_auth,
                     )
                 )
                 read, write, _ = await server_stack.enter_async_context(
