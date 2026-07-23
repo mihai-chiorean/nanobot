@@ -8,6 +8,7 @@ import time
 from contextlib import AsyncExitStack, suppress
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urljoin
 
 import httpx
 from loguru import logger
@@ -66,6 +67,11 @@ def _read_oauth_client_secret(secret_file: str) -> str:
 
 def _build_official_oauth_provider(config, server_url: str):
     """Build the SDK provider when the pinned SDK exposes it."""
+    # The SDK extension currently has no token-endpoint parameter and performs
+    # its first grant against the inferred root /token path. Use the local
+    # provider whenever config declares a different endpoint.
+    if config.token_url != urljoin(server_url, "/token"):
+        return None
     try:
         from mcp.client.auth.extensions.client_credentials import ClientCredentialsOAuthProvider
     except ImportError:

@@ -52,13 +52,33 @@ def test_oauth_config_rejects_static_authorization_header(tmp_path) -> None:
 
 
 def test_official_provider_does_not_mask_secret_file_errors(tmp_path) -> None:
-    config = _oauth_config(str(tmp_path / "missing-secret"))
+    config = MCPServerConfig(
+        type="streamableHttp",
+        url="http://127.0.0.1:8790/mcp",
+        oauthClientCredentials={
+            "tokenUrl": "http://127.0.0.1:8790/token",
+            "clientId": "connector-client",
+            "clientSecretFile": str(tmp_path / "missing-secret"),
+        },
+    )
 
     with pytest.raises(FileNotFoundError):
         mcp_mod._build_official_oauth_provider(
             config.oauth_client_credentials,
             config.url,
         )
+
+
+def test_configured_nondefault_token_endpoint_uses_local_provider(tmp_path) -> None:
+    config = _oauth_config(str(tmp_path / "client-secret"))
+
+    assert (
+        mcp_mod._build_official_oauth_provider(
+            config.oauth_client_credentials,
+            config.url,
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio
@@ -251,7 +271,7 @@ async def test_current_http_transports_receive_official_oauth_provider(
                 url="http://127.0.0.1:8790/mcp",
                 enabled_tools=[],
                 oauthClientCredentials={
-                    "tokenUrl": "http://127.0.0.1:8790/oauth/token",
+                    "tokenUrl": "http://127.0.0.1:8790/token",
                     "clientId": "connector-client",
                     "clientSecretFile": str(secret_file),
                 },

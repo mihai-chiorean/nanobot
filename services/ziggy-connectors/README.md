@@ -156,7 +156,8 @@ systemctl --user daemon-reload
 systemctl --user cat nanobot-gateway.service
 ```
 
-The final command must show `LoadCredential=mcp-client-secret:ziggy-mcp-owner`
+The final command must show
+`LoadCredential=mcp-client-secret:/home/mihai/.config/credstore/ziggy-mcp-owner`
 and `ZIGGY_MCP_CLIENT_SECRET_FILE=%d/mcp-client-secret`. Tenant runtimes get
 the equivalent wiring from the checked-in `nanobot-tenant@.service` template.
 
