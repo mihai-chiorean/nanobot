@@ -38,19 +38,23 @@ func TestLoadRejectsPublicProductionListener(t *testing.T) {
 
 func validEnv(environment string) (map[string]string, map[string][]byte) {
 	return map[string]string{
-			"ZIGGY_CONNECTORS_ENV":                       environment,
-			"ZIGGY_CONNECTORS_LISTEN_ADDR":               "127.0.0.1:8790",
-			"ZIGGY_CONNECTORS_GOOGLE_CLIENT_ID":          "client",
-			"ZIGGY_CONNECTORS_GOOGLE_REDIRECT_URI":       "https://example.test/callback",
-			"ZIGGY_CONNECTORS_GOOGLE_CLIENT_SECRET_FILE": "/client",
-			"ZIGGY_CONNECTORS_STATE_SIGNING_KEY_FILE":    "/state",
-			"ZIGGY_CONNECTORS_TOKEN_ENCRYPTION_KEY_FILE": "/token",
-			"ZIGGY_CONNECTORS_TRUST_KEY_FILE":            "/trust",
+			"ZIGGY_CONNECTORS_ENV":                           environment,
+			"ZIGGY_CONNECTORS_LISTEN_ADDR":                   "127.0.0.1:8790",
+			"ZIGGY_CONNECTORS_GOOGLE_CLIENT_ID":              "client",
+			"ZIGGY_CONNECTORS_GOOGLE_REDIRECT_URI":           "https://example.test/callback",
+			"ZIGGY_CONNECTORS_GOOGLE_CLIENT_SECRET_FILE":     "/client",
+			"ZIGGY_CONNECTORS_STATE_SIGNING_KEY_FILE":        "/state",
+			"ZIGGY_CONNECTORS_TOKEN_ENCRYPTION_KEY_FILE":     "/token",
+			"ZIGGY_CONNECTORS_TRUST_KEY_FILE":                "/trust",
+			"ZIGGY_CONNECTORS_CLIENT_CREDENTIAL_PEPPER_FILE": "/pepper",
+			"ZIGGY_CONNECTORS_MCP_ACCESS_SIGNING_KEY_FILE":   "/mcp-signing",
 		}, map[string][]byte{
-			"/client": []byte("secret"),
-			"/state":  []byte("01234567890123456789012345678901"),
-			"/token":  []byte("01234567890123456789012345678901"),
-			"/trust":  []byte("01234567890123456789012345678901"),
+			"/client":      []byte("secret"),
+			"/state":       []byte("01234567890123456789012345678901"),
+			"/token":       []byte("01234567890123456789012345678901"),
+			"/trust":       []byte("01234567890123456789012345678901"),
+			"/pepper":      []byte("01234567890123456789012345678901"),
+			"/mcp-signing": []byte("01234567890123456789012345678901"),
 		}
 }
 

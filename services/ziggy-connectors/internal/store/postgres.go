@@ -113,6 +113,68 @@ func (r *PostgresRepository) ConsumeOAuthTransaction(ctx context.Context, tenant
 	return record, nil
 }
 
+func (r *PostgresRepository) UpsertRuntimeOAuthClient(ctx context.Context, client RuntimeOAuthClient) error {
+	if !client.Tenant.Valid() || client.ClientID == "" || client.RuntimeID == "" || client.RuntimeGeneration < 1 || len(client.SecretHash) == 0 {
+		return errors.New("runtime OAuth client is invalid")
+	}
+	createdAt := client.CreatedAt
+	if createdAt.IsZero() {
+		createdAt = time.Now()
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	// Serialize generation replacement even when no prior row exists to lock.
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, tenantKey(client.Tenant)+"\x00"+client.RuntimeID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM ziggy_connector_runtime_oauth_clients WHERE user_id=$1 AND workspace_id=$2 AND runtime_id=$3 AND runtime_generation<>$4`, client.Tenant.UserID, client.Tenant.WorkspaceID, client.RuntimeID, client.RuntimeGeneration); err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `
+INSERT INTO ziggy_connector_runtime_oauth_clients
+ (client_id, user_id, workspace_id, runtime_id, runtime_generation, secret_hash, scopes, created_at, updated_at)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,now())
+ON CONFLICT (user_id, workspace_id, runtime_id, runtime_generation) DO UPDATE SET
+ client_id=EXCLUDED.client_id, secret_hash=EXCLUDED.secret_hash, scopes=EXCLUDED.scopes, updated_at=now()`,
+		client.ClientID, client.Tenant.UserID, client.Tenant.WorkspaceID, client.RuntimeID, client.RuntimeGeneration,
+		client.SecretHash, strings.Join(client.Scopes, " "), createdAt)
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (r *PostgresRepository) GetRuntimeOAuthClient(ctx context.Context, clientID string) (RuntimeOAuthClient, error) {
+	var client RuntimeOAuthClient
+	var scopes string
+	err := r.db.QueryRowContext(ctx, `SELECT user_id, workspace_id, runtime_id, runtime_generation, secret_hash, scopes, created_at, updated_at FROM ziggy_connector_runtime_oauth_clients WHERE client_id=$1`, clientID).Scan(
+		&client.Tenant.UserID, &client.Tenant.WorkspaceID, &client.RuntimeID, &client.RuntimeGeneration, &client.SecretHash, &scopes, &client.CreatedAt, &client.UpdatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return RuntimeOAuthClient{}, ErrNotFound
+	}
+	client.ClientID = clientID
+	client.Scopes = strings.Fields(scopes)
+	return client, err
+}
+
+func (r *PostgresRepository) GetRuntimeOAuthClientForRuntime(ctx context.Context, tenant Tenant, runtimeID string, generation int64) (RuntimeOAuthClient, error) {
+	var client RuntimeOAuthClient
+	var scopes string
+	err := r.db.QueryRowContext(ctx, `SELECT client_id, secret_hash, scopes, created_at, updated_at FROM ziggy_connector_runtime_oauth_clients WHERE user_id=$1 AND workspace_id=$2 AND runtime_id=$3 AND runtime_generation=$4`, tenant.UserID, tenant.WorkspaceID, runtimeID, generation).Scan(&client.ClientID, &client.SecretHash, &scopes, &client.CreatedAt, &client.UpdatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return RuntimeOAuthClient{}, ErrNotFound
+	}
+	client.Tenant = tenant
+	client.RuntimeID = runtimeID
+	client.RuntimeGeneration = generation
+	client.Scopes = strings.Fields(scopes)
+	return client, err
+}
+
 var _ AccountRepository = (*PostgresRepository)(nil)
 var _ OAuthTransactionRepository = (*PostgresRepository)(nil)
+var _ RuntimeOAuthClientRepository = (*PostgresRepository)(nil)
 var _ Readiness = (*PostgresRepository)(nil)

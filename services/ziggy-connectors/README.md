@@ -34,6 +34,8 @@ containing secrets. Non-secret environment variables are:
 | --- | --- |
 | `ZIGGY_CONNECTORS_ENV` | `development`, `test`, `staging`, or `production` |
 | `ZIGGY_CONNECTORS_LISTEN_ADDR` | HTTP listen address; default `127.0.0.1:8790` |
+| `ZIGGY_CONNECTORS_OAUTH_ISSUER_URL` | Loopback OAuth authorization-server issuer; default `http://127.0.0.1:8790` |
+| `ZIGGY_CONNECTORS_MCP_RESOURCE_URL` | Canonical loopback MCP resource URL; default `http://127.0.0.1:8790/mcp` |
 | `ZIGGY_CONNECTORS_VERSION` | Health response version; default `dev` |
 | `ZIGGY_CONNECTORS_GOOGLE_CLIENT_ID` | Google OAuth client ID |
 | `ZIGGY_CONNECTORS_GOOGLE_REDIRECT_URI` | Exact registered callback URI; no query/fragment, HTTPS in production |
@@ -53,6 +55,8 @@ Secret values are read from files, with trailing whitespace removed:
 | `ZIGGY_CONNECTORS_STATE_SIGNING_KEY_FILE` | At least 32 random bytes for OAuth state HMAC |
 | `ZIGGY_CONNECTORS_TOKEN_ENCRYPTION_KEY_FILE` | Exactly 32 random bytes for AES-256-GCM |
 | `ZIGGY_CONNECTORS_TRUST_KEY_FILE` | At least 32 random bytes shared with the private gateway |
+| `ZIGGY_CONNECTORS_CLIENT_CREDENTIAL_PEPPER_FILE` | At least 32 random bytes used to hash persisted runtime client secrets |
+| `ZIGGY_CONNECTORS_MCP_ACCESS_SIGNING_KEY_FILE` | At least 32 random bytes used to sign five-minute MCP access tokens |
 | `ZIGGY_CONNECTORS_DATABASE_URL_FILE` | PostgreSQL URL; required in production, optional for local memory storage |
 
 Do not put secrets in logs or command-line arguments. Generate keys into the
@@ -68,12 +72,27 @@ openssl rand -base64 32 | tr -d '\\n' > /run/secrets/ziggy-connectors/private-ga
 The service requests only `openid`, `email`, and
 `https://www.googleapis.com/auth/gmail.readonly`.
 
-## Inference tools
+## Runtime MCP OAuth
 
-Authenticated `POST /mcp` is a Streamable HTTP MCP endpoint. `ziggy-control`
-authenticates the tenant runtime, removes its capability, and signs a
-one-minute tenant principal before forwarding. Google access and refresh tokens
-never reach Nanobot.
+Interactive `/accounts` and `/oauth/google/start` retain the signed control
+principal boundary. Runtime MCP access is separate: `POST /oauth/token` accepts
+only HTTP Basic runtime client credentials and `grant_type=client_credentials`.
+The service derives the user, workspace, runtime ID, and runtime generation
+from the persisted client record; it rejects tenant identity request fields.
+
+The direct production endpoints are `http://127.0.0.1:8790/oauth/token` and
+`http://127.0.0.1:8790/mcp`. The server publishes RFC 9728 protected-resource
+metadata at `/.well-known/oauth-protected-resource/mcp` and OAuth authorization
+server metadata at `/.well-known/oauth-authorization-server`. An unauthenticated
+MCP request returns the `resource_metadata` bearer challenge and scope guidance
+expected by MCP OAuth clients. Optional RFC 8707 `resource` token-request
+parameters must equal the configured MCP resource URL.
+
+MCP access tokens are connector-only HS256 JWTs with the configured issuer,
+the MCP resource URL as audience, `iat`, `exp`, random `jti`, and granted
+scopes. They expire after five minutes. `/mcp` accepts only these bearer tokens,
+and advertises `io.modelcontextprotocol/oauth-client-credentials` during MCP
+initialization. Google access and refresh tokens never reach Nanobot.
 
 The server publishes three read-only tools:
 
@@ -85,6 +104,35 @@ Search is capped at 20 messages per call. Message reads omit attachments and
 cap the extracted text body at 64 KiB. Access tokens are cached only until
 shortly before expiry, refreshes are coalesced, and Gmail calls are limited per
 tenant. Every result labels email content as untrusted external data.
+
+`gmail.status`, `gmail.search`, and `gmail.read` are independently enforced by
+the token's scopes. A token exposes only the corresponding status, search, and
+message-read tools.
+
+### Provision a runtime client
+
+Apply both connector migrations, then provision one client per
+`(user_id, workspace_id, runtime_id, runtime_generation)`. The command creates
+or replaces a mode-`0600` secret file and prints only the client ID, secret file
+path, scopes, and loopback endpoints. Re-running it for the same runtime fence
+keeps the client ID and rotates its secret.
+
+```sh
+go run ./cmd/provision-runtime-oauth-client \
+  --database-url-file /home/mihai/.config/credstore/ziggy-connectors/database-url \
+  --client-credential-pepper-file /home/mihai/.config/credstore/ziggy-connectors/client-credential-pepper \
+  --user-id "$ZIGGY_USER_ID" \
+  --workspace-id "$ZIGGY_WORKSPACE_ID" \
+  --runtime-id "$ZIGGY_RUNTIME_ID" \
+  --runtime-generation "$ZIGGY_RUNTIME_GENERATION" \
+  --secret-file "/home/mihai/.config/credstore/ziggy-mcp-owner/${ZIGGY_WORKSPACE_ID}/gmail-mcp-client-secret"
+```
+
+Use the emitted `client_id`, `secret_file`, and scopes
+`gmail.status gmail.search gmail.read` in the Spark Nanobot configuration.
+The provisioner writes source credentials under the owner-controlled credential
+store; the tenant unit must load that source file with `LoadCredential` into its
+read-only `/run/credentials/...` mount for Nanobot to consume.
 
 ## Local commands
 
@@ -99,7 +147,8 @@ go run ./cmd/ziggy-connectors
 Without `ZIGGY_CONNECTORS_DATABASE_URL_FILE`, local startup uses an in-memory
 repository. That is suitable for tests only; accounts and OAuth transactions
 are lost on restart. With PostgreSQL, apply
-`migrations/001_connector_foundation.sql` using the deployment's migration
+`migrations/001_connector_foundation.sql` and
+`migrations/002_runtime_oauth_clients.sql` using the deployment's migration
 runner before starting the service.
 
 The service listens on `127.0.0.1:8790` by default. `GET /healthz` is a

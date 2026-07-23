@@ -17,6 +17,7 @@ import (
 	"github.com/mihai-chiorean/nanobot/services/ziggy-connectors/internal/httpapi"
 	"github.com/mihai-chiorean/nanobot/services/ziggy-connectors/internal/principal"
 	"github.com/mihai-chiorean/nanobot/services/ziggy-connectors/internal/provider"
+	"github.com/mihai-chiorean/nanobot/services/ziggy-connectors/internal/runtimeauth"
 	"github.com/mihai-chiorean/nanobot/services/ziggy-connectors/internal/store"
 )
 
@@ -39,8 +40,14 @@ func run() error {
 	if err != nil {
 		return classify("startup_crypto", err)
 	}
-	var accounts store.AccountRepository = store.NewMemoryRepository()
-	var transactions store.OAuthTransactionRepository = store.NewMemoryRepository()
+	mcpAccessTokens, err := runtimeauth.New(cfg.MCPAccessSigningKey, cfg.OAuthIssuerURL, cfg.MCPResourceURL)
+	if err != nil {
+		return classify("startup_crypto", err)
+	}
+	memory := store.NewMemoryRepository()
+	var accounts store.AccountRepository = memory
+	var transactions store.OAuthTransactionRepository = memory
+	var runtimeOAuthClients store.RuntimeOAuthClientRepository = memory
 	if cfg.DatabaseURL != "" {
 		db, err := sql.Open("pgx", cfg.DatabaseURL)
 		if err != nil {
@@ -53,8 +60,9 @@ func run() error {
 		}
 		accounts = postgres
 		transactions = postgres
+		runtimeOAuthClients = postgres
 	}
-	api, err := newAPI(cfg, accounts, transactions, logger, tokenCipher, stateSigner)
+	api, err := newAPI(cfg, accounts, transactions, runtimeOAuthClients, logger, tokenCipher, stateSigner, mcpAccessTokens)
 	if err != nil {
 		return classify("startup_api", err)
 	}
@@ -67,7 +75,7 @@ func run() error {
 	return nil
 }
 
-func newAPI(cfg config.Config, accounts store.AccountRepository, transactions store.OAuthTransactionRepository, logger *slog.Logger, tokenCipher crypto.Cipher, stateSigner *crypto.StateSigner) (http.Handler, error) {
+func newAPI(cfg config.Config, accounts store.AccountRepository, transactions store.OAuthTransactionRepository, runtimeOAuthClients store.RuntimeOAuthClientRepository, logger *slog.Logger, tokenCipher crypto.Cipher, stateSigner *crypto.StateSigner, mcpAccessTokens *runtimeauth.TokenManager) (http.Handler, error) {
 	google := provider.NewGoogle(provider.GoogleConfig{
 		ClientID:     cfg.GoogleClientID,
 		ClientSecret: cfg.GoogleClientSecret,
@@ -78,18 +86,23 @@ func newAPI(cfg config.Config, accounts store.AccountRepository, transactions st
 		GmailAPIURL:  cfg.GoogleGmailAPIURL,
 	})
 	return httpapi.New(httpapi.Config{
-		Environment:       cfg.Environment,
-		Version:           cfg.Version,
-		GoogleRedirectURI: cfg.GoogleRedirectURI,
-		GoogleScopes:      cfg.GoogleScopes,
-		StateTTL:          cfg.StateTTL,
-		StateSigner:       stateSigner,
-		TokenCipher:       tokenCipher,
-		Accounts:          accounts,
-		OAuthTransactions: transactions,
-		Google:            google,
-		PrincipalVerifier: principal.NewVerifier(cfg.TrustKey),
-		Logger:            logger,
+		Environment:            cfg.Environment,
+		Version:                cfg.Version,
+		GoogleRedirectURI:      cfg.GoogleRedirectURI,
+		GoogleScopes:           cfg.GoogleScopes,
+		StateTTL:               cfg.StateTTL,
+		StateSigner:            stateSigner,
+		TokenCipher:            tokenCipher,
+		Accounts:               accounts,
+		OAuthTransactions:      transactions,
+		RuntimeOAuthClients:    runtimeOAuthClients,
+		Google:                 google,
+		PrincipalVerifier:      principal.NewVerifier(cfg.TrustKey),
+		ClientCredentialPepper: cfg.ClientCredentialPepper,
+		MCPAccessTokens:        mcpAccessTokens,
+		OAuthIssuerURL:         cfg.OAuthIssuerURL,
+		MCPResourceURL:         cfg.MCPResourceURL,
+		Logger:                 logger,
 	})
 }
 
