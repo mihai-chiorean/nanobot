@@ -327,7 +327,10 @@ public struct WorkTask: Codable, Hashable, Sendable {
         let c = try decoder.container(keyedBy: AnyCodingKey.self)
         id = try c.decode(String.self, forAny: ["id", "task_id", "key"])
         title = try c.decodeIfPresent(String.self, forAny: ["title", "name"])
-        description = try c.decodeIfPresent(String.self, forAny: ["description", "prompt", "content"])
+        description = try c.decodeIfPresent(
+            String.self,
+            forAny: ["description", "prompt", "content", "prompt_preview", "result_summary", "error"]
+        )
         status = try c.decodeIfPresent(ZiggyStatus.self, forAny: ["status", "state"]) ?? .queued
         sessionKey = try c.decodeIfPresent(String.self, forAny: ["session_key", "chat_key", "chat_id"])
         progress = try c.decodeIfPresent(Double.self, forAny: ["progress", "percent"])
@@ -373,7 +376,9 @@ public struct WorkEvent: Codable, Hashable, Sendable {
         status = try c.decodeIfPresent(ZiggyStatus.self, forAny: ["status"])
             ?? payload?.objectString(for: ["status"]).map(ZiggyStatus.init)
         message = try c.decodeIfPresent(String.self, forAny: ["message", "text", "detail"])
-            ?? payload?.objectString(for: ["message", "text", "detail", "content"])
+            ?? payload?.objectString(
+                for: ["message", "text", "detail", "content", "result_summary", "error", "summary"]
+            )
         actor = try c.decodeIfPresent(String.self, forAny: ["actor"])
         stepID = try c.decodeIfPresent(String.self, forAny: ["step_id"])
         createdAt = try c.decodeIfPresent(ZiggyTimestamp.self, forAny: ["created_at", "timestamp"])
