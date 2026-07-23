@@ -55,6 +55,7 @@ final class AppModel {
     enum Tab: Hashable {
         case chats
         case work
+        case integrations
         case settings
     }
 
@@ -63,6 +64,13 @@ final class AppModel {
         case needsEnrollment
         case connecting
         case ready
+        case failed(String)
+    }
+
+    enum ConnectorLoadState: Equatable {
+        case idle
+        case loading
+        case loaded
         case failed(String)
     }
 
@@ -79,9 +87,16 @@ final class AppModel {
     var messagesByChatID: [String: [ChatItem]] = [:]
     var workTasks: [WorkTask] = []
     var workEventsByTaskID: [String: [WorkEvent]] = [:]
+    var connectorAccounts: [ConnectorAccount] = []
+    var connectorLoadState: ConnectorLoadState = .idle
     var isRefreshing = false
     var isSending = false
+    var isStartingGoogleConnector = false
     var bannerMessage: String?
+
+    var isLoadingConnectors: Bool {
+        connectorLoadState == .loading
+    }
 
     var isConfigured: Bool {
         if case .ready = phase { return true }
@@ -234,7 +249,8 @@ final class AppModel {
 
             async let sessionsLoad: Void = loadSessions(showSpinner: false)
             async let workLoad: Void = loadWork(showSpinner: false)
-            _ = await (sessionsLoad, workLoad)
+            async let connectorsLoad: Void = loadConnectors()
+            _ = await (sessionsLoad, workLoad, connectorsLoad)
         } catch {
             guard attempt == connectionAttempt else { return }
             connectionState = .failed(Self.message(for: error))
@@ -249,6 +265,14 @@ final class AppModel {
             return
         }
         await connectAuthenticated()
+    }
+
+    func authenticationWillChange() {
+        connectionAttempt += 1
+        credentialGeneration += 1
+        connectorAccounts = []
+        connectorLoadState = .idle
+        isStartingGoogleConnector = false
     }
 
     func retryConnection() async {
@@ -304,12 +328,15 @@ final class AppModel {
         sessions = []
         workTasks = []
         workEventsByTaskID = [:]
+        connectorAccounts = []
+        connectorLoadState = .idle
         messagesByChatID = [:]
         selectedSessionKey = nil
         chatNavigationPath = []
         pendingNewChat = false
         isRefreshing = false
         isSending = false
+        isStartingGoogleConnector = false
         modelName = "Ziggy"
         bannerMessage = nil
         phase = .needsEnrollment
@@ -320,7 +347,8 @@ final class AppModel {
         isRefreshing = true
         async let sessionsLoad: Void = loadSessions(showSpinner: false)
         async let workLoad: Void = loadWork(showSpinner: false)
-        _ = await (sessionsLoad, workLoad)
+        async let connectorsLoad: Void = loadConnectors()
+        _ = await (sessionsLoad, workLoad, connectorsLoad)
         isRefreshing = false
     }
 
@@ -430,6 +458,95 @@ final class AppModel {
         } catch {
             bannerMessage = Self.message(for: error)
         }
+    }
+
+    func loadConnectors() async {
+        connectorLoadState = .loading
+        let attempt = connectionAttempt
+        guard let sessionIdentifier = authSession.sessionIdentifier else {
+            connectorLoadState = .failed(Self.message(for: AuthSessionError.notSignedIn))
+            return
+        }
+        guard let serverURL = configuredServerURL else {
+            connectorLoadState = .failed(Self.message(for: ZiggyRESTError.invalidURL))
+            return
+        }
+        do {
+            let identityToken = try await authSession.sessionToken()
+            guard isCurrentConnectorOperation(
+                attempt: attempt,
+                sessionIdentifier: sessionIdentifier
+            ) else {
+                throw CancellationError()
+            }
+            let response = try await ZiggyRESTClient(baseURL: serverURL)
+                .fetchConnectorAccounts(identityToken: identityToken)
+            guard isCurrentConnectorOperation(
+                attempt: attempt,
+                sessionIdentifier: sessionIdentifier
+            ) else {
+                throw CancellationError()
+            }
+            connectorAccounts = response.items.sorted {
+                ($0.updatedAt?.date ?? $0.createdAt?.date ?? .distantPast)
+                    > ($1.updatedAt?.date ?? $1.createdAt?.date ?? .distantPast)
+            }
+            connectorLoadState = .loaded
+        } catch is CancellationError {
+            return
+        } catch {
+            let message = Self.message(for: error)
+            connectorLoadState = .failed(message)
+            bannerMessage = message
+        }
+    }
+
+    func googleConnectorAuthorizationURL() async -> URL? {
+        isStartingGoogleConnector = true
+        defer { isStartingGoogleConnector = false }
+
+        let attempt = connectionAttempt
+        guard let sessionIdentifier = authSession.sessionIdentifier else {
+            bannerMessage = Self.message(for: AuthSessionError.notSignedIn)
+            return nil
+        }
+        guard let serverURL = configuredServerURL else {
+            bannerMessage = Self.message(for: ZiggyRESTError.invalidURL)
+            return nil
+        }
+        do {
+            let identityToken = try await authSession.sessionToken()
+            guard isCurrentConnectorOperation(
+                attempt: attempt,
+                sessionIdentifier: sessionIdentifier
+            ) else {
+                throw CancellationError()
+            }
+            let authorization = try await ZiggyRESTClient(baseURL: serverURL)
+                .startGoogleConnector(identityToken: identityToken)
+            guard isCurrentConnectorOperation(
+                attempt: attempt,
+                sessionIdentifier: sessionIdentifier
+            ) else {
+                throw CancellationError()
+            }
+            guard let url = authorization.googleURL else {
+                throw ZiggyRESTError.invalidResponse
+            }
+            return url
+        } catch is CancellationError {
+            return nil
+        } catch {
+            bannerMessage = Self.message(for: error)
+            return nil
+        }
+    }
+
+    private func isCurrentConnectorOperation(
+        attempt: Int,
+        sessionIdentifier: String
+    ) -> Bool {
+        attempt == connectionAttempt && authSession.sessionIdentifier == sessionIdentifier
     }
 
     func subscribe(to task: WorkTask) async {

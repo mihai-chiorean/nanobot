@@ -49,6 +49,7 @@
 		E7CD03595BD9B8420B14326B /* ModelAndEnvelopeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 057959C27119ABD1D84F35F8 /* ModelAndEnvelopeTests.swift */; };
 		EBD4F225C892A464AF644CAE /* WebSocketModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 35981D9C5CBC599C86C80BBB /* WebSocketModels.swift */; };
 		F000CB34B5C939E759F637C3 /* KeychainCredentialStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = B4E429AF36323AD0AC54FEF8 /* KeychainCredentialStore.swift */; };
+		F44162AAACF0318E5C1AB9E1 /* IntegrationsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1B00B8147E32361A9095348 /* IntegrationsView.swift */; };
 		F561230C1767A449A323DDE7 /* ClerkKit in Frameworks */ = {isa = PBXBuildFile; productRef = 978DC07A45BD404E2ECA4A5B /* ClerkKit */; };
 		F80D5BD130C3A8960FEE198C /* ChatStreamReconciler.swift in Sources */ = {isa = PBXBuildFile; fileRef = 51C529E3547CE9F0BD41F4BC /* ChatStreamReconciler.swift */; };
 		FFE5E9DD2522EA65ED14BB07 /* JSONValue.swift in Sources */ = {isa = PBXBuildFile; fileRef = C6DD62E96A55077A00B9E73E /* JSONValue.swift */; };
@@ -111,6 +112,7 @@
 		A3EA8E83B79AB34B8E24B33A /* ZiggyDesignSystem.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ZiggyDesignSystem.swift; sourceTree = "<group>"; };
 		AB7BD6053DA584983E8308CB /* AuthSessionService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuthSessionService.swift; sourceTree = "<group>"; };
 		B1263AEDF697865C7D837DB6 /* ServerURLValidation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerURLValidation.swift; sourceTree = "<group>"; };
+		B1B00B8147E32361A9095348 /* IntegrationsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IntegrationsView.swift; sourceTree = "<group>"; };
 		B4E429AF36323AD0AC54FEF8 /* KeychainCredentialStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeychainCredentialStore.swift; sourceTree = "<group>"; };
 		BB2BE98AEC948AEEE47098C9 /* Base.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Base.xcconfig; sourceTree = "<group>"; };
 		C6DD62E96A55077A00B9E73E /* JSONValue.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JSONValue.swift; sourceTree = "<group>"; };
@@ -162,6 +164,7 @@
 			isa = PBXGroup;
 			children = (
 				176D6AA5200E5046448EFE1F /* Chat */,
+				542F39E162AF960CC5F176E0 /* Integrations */,
 				D1244A0D1CB6F2B0D5678CB7 /* Settings */,
 				4E3E2A2691EA228EAD29CFEC /* Work */,
 			);
@@ -208,6 +211,14 @@
 				CA638D5D7A68EA903F36BED4 /* WorkScreens.swift */,
 			);
 			path = Work;
+			sourceTree = "<group>";
+		};
+		542F39E162AF960CC5F176E0 /* Integrations */ = {
+			isa = PBXGroup;
+			children = (
+				B1B00B8147E32361A9095348 /* IntegrationsView.swift */,
+			);
+			path = Integrations;
 			sourceTree = "<group>";
 		};
 		6055FE9026D2EECC114F17CC /* ZiggyTests */ = {
@@ -498,6 +509,7 @@
 				F80D5BD130C3A8960FEE198C /* ChatStreamReconciler.swift in Sources */,
 				260D78836B68B453C238908C /* CredentialStore.swift in Sources */,
 				A7A44E0591B8E3B535103F5B /* EnrollmentView.swift in Sources */,
+				F44162AAACF0318E5C1AB9E1 /* IntegrationsView.swift in Sources */,
 				FFE5E9DD2522EA65ED14BB07 /* JSONValue.swift in Sources */,
 				F000CB34B5C939E759F637C3 /* KeychainCredentialStore.swift in Sources */,
 				CCCA49DFAFE5598E38E39574 /* LegacyContentAdapter.swift in Sources */,

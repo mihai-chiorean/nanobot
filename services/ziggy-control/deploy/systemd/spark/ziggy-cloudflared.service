@@ -1,0 +1,39 @@
+[Unit]
+Description=Cloudflare Tunnel for Ziggy control on Spark
+After=network-online.target ziggy-control.service
+Wants=network-online.target
+Requires=ziggy-control.service
+
+[Service]
+Type=simple
+User=ziggy-control
+Group=ziggy-control
+LoadCredential=cloudflare-tunnel-token:/etc/ziggy/secrets/cloudflare-ziggy-tunnel-token
+ExecStart=/usr/local/bin/cloudflared tunnel --no-autoupdate run --token-file %d/cloudflare-tunnel-token --url http://127.0.0.1:8788
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=15s
+
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ziggy-cloudflared
+
+[Install]
+WantedBy=multi-user.target

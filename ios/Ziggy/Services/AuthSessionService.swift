@@ -27,6 +27,7 @@ struct ZiggyIdentity: Sendable, Equatable {
 @MainActor
 protocol AuthSessionProviding: AnyObject {
     var isSignedIn: Bool { get }
+    var sessionIdentifier: String? { get }
     var identity: ZiggyIdentity? { get }
 
     func sessionToken() async throws -> String
@@ -59,6 +60,7 @@ final class ClerkAuthSession: AuthSessionProviding {
     }
 
     var isSignedIn: Bool { clerk.session != nil }
+    var sessionIdentifier: String? { clerk.session?.id }
 
     var identity: ZiggyIdentity? {
         guard let user = clerk.user,
@@ -88,6 +90,7 @@ final class ClerkAuthSession: AuthSessionProviding {
 @MainActor
 final class UnconfiguredAuthSession: AuthSessionProviding {
     var isSignedIn: Bool { false }
+    var sessionIdentifier: String? { nil }
     var identity: ZiggyIdentity? { nil }
 
     func sessionToken() async throws -> String { throw AuthSessionError.notConfigured }
