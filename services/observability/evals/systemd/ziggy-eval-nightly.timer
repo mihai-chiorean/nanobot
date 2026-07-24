@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Ziggy policy batteries nightly
+
+[Timer]
+OnCalendar=*-*-* 02:00:00
+Persistent=true
+RandomizedDelaySec=120
+Unit=ziggy-eval-nightly.service
+
+[Install]
+WantedBy=timers.target

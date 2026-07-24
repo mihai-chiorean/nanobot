@@ -1,0 +1,13 @@
+[Unit]
+Description=Ziggy nightly policy battery regression check
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+TimeoutStartSec=600
+Environment=PATH=/home/mihai/workspace/ziggy/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/home/mihai/.local/libexec/ziggy-evals/nightly-batteries.sh
+
+[Install]
+WantedBy=default.target
