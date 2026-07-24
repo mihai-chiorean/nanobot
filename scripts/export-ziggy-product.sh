@@ -323,9 +323,8 @@ jobs:
       - run: npm test
       - run: npm run lint
       - run: npm run build
-      - name: Report npm audit findings
+      - name: Reject high-severity npm advisories
         run: npm audit --audit-level=high
-        continue-on-error: true
       - name: Validate product tree after web build
         working-directory: .
         run: python3 scripts/validate-ziggy-product-split.py --export .

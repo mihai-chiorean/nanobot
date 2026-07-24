@@ -169,10 +169,11 @@ private-key headers, Grafana Cloud glc_ tokens, sk_live_/sk_test_ tokens, and
 Google API key forms. Fixtures use explicit non-matching placeholders; only
 generated dependency and build directories are skipped from content scanning.
 
-The web CI runs npm audit --audit-level=high as a non-blocking report and then
-validates the product tree again after npm run build. The current lockfile
-reports two high and two critical advisories; they require dependency-owner
-triage and targeted upgrades, not broad force upgrades.
+The web CI blocks on `npm audit --audit-level=high` and then validates the
+product tree again after `npm run build`. The current lockfile has no high or
+critical advisories. Its remaining moderate Clerk UI/Solana dependency findings
+stay visible in audit output and must be handled through compatible upstream
+updates rather than a forced Clerk downgrade.
 
 ## History strategy
 
