@@ -274,7 +274,17 @@ func tenantDatabaseConfig(lookup LookupEnv, readFile ReadFile) (string, error) {
 		return "", nil
 	}
 	parsed, err := url.Parse(inline)
-	if err != nil || (parsed.Scheme != "postgres" && parsed.Scheme != "postgresql") || parsed.Host == "" {
+	if err != nil {
+		return "", fmt.Errorf("ZIGGY_TENANT_DATABASE_URL must be a PostgreSQL URL")
+	}
+	socketHost := strings.TrimSpace(parsed.Query().Get("host"))
+	hasNetworkHost := strings.TrimSpace(parsed.Hostname()) != ""
+	hasSocketHost := filepath.IsAbs(socketHost) && filepath.Clean(socketHost) == socketHost
+	hasDatabase := strings.Trim(parsed.EscapedPath(), "/") != ""
+	if (parsed.Scheme != "postgres" && parsed.Scheme != "postgresql") ||
+		(!hasNetworkHost && !hasSocketHost) ||
+		!hasDatabase ||
+		parsed.Fragment != "" {
 		return "", fmt.Errorf("ZIGGY_TENANT_DATABASE_URL must be a PostgreSQL URL")
 	}
 	return inline, nil

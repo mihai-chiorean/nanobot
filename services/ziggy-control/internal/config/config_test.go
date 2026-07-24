@@ -86,6 +86,44 @@ func TestLoadFromPostgresTenantMode(t *testing.T) {
 	}
 }
 
+func TestLoadFromPostgresTenantSocketMode(t *testing.T) {
+	const databaseURL = "postgresql:///ziggy_control?host=/var/run/postgresql&port=5433&sslmode=disable"
+	environment := map[string]string{
+		"ZIGGY_UPSTREAM_URL":        "http://127.0.0.1:8765",
+		"ZIGGY_TENANCY_MODE":        "postgres",
+		"ZIGGY_TENANT_DATABASE_URL": databaseURL,
+		"ZIGGY_AUTHORIZED_PARTIES":  "https://chat.example.com",
+		"CLERK_SECRET_KEY":          "secret",
+	}
+	config, err := LoadFrom(mapLookup(environment))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.TenantDatabaseURL != databaseURL {
+		t.Fatalf("TenantDatabaseURL = %q, want %q", config.TenantDatabaseURL, databaseURL)
+	}
+}
+
+func TestLoadFromPostgresTenantModeRejectsMissingHostOrDatabase(t *testing.T) {
+	for _, databaseURL := range []string{
+		"postgresql:///ziggy_control?sslmode=disable",
+		"postgresql://127.0.0.1?sslmode=disable",
+		"postgresql:///ziggy_control?host=relative/socket&sslmode=disable",
+		"postgresql://[::1/ziggy_control",
+	} {
+		environment := map[string]string{
+			"ZIGGY_UPSTREAM_URL":        "http://127.0.0.1:8765",
+			"ZIGGY_TENANCY_MODE":        "postgres",
+			"ZIGGY_TENANT_DATABASE_URL": databaseURL,
+			"ZIGGY_AUTHORIZED_PARTIES":  "https://chat.example.com",
+			"CLERK_SECRET_KEY":          "secret",
+		}
+		if _, err := LoadFrom(mapLookup(environment)); err == nil {
+			t.Fatalf("LoadFrom() accepted invalid tenant database URL %q", databaseURL)
+		}
+	}
+}
+
 func TestLoadFromRequiresOwnerOnlyForSingleTenantFallback(t *testing.T) {
 	environment := map[string]string{
 		"ZIGGY_UPSTREAM_URL":           "http://127.0.0.1:8765",
