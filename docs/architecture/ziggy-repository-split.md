@@ -29,6 +29,7 @@ scripts/test-ziggy-product-split.sh.
 ├── services/
 │   ├── ziggy-control/           authenticated product front door
 │   ├── ziggy-connectors/        tenant connectors and MCP OAuth client
+│   ├── ziggy-runtime-manager/   rootless per-tenant runtime supervisor
 │   └── ziggy-work/              durable Work service
 ├── observability/               collector, dashboards, and privacy checks
 ├── deploy/                      index; implementation stays with each service
@@ -44,7 +45,7 @@ scripts/test-ziggy-product-split.sh.
 
 The source webui/ directory is renamed to web/. The export transform rewrites
 the copied Vite config so its output is web/dist, never ../nanobot/web/dist.
-The source bridge/ directory is placed at web/bridge/. The three service
+The source bridge/ directory is placed at web/bridge/. The four service
 directories are preserved so their Go modules, tests, migrations, and
 service-local deployment assets remain together. observability/ is promoted
 from services/observability/. Root runbooks/ and research/ are indexes only;
@@ -135,6 +136,7 @@ intentionally product-only:
 | PWA | web/ | npm ci, npm test, npm run lint, npm run build. |
 | ziggy-control | services/ziggy-control/ | make verify, linux-amd64, linux-arm64. |
 | ziggy-connectors | services/ziggy-connectors/ | make verify, linux-amd64, linux-arm64. |
+| ziggy-runtime-manager | services/ziggy-runtime-manager/ | make verify. |
 | ziggy-work | services/ziggy-work/ | go test, go test -race, go vet, go build. |
 | Observability | observability/otelcol/ | shell syntax checks; profile and privacy-canary validation in deployment CI. |
 
@@ -188,6 +190,7 @@ git filter-repo --force \
   --path bridge/ \
   --path services/ziggy-control/ \
   --path services/ziggy-connectors/ \
+  --path services/ziggy-runtime-manager/ \
   --path services/ziggy-work/ \
   --path services/observability/ \
   --path docs/architecture/ \

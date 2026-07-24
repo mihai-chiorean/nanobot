@@ -192,6 +192,7 @@ runtime pinned in .ziggy/nanobot.lock.json; its source is not copied here.
 - web/: branded PWA and its bridge extension.
 - services/ziggy-control/: authenticated product front door and tenant control plane.
 - services/ziggy-connectors/: tenant connector and MCP OAuth service.
+- services/ziggy-runtime-manager/: rootless per-tenant runtime supervisor.
 - services/ziggy-work/: durable Work service.
 - observability/: collector, dashboards, and privacy validation assets.
 - deploy/, docs/runbooks/, and docs/research/: operational indexes and source docs.
@@ -210,6 +211,7 @@ vendor the full Nanobot tree.
     cd web && npm ci && npm test && npm run lint && npm run build
     cd ../services/ziggy-control && make verify
     cd ../ziggy-connectors && make verify
+    cd ../ziggy-runtime-manager && make verify
     cd ../ziggy-work && go test ./... && go test -race ./... && go vet ./... && go build ./...
     cd ../../web && npm audit --audit-level=high
 
@@ -257,6 +259,7 @@ Deployment implementation stays beside its owning service:
 
 - ../services/ziggy-control/deploy/
 - ../services/ziggy-connectors/deploy/
+- ../services/ziggy-runtime-manager/deploy/
 - ../services/ziggy-work/deploy/
 - ../observability/otelcol/
 
@@ -345,6 +348,9 @@ jobs:
           - name: connectors
             path: services/ziggy-connectors
             command: make verify linux-amd64 linux-arm64
+          - name: runtime-manager
+            path: services/ziggy-runtime-manager
+            command: make verify
           - name: work
             path: services/ziggy-work
             command: go test ./... && go test -race ./... && go vet ./... && go build ./...
