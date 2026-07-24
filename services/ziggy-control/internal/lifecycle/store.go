@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mihai-chiorean/nanobot/services/ziggy-control/internal/config"
 	"github.com/mihai-chiorean/nanobot/services/ziggy-control/internal/identity"
 	"github.com/mihai-chiorean/nanobot/services/ziggy-control/internal/tenant"
 )
@@ -20,6 +21,8 @@ const defaultQueryTimeout = 2 * time.Second
 var (
 	ErrNotAuthorized      = errors.New("tenant is not authorized")
 	ErrRuntimeUnavailable = errors.New("tenant runtime is unavailable")
+	ErrInvalidTransition  = errors.New("tenant lifecycle transition is invalid")
+	ErrActivationMismatch = errors.New("runtime activation does not match the pending allocation")
 )
 
 type RuntimeAllocation struct {
@@ -32,10 +35,19 @@ type RuntimeAllocation struct {
 	UpstreamBootstrapSecret string
 }
 
+type RuntimeActivation struct {
+	UserID                  string
+	WorkspaceID             string
+	RuntimeID               string
+	ExpectedGeneration      int64
+	UpstreamURL             string
+	UpstreamBootstrapSecret string
+}
+
 // RuntimeProvisioner is deliberately narrow. A later runtime manager owns the
 // implementation; this package only persists and returns allocation intent.
 type RuntimeProvisioner interface {
-	EnsureRuntime(context.Context, RuntimeAllocation) error
+	ActivateRuntime(context.Context, RuntimeActivation) error
 }
 
 type Store struct {
@@ -162,8 +174,8 @@ WHERE u.user_id=$1 AND w.workspace_id=$2`, userID, workspaceID).Scan(&status, &r
 	return allocation(userID, workspaceID, runtime), nil
 }
 
-// Invite is idempotent for an existing unbound admission with the same email.
-// No network API calls it; an operator lifecycle tool can use it later.
+// Invite is idempotent for an existing admission with the same email, including
+// simultaneous calls from separate control processes.
 func (s *Store) Invite(ctx context.Context, expectedEmail string) (string, error) {
 	email, err := canonicalEmail(expectedEmail)
 	if err != nil {
@@ -176,31 +188,141 @@ func (s *Store) Invite(ctx context.Context, expectedEmail string) (string, error
 		return "", err
 	}
 	defer tx.Rollback()
-	var existingID string
-	err = tx.QueryRowContext(ctx, `SELECT user_id FROM ziggy_tenant_users WHERE expected_email=$1 FOR UPDATE`, email).Scan(&existingID)
-	if err == nil {
-		if err := tx.Commit(); err != nil {
-			return "", err
-		}
-		return existingID, nil
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return "", err
-	}
 	userID, err := s.newID("usr")
 	if err != nil {
 		return "", err
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO ziggy_tenant_users (user_id, expected_email, lifecycle_status, created_at, updated_at) VALUES ($1,$2,'invited',$3,$3)`, userID, email, s.now().UTC()); err != nil {
+	err = tx.QueryRowContext(ctx, `INSERT INTO ziggy_tenant_users (user_id, expected_email, lifecycle_status, created_at, updated_at)
+VALUES ($1,$2,'invited',$3,$3)
+ON CONFLICT (expected_email) DO NOTHING
+RETURNING user_id`, userID, email, s.now().UTC()).Scan(&userID)
+	if err == nil {
+		if err := appendEvent(ctx, tx, userID, "", "user_invited", "operator", 0, s.now()); err != nil {
+			return "", err
+		}
+		if err := tx.Commit(); err != nil {
+			return "", err
+		}
+		return userID, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
 		return "", err
 	}
-	if err := appendEvent(ctx, tx, userID, "", "user_invited", "operator", 0, s.now()); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT user_id FROM ziggy_tenant_users WHERE expected_email=$1 FOR UPDATE`, email).Scan(&userID); err != nil {
 		return "", err
 	}
 	if err := tx.Commit(); err != nil {
 		return "", err
 	}
 	return userID, nil
+}
+
+// MarkDeletionPending revokes bootstrap and remembered credentials before data
+// deletion work begins. Deleted users are terminal and cannot re-enter this state.
+func (s *Store) MarkDeletionPending(ctx context.Context, userID string) error {
+	ctx, cancel := s.operationContext(ctx)
+	defer cancel()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	status, workspaceID, generation, err := userRuntimeForUpdate(ctx, tx, userID)
+	if err != nil {
+		return err
+	}
+	if status == "deletion_pending" || status == "deleted" {
+		return ErrInvalidTransition
+	}
+	now := s.now().UTC()
+	if _, err := tx.ExecContext(ctx, `UPDATE ziggy_tenant_users SET lifecycle_status='deletion_pending', updated_at=$2 WHERE user_id=$1`, userID, now); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE ziggy_tenant_runtime_allocations SET allocation_state='disabled', updated_at=$2 WHERE user_id=$1 AND allocation_state <> 'deleted'`, userID, now); err != nil {
+		return err
+	}
+	if err := appendEvent(ctx, tx, userID, workspaceID, "user_deletion_pending", "operator", generation, now); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// MarkDeleted completes an explicit deletion workflow. It requires the
+// revocation transition above, but leaves physical data removal to its owner.
+func (s *Store) MarkDeleted(ctx context.Context, userID string) error {
+	ctx, cancel := s.operationContext(ctx)
+	defer cancel()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	status, workspaceID, generation, err := userRuntimeForUpdate(ctx, tx, userID)
+	if err != nil {
+		return err
+	}
+	if status != "deletion_pending" {
+		return ErrInvalidTransition
+	}
+	now := s.now().UTC()
+	if _, err := tx.ExecContext(ctx, `UPDATE ziggy_tenant_users SET lifecycle_status='deleted', deleted_at=$2, updated_at=$2 WHERE user_id=$1 AND lifecycle_status='deletion_pending'`, userID, now); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE ziggy_tenant_runtime_allocations SET allocation_state='deleted', updated_at=$2 WHERE user_id=$1`, userID, now); err != nil {
+		return err
+	}
+	if err := appendEvent(ctx, tx, userID, workspaceID, "user_deleted", "operator", generation, now); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// ActivateRuntime is the sole lifecycle write needed by a runtime manager. It
+// only activates the exact pending runtime generation returned by allocation.
+func (s *Store) ActivateRuntime(ctx context.Context, activation RuntimeActivation) error {
+	if err := validActivation(activation); err != nil {
+		return err
+	}
+	ctx, cancel := s.operationContext(ctx)
+	defer cancel()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var status, state string
+	var generation int64
+	err = tx.QueryRowContext(ctx, `SELECT u.lifecycle_status, r.allocation_state, r.generation
+FROM ziggy_tenant_users u
+JOIN ziggy_tenant_workspaces w ON w.user_id=u.user_id
+JOIN ziggy_tenant_runtime_allocations r ON r.workspace_id=w.workspace_id
+WHERE u.user_id=$1 AND w.workspace_id=$2 AND r.runtime_id=$3
+FOR UPDATE OF u, r`, activation.UserID, activation.WorkspaceID, activation.RuntimeID).Scan(&status, &state, &generation)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrActivationMismatch
+	}
+	if err != nil {
+		return err
+	}
+	if status != "active" || state != "pending" || generation != activation.ExpectedGeneration {
+		return ErrActivationMismatch
+	}
+	now := s.now().UTC()
+	result, err := tx.ExecContext(ctx, `UPDATE ziggy_tenant_runtime_allocations
+SET allocation_state='active', upstream_url=$5, upstream_bootstrap_secret=$6, updated_at=$7
+WHERE workspace_id=$1 AND user_id=$2 AND runtime_id=$3 AND generation=$4 AND allocation_state='pending'`,
+		activation.WorkspaceID, activation.UserID, activation.RuntimeID, activation.ExpectedGeneration,
+		activation.UpstreamURL, activation.UpstreamBootstrapSecret, now)
+	if err != nil {
+		return err
+	}
+	if changed, _ := result.RowsAffected(); changed != 1 {
+		return ErrActivationMismatch
+	}
+	if err := appendEvent(ctx, tx, activation.UserID, activation.WorkspaceID, "runtime_activated", "runtime_manager", activation.ExpectedGeneration, now); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) Disable(ctx context.Context, userID string) error {
@@ -218,7 +340,7 @@ func (s *Store) Disable(ctx context.Context, userID string) error {
 	if err != nil {
 		return err
 	}
-	result, err := tx.ExecContext(ctx, `UPDATE ziggy_tenant_users SET lifecycle_status='disabled', disabled_at=$2, updated_at=$2 WHERE user_id=$1 AND lifecycle_status <> 'deleted'`, userID, s.now().UTC())
+	result, err := tx.ExecContext(ctx, `UPDATE ziggy_tenant_users SET lifecycle_status='disabled', disabled_at=$2, updated_at=$2 WHERE user_id=$1 AND lifecycle_status IN ('invited', 'active', 'disabled')`, userID, s.now().UTC())
 	if err != nil {
 		return err
 	}
@@ -237,6 +359,34 @@ func (s *Store) Disable(ctx context.Context, userID string) error {
 		return err
 	}
 	return tx.Commit()
+}
+
+func userRuntimeForUpdate(ctx context.Context, tx *sql.Tx, userID string) (string, string, int64, error) {
+	var status string
+	err := tx.QueryRowContext(ctx, `SELECT lifecycle_status FROM ziggy_tenant_users WHERE user_id=$1 FOR UPDATE`, userID).Scan(&status)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", "", 0, ErrNotAuthorized
+	}
+	if err != nil {
+		return "", "", 0, err
+	}
+	var workspaceID string
+	err = tx.QueryRowContext(ctx, `SELECT workspace_id FROM ziggy_tenant_workspaces WHERE user_id=$1 FOR UPDATE`, userID).Scan(&workspaceID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return status, "", 0, nil
+	}
+	if err != nil {
+		return "", "", 0, err
+	}
+	var generation int64
+	err = tx.QueryRowContext(ctx, `SELECT generation FROM ziggy_tenant_runtime_allocations WHERE workspace_id=$1 FOR UPDATE`, workspaceID).Scan(&generation)
+	if errors.Is(err, sql.ErrNoRows) {
+		return status, workspaceID, 0, nil
+	}
+	if err != nil {
+		return "", "", 0, err
+	}
+	return status, workspaceID, generation, nil
 }
 
 func (s *Store) workspaceForUpdate(ctx context.Context, tx *sql.Tx, userID string) (string, error) {
@@ -330,6 +480,16 @@ func canonicalEmail(value string) (string, error) {
 	return value, nil
 }
 
+func validActivation(activation RuntimeActivation) error {
+	if strings.TrimSpace(activation.UserID) == "" || strings.TrimSpace(activation.WorkspaceID) == "" || strings.TrimSpace(activation.RuntimeID) == "" || activation.ExpectedGeneration <= 0 || len(activation.UpstreamBootstrapSecret) < 32 {
+		return ErrActivationMismatch
+	}
+	if _, err := config.ParsePrivateUpstream(activation.UpstreamURL); err != nil {
+		return fmt.Errorf("runtime activation upstream: %w", err)
+	}
+	return nil
+}
+
 func bootstrapAllowed(status string) bool { return status == "invited" || status == "active" }
 
 func authorizationError(err error) error {
@@ -348,3 +508,4 @@ func randomID(prefix string) (string, error) {
 }
 
 var _ tenant.Resolver = (*Store)(nil)
+var _ RuntimeProvisioner = (*Store)(nil)

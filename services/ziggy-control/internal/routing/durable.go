@@ -89,9 +89,6 @@ func (r *DurableRouter) RememberCredentials(ctx context.Context, route httpapi.T
 		return errors.New("tenant is no longer active")
 	}
 	r.cleanupExpired()
-	if r.count.Load()+int64(len(credentials)) > r.capacity {
-		return errors.New("credential routing capacity reached")
-	}
 	expiresAt := r.now().Add(ttl)
 	for _, credential := range credentials {
 		credential = strings.TrimSpace(credential)
@@ -100,7 +97,7 @@ func (r *DurableRouter) RememberCredentials(ctx context.Context, route httpapi.T
 		}
 		key := sha256.Sum256([]byte(credential))
 		entry := credentialRoute{route: route, expiresAt: expiresAt}
-		if existing, loaded := r.entries.LoadOrStore(key, entry); loaded {
+		if existing, loaded := r.entries.Load(key); loaded {
 			current, valid := existing.(credentialRoute)
 			if !valid || current.route.UserID != route.UserID || current.route.WorkspaceID != route.WorkspaceID {
 				return errors.New("transport credential collision")
@@ -108,7 +105,19 @@ func (r *DurableRouter) RememberCredentials(ctx context.Context, route httpapi.T
 			r.entries.Store(key, entry)
 			continue
 		}
-		r.count.Add(1)
+		if !r.reserveCredentialSlot() {
+			return errors.New("credential routing capacity reached")
+		}
+		actual, loaded := r.entries.LoadOrStore(key, entry)
+		if !loaded {
+			continue
+		}
+		r.count.Add(-1)
+		current, valid := actual.(credentialRoute)
+		if !valid || current.route.UserID != route.UserID || current.route.WorkspaceID != route.WorkspaceID {
+			return errors.New("transport credential collision")
+		}
+		r.entries.Store(key, entry)
 	}
 	return nil
 }
@@ -150,6 +159,18 @@ func (r *DurableRouter) cleanupExpired() {
 		}
 		return true
 	})
+}
+
+func (r *DurableRouter) reserveCredentialSlot() bool {
+	for {
+		current := r.count.Load()
+		if current >= r.capacity {
+			return false
+		}
+		if r.count.CompareAndSwap(current, current+1) {
+			return true
+		}
+	}
 }
 
 var _ httpapi.TenantRouter = (*DurableRouter)(nil)

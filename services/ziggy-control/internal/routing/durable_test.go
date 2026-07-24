@@ -3,8 +3,10 @@ package routing
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
+	"sync"
 	"testing"
 	"time"
 
@@ -68,6 +70,62 @@ func TestDurableRouterLeavesPendingRuntimeUnroutable(t *testing.T) {
 	}
 	if err := router.RememberCredentials(context.Background(), route, []string{"token"}, time.Minute); err == nil {
 		t.Fatal("pending runtime credentials were remembered")
+	}
+}
+
+func TestDurableRouterConcurrentCredentialCapacity(t *testing.T) {
+	resolver := &durableResolver{active: true, allocation: tenant.Allocation{
+		UserID: "usr_test", WorkspaceID: "ws_test", Status: "active",
+		UpstreamURL: "http://127.0.0.1:8765", UpstreamBootstrapSecret: "01234567890123456789012345678901",
+	}}
+	router, err := NewDurable(resolver, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	router.capacity = 8
+	route, err := router.ResolvePrincipal(context.Background(), identity.Principal{Subject: "clerk_test", Email: "test@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const contenders = 32
+	start := make(chan struct{})
+	errs := make(chan error, contenders)
+	var group sync.WaitGroup
+	for index := range contenders {
+		group.Add(1)
+		go func(index int) {
+			defer group.Done()
+			<-start
+			errs <- router.RememberCredentials(context.Background(), route, []string{fmt.Sprintf("credential-%d", index)}, time.Minute)
+		}(index)
+	}
+	close(start)
+	group.Wait()
+	close(errs)
+	successes := 0
+	for err := range errs {
+		if err == nil {
+			successes++
+			continue
+		}
+		if err.Error() != "credential routing capacity reached" {
+			t.Fatalf("RememberCredentials() error = %v", err)
+		}
+	}
+	if successes != int(router.capacity) {
+		t.Fatalf("successful admissions = %d, want %d", successes, router.capacity)
+	}
+	if got := router.count.Load(); got != router.capacity {
+		t.Fatalf("credential count = %d, want %d", got, router.capacity)
+	}
+	entries := 0
+	router.entries.Range(func(_, _ any) bool {
+		entries++
+		return true
+	})
+	if entries != int(router.capacity) {
+		t.Fatalf("stored credentials = %d, want %d", entries, router.capacity)
 	}
 }
 

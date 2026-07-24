@@ -95,8 +95,13 @@ the same deny result. Email changes never transfer a workspace.
 A newly created allocation is `pending`; it intentionally has no public route.
 `/auth/bootstrap` returns `503` until a future runtime manager activates the
 allocation with a private endpoint and bootstrap secret. The lifecycle package
-defines only a `RuntimeProvisioner` interface for that manager. It does not
-shell out, start containers, or own runtime placement. Once active, remembered
+defines only a `RuntimeProvisioner` interface for that manager. Activation is
+transactional and requires the exact pending runtime ID and generation; an
+already active, disabled, or replaced allocation cannot be activated again.
+Operators can transition users through `disabled`, `deletion_pending`, and
+`deleted`; the final transition requires deletion-pending and marks the runtime
+allocation deleted without removing audit history. This service does not shell
+out, start containers, or own runtime placement. Once active, remembered
 transport credentials are rechecked against the durable lifecycle source on
 every request, so disable and deletion take effect before runtime lookup.
 
