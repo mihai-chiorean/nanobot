@@ -1,6 +1,6 @@
 # Ziggy Phase 1-3 and 7 Review
 
-Status: remediation in progress
+Status: code review closed; staged rollout gates remain
 
 Date: 2026-07-24
 
@@ -40,10 +40,23 @@ and release configuration that did not fail closed.
   Ziggy code; the complete upstream license remains under `licenses/`.
 - Web dependency updates removed every high and critical npm advisory, and
   product CI rejects their reintroduction.
+- PostgreSQL schema identity is non-overwritable, remote database connections
+  require verified TLS, and Unix-socket peer authentication remains supported.
+- Tenant admission happens before durable database resolution, refreshes its
+  tenant count without request-path locks, and revocation evicts route and
+  credential caches after the lifecycle transaction commits.
+- Runtime deletion treats Podman exit 125 as an error, requires systemd to stop
+  or prove a unit absent, verifies manager ownership labels before destructive
+  operations, and prevents one workspace from exhausting global admission.
+- Product exports read exact Git object bytes, emit parser-validated CI,
+  rewrite standalone Go module identities, reject Nanobot source trees at any
+  depth, and scan successfully on macOS and Linux.
+- Release iOS builds require a production Clerk key plus an explicit archive
+  build number greater than the already-used TestFlight build 1.
 
-## Required Remediation
+## Closed Remediation
 
-The branch must not merge until focused follow-up reviews close these items:
+Focused follow-up reviews and regression tests closed these merge blockers:
 
 - persist and serialize runtime generation fences, including absent-container
   and destructive-replay cases;
@@ -60,6 +73,22 @@ The branch must not merge until focused follow-up reviews close these items:
 - close secret-scanner gaps and remove unowned, unbuildable bridge content;
 - fail Release iOS builds closed on production Clerk configuration and expose
   version/build information for support.
+
+## Verification
+
+- `ziggy-control` passed PostgreSQL-backed tests, race detection, vet, and a
+  static production build.
+- `ziggy-runtime-manager` passed unit and race tests, repeated admission and
+  Podman regression tests, vet, native build, and Linux ARM64 cross-build.
+- The exact-commit product export passed deterministic clone/detached-HEAD
+  checks, YAML parsing, nested-boundary negative tests, and Gitleaks.
+- All four exported Go services passed their test, race, vet, and build gates;
+  connectors also passed `govulncheck`.
+- The exported web app passed 61 tests, lint, production build, and the
+  high-severity npm audit gate. Twelve moderate and one low transitive
+  advisories remain visible.
+- The iOS app passed 74 Swift Testing tests across 12 suites. The unsigned
+  Release build passed with explicit build 2 configuration.
 
 ## Explicit Production Blocks
 
