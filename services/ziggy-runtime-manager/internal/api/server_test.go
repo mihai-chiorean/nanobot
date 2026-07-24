@@ -37,6 +37,9 @@ func (f *fakeDriver) Stop(context.Context, runtime.Request) (runtime.Status, err
 func (f *fakeDriver) Delete(context.Context, runtime.Request) error {
 	return errors.New("not implemented")
 }
+func (f *fakeDriver) DeleteTenantData(context.Context, runtime.Request) error {
+	return errors.New("not implemented")
+}
 
 func TestDispatchAllowsOnlyLifecycleRequestFields(t *testing.T) {
 	driver := &fakeDriver{}
@@ -67,6 +70,19 @@ func TestSocketRejectsOversizedRequest(t *testing.T) {
 	if _, err := connection.Write([]byte(strings.Repeat("x", 65) + "\n")); err != nil {
 		t.Fatal(err)
 	}
+	if response := readResponse(t, connection); response.Error != "request_too_large" {
+		t.Fatalf("response=%+v", response)
+	}
+}
+
+func TestSocketHardCapsSubstantiallyOversizedRequest(t *testing.T) {
+	socket, stop := startServer(t, Server{Driver: &fakeDriver{}, MaxRequestBytes: 64})
+	defer stop()
+	connection := dial(t, socket)
+	defer connection.Close()
+	// A 1 MiB line must be rejected after the max+1-byte reader limit, rather
+	// than accumulated by bufio.ReadString across repeated buffer fills.
+	_, _ = connection.Write([]byte(strings.Repeat("x", 1<<20) + "\n"))
 	if response := readResponse(t, connection); response.Error != "request_too_large" {
 		t.Fatalf("response=%+v", response)
 	}
@@ -226,6 +242,9 @@ func (d *blockingDriver) Stop(context.Context, runtime.Request) (runtime.Status,
 	return runtime.Status{}, runtime.ErrNotFound
 }
 func (d *blockingDriver) Delete(context.Context, runtime.Request) error { return runtime.ErrNotFound }
+func (d *blockingDriver) DeleteTenantData(context.Context, runtime.Request) error {
+	return runtime.ErrNotFound
+}
 
 func (d *blockingDriver) sawDeadline() bool {
 	d.mu.Lock()

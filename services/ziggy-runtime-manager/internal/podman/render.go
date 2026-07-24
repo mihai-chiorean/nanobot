@@ -28,7 +28,9 @@ func tenantNames(r runtime.Request) (string, string, string) {
 	// The stable name is the local single-writer fence. A new generation cannot
 	// create a second container until the old generation has been drained and deleted.
 	base := "ziggy-tenant-" + r.WorkspaceID
-	return base, base + "-root", base + "-config"
+	// Workspace data outlives a runtime generation. Config material is a
+	// generation capability and is deleted with the generation that used it.
+	return base, base + "-root", base + "-g" + fmt.Sprintf("%d", r.Generation) + "-config"
 }
 
 func egressNetwork(r runtime.Request) string {

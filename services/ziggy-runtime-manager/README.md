@@ -20,12 +20,18 @@ generation rejects a replacement until the control plane has drained and
 stopped it. This prevents accidental two-writer promotion, but it is not a
 substitute for the PostgreSQL lease/fence required in Phase 2.
 
+`delete` is normal **generation cleanup**: it removes the container, its
+generation-scoped config volume, its internal network, and the generated unit,
+but preserves the manager-owned workspace data volume. `delete_tenant_data` is
+the separate destructive operation; it refuses while a runtime exists and
+requires the generation-independent workspace-volume labels.
+
 Manager logs contain operation, workspace ID, generation, and result only.
 They do not write prompts, workspace paths, credentials, config, command
 output, or runtime stderr.
 
 The Unix socket is JSON-lines only: one request line per connection, with a
-4 KiB request limit, 16 concurrent requests, five-second read/write deadlines,
+hard 4 KiB `max+1` read cap, 16 concurrent requests, five-second read/write deadlines,
 and a 30-second request-scoped driver deadline. Configuration cannot raise
 those limits above 64 KiB, 256 requests, or one minute. Excess connections are
 rejected instead of creating unbounded handler goroutines.

@@ -158,17 +158,45 @@ func (d Driver) Delete(ctx context.Context, request runtime.Request) error {
 		return err
 	}
 	_ = d.systemctl(ctx, "stop", UnitName(request))
-	container, rootVolume, configVolume := tenantNames(request)
-	for _, args := range [][]string{{"rm", "--force", "--time", "30", container}, {"volume", "rm", rootVolume}, {"volume", "rm", configVolume}, {"network", "rm", egressNetwork(request)}} {
-		result, err := d.Runner.Run(ctx, Command{Path: "podman", Args: args})
-		if err != nil || (result.ExitCode != 0 && result.ExitCode != 1) {
-			return errors.New("runtime deletion command failed")
-		}
+	container, _, configVolume := tenantNames(request)
+	result, err := d.Runner.Run(ctx, Command{Path: "podman", Args: []string{"rm", "--force", "--time", "30", container}})
+	if err != nil || (result.ExitCode != 0 && result.ExitCode != 1) {
+		return errors.New("runtime deletion command failed")
+	}
+	if err := d.removeOwnedVolume(ctx, configVolume, lifecycleLabels(request)); err != nil {
+		return err
+	}
+	if err := d.removeOwnedNetwork(ctx, request); err != nil {
+		return err
 	}
 	if err := os.Remove(filepath.Join(d.QuadletDir, strings.TrimSuffix(UnitName(request), ".service")+".container")); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return err
 	}
 	return d.systemctl(ctx, "daemon-reload")
+}
+
+// DeleteTenantData is intentionally separate from generation cleanup. A caller
+// must remove the active generation first, then make an explicit destructive
+// request before the persistent workspace volume can be removed.
+func (d Driver) DeleteTenantData(ctx context.Context, request runtime.Request) error {
+	if err := d.validateRequest(request, false); err != nil {
+		return err
+	}
+	actual, found, err := d.currentGeneration(ctx, request)
+	if err != nil {
+		return err
+	}
+	if found {
+		if actual > request.Generation {
+			return runtime.ErrStaleGeneration
+		}
+		if actual != request.Generation {
+			return runtime.ErrGenerationConflict
+		}
+		return errors.New("runtime generation must be deleted before tenant data deletion")
+	}
+	_, rootVolume, _ := tenantNames(request)
+	return d.removeOwnedWorkspaceVolume(ctx, rootVolume, request)
 }
 
 func (d Driver) stage(ctx context.Context, request runtime.Request) error {
@@ -187,10 +215,11 @@ func (d Driver) stage(ctx context.Context, request runtime.Request) error {
 	if err := d.ensureNetwork(ctx, request); err != nil {
 		return err
 	}
-	for _, volume := range []string{rootVolume, configVolume} {
-		if err := d.ensureVolume(ctx, request, volume); err != nil {
-			return err
-		}
+	if err := d.ensureWorkspaceVolume(ctx, rootVolume, request); err != nil {
+		return err
+	}
+	if err := d.ensureVolume(ctx, configVolume, lifecycleLabels(request)); err != nil {
+		return err
 	}
 	stageArgs := []string{"run", "--rm", "--network", "none", "--read-only", "--cap-drop", "all", "--security-opt", "no-new-privileges", "--userns", "auto:size=65536", "--volume", configVolume + ":/run/ziggy/config:rw,U,Z", "--entrypoint", "/usr/local/bin/ziggy-runtime-stage-config", d.Policy.ImageDigest}
 	result, err := d.Runner.Run(ctx, Command{Path: "podman", Args: stageArgs, Stdin: config})
@@ -209,29 +238,44 @@ func (d Driver) stage(ctx context.Context, request runtime.Request) error {
 
 func (d Driver) ensureNetwork(ctx context.Context, request runtime.Request) error {
 	name := egressNetwork(request)
-	args := append([]string{"network", "create", "--internal"}, labelArgs(request)...)
+	args := append([]string{"network", "create", "--internal"}, labelArgs(lifecycleLabels(request))...)
 	args = append(args, name)
 	return d.createAndVerify(ctx, Command{Path: "podman", Args: args}, Command{Path: "podman", Args: []string{"network", "inspect", "--format", "{{json .}}", name}}, func(raw []byte) error {
 		var inspection struct {
 			Internal bool              `json:"internal"`
 			Labels   map[string]string `json:"labels"`
 		}
-		if err := json.Unmarshal(raw, &inspection); err != nil || !inspection.Internal || !labelsMatch(inspection.Labels, request) {
+		if err := json.Unmarshal(raw, &inspection); err != nil || !inspection.Internal || !labelsMatch(inspection.Labels, lifecycleLabels(request)) {
 			return errors.New("runtime network is not manager-owned and internal")
 		}
 		return nil
 	})
 }
 
-func (d Driver) ensureVolume(ctx context.Context, request runtime.Request, name string) error {
-	args := append([]string{"volume", "create"}, labelArgs(request)...)
+func (d Driver) ensureVolume(ctx context.Context, name string, expectedLabels map[string]string) error {
+	args := append([]string{"volume", "create"}, labelArgs(expectedLabels)...)
 	args = append(args, name)
 	return d.createAndVerify(ctx, Command{Path: "podman", Args: args}, Command{Path: "podman", Args: []string{"volume", "inspect", "--format", "{{json .}}", name}}, func(raw []byte) error {
 		var inspection struct {
 			Labels map[string]string `json:"Labels"`
 		}
-		if err := json.Unmarshal(raw, &inspection); err != nil || !labelsMatch(inspection.Labels, request) {
+		if err := json.Unmarshal(raw, &inspection); err != nil || !labelsMatch(inspection.Labels, expectedLabels) {
 			return errors.New("runtime volume is not manager-owned")
+		}
+		return nil
+	})
+}
+
+func (d Driver) ensureWorkspaceVolume(ctx context.Context, name string, request runtime.Request) error {
+	expectedLabels := workspaceVolumeLabels(request)
+	args := append([]string{"volume", "create"}, labelArgs(expectedLabels)...)
+	args = append(args, name)
+	return d.createAndVerify(ctx, Command{Path: "podman", Args: args}, Command{Path: "podman", Args: []string{"volume", "inspect", "--format", "{{json .}}", name}}, func(raw []byte) error {
+		var inspection struct {
+			Labels map[string]string `json:"Labels"`
+		}
+		if err := json.Unmarshal(raw, &inspection); err != nil || !workspaceVolumeLabelsMatch(inspection.Labels, expectedLabels) {
+			return errors.New("workspace volume is not manager-owned and generation-independent")
 		}
 		return nil
 	})
@@ -249,13 +293,12 @@ func (d Driver) createAndVerify(ctx context.Context, create, inspect Command, ve
 	return nil
 }
 
-func labelArgs(request runtime.Request) []string {
-	labels := lifecycleLabels(request)
-	return []string{
-		"--label", managerOwnerLabel + "=" + labels[managerOwnerLabel],
-		"--label", workspaceLabel + "=" + labels[workspaceLabel],
-		"--label", generationLabel + "=" + labels[generationLabel],
+func labelArgs(labels map[string]string) []string {
+	args := []string{"--label", managerOwnerLabel + "=" + labels[managerOwnerLabel], "--label", workspaceLabel + "=" + labels[workspaceLabel]}
+	if generation, ok := labels[generationLabel]; ok {
+		args = append(args, "--label", generationLabel+"="+generation)
 	}
+	return args
 }
 
 func lifecycleLabels(request runtime.Request) map[string]string {
@@ -266,13 +309,90 @@ func lifecycleLabels(request runtime.Request) map[string]string {
 	}
 }
 
-func labelsMatch(actual map[string]string, request runtime.Request) bool {
-	for key, value := range lifecycleLabels(request) {
+func workspaceVolumeLabels(request runtime.Request) map[string]string {
+	return map[string]string{
+		managerOwnerLabel: managerOwnerValue,
+		workspaceLabel:    request.WorkspaceID,
+	}
+}
+
+func labelsMatch(actual, expected map[string]string) bool {
+	for key, value := range expected {
 		if actual[key] != value {
 			return false
 		}
 	}
 	return true
+}
+
+func workspaceVolumeLabelsMatch(actual, expected map[string]string) bool {
+	_, hasGeneration := actual[generationLabel]
+	return !hasGeneration && labelsMatch(actual, expected)
+}
+
+func (d Driver) removeOwnedVolume(ctx context.Context, name string, expectedLabels map[string]string) error {
+	inspection, err := d.Runner.Run(ctx, Command{Path: "podman", Args: []string{"volume", "inspect", "--format", "{{json .}}", name}})
+	if err != nil {
+		return err
+	}
+	if inspection.ExitCode == 125 || inspection.ExitCode == 1 {
+		return nil
+	}
+	var volume struct {
+		Labels map[string]string `json:"Labels"`
+	}
+	if inspection.ExitCode != 0 || json.Unmarshal([]byte(inspection.Stdout), &volume) != nil || !labelsMatch(volume.Labels, expectedLabels) {
+		return errors.New("runtime volume is not manager-owned")
+	}
+	removed, err := d.Runner.Run(ctx, Command{Path: "podman", Args: []string{"volume", "rm", name}})
+	if err != nil || (removed.ExitCode != 0 && removed.ExitCode != 1) {
+		return errors.New("runtime volume deletion failed")
+	}
+	return nil
+}
+
+func (d Driver) removeOwnedWorkspaceVolume(ctx context.Context, name string, request runtime.Request) error {
+	inspection, err := d.Runner.Run(ctx, Command{Path: "podman", Args: []string{"volume", "inspect", "--format", "{{json .}}", name}})
+	if err != nil {
+		return err
+	}
+	if inspection.ExitCode == 125 || inspection.ExitCode == 1 {
+		return nil
+	}
+	var volume struct {
+		Labels map[string]string `json:"Labels"`
+	}
+	if inspection.ExitCode != 0 || json.Unmarshal([]byte(inspection.Stdout), &volume) != nil || !workspaceVolumeLabelsMatch(volume.Labels, workspaceVolumeLabels(request)) {
+		return errors.New("workspace volume is not manager-owned and generation-independent")
+	}
+	removed, err := d.Runner.Run(ctx, Command{Path: "podman", Args: []string{"volume", "rm", name}})
+	if err != nil || (removed.ExitCode != 0 && removed.ExitCode != 1) {
+		return errors.New("workspace volume deletion failed")
+	}
+	return nil
+}
+
+func (d Driver) removeOwnedNetwork(ctx context.Context, request runtime.Request) error {
+	name := egressNetwork(request)
+	inspection, err := d.Runner.Run(ctx, Command{Path: "podman", Args: []string{"network", "inspect", "--format", "{{json .}}", name}})
+	if err != nil {
+		return err
+	}
+	if inspection.ExitCode == 125 || inspection.ExitCode == 1 {
+		return nil
+	}
+	var network struct {
+		Internal bool              `json:"internal"`
+		Labels   map[string]string `json:"labels"`
+	}
+	if inspection.ExitCode != 0 || json.Unmarshal([]byte(inspection.Stdout), &network) != nil || !network.Internal || !labelsMatch(network.Labels, lifecycleLabels(request)) {
+		return errors.New("runtime network is not manager-owned and internal")
+	}
+	removed, err := d.Runner.Run(ctx, Command{Path: "podman", Args: []string{"network", "rm", name}})
+	if err != nil || (removed.ExitCode != 0 && removed.ExitCode != 1) {
+		return errors.New("runtime network deletion failed")
+	}
+	return nil
 }
 
 func (d Driver) currentGeneration(ctx context.Context, request runtime.Request) (uint64, bool, error) {

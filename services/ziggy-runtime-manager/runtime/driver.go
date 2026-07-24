@@ -50,7 +50,12 @@ type Driver interface {
 	Health(context.Context, Request) (Status, error)
 	Drain(context.Context, Request) (Status, error)
 	Stop(context.Context, Request) (Status, error)
+	// Delete removes only generation-scoped runtime artifacts. It preserves the
+	// tenant workspace volume for a replacement generation.
 	Delete(context.Context, Request) error
+	// DeleteTenantData is an explicit destructive operation for the persistent
+	// workspace volume and must not be used for ordinary generation replacement.
+	DeleteTenantData(context.Context, Request) error
 }
 
 func (r Request) Valid() bool { return r.WorkspaceID != "" && r.Generation > 0 }

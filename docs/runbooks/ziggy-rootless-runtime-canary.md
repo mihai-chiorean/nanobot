@@ -72,11 +72,17 @@ and healthy.
 2. Send `drain`, then `stop`, using the currently fenced generation. Verify the
    process cgroup is empty and the loopback port no longer accepts connections.
 3. If the runtime is compromised or policy verification fails, send `delete` to
-   remove the container, config/root volumes, internal network, and generated
-   Quadlet unit. Revoke its model/MCP capabilities at their brokers immediately.
+   remove the container, generation config volume, internal network, and
+   generated Quadlet unit. It preserves the workspace volume for recovery or a
+   replacement generation. Revoke its model/MCP capabilities at their brokers
+   immediately.
 4. Restore the tenant workspace only from a snapshot taken before the canary;
    keep external audit and forensic metadata outside the restored volume.
 5. Return the tenant to the existing static, `exec=false` runtime only after
    the original routing and health checks pass. Do not reuse the old generation
    or capabilities. Preserve the failed image digest, Quadlet checksum, kernel,
    Podman version, and test output for investigation.
+
+Use `delete_tenant_data` only for an intentional tenant-data destruction after
+the runtime is absent and retention approval is recorded. It is not part of
+generation upgrade or ordinary rollback.

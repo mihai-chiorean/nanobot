@@ -130,7 +130,7 @@ func (s Server) serveConnection(ctx context.Context, connection net.Conn, limits
 	if err := connection.SetReadDeadline(time.Now().Add(limits.readTimeout)); err != nil {
 		return
 	}
-	line, err := bufio.NewReaderSize(connection, int(limits.maxRequestBytes+1)).ReadString('\n')
+	line, err := bufio.NewReaderSize(io.LimitReader(connection, limits.maxRequestBytes+1), int(limits.maxRequestBytes+1)).ReadString('\n')
 	if len(line) > int(limits.maxRequestBytes) || errors.Is(err, bufio.ErrBufferFull) {
 		s.writeResponse(connection, limits, Response{Error: "request_too_large"})
 		return
@@ -194,6 +194,11 @@ func (s Server) dispatch(ctx context.Context, request Request) (runtime.Status, 
 			return runtime.Status{}, err
 		}
 		return runtime.Status{WorkspaceID: lifecycle.WorkspaceID, Generation: lifecycle.Generation, State: runtime.StateAbsent}, nil
+	case "delete_tenant_data":
+		if err := s.Driver.DeleteTenantData(ctx, lifecycle); err != nil {
+			return runtime.Status{}, err
+		}
+		return runtime.Status{WorkspaceID: lifecycle.WorkspaceID, Generation: lifecycle.Generation, State: runtime.StateAbsent}, nil
 	default:
 		return runtime.Status{}, errors.New("unsupported lifecycle operation")
 	}
@@ -204,7 +209,7 @@ func (s Server) log(request Request, result string) {
 		return
 	}
 	operation := request.Operation
-	if operation != "ensure_running" && operation != "health" && operation != "drain" && operation != "stop" && operation != "delete" {
+	if operation != "ensure_running" && operation != "health" && operation != "drain" && operation != "stop" && operation != "delete" && operation != "delete_tenant_data" {
 		operation = "invalid"
 	}
 	workspaceID := request.WorkspaceID

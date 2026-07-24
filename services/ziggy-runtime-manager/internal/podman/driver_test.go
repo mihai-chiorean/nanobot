@@ -28,6 +28,9 @@ func (f *fakeRunner) Run(_ context.Context, command Command) (Result, error) {
 		return Result{Stdout: prerequisiteJSON(true, lifecycleLabels(runtime.Request{WorkspaceID: "tenant-alpha", Generation: 7}))}, nil
 	}
 	if command.Path == "podman" && len(command.Args) > 1 && command.Args[0] == "volume" && command.Args[1] == "inspect" {
+		if strings.HasSuffix(command.Args[len(command.Args)-1], "-root") {
+			return Result{Stdout: prerequisiteJSON(false, workspaceVolumeLabels(runtime.Request{WorkspaceID: "tenant-alpha", Generation: 7}))}, nil
+		}
 		return Result{Stdout: prerequisiteJSON(false, lifecycleLabels(runtime.Request{WorkspaceID: "tenant-alpha", Generation: 7}))}, nil
 	}
 	if command.Path == "podman" && len(command.Args) > 1 && command.Args[0] == "inspect" {
@@ -134,7 +137,7 @@ func TestPrerequisitesRejectUnownedExistingResources(t *testing.T) {
 			if test.network {
 				err = driver.ensureNetwork(context.Background(), request)
 			} else {
-				err = driver.ensureVolume(context.Background(), request, "ziggy-tenant-tenant-alpha-root")
+				err = driver.ensureWorkspaceVolume(context.Background(), "ziggy-tenant-tenant-alpha-root", request)
 			}
 			if err == nil {
 				t.Fatal("pre-existing unowned prerequisite was accepted")
@@ -162,8 +165,8 @@ func TestPrerequisitesAcceptLabeledExistingResourcesAfterCreateConflict(t *testi
 		t.Fatalf("network create did not carry manager labels: %+v", runner.commands[0])
 	}
 
-	volumeRunner := &prerequisiteRunner{createExit: 125, inspect: prerequisiteJSON(false, lifecycleLabels(request))}
-	if err := (Driver{Runner: volumeRunner}).ensureVolume(context.Background(), request, "ziggy-tenant-tenant-alpha-root"); err != nil {
+	volumeRunner := &prerequisiteRunner{createExit: 125, inspect: prerequisiteJSON(false, workspaceVolumeLabels(request))}
+	if err := (Driver{Runner: volumeRunner}).ensureWorkspaceVolume(context.Background(), "ziggy-tenant-tenant-alpha-root", request); err != nil {
 		t.Fatal(err)
 	}
 	if len(volumeRunner.commands) != 2 || volumeRunner.commands[1].Args[0] != "volume" || volumeRunner.commands[1].Args[1] != "inspect" {
@@ -179,10 +182,144 @@ func TestMalformedWorkspaceIsNotAnInvalidGeneration(t *testing.T) {
 	}
 }
 
+func TestGenerationReplacementPreservesWorkspaceVolume(t *testing.T) {
+	runner := &upgradeRunner{volumes: map[string]map[string]string{}, networks: map[string]map[string]string{}}
+	driver := Driver{Policy: fixturePolicy(), QuadletDir: t.TempDir(), Runner: runner, Now: func() time.Time { return fixtureNow }}
+	generationOne := runtime.Request{WorkspaceID: "tenant-alpha", Generation: 1}
+	generationTwo := runtime.Request{WorkspaceID: "tenant-alpha", Generation: 2}
+	if _, err := driver.EnsureRunning(context.Background(), generationOne); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := driver.Stop(context.Background(), generationOne); err != nil {
+		t.Fatal(err)
+	}
+	if err := driver.Delete(context.Background(), generationOne); err != nil {
+		t.Fatal(err)
+	}
+	if _, found := runner.volumes["ziggy-tenant-tenant-alpha-root"]; !found {
+		t.Fatal("generation cleanup removed the persistent workspace volume")
+	}
+	if _, found := runner.volumes["ziggy-tenant-tenant-alpha-g1-config"]; found {
+		t.Fatal("generation cleanup retained generation-one config")
+	}
+	if _, err := driver.EnsureRunning(context.Background(), generationTwo); err != nil {
+		t.Fatal(err)
+	}
+	rootLabels := runner.volumes["ziggy-tenant-tenant-alpha-root"]
+	if _, generationLabeled := rootLabels[generationLabel]; generationLabeled {
+		t.Fatal("workspace volume must not be generation-labeled")
+	}
+	if _, found := runner.volumes["ziggy-tenant-tenant-alpha-g2-config"]; !found {
+		t.Fatal("generation-two config volume was not created")
+	}
+	if _, err := driver.EnsureRunning(context.Background(), generationOne); !errors.Is(err, runtime.ErrStaleGeneration) {
+		t.Fatalf("stale generation error=%v", err)
+	}
+}
+
 type prerequisiteRunner struct {
 	createExit int
 	inspect    string
 	commands   []Command
+}
+
+type upgradeRunner struct {
+	containerGeneration string
+	pendingGeneration   string
+	volumes             map[string]map[string]string
+	networks            map[string]map[string]string
+}
+
+func (r *upgradeRunner) Run(_ context.Context, command Command) (Result, error) {
+	if command.Path == "systemctl" {
+		if len(command.Args) > 1 && command.Args[1] == "start" {
+			r.containerGeneration = r.pendingGeneration
+		}
+		return Result{}, nil
+	}
+	if command.Path != "podman" || len(command.Args) == 0 {
+		return Result{}, nil
+	}
+	switch command.Args[0] {
+	case "inspect":
+		if strings.Contains(command.Args[2], "io.ziggy.generation") {
+			if r.containerGeneration == "" {
+				return Result{ExitCode: 125}, nil
+			}
+			return Result{Stdout: r.containerGeneration}, nil
+		}
+		return Result{Stdout: `{"Status":"running","Health":{"Status":"healthy"}}`}, nil
+	case "rm":
+		r.containerGeneration = ""
+		return Result{}, nil
+	case "network":
+		return r.runNetwork(command.Args)
+	case "volume":
+		return r.runVolume(command.Args)
+	case "run":
+		return Result{}, nil
+	default:
+		return Result{}, nil
+	}
+}
+
+func (r *upgradeRunner) runNetwork(args []string) (Result, error) {
+	name := args[len(args)-1]
+	switch args[1] {
+	case "create":
+		if _, exists := r.networks[name]; exists {
+			return Result{ExitCode: 125}, nil
+		}
+		r.networks[name] = commandLabels(args)
+		r.pendingGeneration = r.networks[name][generationLabel]
+		return Result{}, nil
+	case "inspect":
+		labels, exists := r.networks[name]
+		if !exists {
+			return Result{ExitCode: 125}, nil
+		}
+		return Result{Stdout: prerequisiteJSON(true, labels)}, nil
+	case "rm":
+		delete(r.networks, name)
+		return Result{}, nil
+	}
+	return Result{}, nil
+}
+
+func (r *upgradeRunner) runVolume(args []string) (Result, error) {
+	name := args[len(args)-1]
+	switch args[1] {
+	case "create":
+		if _, exists := r.volumes[name]; exists {
+			return Result{ExitCode: 125}, nil
+		}
+		r.volumes[name] = commandLabels(args)
+		return Result{}, nil
+	case "inspect":
+		labels, exists := r.volumes[name]
+		if !exists {
+			return Result{ExitCode: 125}, nil
+		}
+		return Result{Stdout: prerequisiteJSON(false, labels)}, nil
+	case "rm":
+		delete(r.volumes, name)
+		return Result{}, nil
+	}
+	return Result{}, nil
+}
+
+func commandLabels(args []string) map[string]string {
+	labels := map[string]string{}
+	for index := 0; index+1 < len(args); index++ {
+		if args[index] != "--label" {
+			continue
+		}
+		key, value, found := strings.Cut(args[index+1], "=")
+		if found {
+			labels[key] = value
+		}
+	}
+	return labels
 }
 
 func (r *prerequisiteRunner) Run(_ context.Context, command Command) (Result, error) {
