@@ -24,13 +24,41 @@ type TenantRoute struct {
 
 type TenantRouter interface {
 	ResolvePrincipal(context.Context, identity.Principal) (TenantRoute, error)
-	ResolveCredential(string) (TenantRoute, bool)
-	RememberCredentials(TenantRoute, []string, time.Duration) error
+	ResolveCredential(context.Context, string) (TenantRoute, error)
+	RememberCredentials(context.Context, TenantRoute, []string, time.Duration) error
 	Default() TenantRoute
 }
 
 type runtimeCredentialRouter interface {
 	ResolveRuntimeCredential(string) (TenantRoute, bool)
+}
+
+type tenantRouteSource uint8
+
+const (
+	tenantRouteNone tenantRouteSource = iota
+	tenantRoutePrincipal
+	tenantRouteCredential
+	tenantRouteRuntimeCredential
+	tenantRouteDefault
+)
+
+type tenantRouteResolution struct {
+	route  TenantRoute
+	source tenantRouteSource
+	err    error
+	found  bool
+}
+
+type tenantRouteResolutionKey struct{}
+
+func withTenantRouteResolution(ctx context.Context, resolution tenantRouteResolution) context.Context {
+	return context.WithValue(ctx, tenantRouteResolutionKey{}, resolution)
+}
+
+func tenantRouteResolutionFromContext(ctx context.Context) (tenantRouteResolution, bool) {
+	resolution, ok := ctx.Value(tenantRouteResolutionKey{}).(tenantRouteResolution)
+	return resolution, ok
 }
 
 type capturedResponse struct {

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -41,6 +42,7 @@ type Config struct {
 	SSEInFlight       int64
 	WebSocketInFlight int64
 	TenantCount       int
+	TenantCountSource TenantCountSource
 	Version           string
 }
 
@@ -77,6 +79,18 @@ type tenantCountProvider interface {
 	TenantCount() int
 }
 
+type TenantCountSource interface {
+	CurrentTenantCount() int64
+}
+
+type staticTenantCount int64
+
+func (count staticTenantCount) CurrentTenantCount() int64 { return int64(count) }
+
+type admissionIdentityRouter interface {
+	AdmissionIdentity(string) (string, bool)
+}
+
 const (
 	admissionHTTP admissionClass = iota
 	admissionSSE
@@ -89,9 +103,13 @@ type admissionGate struct {
 }
 
 func (gate *admissionGate) tryAcquire() (func(), bool) {
+	return gate.tryAcquireLimit(gate.limit)
+}
+
+func (gate *admissionGate) tryAcquireLimit(limit int64) (func(), bool) {
 	for {
 		current := gate.active.Load()
-		if current >= gate.limit {
+		if current >= limit {
 			return nil, false
 		}
 		if gate.active.CompareAndSwap(current, current+1) {
@@ -109,7 +127,7 @@ type inboundAdmission struct {
 	http             admissionGate
 	sse              admissionGate
 	webSocket        admissionGate
-	tenantCount      int64
+	tenantCount      TenantCountSource
 	httpTenants      sync.Map
 	sseTenants       sync.Map
 	webSocketTenants sync.Map
@@ -120,6 +138,15 @@ func newInboundAdmission(httpLimit, sseLimit, webSocketLimit int64) *inboundAdmi
 }
 
 func newInboundAdmissionWithTenantCount(httpLimit, sseLimit, webSocketLimit int64, tenantCount int) *inboundAdmission {
+	return newInboundAdmissionWithTenantCountSource(
+		httpLimit,
+		sseLimit,
+		webSocketLimit,
+		staticTenantCount(tenantCount),
+	)
+}
+
+func newInboundAdmissionWithTenantCountSource(httpLimit, sseLimit, webSocketLimit int64, tenantCount TenantCountSource) *inboundAdmission {
 	if httpLimit <= 0 {
 		httpLimit = defaultHTTPInFlight
 	}
@@ -129,14 +156,14 @@ func newInboundAdmissionWithTenantCount(httpLimit, sseLimit, webSocketLimit int6
 	if webSocketLimit <= 0 {
 		webSocketLimit = defaultWebSocketInFlight
 	}
-	if tenantCount <= 0 {
-		tenantCount = 1
+	if tenantCount == nil {
+		tenantCount = staticTenantCount(1)
 	}
 	return &inboundAdmission{
 		http:        admissionGate{limit: httpLimit},
 		sse:         admissionGate{limit: sseLimit},
 		webSocket:   admissionGate{limit: webSocketLimit},
-		tenantCount: int64(tenantCount),
+		tenantCount: tenantCount,
 	}
 }
 
@@ -177,6 +204,10 @@ func New(config Config) (http.Handler, error) {
 			tenantCount = provider.TenantCount()
 		}
 	}
+	tenantCountSource := config.TenantCountSource
+	if tenantCountSource == nil {
+		tenantCountSource = staticTenantCount(tenantCount)
+	}
 
 	api := &API{
 		proxy:           config.Proxy,
@@ -192,7 +223,7 @@ func New(config Config) (http.Handler, error) {
 		ownerSubject:    strings.TrimSpace(config.OwnerSubject),
 		blockedPaths:    cloneBlockedPaths(config.BlockedPaths),
 		maxRequestBody:  config.MaxRequestBody,
-		admission:       newInboundAdmissionWithTenantCount(config.HTTPInFlight, config.SSEInFlight, config.WebSocketInFlight, tenantCount),
+		admission:       newInboundAdmissionWithTenantCountSource(config.HTTPInFlight, config.SSEInFlight, config.WebSocketInFlight, tenantCountSource),
 		version:         config.Version,
 	}
 	if api.telemetry == nil {
@@ -231,35 +262,35 @@ func (api *API) admit(next http.Handler) http.Handler {
 		case isWorkEventStream(r), acceptsSSE(r):
 			class = admissionSSE
 		}
-		release, acquired := api.admission.tryAcquire(class, api.admissionTenant(r))
+
+		globalRelease, acquired := api.admission.tryAcquireGlobal(class)
 		if !acquired {
 			w.Header().Set("Retry-After", "1")
 			writeError(w, http.StatusServiceUnavailable, "inbound capacity unavailable")
 			return
 		}
-		defer release()
-		next.ServeHTTP(w, r)
+		defer globalRelease()
+
+		tenantRelease, acquired := api.admission.tryAcquireTenant(class, api.admissionIdentity(r))
+		if !acquired {
+			w.Header().Set("Retry-After", "1")
+			writeError(w, http.StatusServiceUnavailable, "inbound capacity unavailable")
+			return
+		}
+		defer tenantRelease()
+
+		resolution := api.resolveTenantRoute(r)
+		request := r.WithContext(withTenantRouteResolution(r.Context(), resolution))
+		next.ServeHTTP(w, request)
 	})
 }
 
 func (admission *inboundAdmission) tryAcquire(class admissionClass, tenant string) (func(), bool) {
-	global, tenants := admission.gates(class)
-	globalRelease, acquired := global.tryAcquire()
+	globalRelease, acquired := admission.tryAcquireGlobal(class)
 	if !acquired {
 		return nil, false
 	}
-
-	if strings.TrimSpace(tenant) == "" {
-		tenant = anonymousTenant
-	}
-	tenantCount := admission.tenantCount
-	if tenant == anonymousTenant {
-		tenantCount++
-	}
-	tenantLimit := admission.share(global.limit, tenantCount)
-	entry := &admissionGate{limit: tenantLimit}
-	actual, _ := tenants.LoadOrStore(tenant, entry)
-	tenantRelease, acquired := actual.(*admissionGate).tryAcquire()
+	tenantRelease, acquired := admission.tryAcquireTenant(class, tenant)
 	if !acquired {
 		globalRelease()
 		return nil, false
@@ -268,6 +299,26 @@ func (admission *inboundAdmission) tryAcquire(class admissionClass, tenant strin
 		tenantRelease()
 		globalRelease()
 	}, true
+}
+
+func (admission *inboundAdmission) tryAcquireGlobal(class admissionClass) (func(), bool) {
+	global, _ := admission.gates(class)
+	return global.tryAcquire()
+}
+
+func (admission *inboundAdmission) tryAcquireTenant(class admissionClass, tenant string) (func(), bool) {
+	global, tenants := admission.gates(class)
+	if strings.TrimSpace(tenant) == "" {
+		tenant = anonymousTenant
+	}
+	tenantCount := admission.tenantCount.CurrentTenantCount()
+	if tenantCount < 1 {
+		tenantCount = 1
+	}
+	tenantLimit := admission.share(global.limit, tenantCount+1)
+	entry := &admissionGate{}
+	actual, _ := tenants.LoadOrStore(tenant, entry)
+	return actual.(*admissionGate).tryAcquireLimit(tenantLimit)
 }
 
 func (admission *inboundAdmission) gates(class admissionClass) (*admissionGate, *sync.Map) {
@@ -292,32 +343,54 @@ func (admission *inboundAdmission) share(limit, tenantCount int64) int64 {
 	return share
 }
 
-func (api *API) admissionTenant(r *http.Request) string {
-	if principal, ok := identity.FromContext(r.Context()); ok {
-		if api.tenantRouter != nil {
-			route, err := api.tenantRouter.ResolvePrincipal(r.Context(), principal)
-			if err == nil && strings.TrimSpace(route.UserID) != "" {
-				return route.UserID
-			}
-			return anonymousTenant
-		}
-		if api.isOwner(principal) {
-			return "owner"
-		}
-		return anonymousTenant
+func (api *API) resolveTenantRoute(r *http.Request) tenantRouteResolution {
+	if api.tenantRouter == nil {
+		return tenantRouteResolution{}
 	}
-	if api.tenantRouter != nil {
-		credential := requestCredential(r)
-		if route, ok := api.tenantRouter.ResolveCredential(credential); ok && strings.TrimSpace(route.UserID) != "" {
-			return route.UserID
+	if principal, ok := identity.FromContext(r.Context()); ok {
+		route, err := api.tenantRouter.ResolvePrincipal(r.Context(), principal)
+		return tenantRouteResolution{
+			route: route, source: tenantRoutePrincipal, err: err,
+			found: err == nil && strings.TrimSpace(route.UserID) != "",
+		}
+	}
+	credential := requestCredential(r)
+	if credential != "" {
+		route, err := api.tenantRouter.ResolveCredential(r.Context(), credential)
+		if err == nil && strings.TrimSpace(route.UserID) != "" {
+			return tenantRouteResolution{route: route, source: tenantRouteCredential, found: true}
 		}
 		if router, ok := api.tenantRouter.(runtimeCredentialRouter); ok {
-			if route, ok := router.ResolveRuntimeCredential(credential); ok && strings.TrimSpace(route.UserID) != "" {
-				return route.UserID
+			if runtimeRoute, found := router.ResolveRuntimeCredential(credential); found && strings.TrimSpace(runtimeRoute.UserID) != "" {
+				return tenantRouteResolution{route: runtimeRoute, source: tenantRouteRuntimeCredential, found: true}
+			}
+		}
+		return tenantRouteResolution{source: tenantRouteCredential, err: err}
+	}
+	route := api.tenantRouter.Default()
+	return tenantRouteResolution{route: route, source: tenantRouteDefault, found: route.Proxy != nil}
+}
+
+func (api *API) admissionIdentity(r *http.Request) string {
+	if principal, ok := identity.FromContext(r.Context()); ok {
+		if subject := strings.TrimSpace(principal.Subject); subject != "" {
+			return hashedAdmissionIdentity("clerk", subject)
+		}
+	}
+	credential := requestCredential(r)
+	if credential != "" {
+		if router, ok := api.tenantRouter.(admissionIdentityRouter); ok {
+			if tenant, found := router.AdmissionIdentity(credential); found && strings.TrimSpace(tenant) != "" {
+				return hashedAdmissionIdentity("tenant", tenant)
 			}
 		}
 	}
 	return anonymousTenant
+}
+
+func hashedAdmissionIdentity(kind, value string) string {
+	digest := sha256.Sum256([]byte(kind + "\x00" + value))
+	return kind + ":" + hex.EncodeToString(digest[:])
 }
 
 func acceptsSSE(r *http.Request) bool {
@@ -380,10 +453,15 @@ func (api *API) bootstrap(w http.ResponseWriter, r *http.Request) {
 		api.proxy.ServeHTTP(w, r)
 		return
 	}
-	route, err := api.tenantRouter.ResolvePrincipal(r.Context(), principal)
-	if err != nil || route.Proxy == nil {
+	resolution, resolved := tenantRouteResolutionFromContext(r.Context())
+	if !resolved || resolution.source != tenantRoutePrincipal || resolution.err != nil || !resolution.found {
 		api.logger.WarnContext(r.Context(), "bootstrap authorization denied", "route", "bootstrap")
 		writeError(w, http.StatusForbidden, "account not authorized")
+		return
+	}
+	route := resolution.route
+	if route.Proxy == nil {
+		writeError(w, http.StatusServiceUnavailable, "tenant runtime unavailable")
 		return
 	}
 	api.logger.InfoContext(r.Context(), "bootstrap authorized", "route", "bootstrap")
@@ -412,30 +490,32 @@ func (api *API) forward(w http.ResponseWriter, r *http.Request) {
 	proxy := api.proxy
 	if api.tenantRouter != nil {
 		if credential := requestCredential(r); credential != "" {
-			route, ok := api.tenantRouter.ResolveCredential(credential)
-			if !ok || route.Proxy == nil {
+			resolution, resolved := tenantRouteResolutionFromContext(r.Context())
+			if !resolved || resolution.source != tenantRouteCredential || resolution.err != nil || !resolution.found || resolution.route.Proxy == nil {
 				writeError(w, http.StatusUnauthorized, "transport credential expired or unknown")
 				return
 			}
-			proxy = route.Proxy
-		} else if route := api.tenantRouter.Default(); route.Proxy != nil {
-			proxy = route.Proxy
+			proxy = resolution.route.Proxy
+		} else if resolution, resolved := tenantRouteResolutionFromContext(r.Context()); resolved && resolution.source == tenantRouteDefault && resolution.found {
+			proxy = resolution.route.Proxy
 		}
 	}
 	proxy.ServeHTTP(w, r)
 }
 
 func (api *API) work(w http.ResponseWriter, r *http.Request) {
-	credential, _, valid := bearerCredential(r.Header.Get("Authorization"))
+	_, _, valid := bearerCredential(r.Header.Get("Authorization"))
 	if !valid || api.tenantRouter == nil || api.workProxy == nil || api.workSigner == nil {
 		writeError(w, http.StatusUnauthorized, "transport credential required")
 		return
 	}
-	route, ok := api.tenantRouter.ResolveCredential(credential)
-	if !ok || strings.TrimSpace(route.UserID) == "" || strings.TrimSpace(route.WorkspaceID) == "" {
+	resolution, resolved := tenantRouteResolutionFromContext(r.Context())
+	if !resolved || resolution.source != tenantRouteCredential || resolution.err != nil || !resolution.found ||
+		strings.TrimSpace(resolution.route.UserID) == "" || strings.TrimSpace(resolution.route.WorkspaceID) == "" {
 		writeError(w, http.StatusUnauthorized, "transport credential expired or unknown")
 		return
 	}
+	route := resolution.route
 	if r.Body != nil {
 		if r.ContentLength > api.maxRequestBody {
 			writeError(w, http.StatusRequestEntityTooLarge, "request body too large")
@@ -475,7 +555,7 @@ func (api *API) proxyTenantBootstrap(w http.ResponseWriter, r *http.Request, rou
 		return
 	}
 	if len(credentials) > 0 {
-		if err := api.tenantRouter.RememberCredentials(route, credentials, ttl); err != nil {
+		if err := api.tenantRouter.RememberCredentials(r.Context(), route, credentials, ttl); err != nil {
 			api.logger.ErrorContext(r.Context(), "tenant bootstrap routing failed", "route", "bootstrap", "error_class", "credential_capacity")
 			writeError(w, http.StatusServiceUnavailable, "tenant routing capacity unavailable")
 			return

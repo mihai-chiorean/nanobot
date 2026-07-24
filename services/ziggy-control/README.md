@@ -13,9 +13,10 @@ iOS / web -> Cloudflare -> ziggy-control -> private Nanobot -> Spark models
 
 - Verify the Clerk JWT on `GET /auth/bootstrap` with the official Clerk Go SDK.
 - Resolve a signed email claim, falling back to Clerk's Users API when needed.
-- Resolve a verified Clerk subject and email through a server-owned tenant
-  manifest. An unpinned tester subject is durably bound on first successful
-  login and cannot later be replaced by another Clerk account.
+- Resolve a verified Clerk subject and email through the selected server-owned
+  tenant source. PostgreSQL mode binds an invited email to one Clerk subject,
+  activates it, and creates one personal workspace and pending runtime
+  allocation in one transaction. A bound subject cannot be replaced.
 - Forward bootstrap to that tenant's private runtime without changing the
   response shape, then retain only a SHA-256 fingerprint that binds each
   short-lived transport token to the same runtime.
@@ -69,6 +70,80 @@ protocol change should add a private Nanobot token-broker endpoint authenticated
 only by `ziggy-control`; it should not expose another public token mint or
 change the mobile protocol during the front-door cutover.
 
+## Durable Tenant Lifecycle
+
+`ZIGGY_TENANCY_MODE=manifest` is the explicit compatibility mode for the
+current production manifest and binding-file deployment. It preserves the
+existing static runtime behavior and remains the default when a manifest is
+configured without a mode value.
+
+`ZIGGY_TENANCY_MODE=postgres` selects the durable lifecycle source. Apply
+[`migrations/001_tenant_lifecycle_foundation.sql`](migrations/001_tenant_lifecycle_foundation.sql)
+through [`migrations/004_schema_identity.sql`](migrations/004_schema_identity.sql)
+with deployment-owned migration tooling before starting the service; the
+process verifies the complete schema identity and never changes production
+schema. Applied migrations are immutable: CI hashes migrations 001 through 003,
+and readiness requires the exact identity recorded by migration 004. Replaying
+migration 004 never overwrites an existing identity; a mismatch remains a
+readiness failure and requires operator investigation.
+Do not configure the manifest or binding-file variables in PostgreSQL mode.
+
+The durable source stores the invited email, stable Clerk subject, lifecycle
+state (`invited`, `active`, `disabled`, `deletion_pending`, `deleted`), exactly
+one personal workspace, one runtime allocation with a generation, and an
+append-only content-free lifecycle event trail. The first authorized bootstrap
+matches a normalized verified email to a pre-invited record, binds its Clerk
+subject, and creates any missing workspace/allocation atomically. Unknown,
+disabled, deletion-pending, and deleted identities create nothing and receive
+the same deny result. Email changes never transfer a workspace.
+
+A newly created allocation is `pending`; it intentionally has no public route.
+`/auth/bootstrap` returns `503` until a future runtime manager activates the
+allocation with a private endpoint and bootstrap secret. The lifecycle package
+defines only a `RuntimeProvisioner` interface for that manager. Activation is
+transactional and requires the exact pending runtime ID and generation; an
+already active, disabled, or replaced allocation cannot be activated again.
+PostgreSQL also rejects reuse of any non-empty private runtime endpoint or
+bootstrap secret across tenants.
+Operators can transition users through `disabled`, `deletion_pending`, and
+`deleted`; the final transition requires deletion-pending plus a nonempty
+external destruction receipt. Only the receipt's SHA-256 digest is retained.
+An exact retry is idempotent; a different receipt is rejected. Terminal
+deletion clears the email, Clerk subject, runtime endpoint, bootstrap secret,
+and runtime metadata while preserving product-generated user/workspace/runtime
+IDs and the content-free audit trail. This service does not shell out, start
+containers, or own runtime placement. Once active, remembered transport
+credentials are rechecked against the durable lifecycle source on every
+request, so disable and deletion take effect before runtime lookup.
+
+Roll out by applying the migration, importing invited users and active runtime
+allocation metadata into PostgreSQL, validating a non-production control
+instance in `postgres` mode, then switching the production mode variable.
+Rollback is setting `ZIGGY_TENANCY_MODE=manifest` with the original immutable
+manifest and bindings intact. Do not run both modes in one process and do not
+copy a Clerk subject or workspace identifier from a client request.
+
+The import is an explicit operator step; it never runs during service startup:
+
+```sh
+make tenant-import
+sudo bin/import-tenant-manifest \
+  --manifest /etc/ziggy/tenants.json \
+  --bindings /var/lib/ziggy-control/tenant-bindings.json \
+  --database-url-file /etc/ziggy/secrets/tenant-database-url \
+  --dry-run
+```
+
+The command loads the same strict manifest and bindings validation as manifest
+mode, prints only aggregate counts, and rolls the dry-run transaction back.
+Repeat without `--dry-run` to import. It preserves user/workspace IDs and bound
+subjects, and refuses any durable conflict without partially importing a batch.
+Imports are sorted, serialized with a PostgreSQL transaction advisory lock, and
+retry serialization/deadlock failures only; concurrent identical imports
+converge to the same rows and events.
+The staged switch and rollback procedure is in
+[`deploy/runbooks/postgres-tenant-import.md`](deploy/runbooks/postgres-tenant-import.md).
+
 ## Configuration
 
 Required variables:
@@ -77,13 +152,15 @@ Required variables:
 |---|---|
 | `CLERK_SECRET_KEY` or `CLERK_SECRET_KEY_FILE` | Backend key, supplied inline for development or through a credential file. Set exactly one. |
 | `ZIGGY_UPSTREAM_URL` | Private Nanobot origin. It must use an explicit loopback, RFC1918 IPv4, IPv6 ULA/link-local, or Tailscale `100.64.0.0/10` address. Userinfo, query, fragment, and public hostnames are rejected. |
-| `ZIGGY_TENANTS_FILE` | Immutable tenant allocation manifest. Production requires it. |
-| `ZIGGY_TENANT_BINDINGS_FILE` | Durable first-login Clerk subject bindings. Production requires it and the service must be able to write it. |
+| `ZIGGY_TENANCY_MODE` | `manifest` compatibility mode or `postgres` durable lifecycle mode. `legacy` is development-only. |
+| `ZIGGY_TENANTS_FILE` | Required only in `manifest` mode: immutable tenant allocation manifest. |
+| `ZIGGY_TENANT_BINDINGS_FILE` | Required only in `manifest` mode: durable first-login Clerk subject bindings. |
+| `ZIGGY_TENANT_DATABASE_URL` or `ZIGGY_TENANT_DATABASE_URL_FILE` | Required only in `postgres` mode. Set exactly one. Unix-socket URLs support local peer authentication; network URLs must use `sslmode=verify-full`. Use a credential file in production. |
 
 Optional variables are documented in [`.env.example`](.env.example). In
 production, at least one `ZIGGY_AUTHORIZED_PARTIES` value is mandatory. Tenant
-identity is resolved through the manifest and durable Clerk subject binding;
-an email match alone is not an identity boundary. The origin allowlist is
+identity is resolved through the configured tenant source and durable Clerk
+subject binding; an email match alone is not an identity boundary. The origin allowlist is
 enforced when a token contains `azp`;
 Clerk's native clients legitimately omit that browser-origin claim, so those
 tokens continue through issuer, signature, lifetime, subject, and tenant
@@ -91,7 +168,7 @@ binding validation. Development, local, staging, and test environments retain
 the explicit escape hatch for deployments without a browser origin or subject
 pin.
 
-The manifest format is shown in
+In manifest mode, the format is shown in
 [`deploy/tenants.example.json`](deploy/tenants.example.json). It must contain
 exactly one `legacy_default` allocation. Every active tenant has unique
 `user_id`, `workspace_id`, email, private upstream URL, and
@@ -121,7 +198,12 @@ legacy Nanobot fallback and bearer behavior.
 The default global admission limits are 64 ordinary HTTP requests, 8 SSE
 streams, and 8 WebSocket connections. Each configured tenant receives an
 equal share of each class, while anonymous traffic receives a separate share;
-the global limits remain hard caps. Override the global limits with
+the global limits remain hard caps and one tenant cannot consume an entire
+class. PostgreSQL mode counts admitted durable tenants at startup. A cheap
+global slot and a stable authenticated-identity share are acquired before
+durable route resolution, and the one resolved route is reused by the handler.
+The admitted tenant count refreshes from PostgreSQL every 15 seconds through an
+atomic source; the request path takes no count lock. Override the global limits with
 `ZIGGY_MAX_HTTP_IN_FLIGHT`, `ZIGGY_MAX_SSE_IN_FLIGHT`, and
 `ZIGGY_MAX_WEBSOCKET_IN_FLIGHT`. `/healthz` and `/readyz` bypass these limits.
 
@@ -198,6 +280,9 @@ The checked-in unit expects:
 - tenant subject bindings: `/var/lib/ziggy-control/tenant-bindings.json`,
   written atomically by the `ziggy-control` account; the unit's
   `StateDirectory=ziggy-control` creates the parent
+- tenant database URL credential: required only in PostgreSQL mode and supplied
+  through `ZIGGY_TENANT_DATABASE_URL_FILE`; migration ownership and database
+  credentials remain outside this service unit
 - Clerk credential: `/etc/ziggy/secrets/clerk-secret-key`, owned by root and
   mode `0400`; the base unit is the only unit that loads it with
   `LoadCredential`
@@ -236,6 +321,10 @@ sudo install -o root -g root -m 0644 \
 sudo install -o root -g root -m 0644 \
   services/ziggy-control/deploy/systemd/ziggy-control.service.d/30-work-credential.conf \
   /etc/systemd/system/ziggy-control.service.d/30-work-credential.conf
+# Install only immediately before changing to ZIGGY_TENANCY_MODE=postgres:
+sudo install -o root -g root -m 0644 \
+  services/ziggy-control/deploy/systemd/ziggy-control.service.d/40-tenant-database-credential.conf \
+  /etc/systemd/system/ziggy-control.service.d/40-tenant-database-credential.conf
 ```
 
 The base unit loads only Clerk. Its `EnvironmentFile` is read before the
@@ -249,6 +338,10 @@ install, remove, or change a drop-in before the same reload and restart. On the
 first upgrade from the older unit, its inline OTel and connector credentials
 are removed with the base file, so install the desired drop-ins before
 restarting if either integration must remain enabled.
+The tenant database credential is intentionally a separate optional drop-in:
+do not install `40-tenant-database-credential.conf` in manifest mode. It sets
+`ZIGGY_TENANT_DATABASE_URL_FILE` only for PostgreSQL mode, so the unchanged
+manifest deployment never requires a database DSN credential.
 
 Install or upgrade the versioned binary atomically, retain the previous binary
 as `/usr/local/bin/ziggy-control.previous`, then:
@@ -301,9 +394,9 @@ orchestrator.
 
 This pilot uses one Nanobot process, config tree, runtime-data tree, and
 workspace per admitted user. It deliberately does not make Nanobot internally
-multi-tenant. The allocation manifest is the control-plane source of truth and
-the subject-binding file is a small local persistence bridge; PostgreSQL runtime
-leases and automatic cold-start scheduling remain later milestones.
+multi-tenant. The manifest and binding file remain a compatibility source;
+PostgreSQL mode is the durable product source. Runtime leases, activation, and
+automatic cold-start scheduling remain runtime-manager milestones.
 
 The checked-in Spark template `deploy/systemd/spark/nanobot-tenant@.service`
 adds a read-only home/system view and one tenant-specific writable tree. Tools

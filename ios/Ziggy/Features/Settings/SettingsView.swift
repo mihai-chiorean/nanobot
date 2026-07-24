@@ -1,7 +1,37 @@
 import SwiftUI
 
+struct AppVersion: Equatable, Sendable {
+    let marketingVersion: String
+    let buildNumber: String
+
+    init(infoDictionary: [String: Any]) {
+        marketingVersion = Self.value(
+            forKey: "CFBundleShortVersionString",
+            in: infoDictionary
+        )
+        buildNumber = Self.value(forKey: "CFBundleVersion", in: infoDictionary)
+    }
+
+    static var current: AppVersion {
+        AppVersion(infoDictionary: Bundle.main.infoDictionary ?? [:])
+    }
+
+    private static func value(forKey key: String, in infoDictionary: [String: Any]) -> String {
+        guard let value = infoDictionary[key] as? String else {
+            return "Unknown"
+        }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "Unknown" : trimmed
+    }
+}
+
 struct SettingsView: View {
     @Environment(AppModel.self) private var appModel
+    private let appVersion: AppVersion
+
+    init(appVersion: AppVersion = .current) {
+        self.appVersion = appVersion
+    }
 
     var body: some View {
         @Bindable var appModel = appModel
@@ -54,6 +84,12 @@ struct SettingsView: View {
                         SettingsRow(title: "Chat", value: "WebSocket")
                         SettingsDivider()
                         SettingsRow(title: "Streaming API", value: "SSE")
+                    }
+
+                    SettingsSection(title: "About") {
+                        SettingsRow(title: "Version", value: appVersion.marketingVersion)
+                        SettingsDivider()
+                        SettingsRow(title: "Build", value: appVersion.buildNumber)
                     }
 
                     SettingsSection(title: "Access") {

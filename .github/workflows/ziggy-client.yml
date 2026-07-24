@@ -74,6 +74,10 @@ jobs:
         working-directory: webui
         run: npm run build
 
+      - name: Reject high-severity npm advisories
+        working-directory: webui
+        run: npm audit --audit-level=high
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -103,6 +107,7 @@ jobs:
     timeout-minutes: 20
     env:
       ZIGGY_CI_CLERK_PUBLISHABLE_KEY: pk_test_Y2lfemlnZ3lfY2xpZW50X2lvcw
+      ZIGGY_CI_CLERK_LIVE_SUFFIX: ci_release_validation
     steps:
       - uses: actions/checkout@v4
 
@@ -153,3 +158,23 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             CLERK_PUBLISHABLE_KEY="$ZIGGY_CI_CLERK_PUBLISHABLE_KEY" \
             test-without-building
+
+      - name: Test Release configuration validation
+        run: ios/Scripts/test-release-configuration.sh
+
+      - name: Build unsigned Release app
+        run: |
+          build_number=$((GITHUB_RUN_NUMBER + 1))
+          xcodebuild \
+            -project ios/Ziggy.xcodeproj \
+            -scheme Ziggy \
+            -configuration Release \
+            -destination "$ZIGGY_SIMULATOR_DESTINATION" \
+            -derivedDataPath "$RUNNER_TEMP/ziggy-release-derived-data" \
+            -clonedSourcePackagesDirPath "$RUNNER_TEMP/ziggy-source-packages" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CURRENT_PROJECT_VERSION="${build_number}" \
+            ZIGGY_ARCHIVE_BUILD_NUMBER="${build_number}" \
+            CLERK_PUBLISHABLE_KEY="pk_live_${ZIGGY_CI_CLERK_LIVE_SUFFIX}" \
+            build

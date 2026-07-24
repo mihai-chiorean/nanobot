@@ -2,24 +2,59 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"sync/atomic"
 	"syscall"
 	"time"
 
+	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/mihai-chiorean/nanobot/services/ziggy-control/internal/auth"
 	"github.com/mihai-chiorean/nanobot/services/ziggy-control/internal/config"
 	"github.com/mihai-chiorean/nanobot/services/ziggy-control/internal/httpapi"
+	"github.com/mihai-chiorean/nanobot/services/ziggy-control/internal/lifecycle"
 	"github.com/mihai-chiorean/nanobot/services/ziggy-control/internal/routing"
 	"github.com/mihai-chiorean/nanobot/services/ziggy-control/internal/telemetry"
 	"github.com/mihai-chiorean/nanobot/services/ziggy-control/internal/tenant"
 )
 
 var version = "dev"
+
+const tenantCountRefreshInterval = 15 * time.Second
+
+type atomicTenantCount struct {
+	value atomic.Int64
+}
+
+type tenantCountReader interface {
+	AdmissionTenantCount(context.Context) (int, error)
+}
+
+func newAtomicTenantCount(count int) *atomicTenantCount {
+	source := &atomicTenantCount{}
+	source.Store(count)
+	return source
+}
+
+func (source *atomicTenantCount) CurrentTenantCount() int64 {
+	count := source.value.Load()
+	if count < 1 {
+		return 1
+	}
+	return count
+}
+
+func (source *atomicTenantCount) Store(count int) {
+	if count < 0 {
+		count = 0
+	}
+	source.value.Store(int64(count))
+}
 
 func main() {
 	if err := run(); err != nil {
@@ -39,7 +74,7 @@ func run() error {
 		"version", version,
 	)
 	slog.SetDefault(logger)
-	if cfg.TenantManifest == "" && cfg.OwnerSubject == "" {
+	if cfg.TenantMode == "legacy" && cfg.OwnerSubject == "" {
 		logger.Warn("single-tenant fallback subject is not pinned")
 	}
 	if cfg.DeploymentEnv != "production" && len(cfg.AuthorizedParties) == 0 {
@@ -83,7 +118,9 @@ func run() error {
 
 	var tenantRouter httpapi.TenantRouter
 	tenantCount := 1
-	if cfg.TenantManifest != "" {
+	var tenantCountSource *atomicTenantCount
+	var durableTenantStore tenantCountReader
+	if cfg.TenantMode == "manifest" {
 		registry, err := tenant.Load(cfg.TenantManifest, cfg.TenantBindings)
 		if err != nil {
 			return err
@@ -101,6 +138,38 @@ func run() error {
 		}
 		tenantCount = len(registry.Allocations())
 		logger.Info("tenant routing enabled", "tenant_count", len(registry.Allocations()))
+	} else if cfg.TenantMode == "postgres" {
+		db, err := sql.Open("pgx", cfg.TenantDatabaseURL)
+		if err != nil {
+			return fmt.Errorf("open tenant database: %w", err)
+		}
+		defer db.Close()
+		db.SetMaxOpenConns(16)
+		db.SetMaxIdleConns(4)
+		store, err := lifecycle.NewStore(db)
+		if err != nil {
+			return err
+		}
+		startupCtx, cancel := context.WithTimeout(context.Background(), cfg.ReadinessTimeout)
+		err = store.Ready(startupCtx)
+		if err != nil {
+			cancel()
+			return fmt.Errorf("tenant lifecycle database unavailable: %w", err)
+		}
+		tenantCount, err = store.AdmissionTenantCount(startupCtx)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("tenant admission count unavailable: %w", err)
+		}
+		durableRouter, err := routing.NewDurable(store, logger, observability)
+		if err != nil {
+			return err
+		}
+		store.SetRevocationObserver(durableRouter.EvictTenant)
+		tenantRouter = durableRouter
+		tenantCountSource = newAtomicTenantCount(tenantCount)
+		durableTenantStore = store
+		logger.Info("durable tenant routing enabled", "tenant_count", tenantCount)
 	}
 	var connectorProxy http.Handler
 	var connectorSigner *httpapi.ConnectorSigner
@@ -158,6 +227,7 @@ func run() error {
 		SSEInFlight:       cfg.SSEInFlight,
 		WebSocketInFlight: cfg.WebSocketInFlight,
 		TenantCount:       tenantCount,
+		TenantCountSource: tenantCountSource,
 		Version:           version,
 	})
 	if err != nil {
@@ -176,7 +246,22 @@ func run() error {
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	var tenantCountRefreshDone <-chan struct{}
+	if durableTenantStore != nil && tenantCountSource != nil {
+		tenantCountRefreshDone = startTenantCountRefresh(
+			ctx,
+			durableTenantStore,
+			tenantCountSource,
+			logger,
+			tenantCountRefreshInterval,
+		)
+	}
+	defer func() {
+		stop()
+		if tenantCountRefreshDone != nil {
+			<-tenantCountRefreshDone
+		}
+	}()
 	serveErr := make(chan error, 1)
 	go func() {
 		logger.Info("ziggy-control listening",
@@ -221,4 +306,33 @@ func run() error {
 		return shutdownErr
 	}
 	return nil
+}
+
+func startTenantCountRefresh(
+	ctx context.Context,
+	store tenantCountReader,
+	source *atomicTenantCount,
+	logger *slog.Logger,
+	interval time.Duration,
+) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				count, err := store.AdmissionTenantCount(ctx)
+				if err != nil {
+					logger.Warn("tenant admission count refresh failed", "error_class", "database")
+					continue
+				}
+				source.Store(count)
+			}
+		}
+	}()
+	return done
 }

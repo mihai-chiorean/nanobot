@@ -1,0 +1,25 @@
+[Unit]
+Description=Ziggy rootless tenant runtime manager
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/ziggy-runtime-manager -policy %h/.config/ziggy-runtime-manager/policy.json -quadlet-dir %h/.config/containers/systemd -state-dir %h/.local/state/ziggy-runtime-manager -socket /run/ziggy-runtime-manager/manager.sock -socket-group ziggy-control
+Restart=on-failure
+RestartSec=3s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=read-only
+ProtectSystem=strict
+ReadWritePaths=%h/.config/containers/systemd %h/.local/state/ziggy-runtime-manager %h/.local/share/containers %h/.cache/containers %t/containers /run/ziggy-runtime-manager
+ProtectControlGroups=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+UMask=0077
+
+[Install]
+WantedBy=default.target

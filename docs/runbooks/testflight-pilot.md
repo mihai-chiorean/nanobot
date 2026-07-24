@@ -78,20 +78,26 @@ DEVELOPMENT_TEAM = 98KW2QQ963
 
 Use `MARKETING_VERSION` for the user-visible version. Increment
 `CURRENT_PROJECT_VERSION` for every upload; App Store Connect rejects a reused
-build number.
+build number. Release builds intentionally keep build `1` as a non-uploadable
+sentinel in `Base.xcconfig`. Every CI Release build or archive must explicitly
+set both `CURRENT_PROJECT_VERSION` and `ZIGGY_ARCHIVE_BUILD_NUMBER` to the same
+integer greater than `1`. Choose a value greater than the latest build already
+uploaded to App Store Connect.
 
 ## Archive And Internal Smoke Test
 
 Archive with automatic signing:
 
 ```sh
-rm -rf build/Ziggy.xcarchive
+build_number=2 # Replace with a value greater than the latest TestFlight build.
 xcodebuild -project Ziggy.xcodeproj \
   -scheme Ziggy \
   -configuration Release \
   -destination 'generic/platform=iOS' \
   -archivePath build/Ziggy.xcarchive \
   -allowProvisioningUpdates \
+  CURRENT_PROJECT_VERSION="$build_number" \
+  ZIGGY_ARCHIVE_BUILD_NUMBER="$build_number" \
   archive
 ```
 

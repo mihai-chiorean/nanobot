@@ -408,6 +408,7 @@
 			isa = PBXNativeTarget;
 			buildConfigurationList = 9D04AAD8AD64B62997EB3E44 /* Build configuration list for PBXNativeTarget "Ziggy" */;
 			buildPhases = (
+				7C5B3C74C58C2181707809E5 /* Validate Release configuration */,
 				9C592297FABB4A6A9D8F11A5 /* Sources */,
 				2A65E4D84ECD9A871D2F1F1C /* Resources */,
 				631B68F3F98D4A8A595D8EE1 /* Frameworks */,
@@ -504,6 +505,29 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		7C5B3C74C58C2181707809E5 /* Validate Release configuration */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+				"$(SRCROOT)/Scripts/validate-release-configuration.sh",
+			);
+			name = "Validate Release configuration";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "/bin/bash \"$SCRIPT_INPUT_FILE_0\"";
+		};
+/* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		41B9E4D5F82FF6F4657B693E /* Sources */ = {

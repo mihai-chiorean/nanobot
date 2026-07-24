@@ -125,12 +125,45 @@ func (registry *Registry) Resolve(_ context.Context, principal identity.Principa
 	return registry.bindSubject(allocation, subject)
 }
 
+// ResolveActive supports the same server-side credential recheck contract as
+// the durable resolver. Manifest mode remains immutable until restart.
+func (registry *Registry) ResolveActive(_ context.Context, userID, workspaceID string) (Allocation, error) {
+	state := registry.state.Load()
+	if state == nil {
+		return Allocation{}, ErrNotAuthorized
+	}
+	allocation, ok := state.byUserID[strings.TrimSpace(userID)]
+	if !ok || allocation.WorkspaceID != strings.TrimSpace(workspaceID) || allocation.Status != "active" {
+		return Allocation{}, ErrNotAuthorized
+	}
+	return allocation, nil
+}
+
 func (registry *Registry) Allocations() []Allocation {
 	state := registry.state.Load()
 	if state == nil {
 		return nil
 	}
 	return append([]Allocation(nil), state.all...)
+}
+
+// ImportAllocations returns a stable manifest snapshot with persisted first
+// login bindings folded into ClerkSubject. It is for one-shot migration tools;
+// runtime routing continues to use the internal snapshot directly.
+func (registry *Registry) ImportAllocations() []Allocation {
+	state := registry.state.Load()
+	if state == nil {
+		return nil
+	}
+	allocations := make([]Allocation, 0, len(state.all))
+	for _, candidate := range state.all {
+		allocation := candidate
+		if binding, ok := state.bindings[allocation.UserID]; ok {
+			allocation.ClerkSubject = binding.ClerkSubject
+		}
+		allocations = append(allocations, allocation)
+	}
+	return allocations
 }
 
 func (registry *Registry) Default() Allocation {
@@ -140,6 +173,8 @@ func (registry *Registry) Default() Allocation {
 	}
 	return state.fallback
 }
+
+var _ Resolver = (*Registry)(nil)
 
 func (registry *Registry) bindSubject(allocation Allocation, subject string) (Allocation, error) {
 	registry.bindMu.Lock()

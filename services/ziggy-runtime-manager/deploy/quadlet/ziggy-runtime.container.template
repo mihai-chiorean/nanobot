@@ -1,0 +1,35 @@
+# This is documentation for the stable workspace units emitted by the manager.
+# Install no handwritten tenant units. Values in angle brackets are manager-owned.
+[Container]
+Image=<immutable-image-digest>
+ContainerName=ziggy-tenant-<workspace>
+Network=ziggy-tenant-<workspace>-g<generation>
+Volume=ziggy-tenant-<workspace>-root:/home/nanobot/.nanobot:rw,U,Z
+Volume=ziggy-tenant-<workspace>-g<generation>-config:/run/ziggy/config:ro,U,Z
+ReadOnly=true
+ReadOnlyTmpfs=false
+ImageVolume=ignore
+Pull=never
+LogDriver=journald
+User=1000:1000
+UserNS=auto:size=65536
+DropCapability=all
+NoNewPrivileges=true
+SecurityLabelDisable=false
+PidsLimit=256
+Memory=1G
+PodmanArgs=--cpus=1.0
+PublishPort=127.0.0.1:<unique-port>:18790/tcp
+Tmpfs=/tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777
+Tmpfs=/run:rw,nosuid,nodev,noexec,size=16m,mode=755
+Tmpfs=/dev/shm:rw,nosuid,nodev,noexec,size=64m,mode=1777
+HealthCmd=CMD-SHELL python3 -c '<GET /health; require HTTP 200 and exact JSON {"status":"ok"}>'
+Label=io.ziggy.owner=ziggy-runtime-manager
+Exec=nanobot gateway --config /run/ziggy/config/config.json
+
+[Service]
+ProtectHome=read-only
+ProtectSystem=strict
+ReadWritePaths=%h/.local/share/containers
+ReadWritePaths=%h/.cache/containers
+ReadWritePaths=%t/containers

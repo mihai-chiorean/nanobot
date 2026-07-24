@@ -1,0 +1,10 @@
+[Unit]
+Description=Ziggy tenant runtime aggregate limits
+
+[Slice]
+CPUAccounting=true
+MemoryAccounting=true
+TasksAccounting=true
+CPUQuota=400%
+MemoryMax=4G
+TasksMax=1024

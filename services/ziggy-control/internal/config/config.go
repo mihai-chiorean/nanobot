@@ -44,6 +44,8 @@ type Config struct {
 	AuthorizedParties []string
 	TenantManifest    string
 	TenantBindings    string
+	TenantMode        string
+	TenantDatabaseURL string
 	ConnectorsURL     *url.URL
 	ConnectorTrustKey []byte
 	WorkURL           *url.URL
@@ -154,8 +156,33 @@ func loadFrom(lookup LookupEnv, readFile ReadFile) (Config, error) {
 			return Config{}, fmt.Errorf("ZIGGY_OWNER_EMAIL: invalid email address")
 		}
 	}
-	if tenantManifest == "" && ownerEmail == "" {
-		return Config{}, fmt.Errorf("ZIGGY_OWNER_EMAIL is required without a tenant manifest")
+	tenantMode, err := tenancyMode(lookup, tenantManifest)
+	if err != nil {
+		return Config{}, err
+	}
+	tenantDatabaseURL, err := tenantDatabaseConfig(lookup, readFile)
+	if err != nil {
+		return Config{}, err
+	}
+	switch tenantMode {
+	case "manifest":
+		if tenantManifest == "" {
+			return Config{}, fmt.Errorf("ZIGGY_TENANTS_FILE and ZIGGY_TENANT_BINDINGS_FILE are required in manifest mode")
+		}
+		if tenantDatabaseURL != "" {
+			return Config{}, fmt.Errorf("tenant database configuration is only valid in postgres mode")
+		}
+	case "postgres":
+		if tenantManifest != "" {
+			return Config{}, fmt.Errorf("tenant manifest configuration is not valid in postgres mode")
+		}
+		if tenantDatabaseURL == "" {
+			return Config{}, fmt.Errorf("ZIGGY_TENANT_DATABASE_URL or ZIGGY_TENANT_DATABASE_URL_FILE is required in postgres mode")
+		}
+	case "legacy":
+		if tenantManifest != "" || tenantDatabaseURL != "" || ownerEmail == "" {
+			return Config{}, fmt.Errorf("legacy mode requires only ZIGGY_OWNER_EMAIL")
+		}
 	}
 	connectorsURL, connectorTrustKey, err := connectorConfig(lookup, readFile)
 	if err != nil {
@@ -173,8 +200,8 @@ func loadFrom(lookup LookupEnv, readFile ReadFile) (Config, error) {
 		if len(authorizedParties) == 0 {
 			return Config{}, fmt.Errorf("ZIGGY_AUTHORIZED_PARTIES is required in production")
 		}
-		if tenantManifest == "" {
-			return Config{}, fmt.Errorf("ZIGGY_TENANTS_FILE and ZIGGY_TENANT_BINDINGS_FILE are required in production")
+		if tenantMode == "legacy" {
+			return Config{}, fmt.Errorf("ZIGGY_TENANCY_MODE=legacy is not allowed in production")
 		}
 		if !upstreamPreflight {
 			return Config{}, fmt.Errorf("ZIGGY_UPSTREAM_PREFLIGHT cannot be disabled in production")
@@ -190,6 +217,8 @@ func loadFrom(lookup LookupEnv, readFile ReadFile) (Config, error) {
 		AuthorizedParties: authorizedParties,
 		TenantManifest:    tenantManifest,
 		TenantBindings:    tenantBindings,
+		TenantMode:        tenantMode,
+		TenantDatabaseURL: tenantDatabaseURL,
 		ConnectorsURL:     connectorsURL,
 		ConnectorTrustKey: connectorTrustKey,
 		WorkURL:           workURL,
@@ -210,6 +239,61 @@ func loadFrom(lookup LookupEnv, readFile ReadFile) (Config, error) {
 		OTelTraceSample:   otelTraceSample,
 		DeploymentEnv:     deploymentEnv,
 	}, nil
+}
+
+func tenancyMode(lookup LookupEnv, tenantManifest string) (string, error) {
+	mode := strings.ToLower(optional(lookup, "ZIGGY_TENANCY_MODE"))
+	if mode == "" {
+		if tenantManifest != "" {
+			return "manifest", nil
+		}
+		return "legacy", nil
+	}
+	switch mode {
+	case "manifest", "postgres", "legacy":
+		return mode, nil
+	default:
+		return "", fmt.Errorf("ZIGGY_TENANCY_MODE must be manifest, postgres, or legacy")
+	}
+}
+
+func tenantDatabaseConfig(lookup LookupEnv, readFile ReadFile) (string, error) {
+	inline := optional(lookup, "ZIGGY_TENANT_DATABASE_URL")
+	filename := optional(lookup, "ZIGGY_TENANT_DATABASE_URL_FILE")
+	if inline != "" && filename != "" {
+		return "", fmt.Errorf("set only one of ZIGGY_TENANT_DATABASE_URL or ZIGGY_TENANT_DATABASE_URL_FILE")
+	}
+	if filename != "" {
+		contents, err := readFile(filename)
+		if err != nil {
+			return "", fmt.Errorf("ZIGGY_TENANT_DATABASE_URL_FILE: %w", err)
+		}
+		inline = strings.TrimSpace(string(contents))
+	}
+	if inline == "" {
+		return "", nil
+	}
+	parsed, err := url.Parse(inline)
+	if err != nil {
+		return "", fmt.Errorf("ZIGGY_TENANT_DATABASE_URL must be a PostgreSQL URL")
+	}
+	socketHost := strings.TrimSpace(parsed.Query().Get("host"))
+	hasNetworkHost := strings.TrimSpace(parsed.Hostname()) != ""
+	hasSocketHost := filepath.IsAbs(socketHost) && filepath.Clean(socketHost) == socketHost
+	hasDatabase := strings.Trim(parsed.EscapedPath(), "/") != ""
+	if (parsed.Scheme != "postgres" && parsed.Scheme != "postgresql") ||
+		(hasNetworkHost == hasSocketHost) ||
+		!hasDatabase ||
+		parsed.Fragment != "" {
+		return "", fmt.Errorf("ZIGGY_TENANT_DATABASE_URL must be a PostgreSQL URL")
+	}
+	if hasNetworkHost {
+		sslModes := parsed.Query()["sslmode"]
+		if len(sslModes) != 1 || sslModes[0] != "verify-full" {
+			return "", fmt.Errorf("ZIGGY_TENANT_DATABASE_URL must use sslmode=verify-full for network connections")
+		}
+	}
+	return inline, nil
 }
 
 func workConfig(lookup LookupEnv, readFile ReadFile) (*url.URL, []byte, error) {

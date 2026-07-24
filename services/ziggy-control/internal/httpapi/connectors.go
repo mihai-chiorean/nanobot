@@ -84,16 +84,17 @@ func (api *API) connectors(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	principal, ok := identity.FromContext(r.Context())
+	_, ok := identity.FromContext(r.Context())
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	route, err := api.tenantRouter.ResolvePrincipal(r.Context(), principal)
-	if err != nil {
+	resolution, resolved := tenantRouteResolutionFromContext(r.Context())
+	if !resolved || resolution.source != tenantRoutePrincipal || resolution.err != nil || !resolution.found {
 		writeError(w, http.StatusForbidden, "account not authorized")
 		return
 	}
+	route := resolution.route
 	signed, err := api.connectorSigner.sign(route.UserID, route.WorkspaceID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "connector identity unavailable")

@@ -56,6 +56,12 @@ targets:
         INFOPLIST_FILE: Ziggy/Resources/Info.plist
         TARGETED_DEVICE_FAMILY: "1"
         SUPPORTS_MACCATALYST: false
+    preBuildScripts:
+      - name: Validate Release configuration
+        script: /bin/bash "$SCRIPT_INPUT_FILE_0"
+        inputFiles:
+          - $(SRCROOT)/Scripts/validate-release-configuration.sh
+        basedOnDependencyAnalysis: false
     scheme:
       testTargets:
         - ZiggyTests

@@ -1,0 +1,305 @@
+{
+  "schema": 3,
+  "name": "ziggy-product-repository",
+  "source": {
+    "repository": "https://github.com/mihai-chiorean/nanobot.git",
+    "revision_policy": "exact-head-commit",
+    "working_tree_policy": "clean_required",
+    "tracked_files_only": true
+  },
+  "nanobot_dependency": {
+    "upstream_baseline": {
+      "package": "nanobot-ai",
+      "repository": "https://github.com/HKUDS/nanobot.git",
+      "ref": "v0.1.5.post3",
+      "commit": "0b1631f33d8040802aa09d66a01bc731e3cb85a2",
+      "pin_options": ["commit", "tag", "artifact_digest"]
+    },
+    "effective_runtime_policy": {
+      "pre_artifact_kind": "source-export",
+      "artifact": {
+        "image": null,
+        "digest": null,
+        "wheel": null,
+        "signature": null
+      },
+      "independent_deployment": {
+        "deployable": false,
+        "status": "blocked-no-signed-runtime-artifact",
+        "required_evidence": "signed-image-digest-or-wheel"
+      }
+    },
+    "update_rule": "advance the upstream baseline and effective runtime together; rerun the product contract tests before merging"
+  },
+  "entries": [
+    {"source_prefix": "ios", "destination_prefix": "ios", "required": true},
+    {"source_prefix": "webui", "destination_prefix": "web", "exclude": ["webui/vite.config.ts"], "required": true},
+    {
+      "source": "webui/vite.config.ts",
+      "destination": "web/vite.config.ts",
+      "text_replacements": [
+        {
+          "from": "path.resolve(__dirname, \"../nanobot/web/dist\")",
+          "to": "path.resolve(__dirname, \"./dist\")"
+        }
+      ],
+      "required": true
+    },
+    {"source_prefix": "services/ziggy-control", "destination_prefix": "services/ziggy-control", "exclude": ["services/ziggy-control/.env.example"], "required": true},
+    {"source_prefix": "services/ziggy-connectors", "destination_prefix": "services/ziggy-connectors", "exclude": ["services/ziggy-connectors/.env.example"], "required": true},
+    {"source_prefix": "services/ziggy-runtime-manager", "destination_prefix": "services/ziggy-runtime-manager", "required": true},
+    {"source_prefix": "services/ziggy-work", "destination_prefix": "services/ziggy-work", "exclude": ["services/ziggy-work/.env.example"], "required": true},
+    {"source_prefix": "services/observability", "destination_prefix": "observability", "required": true},
+    {"source_prefix": "docs/architecture/ziggy-", "destination_prefix": "docs/architecture", "required": true},
+    {"source_prefix": "docs/runbooks", "destination_prefix": "docs/runbooks", "required": true},
+    {"source_prefix": "docs/research", "destination_prefix": "docs/research", "required": true},
+    {"source_prefix": "docs/reviews/ziggy-", "destination_prefix": "docs/reviews", "required": true},
+    {"source_prefix": "config/ziggy-repository-split.json", "destination_prefix": "config/ziggy-repository-split.json", "required": true},
+    {"source_prefix": "scripts/export-ziggy-product.sh", "destination_prefix": "scripts/export-ziggy-product.sh", "required": true},
+    {"source_prefix": "scripts/validate-ziggy-product-split.py", "destination_prefix": "scripts/validate-ziggy-product-split.py", "required": true},
+    {"source_prefix": "scripts/test-ziggy-product-split.sh", "destination_prefix": "scripts/test-ziggy-product-split.sh", "required": true},
+    {"source_prefix": "scripts/assert-ziggy-web-build.sh", "destination_prefix": "scripts/assert-ziggy-web-build.sh", "required": true},
+    {"source_prefix": "scripts/scan-ziggy-product-secrets.sh", "destination_prefix": "scripts/scan-ziggy-product-secrets.sh", "required": true},
+    {"source": "LICENSE", "destination": "licenses/nanobot-MIT.txt", "required": true},
+    {"source": "THIRD_PARTY_NOTICES.md", "destination": "licenses/nanobot-third-party-notices.md", "required": true}
+  ],
+  "export_text_replacements": [
+    {
+      "id": "ziggy-control-module-identity",
+      "path_regex": "^services/ziggy-control/(?:go\\.mod|.*\\.go)$",
+      "from": "github.com/mihai-chiorean/nanobot/services/ziggy-control",
+      "to": "github.com/mihai-chiorean/ziggy/services/ziggy-control",
+      "minimum_matches": 1
+    },
+    {
+      "id": "ziggy-connectors-module-identity",
+      "path_regex": "^services/ziggy-connectors/(?:go\\.mod|.*\\.go)$",
+      "from": "github.com/mihai-chiorean/nanobot/services/ziggy-connectors",
+      "to": "github.com/mihai-chiorean/ziggy/services/ziggy-connectors",
+      "minimum_matches": 1
+    },
+    {
+      "id": "ziggy-runtime-manager-module-identity",
+      "path_regex": "^services/ziggy-runtime-manager/(?:go\\.mod|.*\\.go)$",
+      "from": "github.com/mihai-chiorean/nanobot/services/ziggy-runtime-manager",
+      "to": "github.com/mihai-chiorean/ziggy/services/ziggy-runtime-manager",
+      "minimum_matches": 1
+    },
+    {
+      "id": "ziggy-work-module-identity",
+      "path_regex": "^services/ziggy-work/(?:go\\.mod|.*\\.go)$",
+      "from": "github.com/mihai-chiorean/nanobot/services/ziggy-work",
+      "to": "github.com/mihai-chiorean/ziggy/services/ziggy-work",
+      "minimum_matches": 1
+    }
+  ],
+  "generated": [
+    {"destination": "README.md", "kind": "product_readme"},
+    {"destination": ".gitignore", "kind": "product_gitignore"},
+    {"destination": "LICENSE", "kind": "license_index"},
+    {"destination": "THIRD_PARTY_NOTICES.md", "kind": "third_party_index"},
+    {"destination": "deploy/README.md", "kind": "deploy_index"},
+    {"destination": "runbooks/README.md", "kind": "runbooks_index"},
+    {"destination": "research/README.md", "kind": "research_index"},
+    {"destination": ".github/workflows/ziggy-product.yml", "kind": "product_ci"},
+    {"destination": ".ziggy/export-metadata.json", "kind": "export_metadata"},
+    {"destination": ".ziggy/nanobot.lock.json", "kind": "nanobot_lock"}
+  ],
+  "validation": {
+    "required_output_paths": [
+      "ios",
+      "web",
+      "services/ziggy-control",
+      "services/ziggy-connectors",
+      "services/ziggy-runtime-manager",
+      "services/ziggy-work",
+      "observability",
+      "deploy",
+      "docs/architecture",
+      "docs/runbooks",
+      "docs/research",
+      "licenses",
+      ".github/workflows/ziggy-product.yml",
+      ".ziggy/export-metadata.json",
+      ".ziggy/nanobot.lock.json"
+    ],
+    "required_output_text": [
+      {
+        "path": "web/vite.config.ts",
+        "contains": "path.resolve(__dirname, \"./dist\")",
+        "absent": "../nanobot/web/dist"
+      },
+      {
+        "path": "LICENSE",
+        "contains": "No license is granted",
+        "absent": "Permission is hereby granted"
+      },
+      {
+        "path": "README.md",
+        "contains": "not independently deployable",
+        "absent": "is independently deployable"
+      }
+    ],
+    "forbidden_output_prefixes": [
+      "nanobot",
+      "tests",
+      "webui",
+      "pyproject.toml",
+      "uv.lock",
+      "Dockerfile",
+      "docker-compose.yml",
+      "entrypoint.sh",
+      "core_agent_lines.sh",
+      "case",
+      "images",
+      "root-fork-copy"
+    ],
+    "secret_filename_patterns": [
+      "(^|/)\\.env(?:$|[._-].*)",
+      "\\.pem$",
+      "\\.p12$",
+      "\\.key$",
+      "(^|/)(credentials|secrets?)(\\.|/|$)"
+    ],
+    "secret_content_max_file_bytes": 524288,
+    "secret_content_max_total_bytes": 16777216,
+    "secret_content_patterns": [
+      {
+        "id": "private-key-header",
+        "regex": "-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----"
+      },
+      {
+        "id": "grafana-cloud-token",
+        "regex": "(?<![A-Za-z0-9_-])glc_[A-Za-z0-9_-]{32,128}(?![A-Za-z0-9_-])"
+      },
+      {
+        "id": "stripe-secret-token",
+        "regex": "(?<![A-Za-z0-9_-])sk_(?:live|test)_[A-Za-z0-9]{24,128}(?![A-Za-z0-9_-])"
+      },
+      {
+        "id": "google-api-key",
+        "regex": "(?<![A-Za-z0-9_-])AIza[0-9A-Za-z_-]{35}(?![A-Za-z0-9_-])"
+      },
+      {
+        "id": "postgresql-url-credentials",
+        "regex": "(?i)(?<![A-Za-z0-9])postgres(?:ql)?://[A-Za-z0-9._~%+-]+:(?!\\$)[^\\s/@]{1,256}@"
+      },
+      {
+        "id": "github-token",
+        "regex": "(?<![A-Za-z0-9_])(?:gh[pousr]_[A-Za-z0-9]{36,255}|github_pat_[A-Za-z0-9_]{82,255})(?![A-Za-z0-9_])"
+      },
+      {
+        "id": "aws-access-key",
+        "regex": "(?<![A-Z0-9])(?:AKIA|ASIA)[A-Z0-9]{16}(?![A-Z0-9])"
+      },
+      {
+        "id": "slack-token",
+        "regex": "(?<![A-Za-z0-9-])xox[baprs]-[A-Za-z0-9-]{20,200}(?![A-Za-z0-9-])"
+      },
+      {
+        "id": "anthropic-api-key",
+        "regex": "(?<![A-Za-z0-9_-])sk-ant-(?:api03-)?[A-Za-z0-9_-]{40,200}(?![A-Za-z0-9_-])"
+      },
+      {
+        "id": "openai-project-key",
+        "regex": "(?<![A-Za-z0-9_-])sk-(?:proj-|svcacct-)[A-Za-z0-9_-]{40,200}(?![A-Za-z0-9_-])"
+      },
+      {
+        "id": "gitlab-token",
+        "regex": "(?<![A-Za-z0-9_-])glpat-[A-Za-z0-9_-]{20,200}(?![A-Za-z0-9_-])"
+      },
+      {
+        "id": "npm-access-token",
+        "regex": "(?<![A-Za-z0-9_])npm_[A-Za-z0-9]{36}(?![A-Za-z0-9_])"
+      },
+      {
+        "id": "sendgrid-api-key",
+        "regex": "(?<![A-Za-z0-9_-])SG\\.[A-Za-z0-9_-]{16,32}\\.[A-Za-z0-9_-]{32,100}(?![A-Za-z0-9_-])"
+      }
+    ],
+    "secret_content_allowlist": [
+      {
+        "id": "ziggy-control-postgresql-unit-test-fixture",
+        "pattern_id": "postgresql-url-credentials",
+        "path_regex": "^services/ziggy-control/internal/config/config_test\\.go$",
+        "match_regex": "^postgres:\\/\\/ziggy:secret@$"
+      }
+    ],
+    "secret_content_exempt_path_patterns": [
+      "(^|/)(?:node_modules|dist|coverage|\\.vite|bin)(/|$)"
+    ],
+    "nanobot_source_tree_signatures": [
+      [
+        "agent/loop.py",
+        "channels/websocket.py",
+        "config/schema.py",
+        "session/manager.py"
+      ]
+    ]
+  },
+  "patches": [
+    {
+      "id": "web-branding-dist",
+      "area": "web branding and packaged frontend",
+      "classification": "product-boundary",
+      "removal_order": 0,
+      "current_commits": ["89815b71", "479882fe"],
+      "paths": ["nanobot/web/dist", "pyproject.toml"],
+      "action": "keep the PWA and branding in web/; consume Nanobot as a runtime and never export nanobot/web/dist"
+    },
+    {
+      "id": "runtime-tenant-auth-transport",
+      "area": "auth token broker and transport",
+      "classification": "product-boundary",
+      "removal_order": 1,
+      "current_commits": ["a183956f", "89815b71", "479882fe", "3fdedbea", "92823268"],
+      "paths": ["nanobot/security/clerk.py", "nanobot/channels/websocket.py", "nanobot/channels/websocket_server.py", "nanobot/cli/commands.py"],
+      "action": "move Clerk verification, tenant admission, and token issuance to ziggy-control; retain only a generic runtime transport contract"
+    },
+    {
+      "id": "work-hooks",
+      "area": "durable Work lifecycle hooks",
+      "classification": "product-boundary",
+      "removal_order": 2,
+      "current_commits": ["55683729", "89815b71", "479882fe"],
+      "paths": ["nanobot/work", "nanobot/agent/tools/work.py", "nanobot/agent/tools/schedule_work.py", "nanobot/channels/websocket.py", "nanobot/agent/loop.py"],
+      "action": "make ziggy-work the durable owner and reduce the runtime integration to a versioned event/command adapter"
+    },
+    {
+      "id": "mcp-oauth-client-credentials",
+      "area": "MCP OAuth support",
+      "classification": "upstreamable",
+      "removal_order": 3,
+      "current_commits": ["4addeb38", "145cec6f", "6972981c"],
+      "paths": ["nanobot/agent/tools/mcp.py", "nanobot/config/schema.py"],
+      "action": "upstream generic client-credentials/token-endpoint configuration; keep tenant credential storage in ziggy-connectors"
+    },
+    {
+      "id": "memory-tenant-scope",
+      "area": "memory and RAG tenant isolation",
+      "classification": "product-boundary",
+      "removal_order": 4,
+      "current_commits": ["2343f7c3", "ac1fe757"],
+      "paths": ["nanobot/agent/loop.py", "nanobot/agent/tools/recall.py", "nanobot/agent/rag.py", "nanobot/config/schema.py"],
+      "action": "bind memory roots and recall providers at the per-tenant runtime boundary; upstream the independent path-safety checks"
+    },
+    {
+      "id": "generic-runtime-fixes",
+      "area": "generic runtime correctness",
+      "classification": "upstreamable",
+      "removal_order": 5,
+      "current_commits": ["8314f206", "92823268"],
+      "paths": ["nanobot/session/manager.py", "nanobot/channels/websocket.py"],
+      "action": "submit narrowly scoped tests and fixes upstream, then advance the pinned dependency"
+    },
+    {
+      "id": "patched-runtime-artifact",
+      "area": "temporary delivery of not-yet-upstreamed patches",
+      "classification": "temporary",
+      "removal_order": 6,
+      "current_commits": ["d2eb946"],
+      "paths": ["nanobot/**"],
+      "action": "build a separately pinned Ziggy runtime artifact or patch overlay; do not vendor the full Nanobot tree into the product repository"
+    }
+  ]
+}
