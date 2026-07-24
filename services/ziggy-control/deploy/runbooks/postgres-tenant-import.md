@@ -10,12 +10,30 @@ control service. It is an operator procedure, not a deployment command.
 - Retain the immutable `/etc/ziggy/tenants.json` and
   `/var/lib/ziggy-control/tenant-bindings.json` files. They are the rollback
   source of truth until the PostgreSQL cutover is accepted.
-- Apply `migrations/001_tenant_lifecycle_foundation.sql` followed by
-  `migrations/002_runtime_allocation_isolation.sql` with the database migration
-  owner. The application/import role must not own schema migrations.
+- Apply migrations `001` through `004` in filename order with the database
+  migration owner. Migration `004` records the checksummed identity required by
+  service readiness. Applied migrations `001` through `003` are immutable.
+- Create separate `ziggy_control` and `ziggy_tenant_import` login roles. Neither
+  role may own the database, schema, tables, migrations, or lifecycle event
+  sequence.
+- As the migration owner, apply the explicit grants after replacing the three
+  psql variables with the deployment's database and role names:
+
+  ```sh
+  psql --set=database_name=ziggy \
+    --set=control_role=ziggy_control \
+    --set=import_role=ziggy_tenant_import \
+    --file=deploy/postgres/least-privilege-grants.sql
+  ```
+
+  The control role has only the column writes needed for lifecycle operations.
+  The importer cannot update existing lifecycle state, runtime allocations, or
+  schema identity. Neither role can update/delete audit events or mutate schema
+  identity.
 - Create `/etc/ziggy/secrets/tenant-database-url`, mode `0400`, containing only
-  the PostgreSQL DSN. Do not put the DSN in the environment file or a command
-  line.
+  the `ziggy_control` PostgreSQL DSN. Give the import command a separate
+  credential file containing the `ziggy_tenant_import` DSN. Do not put either
+  DSN in the environment file or a command line.
 
 ## Import
 
@@ -39,7 +57,10 @@ sudo bin/import-tenant-manifest \
 Run the same command without `--dry-run` to import. It is idempotent: matching
 rows are reported as existing; a mismatched user, subject, workspace, runtime,
 endpoint, or secret fails the complete transaction. The command never prints a
-tenant identity, endpoint, DSN, or secret.
+tenant identity, endpoint, DSN, or secret. Imports are deterministically sorted
+and serialized by a PostgreSQL transaction advisory lock. SQLSTATE `40001` and
+`40P01` are retried within the command deadline; uniqueness or durable-state
+conflicts are not retried.
 
 ## Future Cutover
 

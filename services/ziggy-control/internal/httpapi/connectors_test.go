@@ -5,6 +5,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -26,8 +27,8 @@ func (router connectorTenantRouter) ResolvePrincipal(context.Context, identity.P
 	return router.route, nil
 }
 
-func (router connectorTenantRouter) ResolveCredential(context.Context, string) (TenantRoute, bool) {
-	return TenantRoute{}, false
+func (router connectorTenantRouter) ResolveCredential(context.Context, string) (TenantRoute, error) {
+	return TenantRoute{}, errors.New("credential not found")
 }
 
 func (router connectorTenantRouter) ResolveRuntimeCredential(credential string) (TenantRoute, bool) {

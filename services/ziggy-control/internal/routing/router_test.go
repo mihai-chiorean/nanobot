@@ -49,15 +49,15 @@ func TestRouterKeepsCredentialsBoundToTheirRuntime(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	resolvedOwner, ok := router.ResolveCredential(context.Background(), "owner-token")
-	if !ok || resolvedOwner.WorkspaceID != owner.WorkspaceID {
-		t.Fatalf("owner token route = %+v, %v", resolvedOwner, ok)
+	resolvedOwner, err := router.ResolveCredential(context.Background(), "owner-token")
+	if err != nil || resolvedOwner.WorkspaceID != owner.WorkspaceID {
+		t.Fatalf("owner token route = %+v, %v", resolvedOwner, err)
 	}
-	resolvedTester, ok := router.ResolveCredential(context.Background(), "tester-token")
-	if !ok || resolvedTester.WorkspaceID != tester.WorkspaceID {
-		t.Fatalf("tester token route = %+v, %v", resolvedTester, ok)
+	resolvedTester, err := router.ResolveCredential(context.Background(), "tester-token")
+	if err != nil || resolvedTester.WorkspaceID != tester.WorkspaceID {
+		t.Fatalf("tester token route = %+v, %v", resolvedTester, err)
 	}
-	if _, ok := router.ResolveCredential(context.Background(), "unknown-token"); ok {
+	if _, err := router.ResolveCredential(context.Background(), "unknown-token"); err == nil {
 		t.Fatal("unknown token resolved")
 	}
 	runtimeOwner, ok := router.ResolveRuntimeCredential("owner-bootstrap-secret-with-32-bytes")
@@ -103,7 +103,7 @@ func TestRouterExpiresCredentialWithoutAReaperGoroutine(t *testing.T) {
 		t.Fatal(err)
 	}
 	now = now.Add(2 * time.Minute)
-	if _, ok := router.ResolveCredential(context.Background(), "short-token"); ok {
+	if _, err := router.ResolveCredential(context.Background(), "short-token"); err == nil {
 		t.Fatal("expired token resolved")
 	}
 	if router.count.Load() != 0 {

@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -27,6 +28,31 @@ type writerFunc func([]byte) (int, error)
 func (write writerFunc) Write(body []byte) (int, error) {
 	return write(body)
 }
+
+type countingTenantRouter struct {
+	principalRoute  TenantRoute
+	principalErr    error
+	credentialRoute TenantRoute
+	credentialErr   error
+	principalCalls  atomic.Int32
+	credentialCalls atomic.Int32
+}
+
+func (router *countingTenantRouter) ResolvePrincipal(context.Context, identity.Principal) (TenantRoute, error) {
+	router.principalCalls.Add(1)
+	return router.principalRoute, router.principalErr
+}
+
+func (router *countingTenantRouter) ResolveCredential(context.Context, string) (TenantRoute, error) {
+	router.credentialCalls.Add(1)
+	return router.credentialRoute, router.credentialErr
+}
+
+func (*countingTenantRouter) RememberCredentials(context.Context, TenantRoute, []string, time.Duration) error {
+	return nil
+}
+
+func (*countingTenantRouter) Default() TenantRoute { return TenantRoute{} }
 
 func TestWorkEventStreamAdmissionDoesNotDependOnAcceptHeader(t *testing.T) {
 	for _, test := range []struct {
@@ -345,6 +371,30 @@ func TestInboundAdmissionIsTenantFairWithinGlobalCap(t *testing.T) {
 	}
 }
 
+func TestInboundAdmissionAlwaysReservesCapacityOutsideOneTenant(t *testing.T) {
+	admission := newInboundAdmissionWithTenantCount(4, 4, 4, 1)
+	releases := make([]func(), 0, 3)
+	for range 2 {
+		release, acquired := admission.tryAcquire(admissionHTTP, "tenant-a")
+		if !acquired {
+			t.Fatal("tenant was rejected before its reserved share was full")
+		}
+		releases = append(releases, release)
+	}
+	if release, acquired := admission.tryAcquire(admissionHTTP, "tenant-a"); acquired {
+		release()
+		t.Fatal("one tenant consumed capacity reserved for another admission identity")
+	}
+	release, acquired := admission.tryAcquire(admissionHTTP, "tenant-b")
+	if !acquired {
+		t.Fatal("second tenant could not use reserved global capacity")
+	}
+	releases = append(releases, release)
+	for _, release := range releases {
+		release()
+	}
+}
+
 func TestInboundAdmissionLimitsAnonymousTrafficSeparately(t *testing.T) {
 	admission := newInboundAdmissionWithTenantCount(4, 4, 4, 1)
 
@@ -362,6 +412,107 @@ func TestInboundAdmissionLimitsAnonymousTrafficSeparately(t *testing.T) {
 		release()
 		t.Fatal("anonymous traffic consumed the whole global budget")
 	}
+}
+
+func TestAdmissionSaturationSkipsTenantResolution(t *testing.T) {
+	router := &countingTenantRouter{credentialErr: errors.New("database unavailable")}
+	api := &API{
+		admission:    newInboundAdmissionWithTenantCount(1, 1, 1, 2),
+		tenantRouter: router,
+	}
+	api.admission.http.active.Store(1)
+	handler := api.admit(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("saturated request reached handler")
+	}))
+	request := httptest.NewRequest(http.MethodGet, "/api/sessions", nil)
+	request.Header.Set("Authorization", "Bearer transport-token")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", response.Code)
+	}
+	if router.credentialCalls.Load() != 0 {
+		t.Fatalf("credential resolutions = %d, want 0", router.credentialCalls.Load())
+	}
+}
+
+func TestResolvedRouteIsReusedAndDatabaseFailuresPreserveDenialSemantics(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	t.Run("credential success resolves once", func(t *testing.T) {
+		route := TenantRoute{
+			UserID: "usr_test", WorkspaceID: "ws_test",
+			Proxy: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusNoContent)
+			}),
+		}
+		router := &countingTenantRouter{credentialRoute: route}
+		handler, err := New(Config{
+			Authenticate: Middleware(func(next http.Handler) http.Handler { return next }),
+			Proxy:        http.HandlerFunc(func(http.ResponseWriter, *http.Request) { t.Fatal("fallback proxy used") }),
+			TenantRouter: router,
+			Readiness:    checkerFunc(func(context.Context) error { return nil }),
+			Logger:       logger, MaxRequestBody: 1 << 20, TenantCount: 2,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		request := httptest.NewRequest(http.MethodGet, "/api/sessions", nil)
+		request.Header.Set("Authorization", "Bearer transport-token")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusNoContent {
+			t.Fatalf("status = %d, want 204", response.Code)
+		}
+		if router.credentialCalls.Load() != 1 {
+			t.Fatalf("credential resolutions = %d, want 1", router.credentialCalls.Load())
+		}
+	})
+
+	t.Run("credential database failure remains unauthorized", func(t *testing.T) {
+		router := &countingTenantRouter{credentialErr: errors.New("database unavailable")}
+		handler, err := New(Config{
+			Authenticate: Middleware(func(next http.Handler) http.Handler { return next }),
+			Proxy:        http.HandlerFunc(func(http.ResponseWriter, *http.Request) { t.Fatal("fallback proxy used") }),
+			TenantRouter: router,
+			Readiness:    checkerFunc(func(context.Context) error { return nil }),
+			Logger:       logger, MaxRequestBody: 1 << 20, TenantCount: 2,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		request := httptest.NewRequest(http.MethodGet, "/api/sessions", nil)
+		request.Header.Set("Authorization", "Bearer transport-token")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want 401", response.Code)
+		}
+		if router.credentialCalls.Load() != 1 {
+			t.Fatalf("credential resolutions = %d, want 1", router.credentialCalls.Load())
+		}
+	})
+
+	t.Run("principal database failure remains forbidden", func(t *testing.T) {
+		router := &countingTenantRouter{principalErr: errors.New("database unavailable")}
+		handler, err := New(Config{
+			Authenticate: principalMiddleware(identity.Principal{Subject: "clerk_test", Email: "test@example.com"}),
+			Proxy:        http.HandlerFunc(func(http.ResponseWriter, *http.Request) { t.Fatal("fallback proxy used") }),
+			TenantRouter: router,
+			Readiness:    checkerFunc(func(context.Context) error { return nil }),
+			Logger:       logger, MaxRequestBody: 1 << 20, TenantCount: 2,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/auth/bootstrap", nil))
+		if response.Code != http.StatusForbidden {
+			t.Fatalf("status = %d, want 403", response.Code)
+		}
+		if router.principalCalls.Load() != 1 {
+			t.Fatalf("principal resolutions = %d, want 1", router.principalCalls.Load())
+		}
+	})
 }
 
 func TestHealthAndReadinessBypassInboundAdmission(t *testing.T) {

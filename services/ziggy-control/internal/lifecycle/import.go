@@ -4,11 +4,18 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"sort"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/mihai-chiorean/nanobot/services/ziggy-control/internal/config"
 	"github.com/mihai-chiorean/nanobot/services/ziggy-control/internal/tenant"
+)
+
+const (
+	legacyImportAdvisoryLock = int64(0x5a49474759494d50)
+	legacyImportMaxAttempts  = 4
 )
 
 // ImportResult contains counts only. It deliberately contains no tenant
@@ -30,19 +37,55 @@ func (s *Store) ImportLegacyAllocations(ctx context.Context, allocations []tenan
 	if len(allocations) == 0 {
 		return ImportResult{}, ErrImportConflict
 	}
+	ordered := append([]tenant.Allocation(nil), allocations...)
+	for _, allocation := range ordered {
+		if err := validateImportAllocation(allocation); err != nil {
+			return ImportResult{}, err
+		}
+	}
+	sort.Slice(ordered, func(i, j int) bool {
+		if ordered[i].UserID != ordered[j].UserID {
+			return ordered[i].UserID < ordered[j].UserID
+		}
+		if ordered[i].WorkspaceID != ordered[j].WorkspaceID {
+			return ordered[i].WorkspaceID < ordered[j].WorkspaceID
+		}
+		return ordered[i].Email < ordered[j].Email
+	})
+
 	ctx, cancel := s.operationContext(ctx)
 	defer cancel()
+	for attempt := 0; attempt < legacyImportMaxAttempts; attempt++ {
+		result, err := s.importLegacyAllocationsOnce(ctx, ordered, dryRun)
+		if err == nil || !retryableImportError(err) {
+			return result, err
+		}
+		if attempt == legacyImportMaxAttempts-1 {
+			return ImportResult{}, err
+		}
+		timer := time.NewTimer(time.Duration(attempt+1) * 10 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ImportResult{}, ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return ImportResult{}, errors.New("tenant import retry attempts exhausted")
+}
+
+func (s *Store) importLegacyAllocationsOnce(ctx context.Context, allocations []tenant.Allocation, dryRun bool) (ImportResult, error) {
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
 	if err != nil {
 		return ImportResult{}, err
 	}
 	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1)`, legacyImportAdvisoryLock); err != nil {
+		return ImportResult{}, err
+	}
 
 	result := ImportResult{Tenants: len(allocations)}
 	for _, allocation := range allocations {
-		if err := validateImportAllocation(allocation); err != nil {
-			return ImportResult{}, err
-		}
 		if err := s.importAllocation(ctx, tx, allocation, &result); err != nil {
 			return ImportResult{}, err
 		}
@@ -200,8 +243,13 @@ func sameNullableString(existing sql.NullString, expected string) bool {
 
 func importError(err error) error {
 	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) && (pgErr.Code == "23505" || pgErr.Code == "40001") {
+	if errors.As(err, &pgErr) && pgErr.Code == "23505" {
 		return ErrImportConflict
 	}
 	return err
+}
+
+func retryableImportError(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && (pgErr.Code == "40001" || pgErr.Code == "40P01")
 }

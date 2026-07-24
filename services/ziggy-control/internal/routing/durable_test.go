@@ -46,11 +46,11 @@ func TestDurableRouterRechecksRememberedCredentials(t *testing.T) {
 	if err := router.RememberCredentials(context.Background(), route, []string{"transport-token"}, time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := router.ResolveCredential(context.Background(), "transport-token"); !ok {
-		t.Fatal("active credential did not resolve")
+	if _, err := router.ResolveCredential(context.Background(), "transport-token"); err != nil {
+		t.Fatalf("active credential did not resolve: %v", err)
 	}
 	resolver.active = false
-	if _, ok := router.ResolveCredential(context.Background(), "transport-token"); ok {
+	if _, err := router.ResolveCredential(context.Background(), "transport-token"); err == nil {
 		t.Fatal("disabled credential resolved")
 	}
 }

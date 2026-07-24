@@ -27,9 +27,12 @@ func (router workCredentialRouter) ResolvePrincipal(context.Context, identity.Pr
 	return TenantRoute{}, errors.New("principal resolution is not used by Work")
 }
 
-func (router workCredentialRouter) ResolveCredential(_ context.Context, credential string) (TenantRoute, bool) {
+func (router workCredentialRouter) ResolveCredential(_ context.Context, credential string) (TenantRoute, error) {
 	route, ok := router.routes[credential]
-	return route, ok
+	if !ok {
+		return TenantRoute{}, errors.New("credential not found")
+	}
+	return route, nil
 }
 
 func (router workCredentialRouter) RememberCredentials(context.Context, TenantRoute, []string, time.Duration) error {

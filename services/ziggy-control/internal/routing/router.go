@@ -111,24 +111,24 @@ func (router *Router) ResolvePrincipal(ctx context.Context, principal identity.P
 	return route, nil
 }
 
-func (router *Router) ResolveCredential(_ context.Context, credential string) (httpapi.TenantRoute, bool) {
+func (router *Router) ResolveCredential(_ context.Context, credential string) (httpapi.TenantRoute, error) {
 	credential = strings.TrimSpace(credential)
 	if credential == "" {
-		return httpapi.TenantRoute{}, false
+		return httpapi.TenantRoute{}, tenant.ErrNotAuthorized
 	}
 	key := sha256.Sum256([]byte(credential))
 	value, ok := router.entries.Load(key)
 	if !ok {
-		return httpapi.TenantRoute{}, false
+		return httpapi.TenantRoute{}, tenant.ErrNotAuthorized
 	}
 	entry, ok := value.(credentialRoute)
 	if !ok || !router.now().Before(entry.expiresAt) {
 		if _, deleted := router.entries.LoadAndDelete(key); deleted {
 			router.count.Add(-1)
 		}
-		return httpapi.TenantRoute{}, false
+		return httpapi.TenantRoute{}, tenant.ErrNotAuthorized
 	}
-	return entry.route, true
+	return entry.route, nil
 }
 
 func (router *Router) RememberCredentials(_ context.Context, route httpapi.TenantRoute, credentials []string, ttl time.Duration) error {

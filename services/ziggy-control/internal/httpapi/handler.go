@@ -231,35 +231,35 @@ func (api *API) admit(next http.Handler) http.Handler {
 		case isWorkEventStream(r), acceptsSSE(r):
 			class = admissionSSE
 		}
-		release, acquired := api.admission.tryAcquire(class, api.admissionTenant(r))
+
+		globalRelease, acquired := api.admission.tryAcquireGlobal(class)
 		if !acquired {
 			w.Header().Set("Retry-After", "1")
 			writeError(w, http.StatusServiceUnavailable, "inbound capacity unavailable")
 			return
 		}
-		defer release()
-		next.ServeHTTP(w, r)
+		defer globalRelease()
+
+		resolution := api.resolveTenantRoute(r)
+		tenantRelease, acquired := api.admission.tryAcquireTenant(class, api.admissionTenant(r, resolution))
+		if !acquired {
+			w.Header().Set("Retry-After", "1")
+			writeError(w, http.StatusServiceUnavailable, "inbound capacity unavailable")
+			return
+		}
+		defer tenantRelease()
+
+		request := r.WithContext(withTenantRouteResolution(r.Context(), resolution))
+		next.ServeHTTP(w, request)
 	})
 }
 
 func (admission *inboundAdmission) tryAcquire(class admissionClass, tenant string) (func(), bool) {
-	global, tenants := admission.gates(class)
-	globalRelease, acquired := global.tryAcquire()
+	globalRelease, acquired := admission.tryAcquireGlobal(class)
 	if !acquired {
 		return nil, false
 	}
-
-	if strings.TrimSpace(tenant) == "" {
-		tenant = anonymousTenant
-	}
-	tenantCount := admission.tenantCount
-	if tenant == anonymousTenant {
-		tenantCount++
-	}
-	tenantLimit := admission.share(global.limit, tenantCount)
-	entry := &admissionGate{limit: tenantLimit}
-	actual, _ := tenants.LoadOrStore(tenant, entry)
-	tenantRelease, acquired := actual.(*admissionGate).tryAcquire()
+	tenantRelease, acquired := admission.tryAcquireTenant(class, tenant)
 	if !acquired {
 		globalRelease()
 		return nil, false
@@ -268,6 +268,22 @@ func (admission *inboundAdmission) tryAcquire(class admissionClass, tenant strin
 		tenantRelease()
 		globalRelease()
 	}, true
+}
+
+func (admission *inboundAdmission) tryAcquireGlobal(class admissionClass) (func(), bool) {
+	global, _ := admission.gates(class)
+	return global.tryAcquire()
+}
+
+func (admission *inboundAdmission) tryAcquireTenant(class admissionClass, tenant string) (func(), bool) {
+	global, tenants := admission.gates(class)
+	if strings.TrimSpace(tenant) == "" {
+		tenant = anonymousTenant
+	}
+	tenantLimit := admission.share(global.limit, admission.tenantCount+1)
+	entry := &admissionGate{limit: tenantLimit}
+	actual, _ := tenants.LoadOrStore(tenant, entry)
+	return actual.(*admissionGate).tryAcquire()
 }
 
 func (admission *inboundAdmission) gates(class admissionClass) (*admissionGate, *sync.Map) {
@@ -292,30 +308,43 @@ func (admission *inboundAdmission) share(limit, tenantCount int64) int64 {
 	return share
 }
 
-func (api *API) admissionTenant(r *http.Request) string {
+func (api *API) resolveTenantRoute(r *http.Request) tenantRouteResolution {
+	if api.tenantRouter == nil {
+		return tenantRouteResolution{}
+	}
 	if principal, ok := identity.FromContext(r.Context()); ok {
-		if api.tenantRouter != nil {
-			route, err := api.tenantRouter.ResolvePrincipal(r.Context(), principal)
-			if err == nil && strings.TrimSpace(route.UserID) != "" {
-				return route.UserID
-			}
-			return anonymousTenant
+		route, err := api.tenantRouter.ResolvePrincipal(r.Context(), principal)
+		return tenantRouteResolution{
+			route: route, source: tenantRoutePrincipal, err: err,
+			found: err == nil && strings.TrimSpace(route.UserID) != "",
 		}
+	}
+	credential := requestCredential(r)
+	if credential != "" {
+		route, err := api.tenantRouter.ResolveCredential(r.Context(), credential)
+		if err == nil && strings.TrimSpace(route.UserID) != "" {
+			return tenantRouteResolution{route: route, source: tenantRouteCredential, found: true}
+		}
+		if router, ok := api.tenantRouter.(runtimeCredentialRouter); ok {
+			if runtimeRoute, found := router.ResolveRuntimeCredential(credential); found && strings.TrimSpace(runtimeRoute.UserID) != "" {
+				return tenantRouteResolution{route: runtimeRoute, source: tenantRouteRuntimeCredential, found: true}
+			}
+		}
+		return tenantRouteResolution{source: tenantRouteCredential, err: err}
+	}
+	route := api.tenantRouter.Default()
+	return tenantRouteResolution{route: route, source: tenantRouteDefault, found: route.Proxy != nil}
+}
+
+func (api *API) admissionTenant(r *http.Request, resolution tenantRouteResolution) string {
+	if resolution.source != tenantRouteDefault && resolution.found && strings.TrimSpace(resolution.route.UserID) != "" {
+		return resolution.route.UserID
+	}
+	if principal, ok := identity.FromContext(r.Context()); ok && api.tenantRouter == nil {
 		if api.isOwner(principal) {
 			return "owner"
 		}
 		return anonymousTenant
-	}
-	if api.tenantRouter != nil {
-		credential := requestCredential(r)
-		if route, ok := api.tenantRouter.ResolveCredential(r.Context(), credential); ok && strings.TrimSpace(route.UserID) != "" {
-			return route.UserID
-		}
-		if router, ok := api.tenantRouter.(runtimeCredentialRouter); ok {
-			if route, ok := router.ResolveRuntimeCredential(credential); ok && strings.TrimSpace(route.UserID) != "" {
-				return route.UserID
-			}
-		}
 	}
 	return anonymousTenant
 }
@@ -380,12 +409,13 @@ func (api *API) bootstrap(w http.ResponseWriter, r *http.Request) {
 		api.proxy.ServeHTTP(w, r)
 		return
 	}
-	route, err := api.tenantRouter.ResolvePrincipal(r.Context(), principal)
-	if err != nil {
+	resolution, resolved := tenantRouteResolutionFromContext(r.Context())
+	if !resolved || resolution.source != tenantRoutePrincipal || resolution.err != nil || !resolution.found {
 		api.logger.WarnContext(r.Context(), "bootstrap authorization denied", "route", "bootstrap")
 		writeError(w, http.StatusForbidden, "account not authorized")
 		return
 	}
+	route := resolution.route
 	if route.Proxy == nil {
 		writeError(w, http.StatusServiceUnavailable, "tenant runtime unavailable")
 		return
@@ -416,30 +446,32 @@ func (api *API) forward(w http.ResponseWriter, r *http.Request) {
 	proxy := api.proxy
 	if api.tenantRouter != nil {
 		if credential := requestCredential(r); credential != "" {
-			route, ok := api.tenantRouter.ResolveCredential(r.Context(), credential)
-			if !ok || route.Proxy == nil {
+			resolution, resolved := tenantRouteResolutionFromContext(r.Context())
+			if !resolved || resolution.source != tenantRouteCredential || resolution.err != nil || !resolution.found || resolution.route.Proxy == nil {
 				writeError(w, http.StatusUnauthorized, "transport credential expired or unknown")
 				return
 			}
-			proxy = route.Proxy
-		} else if route := api.tenantRouter.Default(); route.Proxy != nil {
-			proxy = route.Proxy
+			proxy = resolution.route.Proxy
+		} else if resolution, resolved := tenantRouteResolutionFromContext(r.Context()); resolved && resolution.source == tenantRouteDefault && resolution.found {
+			proxy = resolution.route.Proxy
 		}
 	}
 	proxy.ServeHTTP(w, r)
 }
 
 func (api *API) work(w http.ResponseWriter, r *http.Request) {
-	credential, _, valid := bearerCredential(r.Header.Get("Authorization"))
+	_, _, valid := bearerCredential(r.Header.Get("Authorization"))
 	if !valid || api.tenantRouter == nil || api.workProxy == nil || api.workSigner == nil {
 		writeError(w, http.StatusUnauthorized, "transport credential required")
 		return
 	}
-	route, ok := api.tenantRouter.ResolveCredential(r.Context(), credential)
-	if !ok || strings.TrimSpace(route.UserID) == "" || strings.TrimSpace(route.WorkspaceID) == "" {
+	resolution, resolved := tenantRouteResolutionFromContext(r.Context())
+	if !resolved || resolution.source != tenantRouteCredential || resolution.err != nil || !resolution.found ||
+		strings.TrimSpace(resolution.route.UserID) == "" || strings.TrimSpace(resolution.route.WorkspaceID) == "" {
 		writeError(w, http.StatusUnauthorized, "transport credential expired or unknown")
 		return
 	}
+	route := resolution.route
 	if r.Body != nil {
 		if r.ContentLength > api.maxRequestBody {
 			writeError(w, http.StatusRequestEntityTooLarge, "request body too large")

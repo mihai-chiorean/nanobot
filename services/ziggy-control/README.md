@@ -79,9 +79,11 @@ configured without a mode value.
 
 `ZIGGY_TENANCY_MODE=postgres` selects the durable lifecycle source. Apply
 [`migrations/001_tenant_lifecycle_foundation.sql`](migrations/001_tenant_lifecycle_foundation.sql)
-and [`migrations/002_runtime_allocation_isolation.sql`](migrations/002_runtime_allocation_isolation.sql)
+through [`migrations/004_schema_identity.sql`](migrations/004_schema_identity.sql)
 with deployment-owned migration tooling before starting the service; the
-process only checks migration presence and never changes production schema.
+process verifies the complete schema identity and never changes production
+schema. Applied migrations are immutable: CI hashes migrations 001 through 003,
+and readiness requires the exact identity recorded by migration 004.
 Do not configure the manifest or binding-file variables in PostgreSQL mode.
 
 The durable source stores the invited email, stable Clerk subject, lifecycle
@@ -102,11 +104,15 @@ already active, disabled, or replaced allocation cannot be activated again.
 PostgreSQL also rejects reuse of any non-empty private runtime endpoint or
 bootstrap secret across tenants.
 Operators can transition users through `disabled`, `deletion_pending`, and
-`deleted`; the final transition requires deletion-pending and marks the runtime
-allocation deleted without removing audit history. This service does not shell
-out, start containers, or own runtime placement. Once active, remembered
-transport credentials are rechecked against the durable lifecycle source on
-every request, so disable and deletion take effect before runtime lookup.
+`deleted`; the final transition requires deletion-pending plus a nonempty
+external destruction receipt. Only the receipt's SHA-256 digest is retained.
+An exact retry is idempotent; a different receipt is rejected. Terminal
+deletion clears the email, Clerk subject, runtime endpoint, bootstrap secret,
+and runtime metadata while preserving product-generated user/workspace/runtime
+IDs and the content-free audit trail. This service does not shell out, start
+containers, or own runtime placement. Once active, remembered transport
+credentials are rechecked against the durable lifecycle source on every
+request, so disable and deletion take effect before runtime lookup.
 
 Roll out by applying the migration, importing invited users and active runtime
 allocation metadata into PostgreSQL, validating a non-production control
@@ -130,6 +136,9 @@ The command loads the same strict manifest and bindings validation as manifest
 mode, prints only aggregate counts, and rolls the dry-run transaction back.
 Repeat without `--dry-run` to import. It preserves user/workspace IDs and bound
 subjects, and refuses any durable conflict without partially importing a batch.
+Imports are sorted, serialized with a PostgreSQL transaction advisory lock, and
+retry serialization/deadlock failures only; concurrent identical imports
+converge to the same rows and events.
 The staged switch and rollback procedure is in
 [`deploy/runbooks/postgres-tenant-import.md`](deploy/runbooks/postgres-tenant-import.md).
 
@@ -187,7 +196,10 @@ legacy Nanobot fallback and bearer behavior.
 The default global admission limits are 64 ordinary HTTP requests, 8 SSE
 streams, and 8 WebSocket connections. Each configured tenant receives an
 equal share of each class, while anonymous traffic receives a separate share;
-the global limits remain hard caps. Override the global limits with
+the global limits remain hard caps and one tenant cannot consume an entire
+class. PostgreSQL mode counts admitted durable tenants at startup. A cheap
+global slot is acquired before durable route resolution, and the one resolved
+route is reused by the handler. Override the global limits with
 `ZIGGY_MAX_HTTP_IN_FLIGHT`, `ZIGGY_MAX_SSE_IN_FLIGHT`, and
 `ZIGGY_MAX_WEBSOCKET_IN_FLIGHT`. `/healthz` and `/readyz` bypass these limits.
 

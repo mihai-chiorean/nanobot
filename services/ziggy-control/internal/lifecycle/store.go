@@ -3,6 +3,7 @@ package lifecycle
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"errors"
@@ -17,15 +18,23 @@ import (
 	"github.com/mihai-chiorean/nanobot/services/ziggy-control/internal/tenant"
 )
 
-const defaultQueryTimeout = 2 * time.Second
+const (
+	defaultQueryTimeout          = 2 * time.Second
+	maxDestructionReceiptBytes   = 4096
+	expectedSchemaVersion        = 3
+	expectedSchemaIdentitySHA256 = "77d60a6ce09067523ecc9dd7e253452948b31f03cdc52f96c84bcf88fdd0bb6a"
+	schemaIdentityComponent      = "tenant_lifecycle"
+)
 
 var (
-	ErrNotAuthorized      = errors.New("tenant is not authorized")
-	ErrRuntimeUnavailable = errors.New("tenant runtime is unavailable")
-	ErrInvalidTransition  = errors.New("tenant lifecycle transition is invalid")
-	ErrActivationMismatch = errors.New("runtime activation does not match the pending allocation")
-	ErrActivationConflict = errors.New("runtime endpoint allocation is already in use")
-	ErrImportConflict     = errors.New("tenant import conflicts with durable state")
+	ErrNotAuthorized              = errors.New("tenant is not authorized")
+	ErrRuntimeUnavailable         = errors.New("tenant runtime is unavailable")
+	ErrInvalidTransition          = errors.New("tenant lifecycle transition is invalid")
+	ErrActivationMismatch         = errors.New("runtime activation does not match the pending allocation")
+	ErrActivationConflict         = errors.New("runtime endpoint allocation is already in use")
+	ErrImportConflict             = errors.New("tenant import conflicts with durable state")
+	ErrDestructionReceiptRequired = errors.New("valid destruction receipt is required")
+	ErrDestructionReceiptMismatch = errors.New("destruction receipt does not match terminal deletion")
 )
 
 type RuntimeAllocation struct {
@@ -79,15 +88,46 @@ func (s *Store) Ready(ctx context.Context) error {
   AND to_regclass('public.ziggy_tenant_workspaces') IS NOT NULL
   AND to_regclass('public.ziggy_tenant_runtime_allocations') IS NOT NULL
   AND to_regclass('public.ziggy_tenant_lifecycle_events') IS NOT NULL
+  AND to_regclass('public.ziggy_schema_identity') IS NOT NULL
   AND to_regclass('public.ziggy_tenant_runtime_allocations_upstream_url_unique') IS NOT NULL
-  AND to_regclass('public.ziggy_tenant_runtime_allocations_bootstrap_secret_unique') IS NOT NULL`).Scan(&present)
+  AND to_regclass('public.ziggy_tenant_runtime_allocations_bootstrap_secret_unique') IS NOT NULL
+  AND EXISTS (
+      SELECT 1
+      FROM pg_constraint
+      WHERE conrelid = 'public.ziggy_tenant_users'::regclass
+        AND conname = 'ziggy_tenant_users_destruction_receipt_check'
+  )`).Scan(&present)
 	if err != nil {
 		return err
 	}
 	if !present {
 		return errors.New("tenant lifecycle migrations are incomplete")
 	}
+	var schemaVersion int
+	var schemaIdentity string
+	err = s.db.QueryRowContext(ctx, `SELECT schema_version, migration_set_sha256
+FROM ziggy_schema_identity
+WHERE component=$1`, schemaIdentityComponent).Scan(&schemaVersion, &schemaIdentity)
+	if err != nil {
+		return errors.New("tenant lifecycle schema identity is unavailable")
+	}
+	if schemaVersion != expectedSchemaVersion || schemaIdentity != expectedSchemaIdentitySHA256 {
+		return errors.New("tenant lifecycle schema identity does not match this binary")
+	}
 	return nil
+}
+
+func (s *Store) AdmissionTenantCount(ctx context.Context) (int, error) {
+	ctx, cancel := s.operationContext(ctx)
+	defer cancel()
+	var count int
+	err := s.db.QueryRowContext(ctx, `SELECT count(*)
+FROM ziggy_tenant_users
+WHERE lifecycle_status IN ('invited', 'active')`).Scan(&count)
+	if err != nil {
+		return 0, err
+	}
+	return count, nil
 }
 
 // Resolve is the first authorized bootstrap transition. It binds a verified
@@ -252,9 +292,13 @@ func (s *Store) MarkDeletionPending(ctx context.Context, userID string) error {
 	return tx.Commit()
 }
 
-// MarkDeleted completes an explicit deletion workflow. It requires the
-// revocation transition above, but leaves physical data removal to its owner.
-func (s *Store) MarkDeleted(ctx context.Context, userID string) error {
+// MarkDeleted completes an explicit deletion workflow after the data owner
+// returns a destruction receipt. Only its digest is retained for safe retries.
+func (s *Store) MarkDeleted(ctx context.Context, userID, destructionReceipt string) error {
+	receiptDigest, err := destructionReceiptDigest(destructionReceipt)
+	if err != nil {
+		return err
+	}
 	ctx, cancel := s.operationContext(ctx)
 	defer cancel()
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -266,15 +310,29 @@ func (s *Store) MarkDeleted(ctx context.Context, userID string) error {
 	if err != nil {
 		return err
 	}
+	if status == "deleted" {
+		var storedReceipt string
+		if err := tx.QueryRowContext(ctx, `SELECT destruction_receipt FROM ziggy_tenant_users WHERE user_id=$1`, userID).Scan(&storedReceipt); err != nil {
+			return err
+		}
+		if storedReceipt == receiptDigest {
+			return nil
+		}
+		return ErrDestructionReceiptMismatch
+	}
 	if status != "deletion_pending" {
 		return ErrInvalidTransition
 	}
 	now := s.now().UTC()
-	if _, err := tx.ExecContext(ctx, `UPDATE ziggy_tenant_users SET lifecycle_status='deleted', deleted_at=$2, updated_at=$2 WHERE user_id=$1 AND lifecycle_status='deletion_pending'`, userID, now); err != nil {
+	tombstone := deletedEmailTombstone(userID)
+	if _, err := tx.ExecContext(ctx, `UPDATE ziggy_tenant_users
+SET lifecycle_status='deleted', expected_email=$3, clerk_subject=NULL,
+    destruction_receipt=$4, deleted_at=$2, updated_at=$2
+WHERE user_id=$1 AND lifecycle_status='deletion_pending'`, userID, now, tombstone, receiptDigest); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE ziggy_tenant_runtime_allocations
-SET allocation_state='deleted', upstream_url='', upstream_bootstrap_secret='', updated_at=$2
+SET allocation_state='deleted', upstream_url='', upstream_bootstrap_secret='', metadata='{}'::jsonb, updated_at=$2
 WHERE user_id=$1`, userID, now); err != nil {
 		return err
 	}
@@ -512,6 +570,20 @@ func authorizationError(err error) error {
 		return ErrNotAuthorized
 	}
 	return err
+}
+
+func destructionReceiptDigest(receipt string) (string, error) {
+	receipt = strings.TrimSpace(receipt)
+	if receipt == "" || len(receipt) > maxDestructionReceiptBytes {
+		return "", ErrDestructionReceiptRequired
+	}
+	digest := sha256.Sum256([]byte(receipt))
+	return "sha256:" + hex.EncodeToString(digest[:]), nil
+}
+
+func deletedEmailTombstone(userID string) string {
+	digest := sha256.Sum256([]byte("ziggy-deleted-email\x00" + userID))
+	return "deleted-" + hex.EncodeToString(digest[:]) + "@invalid"
 }
 
 func randomID(prefix string) (string, error) {

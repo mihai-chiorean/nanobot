@@ -50,32 +50,32 @@ func (r *DurableRouter) ResolvePrincipal(ctx context.Context, principal identity
 	return r.route(allocation)
 }
 
-func (r *DurableRouter) ResolveCredential(ctx context.Context, credential string) (httpapi.TenantRoute, bool) {
+func (r *DurableRouter) ResolveCredential(ctx context.Context, credential string) (httpapi.TenantRoute, error) {
 	credential = strings.TrimSpace(credential)
 	if credential == "" {
-		return httpapi.TenantRoute{}, false
+		return httpapi.TenantRoute{}, tenant.ErrNotAuthorized
 	}
 	key := sha256.Sum256([]byte(credential))
 	value, ok := r.entries.Load(key)
 	if !ok {
-		return httpapi.TenantRoute{}, false
+		return httpapi.TenantRoute{}, tenant.ErrNotAuthorized
 	}
 	entry, ok := value.(credentialRoute)
 	if !ok || !r.now().Before(entry.expiresAt) {
 		if _, deleted := r.entries.LoadAndDelete(key); deleted {
 			r.count.Add(-1)
 		}
-		return httpapi.TenantRoute{}, false
+		return httpapi.TenantRoute{}, tenant.ErrNotAuthorized
 	}
 	allocation, err := r.resolver.ResolveActive(ctx, entry.route.UserID, entry.route.WorkspaceID)
 	if err != nil {
-		return httpapi.TenantRoute{}, false
+		return httpapi.TenantRoute{}, err
 	}
 	route, err := r.route(allocation)
 	if err != nil {
-		return httpapi.TenantRoute{}, false
+		return httpapi.TenantRoute{}, err
 	}
-	return route, true
+	return route, nil
 }
 
 func (r *DurableRouter) RememberCredentials(ctx context.Context, route httpapi.TenantRoute, credentials []string, ttl time.Duration) error {

@@ -118,15 +118,20 @@ func run() error {
 		}
 		startupCtx, cancel := context.WithTimeout(context.Background(), cfg.ReadinessTimeout)
 		err = store.Ready(startupCtx)
+		if err != nil {
+			cancel()
+			return fmt.Errorf("tenant lifecycle database unavailable: %w", err)
+		}
+		tenantCount, err = store.AdmissionTenantCount(startupCtx)
 		cancel()
 		if err != nil {
-			return fmt.Errorf("tenant lifecycle database unavailable: %w", err)
+			return fmt.Errorf("tenant admission count unavailable: %w", err)
 		}
 		tenantRouter, err = routing.NewDurable(store, logger, observability)
 		if err != nil {
 			return err
 		}
-		logger.Info("durable tenant routing enabled")
+		logger.Info("durable tenant routing enabled", "tenant_count", tenantCount)
 	}
 	var connectorProxy http.Handler
 	var connectorSigner *httpapi.ConnectorSigner
