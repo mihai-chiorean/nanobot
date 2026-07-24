@@ -273,7 +273,9 @@ func (s *Store) MarkDeleted(ctx context.Context, userID string) error {
 	if _, err := tx.ExecContext(ctx, `UPDATE ziggy_tenant_users SET lifecycle_status='deleted', deleted_at=$2, updated_at=$2 WHERE user_id=$1 AND lifecycle_status='deletion_pending'`, userID, now); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE ziggy_tenant_runtime_allocations SET allocation_state='deleted', updated_at=$2 WHERE user_id=$1`, userID, now); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE ziggy_tenant_runtime_allocations
+SET allocation_state='deleted', upstream_url='', upstream_bootstrap_secret='', updated_at=$2
+WHERE user_id=$1`, userID, now); err != nil {
 		return err
 	}
 	if err := appendEvent(ctx, tx, userID, workspaceID, "user_deleted", "operator", generation, now); err != nil {

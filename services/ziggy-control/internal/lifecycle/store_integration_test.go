@@ -199,12 +199,15 @@ func TestPostgresRuntimeActivationAndDeletionTransitions(t *testing.T) {
 	if err := store.MarkDeleted(ctx, userID); err != nil {
 		t.Fatal(err)
 	}
-	var status, runtimeState string
-	if err := db.QueryRowContext(ctx, `SELECT u.lifecycle_status, r.allocation_state FROM ziggy_tenant_users u JOIN ziggy_tenant_runtime_allocations r ON r.user_id=u.user_id WHERE u.user_id=$1`, userID).Scan(&status, &runtimeState); err != nil {
+	var status, runtimeState, upstreamURL, bootstrapSecret string
+	if err := db.QueryRowContext(ctx, `SELECT u.lifecycle_status, r.allocation_state, r.upstream_url, r.upstream_bootstrap_secret
+FROM ziggy_tenant_users u
+JOIN ziggy_tenant_runtime_allocations r ON r.user_id=u.user_id
+WHERE u.user_id=$1`, userID).Scan(&status, &runtimeState, &upstreamURL, &bootstrapSecret); err != nil {
 		t.Fatal(err)
 	}
-	if status != "deleted" || runtimeState != "deleted" {
-		t.Fatalf("deleted status/runtime = %q/%q", status, runtimeState)
+	if status != "deleted" || runtimeState != "deleted" || upstreamURL != "" || bootstrapSecret != "" {
+		t.Fatalf("deleted status/runtime/transport = %q/%q/%q/%q", status, runtimeState, upstreamURL, bootstrapSecret)
 	}
 	if err := store.MarkDeletionPending(ctx, userID); !errors.Is(err, ErrInvalidTransition) {
 		t.Fatalf("deleted pending transition error = %v", err)
