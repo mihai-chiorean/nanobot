@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -69,6 +70,13 @@ type peerIdentity struct {
 	GID int
 	PID int
 }
+
+type workspaceAdmissions struct {
+	mu     sync.Mutex
+	active map[string]struct{}
+}
+
+var workspaceIDPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{2,62}$`)
 
 func (s Server) limits() limits {
 	result := limits{defaultMaxConcurrent, defaultMaxRequestBytes, defaultReadTimeout, defaultWriteTimeout, defaultDriverTimeout}
@@ -135,7 +143,9 @@ func (s Server) ListenAndServe(ctx context.Context, socket string) error {
 		_ = listener.Close()
 	}()
 	limits := s.limits()
-	slots := make(chan struct{}, limits.maxConcurrent)
+	readSlots := make(chan struct{}, limits.maxConcurrent)
+	operationSlots := make(chan struct{}, limits.maxConcurrent)
+	admissions := &workspaceAdmissions{active: make(map[string]struct{})}
 	for {
 		connection, err := listener.Accept()
 		if err != nil {
@@ -151,10 +161,9 @@ func (s Server) ListenAndServe(ctx context.Context, socket string) error {
 			continue
 		}
 		select {
-		case slots <- struct{}{}:
+		case readSlots <- struct{}{}:
 			go func() {
-				defer func() { <-slots }()
-				s.serveConnection(ctx, connection, limits, peer)
+				s.serveConnection(ctx, connection, limits, peer, readSlots, operationSlots, admissions)
 			}()
 		default:
 			s.writeResponse(connection, limits, Response{Error: "server_busy"})
@@ -163,8 +172,24 @@ func (s Server) ListenAndServe(ctx context.Context, socket string) error {
 	}
 }
 
-func (s Server) serveConnection(ctx context.Context, connection net.Conn, limits limits, peer peerIdentity) {
+func (s Server) serveConnection(
+	ctx context.Context,
+	connection net.Conn,
+	limits limits,
+	peer peerIdentity,
+	readSlots chan struct{},
+	operationSlots chan struct{},
+	admissions *workspaceAdmissions,
+) {
 	defer connection.Close()
+	readSlotHeld := true
+	releaseReadSlot := func() {
+		if readSlotHeld {
+			<-readSlots
+			readSlotHeld = false
+		}
+	}
+	defer releaseReadSlot()
 	if err := connection.SetReadDeadline(time.Now().Add(limits.readTimeout)); err != nil {
 		return
 	}
@@ -192,9 +217,33 @@ func (s Server) serveConnection(ctx context.Context, connection net.Conn, limits
 	if err := connection.SetReadDeadline(time.Time{}); err != nil {
 		return
 	}
+	releaseReadSlot()
+	if !request.Valid() {
+		errorName := "invalid_request"
+		if !workspaceIDPattern.MatchString(request.WorkspaceID) {
+			errorName = "invalid_workspace"
+		} else if request.Generation == 0 {
+			errorName = "invalid_generation"
+		}
+		s.writeResponse(connection, limits, Response{Error: errorName})
+		return
+	}
 	if request.Operation == "delete_tenant_data" && !s.authorizeDestructivePeer(peer) {
 		s.log(request, "forbidden")
 		s.writeResponse(connection, limits, Response{Error: "destructive_operation_forbidden"})
+		return
+	}
+	releaseWorkspace, admitted := admissions.tryAcquire(request.WorkspaceID)
+	if !admitted {
+		s.writeResponse(connection, limits, Response{Error: "workspace_busy"})
+		return
+	}
+	defer releaseWorkspace()
+	select {
+	case operationSlots <- struct{}{}:
+		defer func() { <-operationSlots }()
+	default:
+		s.writeResponse(connection, limits, Response{Error: "server_busy"})
 		return
 	}
 	driverCtx, cancel := context.WithTimeout(ctx, limits.driverTimeout)
@@ -331,7 +380,7 @@ func (s Server) log(request Request, result string) {
 		operation = "invalid"
 	}
 	workspaceID := request.WorkspaceID
-	if !regexp.MustCompile(`^[a-z0-9][a-z0-9-]{2,62}$`).MatchString(workspaceID) {
+	if !workspaceIDPattern.MatchString(workspaceID) {
 		workspaceID = "invalid"
 	}
 	// Deliberately content-free: validated IDs, operation, generation and result only.
@@ -360,5 +409,20 @@ func errorCode(err error) string {
 }
 
 func (r Request) Valid() bool {
-	return strings.TrimSpace(r.Operation) != "" && strings.TrimSpace(r.WorkspaceID) != "" && r.Generation > 0
+	return strings.TrimSpace(r.Operation) != "" && workspaceIDPattern.MatchString(r.WorkspaceID) && r.Generation > 0
+}
+
+func (a *workspaceAdmissions) tryAcquire(workspaceID string) (func(), bool) {
+	a.mu.Lock()
+	if _, exists := a.active[workspaceID]; exists {
+		a.mu.Unlock()
+		return nil, false
+	}
+	a.active[workspaceID] = struct{}{}
+	a.mu.Unlock()
+	return func() {
+		a.mu.Lock()
+		delete(a.active, workspaceID)
+		a.mu.Unlock()
+	}, true
 }

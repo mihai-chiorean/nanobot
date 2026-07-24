@@ -48,6 +48,12 @@ func TestRouterKeepsCredentialsBoundToTheirRuntime(t *testing.T) {
 	if err := router.RememberCredentials(context.Background(), tester, []string{"tester-token"}, time.Minute); err != nil {
 		t.Fatal(err)
 	}
+	if userID, ok := router.AdmissionIdentity("owner-token"); !ok || userID != owner.UserID {
+		t.Fatalf("manifest remembered admission identity = %q/%v, want %q/true", userID, ok, owner.UserID)
+	}
+	if userID, ok := router.AdmissionIdentity("owner-bootstrap-secret-with-32-bytes"); !ok || userID != owner.UserID {
+		t.Fatalf("manifest runtime admission identity = %q/%v, want %q/true", userID, ok, owner.UserID)
+	}
 
 	resolvedOwner, err := router.ResolveCredential(context.Background(), "owner-token")
 	if err != nil || resolvedOwner.WorkspaceID != owner.WorkspaceID {

@@ -13,6 +13,8 @@ control service. It is an operator procedure, not a deployment command.
 - Apply migrations `001` through `004` in filename order with the database
   migration owner. Migration `004` records the checksummed identity required by
   service readiness. Applied migrations `001` through `003` are immutable.
+  Migration `004` is replay-safe but never overwrites an existing identity; a
+  mismatch must be investigated rather than repaired by replaying the file.
 - Create separate `ziggy_control` and `ziggy_tenant_import` login roles. Neither
   role may own the database, schema, tables, migrations, or lifecycle event
   sequence.
@@ -33,7 +35,9 @@ control service. It is an operator procedure, not a deployment command.
 - Create `/etc/ziggy/secrets/tenant-database-url`, mode `0400`, containing only
   the `ziggy_control` PostgreSQL DSN. Give the import command a separate
   credential file containing the `ziggy_tenant_import` DSN. Do not put either
-  DSN in the environment file or a command line.
+  DSN in the environment file or a command line. Use an absolute Unix-socket
+  host for local peer authentication or `sslmode=verify-full` for a network
+  connection.
 
 ## Import
 

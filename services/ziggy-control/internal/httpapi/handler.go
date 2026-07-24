@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -41,6 +42,7 @@ type Config struct {
 	SSEInFlight       int64
 	WebSocketInFlight int64
 	TenantCount       int
+	TenantCountSource TenantCountSource
 	Version           string
 }
 
@@ -77,6 +79,18 @@ type tenantCountProvider interface {
 	TenantCount() int
 }
 
+type TenantCountSource interface {
+	CurrentTenantCount() int64
+}
+
+type staticTenantCount int64
+
+func (count staticTenantCount) CurrentTenantCount() int64 { return int64(count) }
+
+type admissionIdentityRouter interface {
+	AdmissionIdentity(string) (string, bool)
+}
+
 const (
 	admissionHTTP admissionClass = iota
 	admissionSSE
@@ -89,9 +103,13 @@ type admissionGate struct {
 }
 
 func (gate *admissionGate) tryAcquire() (func(), bool) {
+	return gate.tryAcquireLimit(gate.limit)
+}
+
+func (gate *admissionGate) tryAcquireLimit(limit int64) (func(), bool) {
 	for {
 		current := gate.active.Load()
-		if current >= gate.limit {
+		if current >= limit {
 			return nil, false
 		}
 		if gate.active.CompareAndSwap(current, current+1) {
@@ -109,7 +127,7 @@ type inboundAdmission struct {
 	http             admissionGate
 	sse              admissionGate
 	webSocket        admissionGate
-	tenantCount      int64
+	tenantCount      TenantCountSource
 	httpTenants      sync.Map
 	sseTenants       sync.Map
 	webSocketTenants sync.Map
@@ -120,6 +138,15 @@ func newInboundAdmission(httpLimit, sseLimit, webSocketLimit int64) *inboundAdmi
 }
 
 func newInboundAdmissionWithTenantCount(httpLimit, sseLimit, webSocketLimit int64, tenantCount int) *inboundAdmission {
+	return newInboundAdmissionWithTenantCountSource(
+		httpLimit,
+		sseLimit,
+		webSocketLimit,
+		staticTenantCount(tenantCount),
+	)
+}
+
+func newInboundAdmissionWithTenantCountSource(httpLimit, sseLimit, webSocketLimit int64, tenantCount TenantCountSource) *inboundAdmission {
 	if httpLimit <= 0 {
 		httpLimit = defaultHTTPInFlight
 	}
@@ -129,14 +156,14 @@ func newInboundAdmissionWithTenantCount(httpLimit, sseLimit, webSocketLimit int6
 	if webSocketLimit <= 0 {
 		webSocketLimit = defaultWebSocketInFlight
 	}
-	if tenantCount <= 0 {
-		tenantCount = 1
+	if tenantCount == nil {
+		tenantCount = staticTenantCount(1)
 	}
 	return &inboundAdmission{
 		http:        admissionGate{limit: httpLimit},
 		sse:         admissionGate{limit: sseLimit},
 		webSocket:   admissionGate{limit: webSocketLimit},
-		tenantCount: int64(tenantCount),
+		tenantCount: tenantCount,
 	}
 }
 
@@ -177,6 +204,10 @@ func New(config Config) (http.Handler, error) {
 			tenantCount = provider.TenantCount()
 		}
 	}
+	tenantCountSource := config.TenantCountSource
+	if tenantCountSource == nil {
+		tenantCountSource = staticTenantCount(tenantCount)
+	}
 
 	api := &API{
 		proxy:           config.Proxy,
@@ -192,7 +223,7 @@ func New(config Config) (http.Handler, error) {
 		ownerSubject:    strings.TrimSpace(config.OwnerSubject),
 		blockedPaths:    cloneBlockedPaths(config.BlockedPaths),
 		maxRequestBody:  config.MaxRequestBody,
-		admission:       newInboundAdmissionWithTenantCount(config.HTTPInFlight, config.SSEInFlight, config.WebSocketInFlight, tenantCount),
+		admission:       newInboundAdmissionWithTenantCountSource(config.HTTPInFlight, config.SSEInFlight, config.WebSocketInFlight, tenantCountSource),
 		version:         config.Version,
 	}
 	if api.telemetry == nil {
@@ -240,8 +271,7 @@ func (api *API) admit(next http.Handler) http.Handler {
 		}
 		defer globalRelease()
 
-		resolution := api.resolveTenantRoute(r)
-		tenantRelease, acquired := api.admission.tryAcquireTenant(class, api.admissionTenant(r, resolution))
+		tenantRelease, acquired := api.admission.tryAcquireTenant(class, api.admissionIdentity(r))
 		if !acquired {
 			w.Header().Set("Retry-After", "1")
 			writeError(w, http.StatusServiceUnavailable, "inbound capacity unavailable")
@@ -249,6 +279,7 @@ func (api *API) admit(next http.Handler) http.Handler {
 		}
 		defer tenantRelease()
 
+		resolution := api.resolveTenantRoute(r)
 		request := r.WithContext(withTenantRouteResolution(r.Context(), resolution))
 		next.ServeHTTP(w, request)
 	})
@@ -280,10 +311,14 @@ func (admission *inboundAdmission) tryAcquireTenant(class admissionClass, tenant
 	if strings.TrimSpace(tenant) == "" {
 		tenant = anonymousTenant
 	}
-	tenantLimit := admission.share(global.limit, admission.tenantCount+1)
-	entry := &admissionGate{limit: tenantLimit}
+	tenantCount := admission.tenantCount.CurrentTenantCount()
+	if tenantCount < 1 {
+		tenantCount = 1
+	}
+	tenantLimit := admission.share(global.limit, tenantCount+1)
+	entry := &admissionGate{}
 	actual, _ := tenants.LoadOrStore(tenant, entry)
-	return actual.(*admissionGate).tryAcquire()
+	return actual.(*admissionGate).tryAcquireLimit(tenantLimit)
 }
 
 func (admission *inboundAdmission) gates(class admissionClass) (*admissionGate, *sync.Map) {
@@ -336,17 +371,26 @@ func (api *API) resolveTenantRoute(r *http.Request) tenantRouteResolution {
 	return tenantRouteResolution{route: route, source: tenantRouteDefault, found: route.Proxy != nil}
 }
 
-func (api *API) admissionTenant(r *http.Request, resolution tenantRouteResolution) string {
-	if resolution.source != tenantRouteDefault && resolution.found && strings.TrimSpace(resolution.route.UserID) != "" {
-		return resolution.route.UserID
-	}
-	if principal, ok := identity.FromContext(r.Context()); ok && api.tenantRouter == nil {
-		if api.isOwner(principal) {
-			return "owner"
+func (api *API) admissionIdentity(r *http.Request) string {
+	if principal, ok := identity.FromContext(r.Context()); ok {
+		if subject := strings.TrimSpace(principal.Subject); subject != "" {
+			return hashedAdmissionIdentity("clerk", subject)
 		}
-		return anonymousTenant
+	}
+	credential := requestCredential(r)
+	if credential != "" {
+		if router, ok := api.tenantRouter.(admissionIdentityRouter); ok {
+			if tenant, found := router.AdmissionIdentity(credential); found && strings.TrimSpace(tenant) != "" {
+				return hashedAdmissionIdentity("tenant", tenant)
+			}
+		}
 	}
 	return anonymousTenant
+}
+
+func hashedAdmissionIdentity(kind, value string) string {
+	digest := sha256.Sum256([]byte(kind + "\x00" + value))
+	return kind + ":" + hex.EncodeToString(digest[:])
 }
 
 func acceptsSSE(r *http.Request) bool {

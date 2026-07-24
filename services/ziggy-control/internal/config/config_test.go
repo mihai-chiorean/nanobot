@@ -73,7 +73,7 @@ func TestLoadFromPostgresTenantMode(t *testing.T) {
 	environment := map[string]string{
 		"ZIGGY_UPSTREAM_URL":        "http://127.0.0.1:8765",
 		"ZIGGY_TENANCY_MODE":        "postgres",
-		"ZIGGY_TENANT_DATABASE_URL": "postgres://ziggy:secret@127.0.0.1:5432/ziggy_tenants?sslmode=disable",
+		"ZIGGY_TENANT_DATABASE_URL": "postgres://ziggy:secret@db.example.com:5432/ziggy_tenants?sslmode=verify-full",
 		"ZIGGY_AUTHORIZED_PARTIES":  "https://chat.example.com",
 		"CLERK_SECRET_KEY":          "secret",
 	}
@@ -83,6 +83,27 @@ func TestLoadFromPostgresTenantMode(t *testing.T) {
 	}
 	if config.TenantMode != "postgres" || config.TenantDatabaseURL == "" || config.TenantManifest != "" {
 		t.Fatalf("postgres mode config = %+v", config)
+	}
+}
+
+func TestLoadFromPostgresTenantModeRejectsUnverifiedNetwork(t *testing.T) {
+	for _, databaseURL := range []string{
+		"postgres://ziggy:secret@db.example.com:5432/ziggy_tenants",
+		"postgres://ziggy:secret@db.example.com:5432/ziggy_tenants?sslmode=disable",
+		"postgres://ziggy:secret@db.example.com:5432/ziggy_tenants?sslmode=require",
+		"postgres://ziggy:secret@db.example.com:5432/ziggy_tenants?sslmode=verify-ca",
+		"postgres://ziggy:secret@db.example.com:5432/ziggy_tenants?sslmode=verify-full&sslmode=disable",
+	} {
+		environment := map[string]string{
+			"ZIGGY_UPSTREAM_URL":        "http://127.0.0.1:8765",
+			"ZIGGY_TENANCY_MODE":        "postgres",
+			"ZIGGY_TENANT_DATABASE_URL": databaseURL,
+			"ZIGGY_AUTHORIZED_PARTIES":  "https://chat.example.com",
+			"CLERK_SECRET_KEY":          "secret",
+		}
+		if _, err := LoadFrom(mapLookup(environment)); err == nil {
+			t.Fatalf("LoadFrom() accepted unverified tenant database URL %q", databaseURL)
+		}
 	}
 }
 
@@ -109,6 +130,7 @@ func TestLoadFromPostgresTenantModeRejectsMissingHostOrDatabase(t *testing.T) {
 		"postgresql:///ziggy_control?sslmode=disable",
 		"postgresql://127.0.0.1?sslmode=disable",
 		"postgresql:///ziggy_control?host=relative/socket&sslmode=disable",
+		"postgresql://db.example.com/ziggy_control?host=/var/run/postgresql&sslmode=verify-full",
 		"postgresql://[::1/ziggy_control",
 	} {
 		environment := map[string]string{

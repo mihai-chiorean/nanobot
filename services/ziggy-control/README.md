@@ -83,7 +83,9 @@ through [`migrations/004_schema_identity.sql`](migrations/004_schema_identity.sq
 with deployment-owned migration tooling before starting the service; the
 process verifies the complete schema identity and never changes production
 schema. Applied migrations are immutable: CI hashes migrations 001 through 003,
-and readiness requires the exact identity recorded by migration 004.
+and readiness requires the exact identity recorded by migration 004. Replaying
+migration 004 never overwrites an existing identity; a mismatch remains a
+readiness failure and requires operator investigation.
 Do not configure the manifest or binding-file variables in PostgreSQL mode.
 
 The durable source stores the invited email, stable Clerk subject, lifecycle
@@ -153,7 +155,7 @@ Required variables:
 | `ZIGGY_TENANCY_MODE` | `manifest` compatibility mode or `postgres` durable lifecycle mode. `legacy` is development-only. |
 | `ZIGGY_TENANTS_FILE` | Required only in `manifest` mode: immutable tenant allocation manifest. |
 | `ZIGGY_TENANT_BINDINGS_FILE` | Required only in `manifest` mode: durable first-login Clerk subject bindings. |
-| `ZIGGY_TENANT_DATABASE_URL` or `ZIGGY_TENANT_DATABASE_URL_FILE` | Required only in `postgres` mode. Set exactly one; use a private PostgreSQL database and a credential file in production. |
+| `ZIGGY_TENANT_DATABASE_URL` or `ZIGGY_TENANT_DATABASE_URL_FILE` | Required only in `postgres` mode. Set exactly one. Unix-socket URLs support local peer authentication; network URLs must use `sslmode=verify-full`. Use a credential file in production. |
 
 Optional variables are documented in [`.env.example`](.env.example). In
 production, at least one `ZIGGY_AUTHORIZED_PARTIES` value is mandatory. Tenant
@@ -198,8 +200,10 @@ streams, and 8 WebSocket connections. Each configured tenant receives an
 equal share of each class, while anonymous traffic receives a separate share;
 the global limits remain hard caps and one tenant cannot consume an entire
 class. PostgreSQL mode counts admitted durable tenants at startup. A cheap
-global slot is acquired before durable route resolution, and the one resolved
-route is reused by the handler. Override the global limits with
+global slot and a stable authenticated-identity share are acquired before
+durable route resolution, and the one resolved route is reused by the handler.
+The admitted tenant count refreshes from PostgreSQL every 15 seconds through an
+atomic source; the request path takes no count lock. Override the global limits with
 `ZIGGY_MAX_HTTP_IN_FLIGHT`, `ZIGGY_MAX_SSE_IN_FLIGHT`, and
 `ZIGGY_MAX_WEBSOCKET_IN_FLIGHT`. `/healthz` and `/readyz` bypass these limits.
 

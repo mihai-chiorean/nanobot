@@ -164,12 +164,13 @@ func (d Driver) Delete(ctx context.Context, request runtime.Request) error {
 	if err := d.assertCurrent(ctx, request); err != nil && !errors.Is(err, runtime.ErrNotFound) {
 		return err
 	}
-	_ = d.systemctl(ctx, "stop", UnitName(request))
-	container, _, configVolume := tenantNames(request)
-	result, err := d.Runner.Run(ctx, Command{Path: "podman", Args: []string{"rm", "--force", "--time", "30", container}})
-	if err != nil || (result.ExitCode != 0 && result.ExitCode != 1) {
-		return errors.New("runtime deletion command failed")
+	if err := d.stopUnitForDeletion(ctx, UnitName(request)); err != nil {
+		return err
 	}
+	if err := d.removeOwnedContainer(ctx, request); err != nil {
+		return err
+	}
+	_, _, configVolume := tenantNames(request)
 	if err := d.removeOwnedVolume(ctx, configVolume, lifecycleLabels(request)); err != nil {
 		return err
 	}
@@ -201,6 +202,13 @@ func (d Driver) DeleteTenantData(ctx context.Context, request runtime.Request) e
 			return runtime.ErrGenerationConflict
 		}
 		return errors.New("runtime generation must be deleted before tenant data deletion")
+	}
+	inactive, err := d.unitInactiveOrAbsent(ctx, UnitName(request))
+	if err != nil {
+		return errors.New("runtime unit state could not be verified before tenant data deletion")
+	}
+	if !inactive {
+		return errors.New("runtime unit remained active before tenant data deletion")
 	}
 	_, rootVolume, _ := tenantNames(request)
 	return d.removeOwnedWorkspaceVolume(ctx, rootVolume, request)
@@ -292,9 +300,20 @@ func (d Driver) ensureWorkspaceVolume(ctx context.Context, name string, request 
 }
 
 func (d Driver) createAndVerify(ctx context.Context, create, inspect Command, verify func([]byte) error) error {
-	created, err := d.Runner.Run(ctx, create)
-	if err != nil || (created.ExitCode != 0 && created.ExitCode != 125) {
-		return errors.New("runtime prerequisite creation failed")
+	if create.Path != "podman" || len(create.Args) < 3 {
+		return errors.New("runtime prerequisite creation command is invalid")
+	}
+	resource := create.Args[0]
+	name := create.Args[len(create.Args)-1]
+	exists, err := d.resourceExists(ctx, resource, name)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		created, err := d.Runner.Run(ctx, create)
+		if err != nil || created.ExitCode != 0 {
+			return errors.New("runtime prerequisite creation failed")
+		}
 	}
 	observed, err := d.Runner.Run(ctx, inspect)
 	if err != nil || observed.ExitCode != 0 || verify([]byte(observed.Stdout)) != nil {
@@ -341,12 +360,16 @@ func workspaceVolumeLabelsMatch(actual, expected map[string]string) bool {
 }
 
 func (d Driver) removeOwnedVolume(ctx context.Context, name string, expectedLabels map[string]string) error {
-	inspection, err := d.Runner.Run(ctx, Command{Path: "podman", Args: []string{"volume", "inspect", "--format", "{{json .}}", name}})
+	exists, err := d.resourceExists(ctx, "volume", name)
 	if err != nil {
 		return err
 	}
-	if inspection.ExitCode == 125 || inspection.ExitCode == 1 {
+	if !exists {
 		return nil
+	}
+	inspection, err := d.Runner.Run(ctx, Command{Path: "podman", Args: []string{"volume", "inspect", "--format", "{{json .}}", name}})
+	if err != nil {
+		return err
 	}
 	var volume struct {
 		Labels map[string]string `json:"Labels"`
@@ -355,19 +378,23 @@ func (d Driver) removeOwnedVolume(ctx context.Context, name string, expectedLabe
 		return errors.New("runtime volume is not manager-owned")
 	}
 	removed, err := d.Runner.Run(ctx, Command{Path: "podman", Args: []string{"volume", "rm", name}})
-	if err != nil || (removed.ExitCode != 0 && removed.ExitCode != 1) {
+	if err != nil || removed.ExitCode != 0 {
 		return errors.New("runtime volume deletion failed")
 	}
 	return nil
 }
 
 func (d Driver) removeOwnedWorkspaceVolume(ctx context.Context, name string, request runtime.Request) error {
-	inspection, err := d.Runner.Run(ctx, Command{Path: "podman", Args: []string{"volume", "inspect", "--format", "{{json .}}", name}})
+	exists, err := d.resourceExists(ctx, "volume", name)
 	if err != nil {
 		return err
 	}
-	if inspection.ExitCode == 125 || inspection.ExitCode == 1 {
+	if !exists {
 		return nil
+	}
+	inspection, err := d.Runner.Run(ctx, Command{Path: "podman", Args: []string{"volume", "inspect", "--format", "{{json .}}", name}})
+	if err != nil {
+		return err
 	}
 	var volume struct {
 		Labels map[string]string `json:"Labels"`
@@ -376,7 +403,7 @@ func (d Driver) removeOwnedWorkspaceVolume(ctx context.Context, name string, req
 		return errors.New("workspace volume is not manager-owned and generation-independent")
 	}
 	removed, err := d.Runner.Run(ctx, Command{Path: "podman", Args: []string{"volume", "rm", name}})
-	if err != nil || (removed.ExitCode != 0 && removed.ExitCode != 1) {
+	if err != nil || removed.ExitCode != 0 {
 		return errors.New("workspace volume deletion failed")
 	}
 	return nil
@@ -384,12 +411,16 @@ func (d Driver) removeOwnedWorkspaceVolume(ctx context.Context, name string, req
 
 func (d Driver) removeOwnedNetwork(ctx context.Context, request runtime.Request) error {
 	name := egressNetwork(request)
-	inspection, err := d.Runner.Run(ctx, Command{Path: "podman", Args: []string{"network", "inspect", "--format", "{{json .}}", name}})
+	exists, err := d.resourceExists(ctx, "network", name)
 	if err != nil {
 		return err
 	}
-	if inspection.ExitCode == 125 || inspection.ExitCode == 1 {
+	if !exists {
 		return nil
+	}
+	inspection, err := d.Runner.Run(ctx, Command{Path: "podman", Args: []string{"network", "inspect", "--format", "{{json .}}", name}})
+	if err != nil {
+		return err
 	}
 	var network struct {
 		Internal bool              `json:"internal"`
@@ -399,7 +430,7 @@ func (d Driver) removeOwnedNetwork(ctx context.Context, request runtime.Request)
 		return errors.New("runtime network is not manager-owned and internal")
 	}
 	removed, err := d.Runner.Run(ctx, Command{Path: "podman", Args: []string{"network", "rm", name}})
-	if err != nil || (removed.ExitCode != 0 && removed.ExitCode != 1) {
+	if err != nil || removed.ExitCode != 0 {
 		return errors.New("runtime network deletion failed")
 	}
 	return nil
@@ -407,21 +438,103 @@ func (d Driver) removeOwnedNetwork(ctx context.Context, request runtime.Request)
 
 func (d Driver) currentGeneration(ctx context.Context, request runtime.Request) (uint64, bool, error) {
 	container, _, _ := tenantNames(request)
-	result, err := d.Runner.Run(ctx, Command{Path: "podman", Args: []string{"inspect", "--format", "{{index .Config.Labels \"io.ziggy.generation\"}}", container}})
+	exists, err := d.resourceExists(ctx, "container", container)
 	if err != nil {
 		return 0, false, err
 	}
-	if result.ExitCode != 0 {
-		if result.ExitCode == 125 || result.ExitCode == 1 {
-			return 0, false, nil
-		}
-		return 0, false, errors.New("runtime generation inspect failed")
+	if !exists {
+		return 0, false, nil
 	}
-	generation, err := strconv.ParseUint(strings.TrimSpace(result.Stdout), 10, 64)
+	result, err := d.Runner.Run(ctx, Command{Path: "podman", Args: []string{"inspect", "--format", "{{json .Config.Labels}}", container}})
+	if err != nil || result.ExitCode != 0 {
+		return 0, false, errors.New("runtime container ownership inspect failed")
+	}
+	var labels map[string]string
+	if err := json.Unmarshal([]byte(result.Stdout), &labels); err != nil ||
+		labels[managerOwnerLabel] != managerOwnerValue ||
+		labels[workspaceLabel] != request.WorkspaceID {
+		return 0, false, errors.New("runtime container is not manager-owned")
+	}
+	generation, err := strconv.ParseUint(strings.TrimSpace(labels[generationLabel]), 10, 64)
 	if err != nil || generation == 0 {
 		return 0, false, errors.New("runtime generation label is invalid")
 	}
 	return generation, true, nil
+}
+
+func (d Driver) resourceExists(ctx context.Context, resource, name string) (bool, error) {
+	result, err := d.Runner.Run(ctx, Command{Path: "podman", Args: []string{resource, "exists", name}})
+	if err != nil {
+		return false, err
+	}
+	switch result.ExitCode {
+	case 0:
+		return true, nil
+	case 1:
+		return false, nil
+	default:
+		return false, fmt.Errorf("podman %s existence check failed", resource)
+	}
+}
+
+func (d Driver) removeOwnedContainer(ctx context.Context, request runtime.Request) error {
+	actual, found, err := d.currentGeneration(ctx, request)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return nil
+	}
+	if actual > request.Generation {
+		return runtime.ErrStaleGeneration
+	}
+	if actual != request.Generation {
+		return runtime.ErrGenerationConflict
+	}
+	container, _, _ := tenantNames(request)
+	result, err := d.Runner.Run(ctx, Command{Path: "podman", Args: []string{"rm", "--force", "--time", "30", container}})
+	if err != nil || result.ExitCode != 0 {
+		return errors.New("runtime deletion command failed")
+	}
+	return nil
+}
+
+func (d Driver) stopUnitForDeletion(ctx context.Context, unit string) error {
+	result, err := d.Runner.Run(ctx, Command{Path: "systemctl", Args: []string{"--user", "stop", unit}})
+	if err == nil && result.ExitCode == 0 {
+		return nil
+	}
+	inactive, stateErr := d.unitInactiveOrAbsent(ctx, unit)
+	if stateErr != nil {
+		return errors.New("runtime systemd stop failed and unit state could not be verified")
+	}
+	if !inactive {
+		return errors.New("runtime systemd stop failed while unit remained active")
+	}
+	return nil
+}
+
+func (d Driver) unitInactiveOrAbsent(ctx context.Context, unit string) (bool, error) {
+	result, err := d.Runner.Run(ctx, Command{
+		Path: "systemctl",
+		Args: []string{"--user", "show", unit, "--property=LoadState", "--property=ActiveState", "--no-pager"},
+	})
+	if err != nil || result.ExitCode != 0 {
+		return false, errors.New("runtime systemd state query failed")
+	}
+	properties := map[string]string{}
+	for _, line := range strings.Split(result.Stdout, "\n") {
+		key, value, found := strings.Cut(strings.TrimSpace(line), "=")
+		if found {
+			properties[key] = value
+		}
+	}
+	loadState, hasLoadState := properties["LoadState"]
+	activeState, hasActiveState := properties["ActiveState"]
+	if !hasLoadState || !hasActiveState || loadState == "" || activeState == "" {
+		return false, errors.New("runtime systemd state response was incomplete")
+	}
+	return activeState == "inactive", nil
 }
 
 func (d Driver) assertCurrent(ctx context.Context, request runtime.Request) error {

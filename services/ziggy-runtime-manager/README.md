@@ -24,6 +24,8 @@ write/fsync/rename/directory-fsync, retained after container deletion, and
 validated on every operation. Malformed, insecure, or unwritable state fails
 closed; an absent file is valid only for a workspace's first accepted
 generation. Podman labels remain a secondary live-resource ownership check.
+Container operations require matching manager-owner, workspace, and generation
+labels both before stopping the systemd unit and immediately before removal.
 
 `delete` is normal **generation cleanup**: it removes the container, its
 generation-scoped config volume, its internal network, and the generated unit,
@@ -35,16 +37,26 @@ workspace-volume labels. Old `ensure_running`, `delete`, and
 deletion first persists a terminal intent, then removes the volume, then marks
 completion. Both pending and completed terminal states reject every future
 generation, so an intentionally destroyed tenant cannot be resurrected.
+Generation cleanup proceeds only after `systemctl stop` succeeds or
+`systemctl show` proves the unit inactive; tenant-data deletion verifies the
+unit remains inactive again. Podman absence is accepted only from exit status
+`1` returned by the resource-specific `container exists`, `volume exists`, or
+`network exists` command. Exit status `125` and all other indeterminate results
+fail closed and cannot produce a deletion tombstone.
 
 Manager logs contain operation, workspace ID, generation, and result only.
 They do not write prompts, workspace paths, credentials, config, command
 output, or runtime stderr.
 
 The Unix socket is JSON-lines only: one request line per connection, with a hard
-4 KiB `max+1` read cap, 16 concurrent requests, five-second read/write
-deadlines, and a 30-second request-scoped driver deadline. Configuration cannot
-raise those limits above 64 KiB, 256 requests, or one minute. Excess
-connections are rejected instead of creating unbounded handler goroutines.
+4 KiB `max+1` read cap, 16 bounded request readers, 16 global lifecycle
+operations, five-second read/write deadlines, and a 30-second request-scoped
+driver deadline. After parsing, at most one operation per workspace is admitted
+before global operation capacity is claimed; duplicates receive
+`workspace_busy`, so one stalled workspace cannot fill the global operation
+budget. Configuration cannot raise the limits above 64 KiB, 256 operations, or
+one minute. Excess readers or unrelated operations are rejected instead of
+creating unbounded handler goroutines.
 
 Startup holds an exclusive `flock` on the adjacent lock file for the listener's
 full lifetime. An existing socket is probed and removed only when it is a stale

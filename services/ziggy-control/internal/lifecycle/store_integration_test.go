@@ -249,6 +249,53 @@ WHERE u.user_id=$1`, userID).Scan(
 	}
 }
 
+func TestPostgresLifecycleRevocationObserverRunsAfterCommit(t *testing.T) {
+	db, store, ctx := integrationStore(t)
+	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
+	userID, activation := pendingActivation(
+		t,
+		db,
+		store,
+		ctx,
+		"revocation-"+suffix+"@example.com",
+		"clerk-revocation-"+suffix,
+	)
+	t.Cleanup(func() { cleanupUser(db, userID) })
+	activation.UpstreamURL = "http://127.0.0.1:8765"
+	activation.UpstreamBootstrapSecret = "revocation-observer-secret-000000"
+	if err := store.ActivateRuntime(ctx, activation); err != nil {
+		t.Fatal(err)
+	}
+
+	var observed []string
+	store.SetRevocationObserver(func(gotUserID, workspaceID string) {
+		if gotUserID != userID || workspaceID != activation.WorkspaceID {
+			t.Errorf("revocation identity = %q/%q, want %q/%q", gotUserID, workspaceID, userID, activation.WorkspaceID)
+			return
+		}
+		var status string
+		if err := db.QueryRowContext(context.Background(), `SELECT lifecycle_status FROM ziggy_tenant_users WHERE user_id=$1`, userID).Scan(&status); err != nil {
+			t.Errorf("query committed revocation state: %v", err)
+			return
+		}
+		observed = append(observed, status)
+	})
+
+	if err := store.Disable(ctx, userID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkDeletionPending(ctx, userID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkDeleted(ctx, userID, "revocation-receipt-"+suffix); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"disabled", "deletion_pending", "deleted"}
+	if fmt.Sprint(observed) != fmt.Sprint(want) {
+		t.Fatalf("observed revocations = %v, want %v", observed, want)
+	}
+}
+
 func TestPostgresRuntimeActivationRejectsSharedEndpointOrSecret(t *testing.T) {
 	db, store, ctx := integrationStore(t)
 	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
@@ -319,12 +366,31 @@ func TestPostgresReadyRequiresCompleteSchema(t *testing.T) {
 	}
 }
 
-func TestPostgresReadyRejectsWrongSchemaIdentity(t *testing.T) {
+func TestPostgresSchemaIdentityReplayDoesNotOverwriteMismatch(t *testing.T) {
 	db, store, ctx := integrationStore(t)
+	var recordedAt time.Time
+	if err := db.QueryRowContext(ctx, `SELECT recorded_at FROM ziggy_schema_identity WHERE component=$1`, schemaIdentityComponent).Scan(&recordedAt); err != nil {
+		t.Fatal(err)
+	}
+	if err := applyMigrationFile(ctx, db, "004_schema_identity.sql"); err != nil {
+		t.Fatal(err)
+	}
+	var replayedAt time.Time
+	if err := db.QueryRowContext(ctx, `SELECT recorded_at FROM ziggy_schema_identity WHERE component=$1`, schemaIdentityComponent).Scan(&replayedAt); err != nil {
+		t.Fatal(err)
+	}
+	if !replayedAt.Equal(recordedAt) {
+		t.Fatalf("schema identity replay changed recorded_at from %s to %s", recordedAt, replayedAt)
+	}
+
 	if _, err := db.ExecContext(ctx, `UPDATE ziggy_schema_identity SET migration_set_sha256=repeat('0',64) WHERE component=$1`, schemaIdentityComponent); err != nil {
 		t.Fatal(err)
 	}
 	defer func() {
+		if _, err := db.ExecContext(context.Background(), `DELETE FROM ziggy_schema_identity WHERE component=$1`, schemaIdentityComponent); err != nil {
+			t.Errorf("remove mismatched schema identity: %v", err)
+			return
+		}
 		if err := applyMigrationFile(ctx, db, "004_schema_identity.sql"); err != nil {
 			t.Errorf("restore schema identity: %v", err)
 		}
@@ -335,8 +401,88 @@ func TestPostgresReadyRejectsWrongSchemaIdentity(t *testing.T) {
 	if err := applyMigrationFile(ctx, db, "004_schema_identity.sql"); err != nil {
 		t.Fatal(err)
 	}
+	var replayedIdentity string
+	if err := db.QueryRowContext(ctx, `SELECT migration_set_sha256 FROM ziggy_schema_identity WHERE component=$1`, schemaIdentityComponent).Scan(&replayedIdentity); err != nil {
+		t.Fatal(err)
+	}
+	if replayedIdentity != strings.Repeat("0", 64) {
+		t.Fatalf("schema identity replay overwrote mismatch with %q", replayedIdentity)
+	}
+	if err := store.Ready(ctx); err == nil {
+		t.Fatal("Ready succeeded after replaying a mismatched schema identity")
+	}
+}
+
+func TestPostgresLegacyDeletionUpgradeAndReplay(t *testing.T) {
+	db, store, ctx := integrationStore(t)
+	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
+	userID := "usr_legacy_deleted_" + suffix
+	workspaceID := "ws_legacy_deleted_" + suffix
+	runtimeID := "rt_legacy_deleted_" + suffix
+	t.Cleanup(func() { cleanupUser(db, userID) })
+	defer func() {
+		if err := applyMigration(ctx, db); err != nil {
+			t.Errorf("restore lifecycle migrations: %v", err)
+		}
+	}()
+
+	if _, err := db.ExecContext(ctx, `ALTER TABLE ziggy_tenant_users DROP CONSTRAINT ziggy_tenant_users_destruction_receipt_check`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `ALTER TABLE ziggy_tenant_users DROP COLUMN destruction_receipt`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO ziggy_tenant_users
+	    (user_id, expected_email, clerk_subject, lifecycle_status, created_at, updated_at, deleted_at)
+	    VALUES ($1,$2,$3,'deleted',now(),now(),now())`,
+		userID, "legacy-deleted-"+suffix+"@example.com", "clerk-legacy-deleted-"+suffix); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO ziggy_tenant_workspaces (workspace_id, user_id, created_at) VALUES ($1,$2,now())`, workspaceID, userID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO ziggy_tenant_runtime_allocations
+	    (workspace_id, user_id, runtime_id, generation, allocation_state, upstream_url, upstream_bootstrap_secret, metadata, created_at, updated_at)
+	    VALUES ($1,$2,$3,1,'deleted','http://127.0.0.1:8765','legacy-deleted-bootstrap-secret-000','{"secret":"legacy"}'::jsonb,now(),now())`,
+		workspaceID, userID, runtimeID); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := applyMigrationFile(ctx, db, "003_terminal_deletion_receipt.sql"); err != nil {
+		t.Fatal(err)
+	}
+	if err := applyMigrationFile(ctx, db, "004_schema_identity.sql"); err != nil {
+		t.Fatal(err)
+	}
 	if err := store.Ready(ctx); err != nil {
-		t.Fatalf("Ready after restoring schema identity = %v", err)
+		t.Fatalf("Ready after legacy upgrade = %v", err)
+	}
+
+	var email, subject, receipt, upstreamURL, secret, metadata string
+	var nullableSubject sql.NullString
+	if err := db.QueryRowContext(ctx, `SELECT
+	    u.expected_email, u.clerk_subject, u.destruction_receipt,
+	    r.upstream_url, r.upstream_bootstrap_secret, r.metadata::text
+	    FROM ziggy_tenant_users u
+	    JOIN ziggy_tenant_runtime_allocations r ON r.user_id=u.user_id
+	    WHERE u.user_id=$1`, userID).Scan(&email, &nullableSubject, &receipt, &upstreamURL, &secret, &metadata); err != nil {
+		t.Fatal(err)
+	}
+	subject = nullableSubject.String
+	if !strings.HasPrefix(email, "deleted-") || !strings.HasSuffix(email, "@invalid") ||
+		subject != "" || !strings.HasPrefix(receipt, "legacy:") ||
+		upstreamURL != "" || secret != "" || metadata != "{}" {
+		t.Fatalf("legacy deletion upgrade = email %q subject %q receipt %q url %q secret %q metadata %q", email, subject, receipt, upstreamURL, secret, metadata)
+	}
+
+	if err := applyMigrationFile(ctx, db, "003_terminal_deletion_receipt.sql"); err != nil {
+		t.Fatalf("replay migration 003: %v", err)
+	}
+	if err := applyMigrationFile(ctx, db, "004_schema_identity.sql"); err != nil {
+		t.Fatalf("replay migration 004: %v", err)
+	}
+	if err := store.Ready(ctx); err != nil {
+		t.Fatalf("Ready after migration replay = %v", err)
 	}
 }
 

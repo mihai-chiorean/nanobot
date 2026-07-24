@@ -54,6 +54,14 @@ func (*countingTenantRouter) RememberCredentials(context.Context, TenantRoute, [
 
 func (*countingTenantRouter) Default() TenantRoute { return TenantRoute{} }
 
+type atomicTenantCountSource struct {
+	value atomic.Int64
+}
+
+func (source *atomicTenantCountSource) CurrentTenantCount() int64 {
+	return source.value.Load()
+}
+
 func TestWorkEventStreamAdmissionDoesNotDependOnAcceptHeader(t *testing.T) {
 	for _, test := range []struct {
 		method string
@@ -414,6 +422,45 @@ func TestInboundAdmissionLimitsAnonymousTrafficSeparately(t *testing.T) {
 	}
 }
 
+func TestInboundAdmissionRefreshesExistingTenantGateLimit(t *testing.T) {
+	source := &atomicTenantCountSource{}
+	source.value.Store(1)
+	admission := newInboundAdmissionWithTenantCountSource(8, 8, 8, source)
+
+	releases := make([]func(), 0, 4)
+	for range 4 {
+		release, acquired := admission.tryAcquire(admissionHTTP, "tenant-a")
+		if !acquired {
+			t.Fatal("tenant was rejected at the initial dynamic limit")
+		}
+		releases = append(releases, release)
+	}
+	if release, acquired := admission.tryAcquire(admissionHTTP, "tenant-a"); acquired {
+		release()
+		t.Fatal("tenant exceeded the initial dynamic limit")
+	}
+	for _, release := range releases {
+		release()
+	}
+
+	source.value.Store(3)
+	releases = releases[:0]
+	for range 2 {
+		release, acquired := admission.tryAcquire(admissionHTTP, "tenant-a")
+		if !acquired {
+			t.Fatal("existing tenant gate did not accept the refreshed limit")
+		}
+		releases = append(releases, release)
+	}
+	if release, acquired := admission.tryAcquire(admissionHTTP, "tenant-a"); acquired {
+		release()
+		t.Fatal("existing tenant gate retained the stale limit")
+	}
+	for _, release := range releases {
+		release()
+	}
+}
+
 func TestAdmissionSaturationSkipsTenantResolution(t *testing.T) {
 	router := &countingTenantRouter{credentialErr: errors.New("database unavailable")}
 	api := &API{
@@ -433,6 +480,53 @@ func TestAdmissionSaturationSkipsTenantResolution(t *testing.T) {
 	}
 	if router.credentialCalls.Load() != 0 {
 		t.Fatalf("credential resolutions = %d, want 0", router.credentialCalls.Load())
+	}
+}
+
+func TestTenantAdmissionSaturationSkipsDurablePrincipalResolution(t *testing.T) {
+	principal := identity.Principal{Subject: "clerk_stable_subject", Email: "test@example.com"}
+	router := &countingTenantRouter{}
+	api := &API{
+		admission:    newInboundAdmissionWithTenantCount(4, 4, 4, 1),
+		tenantRouter: router,
+	}
+	identityKey := hashedAdmissionIdentity("clerk", principal.Subject)
+	first, acquired := api.admission.tryAcquireTenant(admissionHTTP, identityKey)
+	if !acquired {
+		t.Fatal("first tenant admission was rejected")
+	}
+	defer first()
+	second, acquired := api.admission.tryAcquireTenant(admissionHTTP, identityKey)
+	if !acquired {
+		t.Fatal("second tenant admission was rejected")
+	}
+	defer second()
+
+	handler := principalMiddleware(principal)(api.admit(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("tenant-saturated request reached handler")
+	})))
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/auth/bootstrap", nil))
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", response.Code)
+	}
+	if router.principalCalls.Load() != 0 {
+		t.Fatalf("principal resolutions = %d, want 0", router.principalCalls.Load())
+	}
+}
+
+func TestAuthenticatedAdmissionIdentityIsStableAndOpaque(t *testing.T) {
+	api := &API{}
+	principal := identity.Principal{Subject: "clerk_subject_value", Email: "test@example.com"}
+	request := httptest.NewRequest(http.MethodGet, "/auth/bootstrap", nil)
+	request = request.WithContext(identity.NewContext(request.Context(), principal))
+	first := api.admissionIdentity(request)
+	second := api.admissionIdentity(request)
+	if first != second {
+		t.Fatalf("admission identity changed: %q != %q", first, second)
+	}
+	if strings.Contains(first, principal.Subject) {
+		t.Fatalf("admission identity exposed the Clerk subject: %q", first)
 	}
 }
 

@@ -282,10 +282,16 @@ func tenantDatabaseConfig(lookup LookupEnv, readFile ReadFile) (string, error) {
 	hasSocketHost := filepath.IsAbs(socketHost) && filepath.Clean(socketHost) == socketHost
 	hasDatabase := strings.Trim(parsed.EscapedPath(), "/") != ""
 	if (parsed.Scheme != "postgres" && parsed.Scheme != "postgresql") ||
-		(!hasNetworkHost && !hasSocketHost) ||
+		(hasNetworkHost == hasSocketHost) ||
 		!hasDatabase ||
 		parsed.Fragment != "" {
 		return "", fmt.Errorf("ZIGGY_TENANT_DATABASE_URL must be a PostgreSQL URL")
+	}
+	if hasNetworkHost {
+		sslModes := parsed.Query()["sslmode"]
+		if len(sslModes) != 1 || sslModes[0] != "verify-full" {
+			return "", fmt.Errorf("ZIGGY_TENANT_DATABASE_URL must use sslmode=verify-full for network connections")
+		}
 	}
 	return inline, nil
 }

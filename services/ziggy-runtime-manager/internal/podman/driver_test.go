@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -24,6 +25,12 @@ func (f *fakeRunner) Run(_ context.Context, command Command) (Result, error) {
 	if command.Path == "systemctl" && len(command.Args) >= 3 && command.Args[1] == "start" {
 		f.generation = "7"
 	}
+	if command.Path == "podman" && len(command.Args) > 2 && command.Args[1] == "exists" {
+		if command.Args[0] == "container" && f.generation == "" {
+			return Result{ExitCode: 1}, nil
+		}
+		return Result{}, nil
+	}
 	if command.Path == "podman" && len(command.Args) > 1 && command.Args[0] == "network" && command.Args[1] == "inspect" {
 		return Result{Stdout: prerequisiteJSON(true, lifecycleLabels(runtime.Request{WorkspaceID: "tenant-alpha", Generation: 7}))}, nil
 	}
@@ -34,11 +41,9 @@ func (f *fakeRunner) Run(_ context.Context, command Command) (Result, error) {
 		return Result{Stdout: prerequisiteJSON(false, lifecycleLabels(runtime.Request{WorkspaceID: "tenant-alpha", Generation: 7}))}, nil
 	}
 	if command.Path == "podman" && len(command.Args) > 1 && command.Args[0] == "inspect" {
-		if strings.Contains(command.Args[2], "io.ziggy.generation") {
-			if f.generation == "" {
-				return Result{ExitCode: 125}, nil
-			}
-			return Result{Stdout: f.generation}, nil
+		if strings.Contains(command.Args[2], ".Config.Labels") {
+			generation, _ := strconv.ParseUint(f.generation, 10, 64)
+			return Result{Stdout: labelsJSON(lifecycleLabels(runtime.Request{WorkspaceID: "tenant-alpha", Generation: generation}))}, nil
 		}
 		return Result{Stdout: f.state}, nil
 	}
@@ -52,6 +57,11 @@ func prerequisiteJSON(network bool, labels map[string]string) string {
 		value["labels"] = labels
 	}
 	raw, _ := json.Marshal(value)
+	return string(raw)
+}
+
+func labelsJSON(labels map[string]string) string {
+	raw, _ := json.Marshal(labels)
 	return string(raw)
 }
 
@@ -121,6 +131,238 @@ func TestGenerationFenceRejectsStaleAndReplacement(t *testing.T) {
 	}
 }
 
+func TestResourceExistenceTreatsOnlyExitOneAsAbsent(t *testing.T) {
+	for _, resource := range []string{"container", "volume", "network"} {
+		t.Run(resource, func(t *testing.T) {
+			for _, test := range []struct {
+				name       string
+				exitCode   int
+				wantExists bool
+				wantError  bool
+			}{
+				{name: "present", exitCode: 0, wantExists: true},
+				{name: "absent", exitCode: 1},
+				{name: "podman failure", exitCode: 125, wantError: true},
+			} {
+				t.Run(test.name, func(t *testing.T) {
+					driver := Driver{Runner: runnerFunc(func(context.Context, Command) (Result, error) {
+						return Result{ExitCode: test.exitCode}, nil
+					})}
+					exists, err := driver.resourceExists(context.Background(), resource, "test-resource")
+					if exists != test.wantExists || (err != nil) != test.wantError {
+						t.Fatalf("exists=%t err=%v", exists, err)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestTenantDataDeletionFailsClosedOnPodmanExit125(t *testing.T) {
+	var removed bool
+	runner := runnerFunc(func(_ context.Context, command Command) (Result, error) {
+		if command.Path == "systemctl" && command.Args[1] == "show" {
+			return Result{Stdout: "LoadState=not-found\nActiveState=inactive\n"}, nil
+		}
+		if command.Path == "podman" && len(command.Args) >= 2 {
+			switch {
+			case command.Args[0] == "container" && command.Args[1] == "exists":
+				return Result{ExitCode: 1}, nil
+			case command.Args[0] == "volume" && command.Args[1] == "exists":
+				return Result{ExitCode: 125}, nil
+			case command.Args[0] == "volume" && command.Args[1] == "rm":
+				removed = true
+			}
+		}
+		return Result{}, nil
+	})
+	driver := Driver{Policy: fixturePolicy(), QuadletDir: t.TempDir(), Runner: runner, Now: func() time.Time { return fixtureNow }}
+	err := driver.DeleteTenantData(context.Background(), runtime.Request{WorkspaceID: "tenant-alpha", Generation: 7})
+	if err == nil {
+		t.Fatal("Podman storage failure was accepted as completed tenant-data deletion")
+	}
+	if removed {
+		t.Fatal("volume removal ran after an indeterminate existence check")
+	}
+}
+
+func TestTenantDataDeletionRequiresInactiveUnit(t *testing.T) {
+	var volumeChecked bool
+	runner := runnerFunc(func(_ context.Context, command Command) (Result, error) {
+		switch {
+		case command.Path == "podman" && command.Args[0] == "container" && command.Args[1] == "exists":
+			return Result{ExitCode: 1}, nil
+		case command.Path == "podman" && command.Args[0] == "volume" && command.Args[1] == "exists":
+			volumeChecked = true
+			return Result{ExitCode: 1}, nil
+		case command.Path == "systemctl" && command.Args[1] == "show":
+			return Result{Stdout: "LoadState=loaded\nActiveState=active\n"}, nil
+		default:
+			return Result{}, nil
+		}
+	})
+	driver := Driver{Policy: fixturePolicy(), QuadletDir: t.TempDir(), Runner: runner, Now: func() time.Time { return fixtureNow }}
+	err := driver.DeleteTenantData(context.Background(), runtime.Request{WorkspaceID: "tenant-alpha", Generation: 7})
+	if err == nil {
+		t.Fatal("tenant data deletion proceeded while its systemd unit was active")
+	}
+	if volumeChecked {
+		t.Fatal("workspace volume was inspected before the runtime unit was proven inactive")
+	}
+}
+
+func TestDeleteRequiresStoppedOrVerifiedInactiveUnit(t *testing.T) {
+	request := runtime.Request{WorkspaceID: "tenant-alpha", Generation: 7}
+	var removed bool
+	runner := runnerFunc(func(_ context.Context, command Command) (Result, error) {
+		switch {
+		case command.Path == "podman" && command.Args[0] == "container" && command.Args[1] == "exists":
+			return Result{}, nil
+		case command.Path == "podman" && command.Args[0] == "inspect" && strings.Contains(command.Args[2], ".Config.Labels"):
+			return Result{Stdout: labelsJSON(lifecycleLabels(request))}, nil
+		case command.Path == "podman" && command.Args[0] == "rm":
+			removed = true
+			return Result{}, nil
+		case command.Path == "systemctl" && command.Args[1] == "stop":
+			return Result{ExitCode: 1}, nil
+		case command.Path == "systemctl" && command.Args[1] == "show":
+			return Result{Stdout: "LoadState=loaded\nActiveState=active\n"}, nil
+		default:
+			return Result{}, nil
+		}
+	})
+	driver := Driver{Policy: fixturePolicy(), QuadletDir: t.TempDir(), Runner: runner, Now: func() time.Time { return fixtureNow }}
+	if err := driver.Delete(context.Background(), request); err == nil {
+		t.Fatal("delete proceeded after a failed stop left the unit active")
+	}
+	if removed {
+		t.Fatal("container was removed while systemd still considered its unit active")
+	}
+}
+
+func TestDeleteAcceptsVerifiedInactiveUnitAfterStopFailure(t *testing.T) {
+	request := runtime.Request{WorkspaceID: "tenant-alpha", Generation: 7}
+	containerExists := true
+	var removed bool
+	runner := runnerFunc(func(_ context.Context, command Command) (Result, error) {
+		switch {
+		case command.Path == "podman" && command.Args[0] == "container" && command.Args[1] == "exists":
+			if !containerExists {
+				return Result{ExitCode: 1}, nil
+			}
+			return Result{}, nil
+		case command.Path == "podman" && command.Args[0] == "inspect" && strings.Contains(command.Args[2], ".Config.Labels"):
+			return Result{Stdout: labelsJSON(lifecycleLabels(request))}, nil
+		case command.Path == "podman" && command.Args[0] == "rm":
+			containerExists = false
+			removed = true
+			return Result{}, nil
+		case command.Path == "podman" && len(command.Args) > 1 && command.Args[1] == "exists":
+			return Result{ExitCode: 1}, nil
+		case command.Path == "systemctl" && command.Args[1] == "stop":
+			return Result{ExitCode: 1}, nil
+		case command.Path == "systemctl" && command.Args[1] == "show":
+			return Result{Stdout: "LoadState=loaded\nActiveState=inactive\n"}, nil
+		default:
+			return Result{}, nil
+		}
+	})
+	driver := Driver{Policy: fixturePolicy(), QuadletDir: t.TempDir(), Runner: runner, Now: func() time.Time { return fixtureNow }}
+	if err := driver.Delete(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	if !removed {
+		t.Fatal("verified inactive unit did not permit owned container cleanup")
+	}
+}
+
+func TestDeleteRejectsContainerWithoutCompleteOwnershipLabels(t *testing.T) {
+	request := runtime.Request{WorkspaceID: "tenant-alpha", Generation: 7}
+	for _, test := range []struct {
+		name   string
+		labels map[string]string
+	}{
+		{
+			name: "wrong owner",
+			labels: map[string]string{
+				managerOwnerLabel: "someone-else",
+				workspaceLabel:    request.WorkspaceID,
+				generationLabel:   "7",
+			},
+		},
+		{
+			name: "wrong workspace",
+			labels: map[string]string{
+				managerOwnerLabel: managerOwnerValue,
+				workspaceLabel:    "tenant-bravo",
+				generationLabel:   "7",
+			},
+		},
+		{
+			name: "missing generation",
+			labels: map[string]string{
+				managerOwnerLabel: managerOwnerValue,
+				workspaceLabel:    request.WorkspaceID,
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var destructiveCommand bool
+			runner := runnerFunc(func(_ context.Context, command Command) (Result, error) {
+				switch {
+				case command.Path == "podman" && command.Args[0] == "container" && command.Args[1] == "exists":
+					return Result{}, nil
+				case command.Path == "podman" && command.Args[0] == "inspect":
+					return Result{Stdout: labelsJSON(test.labels)}, nil
+				case command.Path == "podman" && command.Args[0] == "rm":
+					destructiveCommand = true
+				case command.Path == "systemctl" && command.Args[1] == "stop":
+					destructiveCommand = true
+				}
+				return Result{}, nil
+			})
+			driver := Driver{Policy: fixturePolicy(), QuadletDir: t.TempDir(), Runner: runner, Now: func() time.Time { return fixtureNow }}
+			if err := driver.Delete(context.Background(), request); err == nil {
+				t.Fatal("container without complete manager ownership was accepted")
+			}
+			if destructiveCommand {
+				t.Fatal("destructive command ran before container ownership was established")
+			}
+		})
+	}
+}
+
+func TestDeleteRevalidatesContainerOwnershipAfterSystemdStop(t *testing.T) {
+	request := runtime.Request{WorkspaceID: "tenant-alpha", Generation: 7}
+	inspections := 0
+	var removed bool
+	runner := runnerFunc(func(_ context.Context, command Command) (Result, error) {
+		switch {
+		case command.Path == "podman" && command.Args[0] == "container" && command.Args[1] == "exists":
+			return Result{}, nil
+		case command.Path == "podman" && command.Args[0] == "inspect":
+			inspections++
+			labels := lifecycleLabels(request)
+			if inspections == 2 {
+				labels[managerOwnerLabel] = "someone-else"
+			}
+			return Result{Stdout: labelsJSON(labels)}, nil
+		case command.Path == "podman" && command.Args[0] == "rm":
+			removed = true
+		case command.Path == "systemctl" && command.Args[1] == "stop":
+			return Result{}, nil
+		}
+		return Result{}, nil
+	})
+	driver := Driver{Policy: fixturePolicy(), QuadletDir: t.TempDir(), Runner: runner, Now: func() time.Time { return fixtureNow }}
+	if err := driver.Delete(context.Background(), request); err == nil {
+		t.Fatal("container ownership change after stop was ignored")
+	}
+	if removed {
+		t.Fatal("container was removed without post-stop ownership verification")
+	}
+}
+
 func TestStopRemainsAvailableAfterCapabilityExpiry(t *testing.T) {
 	policy := fixturePolicy()
 	alpha := policy.Tenants["tenant-alpha"]
@@ -145,7 +387,7 @@ func TestPrerequisitesRejectUnownedExistingResources(t *testing.T) {
 		{"volume must have ownership labels", false, prerequisiteJSON(false, map[string]string{managerOwnerLabel: managerOwnerValue})},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			runner := &prerequisiteRunner{createExit: 125, inspect: test.payload}
+			runner := &prerequisiteRunner{inspect: test.payload}
 			driver := Driver{Runner: runner}
 			var err error
 			if test.network {
@@ -159,15 +401,15 @@ func TestPrerequisitesRejectUnownedExistingResources(t *testing.T) {
 		})
 	}
 
-	runner := &prerequisiteRunner{createExit: 125, inspect: `{"internal":false,"labels":{"io.ziggy.owner":"ziggy-runtime-manager","io.ziggy.workspace":"tenant-alpha","io.ziggy.generation":"7"}}`}
+	runner := &prerequisiteRunner{inspect: `{"internal":false,"labels":{"io.ziggy.owner":"ziggy-runtime-manager","io.ziggy.workspace":"tenant-alpha","io.ziggy.generation":"7"}}`}
 	if err := (Driver{Runner: runner}).ensureNetwork(context.Background(), request); err == nil {
 		t.Fatal("external pre-existing network was accepted")
 	}
 }
 
-func TestPrerequisitesAcceptLabeledExistingResourcesAfterCreateConflict(t *testing.T) {
+func TestPrerequisitesAcceptLabeledExistingResourcesWithoutCreating(t *testing.T) {
 	request := runtime.Request{WorkspaceID: "tenant-alpha", Generation: 7}
-	runner := &prerequisiteRunner{createExit: 125, inspect: prerequisiteJSON(true, lifecycleLabels(request))}
+	runner := &prerequisiteRunner{inspect: prerequisiteJSON(true, lifecycleLabels(request))}
 	driver := Driver{Runner: runner}
 	if err := driver.ensureNetwork(context.Background(), request); err != nil {
 		t.Fatal(err)
@@ -175,16 +417,44 @@ func TestPrerequisitesAcceptLabeledExistingResourcesAfterCreateConflict(t *testi
 	if len(runner.commands) != 2 || runner.commands[1].Args[0] != "network" || runner.commands[1].Args[1] != "inspect" {
 		t.Fatalf("existing network was not inspected: %+v", runner.commands)
 	}
-	if !strings.Contains(strings.Join(runner.commands[0].Args, " "), "io.ziggy.owner=ziggy-runtime-manager") || !strings.Contains(strings.Join(runner.commands[0].Args, " "), "io.ziggy.generation=7") {
-		t.Fatalf("network create did not carry manager labels: %+v", runner.commands[0])
+	if runner.commands[0].Args[1] != "exists" {
+		t.Fatalf("existing network was not checked before inspection: %+v", runner.commands)
 	}
 
-	volumeRunner := &prerequisiteRunner{createExit: 125, inspect: prerequisiteJSON(false, workspaceVolumeLabels(request))}
+	volumeRunner := &prerequisiteRunner{inspect: prerequisiteJSON(false, workspaceVolumeLabels(request))}
 	if err := (Driver{Runner: volumeRunner}).ensureWorkspaceVolume(context.Background(), "ziggy-tenant-tenant-alpha-root", request); err != nil {
 		t.Fatal(err)
 	}
 	if len(volumeRunner.commands) != 2 || volumeRunner.commands[1].Args[0] != "volume" || volumeRunner.commands[1].Args[1] != "inspect" {
 		t.Fatalf("existing volume was not inspected: %+v", volumeRunner.commands)
+	}
+}
+
+func TestPrerequisiteCreationRequiresSuccessfulExitAndManagerLabels(t *testing.T) {
+	request := runtime.Request{WorkspaceID: "tenant-alpha", Generation: 7}
+	failed := &prerequisiteRunner{existsExit: 1, createExit: 125}
+	if err := (Driver{Runner: failed}).ensureNetwork(context.Background(), request); err == nil {
+		t.Fatal("Podman exit 125 was accepted as prerequisite creation success")
+	}
+	if len(failed.commands) != 2 || failed.commands[0].Args[1] != "exists" || failed.commands[1].Args[1] != "create" {
+		t.Fatalf("unexpected failed creation commands: %+v", failed.commands)
+	}
+
+	created := &prerequisiteRunner{
+		existsExit: 1,
+		inspect:    prerequisiteJSON(true, lifecycleLabels(request)),
+	}
+	if err := (Driver{Runner: created}).ensureNetwork(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	if len(created.commands) != 3 || created.commands[1].Args[1] != "create" || created.commands[2].Args[1] != "inspect" {
+		t.Fatalf("unexpected successful creation commands: %+v", created.commands)
+	}
+	createArgs := strings.Join(created.commands[1].Args, " ")
+	if !strings.Contains(createArgs, "io.ziggy.owner=ziggy-runtime-manager") ||
+		!strings.Contains(createArgs, "io.ziggy.workspace=tenant-alpha") ||
+		!strings.Contains(createArgs, "io.ziggy.generation=7") {
+		t.Fatalf("network create did not carry complete manager labels: %q", createArgs)
 	}
 }
 
@@ -232,9 +502,16 @@ func TestGenerationReplacementPreservesWorkspaceVolume(t *testing.T) {
 }
 
 type prerequisiteRunner struct {
+	existsExit int
 	createExit int
 	inspect    string
 	commands   []Command
+}
+
+type runnerFunc func(context.Context, Command) (Result, error)
+
+func (f runnerFunc) Run(ctx context.Context, command Command) (Result, error) {
+	return f(ctx, command)
 }
 
 type upgradeRunner struct {
@@ -255,12 +532,19 @@ func (r *upgradeRunner) Run(_ context.Context, command Command) (Result, error) 
 		return Result{}, nil
 	}
 	switch command.Args[0] {
-	case "inspect":
-		if strings.Contains(command.Args[2], "io.ziggy.generation") {
+	case "container":
+		if command.Args[1] == "exists" {
 			if r.containerGeneration == "" {
-				return Result{ExitCode: 125}, nil
+				return Result{ExitCode: 1}, nil
 			}
-			return Result{Stdout: r.containerGeneration}, nil
+			return Result{}, nil
+		}
+	case "inspect":
+		if strings.Contains(command.Args[2], ".Config.Labels") {
+			request := runtime.Request{WorkspaceID: "tenant-alpha", Generation: 1}
+			generation, _ := strconv.ParseUint(r.containerGeneration, 10, 64)
+			request.Generation = generation
+			return Result{Stdout: labelsJSON(lifecycleLabels(request))}, nil
 		}
 		return Result{Stdout: `{"Status":"running","Health":{"Status":"healthy"}}`}, nil
 	case "rm":
@@ -275,11 +559,17 @@ func (r *upgradeRunner) Run(_ context.Context, command Command) (Result, error) 
 	default:
 		return Result{}, nil
 	}
+	return Result{}, nil
 }
 
 func (r *upgradeRunner) runNetwork(args []string) (Result, error) {
 	name := args[len(args)-1]
 	switch args[1] {
+	case "exists":
+		if _, exists := r.networks[name]; !exists {
+			return Result{ExitCode: 1}, nil
+		}
+		return Result{}, nil
 	case "create":
 		if _, exists := r.networks[name]; exists {
 			return Result{ExitCode: 125}, nil
@@ -303,6 +593,11 @@ func (r *upgradeRunner) runNetwork(args []string) (Result, error) {
 func (r *upgradeRunner) runVolume(args []string) (Result, error) {
 	name := args[len(args)-1]
 	switch args[1] {
+	case "exists":
+		if _, exists := r.volumes[name]; !exists {
+			return Result{ExitCode: 1}, nil
+		}
+		return Result{}, nil
 	case "create":
 		if _, exists := r.volumes[name]; exists {
 			return Result{ExitCode: 125}, nil
@@ -338,6 +633,9 @@ func commandLabels(args []string) map[string]string {
 
 func (r *prerequisiteRunner) Run(_ context.Context, command Command) (Result, error) {
 	r.commands = append(r.commands, command)
+	if len(command.Args) >= 2 && command.Args[1] == "exists" {
+		return Result{ExitCode: r.existsExit}, nil
+	}
 	if len(command.Args) >= 2 && command.Args[1] == "create" {
 		return Result{ExitCode: r.createExit}, nil
 	}

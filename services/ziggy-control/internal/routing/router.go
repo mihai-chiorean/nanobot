@@ -99,6 +99,16 @@ func (router *Router) ResolveRuntimeCredential(credential string) (httpapi.Tenan
 	return route, ok
 }
 
+func (router *Router) AdmissionIdentity(credential string) (string, bool) {
+	if route, ok := router.resolveRememberedCredential(credential); ok {
+		return route.UserID, strings.TrimSpace(route.UserID) != ""
+	}
+	if route, ok := router.ResolveRuntimeCredential(credential); ok {
+		return route.UserID, strings.TrimSpace(route.UserID) != ""
+	}
+	return "", false
+}
+
 func (router *Router) ResolvePrincipal(ctx context.Context, principal identity.Principal) (httpapi.TenantRoute, error) {
 	allocation, err := router.registry.Resolve(ctx, principal)
 	if err != nil {
@@ -112,23 +122,31 @@ func (router *Router) ResolvePrincipal(ctx context.Context, principal identity.P
 }
 
 func (router *Router) ResolveCredential(_ context.Context, credential string) (httpapi.TenantRoute, error) {
+	route, ok := router.resolveRememberedCredential(credential)
+	if !ok {
+		return httpapi.TenantRoute{}, tenant.ErrNotAuthorized
+	}
+	return route, nil
+}
+
+func (router *Router) resolveRememberedCredential(credential string) (httpapi.TenantRoute, bool) {
 	credential = strings.TrimSpace(credential)
 	if credential == "" {
-		return httpapi.TenantRoute{}, tenant.ErrNotAuthorized
+		return httpapi.TenantRoute{}, false
 	}
 	key := sha256.Sum256([]byte(credential))
 	value, ok := router.entries.Load(key)
 	if !ok {
-		return httpapi.TenantRoute{}, tenant.ErrNotAuthorized
+		return httpapi.TenantRoute{}, false
 	}
 	entry, ok := value.(credentialRoute)
 	if !ok || !router.now().Before(entry.expiresAt) {
 		if _, deleted := router.entries.LoadAndDelete(key); deleted {
 			router.count.Add(-1)
 		}
-		return httpapi.TenantRoute{}, tenant.ErrNotAuthorized
+		return httpapi.TenantRoute{}, false
 	}
-	return entry.route, nil
+	return entry.route, true
 }
 
 func (router *Router) RememberCredentials(_ context.Context, route httpapi.TenantRoute, credentials []string, ttl time.Duration) error {

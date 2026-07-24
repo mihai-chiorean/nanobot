@@ -99,7 +99,7 @@ func TestSocketTimesOutStalledPeer(t *testing.T) {
 	}
 }
 
-func TestSocketRejectsExcessConnections(t *testing.T) {
+func TestSocketRejectsWhenGlobalOperationCapacityIsFull(t *testing.T) {
 	driver := &blockingDriver{started: make(chan struct{}), release: make(chan struct{})}
 	socket, stop := startServer(t, Server{Driver: driver, MaxConcurrent: 1, DriverTimeout: time.Second})
 	defer stop()
@@ -113,12 +113,51 @@ func TestSocketRejectsExcessConnections(t *testing.T) {
 	}
 	second := dial(t, socket)
 	defer second.Close()
+	writeRequest(t, second, Request{Operation: "ensure_running", WorkspaceID: "tenant-bravo", Generation: 7})
 	if response := readResponse(t, second); response.Error != "server_busy" {
 		t.Fatalf("response=%+v", response)
 	}
 	close(driver.release)
 	if response := readResponse(t, first); response.Status == nil || response.Status.State != runtime.StateRunning {
 		t.Fatalf("response=%+v", response)
+	}
+}
+
+func TestDuplicateWorkspaceDoesNotConsumeGlobalOperationCapacity(t *testing.T) {
+	driver := &blockingDriver{
+		started:        make(chan struct{}),
+		release:        make(chan struct{}),
+		blockWorkspace: "tenant-alpha",
+	}
+	socket, stop := startServer(t, Server{Driver: driver, MaxConcurrent: 2, DriverTimeout: time.Second})
+	defer stop()
+
+	first := dial(t, socket)
+	defer first.Close()
+	writeRequest(t, first, Request{Operation: "ensure_running", WorkspaceID: "tenant-alpha", Generation: 7})
+	select {
+	case <-driver.started:
+	case <-time.After(time.Second):
+		t.Fatal("first workspace request did not start")
+	}
+
+	duplicate := dial(t, socket)
+	defer duplicate.Close()
+	writeRequest(t, duplicate, Request{Operation: "health", WorkspaceID: "tenant-alpha", Generation: 7})
+	if response := readResponse(t, duplicate); response.Error != "workspace_busy" {
+		t.Fatalf("duplicate response=%+v", response)
+	}
+
+	other := dial(t, socket)
+	defer other.Close()
+	writeRequest(t, other, Request{Operation: "ensure_running", WorkspaceID: "tenant-bravo", Generation: 3})
+	if response := readResponse(t, other); response.Status == nil || response.Status.State != runtime.StateRunning {
+		t.Fatalf("unrelated workspace was starved: %+v", response)
+	}
+
+	close(driver.release)
+	if response := readResponse(t, first); response.Status == nil || response.Status.State != runtime.StateRunning {
+		t.Fatalf("first response=%+v", response)
 	}
 }
 
@@ -216,8 +255,16 @@ func startServerAt(t *testing.T, server Server, socket string) func() {
 	go func() { errs <- server.ListenAndServe(ctx, socket) }()
 	deadline := time.Now().Add(time.Second)
 	for {
-		if _, err := os.Stat(socket); err == nil {
-			break
+		connection, err := net.DialUnix("unix", nil, &net.UnixAddr{Name: socket, Net: "unix"})
+		if err == nil {
+			_ = connection.SetDeadline(time.Now().Add(time.Second))
+			_, writeErr := connection.Write([]byte("{}\n"))
+			var response Response
+			readErr := json.NewDecoder(connection).Decode(&response)
+			_ = connection.Close()
+			if writeErr == nil && readErr == nil && response.Error == "invalid_workspace" {
+				break
+			}
 		}
 		select {
 		case err := <-errs:
@@ -277,10 +324,11 @@ func readResponse(t *testing.T, connection net.Conn) Response {
 }
 
 type blockingDriver struct {
-	mu           sync.Mutex
-	started      chan struct{}
-	release      chan struct{}
-	deadlineSeen bool
+	mu             sync.Mutex
+	started        chan struct{}
+	release        chan struct{}
+	deadlineSeen   bool
+	blockWorkspace string
 }
 
 func (d *blockingDriver) EnsureRunning(ctx context.Context, request runtime.Request) (runtime.Status, error) {
@@ -288,6 +336,9 @@ func (d *blockingDriver) EnsureRunning(ctx context.Context, request runtime.Requ
 	d.mu.Lock()
 	d.deadlineSeen = hasDeadline
 	d.mu.Unlock()
+	if d.blockWorkspace != "" && request.WorkspaceID != d.blockWorkspace {
+		return runtime.Status{WorkspaceID: request.WorkspaceID, Generation: request.Generation, State: runtime.StateRunning}, nil
+	}
 	select {
 	case <-d.started:
 	default:

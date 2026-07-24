@@ -37,4 +37,8 @@ func TestExpectedSchemaIdentityMatchesMigrationFiles(t *testing.T) {
 	if !strings.Contains(string(identityMigration), expectedSchemaIdentitySHA256) {
 		t.Fatal("schema identity migration does not record the binary's expected checksum")
 	}
+	if !strings.Contains(string(identityMigration), "ON CONFLICT (component) DO NOTHING") ||
+		strings.Contains(string(identityMigration), "DO UPDATE") {
+		t.Fatal("schema identity migration must be replay-safe and non-overwritable")
+	}
 }

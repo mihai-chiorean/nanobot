@@ -24,10 +24,6 @@ INSERT INTO ziggy_schema_identity (
       "003_terminal_deletion_receipt.sql": "f7e933def9673d31cc513f738f6b50035ab84b52e352544e477d1272f922d930"
     }'::jsonb
 )
-ON CONFLICT (component) DO UPDATE
-SET schema_version = EXCLUDED.schema_version,
-    migration_set_sha256 = EXCLUDED.migration_set_sha256,
-    migration_files = EXCLUDED.migration_files,
-    recorded_at = now();
+ON CONFLICT (component) DO NOTHING;
 
 REVOKE ALL ON ziggy_schema_identity FROM PUBLIC;

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/mail"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
@@ -27,7 +28,7 @@ const (
 )
 
 var (
-	ErrNotAuthorized              = errors.New("tenant is not authorized")
+	ErrNotAuthorized              = tenant.ErrNotAuthorized
 	ErrRuntimeUnavailable         = errors.New("tenant runtime is unavailable")
 	ErrInvalidTransition          = errors.New("tenant lifecycle transition is invalid")
 	ErrActivationMismatch         = errors.New("runtime activation does not match the pending allocation")
@@ -67,6 +68,11 @@ type Store struct {
 	queryTimeout time.Duration
 	now          func() time.Time
 	newID        func(string) (string, error)
+	revocation   atomic.Pointer[revocationObserver]
+}
+
+type revocationObserver struct {
+	notify func(userID, workspaceID string)
 }
 
 func NewStore(db *sql.DB) (*Store, error) {
@@ -74,6 +80,14 @@ func NewStore(db *sql.DB) (*Store, error) {
 		return nil, errors.New("tenant database handle is required")
 	}
 	return &Store{db: db, queryTimeout: defaultQueryTimeout, now: time.Now, newID: randomID}, nil
+}
+
+func (s *Store) SetRevocationObserver(notify func(userID, workspaceID string)) {
+	if notify == nil {
+		s.revocation.Store(nil)
+		return
+	}
+	s.revocation.Store(&revocationObserver{notify: notify})
 }
 
 func (s *Store) Ready(ctx context.Context) error {
@@ -289,7 +303,11 @@ func (s *Store) MarkDeletionPending(ctx context.Context, userID string) error {
 	if err := appendEvent(ctx, tx, userID, workspaceID, "user_deletion_pending", "operator", generation, now); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.notifyRevoked(userID, workspaceID)
+	return nil
 }
 
 // MarkDeleted completes an explicit deletion workflow after the data owner
@@ -316,6 +334,10 @@ func (s *Store) MarkDeleted(ctx context.Context, userID, destructionReceipt stri
 			return err
 		}
 		if storedReceipt == receiptDigest {
+			if err := tx.Commit(); err != nil {
+				return err
+			}
+			s.notifyRevoked(userID, workspaceID)
 			return nil
 		}
 		return ErrDestructionReceiptMismatch
@@ -339,7 +361,11 @@ WHERE user_id=$1`, userID, now); err != nil {
 	if err := appendEvent(ctx, tx, userID, workspaceID, "user_deleted", "operator", generation, now); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.notifyRevoked(userID, workspaceID)
+	return nil
 }
 
 // ActivateRuntime is the sole lifecycle write needed by a runtime manager. It
@@ -423,7 +449,11 @@ func (s *Store) Disable(ctx context.Context, userID string) error {
 	if err := appendEvent(ctx, tx, userID, workspace.String, "user_disabled", "operator", 0, s.now()); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.notifyRevoked(userID, workspace.String)
+	return nil
 }
 
 func userRuntimeForUpdate(ctx context.Context, tx *sql.Tx, userID string) (string, string, int64, error) {
@@ -522,6 +552,13 @@ func (s *Store) operationContext(ctx context.Context) (context.Context, context.
 		return context.WithCancel(ctx)
 	}
 	return context.WithTimeout(ctx, s.queryTimeout)
+}
+
+func (s *Store) notifyRevoked(userID, workspaceID string) {
+	observer := s.revocation.Load()
+	if observer != nil && observer.notify != nil {
+		observer.notify(userID, workspaceID)
+	}
 }
 
 func canonicalPrincipal(principal identity.Principal) (string, string, error) {
