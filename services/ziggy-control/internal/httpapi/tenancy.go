@@ -24,8 +24,8 @@ type TenantRoute struct {
 
 type TenantRouter interface {
 	ResolvePrincipal(context.Context, identity.Principal) (TenantRoute, error)
-	ResolveCredential(string) (TenantRoute, bool)
-	RememberCredentials(TenantRoute, []string, time.Duration) error
+	ResolveCredential(context.Context, string) (TenantRoute, bool)
+	RememberCredentials(context.Context, TenantRoute, []string, time.Duration) error
 	Default() TenantRoute
 }
 

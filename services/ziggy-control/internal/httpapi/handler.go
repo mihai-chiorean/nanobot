@@ -308,7 +308,7 @@ func (api *API) admissionTenant(r *http.Request) string {
 	}
 	if api.tenantRouter != nil {
 		credential := requestCredential(r)
-		if route, ok := api.tenantRouter.ResolveCredential(credential); ok && strings.TrimSpace(route.UserID) != "" {
+		if route, ok := api.tenantRouter.ResolveCredential(r.Context(), credential); ok && strings.TrimSpace(route.UserID) != "" {
 			return route.UserID
 		}
 		if router, ok := api.tenantRouter.(runtimeCredentialRouter); ok {
@@ -381,9 +381,13 @@ func (api *API) bootstrap(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	route, err := api.tenantRouter.ResolvePrincipal(r.Context(), principal)
-	if err != nil || route.Proxy == nil {
+	if err != nil {
 		api.logger.WarnContext(r.Context(), "bootstrap authorization denied", "route", "bootstrap")
 		writeError(w, http.StatusForbidden, "account not authorized")
+		return
+	}
+	if route.Proxy == nil {
+		writeError(w, http.StatusServiceUnavailable, "tenant runtime unavailable")
 		return
 	}
 	api.logger.InfoContext(r.Context(), "bootstrap authorized", "route", "bootstrap")
@@ -412,7 +416,7 @@ func (api *API) forward(w http.ResponseWriter, r *http.Request) {
 	proxy := api.proxy
 	if api.tenantRouter != nil {
 		if credential := requestCredential(r); credential != "" {
-			route, ok := api.tenantRouter.ResolveCredential(credential)
+			route, ok := api.tenantRouter.ResolveCredential(r.Context(), credential)
 			if !ok || route.Proxy == nil {
 				writeError(w, http.StatusUnauthorized, "transport credential expired or unknown")
 				return
@@ -431,7 +435,7 @@ func (api *API) work(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "transport credential required")
 		return
 	}
-	route, ok := api.tenantRouter.ResolveCredential(credential)
+	route, ok := api.tenantRouter.ResolveCredential(r.Context(), credential)
 	if !ok || strings.TrimSpace(route.UserID) == "" || strings.TrimSpace(route.WorkspaceID) == "" {
 		writeError(w, http.StatusUnauthorized, "transport credential expired or unknown")
 		return
@@ -475,7 +479,7 @@ func (api *API) proxyTenantBootstrap(w http.ResponseWriter, r *http.Request, rou
 		return
 	}
 	if len(credentials) > 0 {
-		if err := api.tenantRouter.RememberCredentials(route, credentials, ttl); err != nil {
+		if err := api.tenantRouter.RememberCredentials(r.Context(), route, credentials, ttl); err != nil {
 			api.logger.ErrorContext(r.Context(), "tenant bootstrap routing failed", "route", "bootstrap", "error_class", "credential_capacity")
 			writeError(w, http.StatusServiceUnavailable, "tenant routing capacity unavailable")
 			return

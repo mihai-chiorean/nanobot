@@ -111,7 +111,7 @@ func (router *Router) ResolvePrincipal(ctx context.Context, principal identity.P
 	return route, nil
 }
 
-func (router *Router) ResolveCredential(credential string) (httpapi.TenantRoute, bool) {
+func (router *Router) ResolveCredential(_ context.Context, credential string) (httpapi.TenantRoute, bool) {
 	credential = strings.TrimSpace(credential)
 	if credential == "" {
 		return httpapi.TenantRoute{}, false
@@ -131,7 +131,7 @@ func (router *Router) ResolveCredential(credential string) (httpapi.TenantRoute,
 	return entry.route, true
 }
 
-func (router *Router) RememberCredentials(route httpapi.TenantRoute, credentials []string, ttl time.Duration) error {
+func (router *Router) RememberCredentials(_ context.Context, route httpapi.TenantRoute, credentials []string, ttl time.Duration) error {
 	known, ok := router.byUserID[route.UserID]
 	if !ok || known.WorkspaceID != route.WorkspaceID {
 		return errors.New("unknown tenant route")

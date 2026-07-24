@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -11,9 +12,11 @@ import (
 	"syscall"
 	"time"
 
+	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/mihai-chiorean/nanobot/services/ziggy-control/internal/auth"
 	"github.com/mihai-chiorean/nanobot/services/ziggy-control/internal/config"
 	"github.com/mihai-chiorean/nanobot/services/ziggy-control/internal/httpapi"
+	"github.com/mihai-chiorean/nanobot/services/ziggy-control/internal/lifecycle"
 	"github.com/mihai-chiorean/nanobot/services/ziggy-control/internal/routing"
 	"github.com/mihai-chiorean/nanobot/services/ziggy-control/internal/telemetry"
 	"github.com/mihai-chiorean/nanobot/services/ziggy-control/internal/tenant"
@@ -39,7 +42,7 @@ func run() error {
 		"version", version,
 	)
 	slog.SetDefault(logger)
-	if cfg.TenantManifest == "" && cfg.OwnerSubject == "" {
+	if cfg.TenantMode == "legacy" && cfg.OwnerSubject == "" {
 		logger.Warn("single-tenant fallback subject is not pinned")
 	}
 	if cfg.DeploymentEnv != "production" && len(cfg.AuthorizedParties) == 0 {
@@ -83,7 +86,7 @@ func run() error {
 
 	var tenantRouter httpapi.TenantRouter
 	tenantCount := 1
-	if cfg.TenantManifest != "" {
+	if cfg.TenantMode == "manifest" {
 		registry, err := tenant.Load(cfg.TenantManifest, cfg.TenantBindings)
 		if err != nil {
 			return err
@@ -101,6 +104,29 @@ func run() error {
 		}
 		tenantCount = len(registry.Allocations())
 		logger.Info("tenant routing enabled", "tenant_count", len(registry.Allocations()))
+	} else if cfg.TenantMode == "postgres" {
+		db, err := sql.Open("pgx", cfg.TenantDatabaseURL)
+		if err != nil {
+			return fmt.Errorf("open tenant database: %w", err)
+		}
+		defer db.Close()
+		db.SetMaxOpenConns(16)
+		db.SetMaxIdleConns(4)
+		store, err := lifecycle.NewStore(db)
+		if err != nil {
+			return err
+		}
+		startupCtx, cancel := context.WithTimeout(context.Background(), cfg.ReadinessTimeout)
+		err = store.Ready(startupCtx)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("tenant lifecycle database unavailable: %w", err)
+		}
+		tenantRouter, err = routing.NewDurable(store, logger, observability)
+		if err != nil {
+			return err
+		}
+		logger.Info("durable tenant routing enabled")
 	}
 	var connectorProxy http.Handler
 	var connectorSigner *httpapi.ConnectorSigner

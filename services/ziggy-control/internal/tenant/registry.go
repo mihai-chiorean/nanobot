@@ -125,6 +125,20 @@ func (registry *Registry) Resolve(_ context.Context, principal identity.Principa
 	return registry.bindSubject(allocation, subject)
 }
 
+// ResolveActive supports the same server-side credential recheck contract as
+// the durable resolver. Manifest mode remains immutable until restart.
+func (registry *Registry) ResolveActive(_ context.Context, userID, workspaceID string) (Allocation, error) {
+	state := registry.state.Load()
+	if state == nil {
+		return Allocation{}, ErrNotAuthorized
+	}
+	allocation, ok := state.byUserID[strings.TrimSpace(userID)]
+	if !ok || allocation.WorkspaceID != strings.TrimSpace(workspaceID) || allocation.Status != "active" {
+		return Allocation{}, ErrNotAuthorized
+	}
+	return allocation, nil
+}
+
 func (registry *Registry) Allocations() []Allocation {
 	state := registry.state.Load()
 	if state == nil {
@@ -140,6 +154,8 @@ func (registry *Registry) Default() Allocation {
 	}
 	return state.fallback
 }
+
+var _ Resolver = (*Registry)(nil)
 
 func (registry *Registry) bindSubject(allocation Allocation, subject string) (Allocation, error) {
 	registry.bindMu.Lock()

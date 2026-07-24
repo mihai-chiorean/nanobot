@@ -26,7 +26,7 @@ func (router connectorTenantRouter) ResolvePrincipal(context.Context, identity.P
 	return router.route, nil
 }
 
-func (router connectorTenantRouter) ResolveCredential(string) (TenantRoute, bool) {
+func (router connectorTenantRouter) ResolveCredential(context.Context, string) (TenantRoute, bool) {
 	return TenantRoute{}, false
 }
 
@@ -34,7 +34,7 @@ func (router connectorTenantRouter) ResolveRuntimeCredential(credential string) 
 	return router.route, credential == router.runtimeCredential && credential != ""
 }
 
-func (router connectorTenantRouter) RememberCredentials(TenantRoute, []string, time.Duration) error {
+func (router connectorTenantRouter) RememberCredentials(context.Context, TenantRoute, []string, time.Duration) error {
 	return nil
 }
 

@@ -35,6 +35,9 @@ func TestLoadFromDefaults(t *testing.T) {
 	if config.TenantManifest != "/etc/ziggy/tenants.json" || config.TenantBindings != "/var/lib/ziggy-control/tenant-bindings.json" {
 		t.Errorf("tenant files not loaded: %+v", config)
 	}
+	if config.TenantMode != "manifest" {
+		t.Errorf("TenantMode = %q, want manifest", config.TenantMode)
+	}
 	if config.ShutdownTimeout != 10*time.Second {
 		t.Errorf("ShutdownTimeout = %s", config.ShutdownTimeout)
 	}
@@ -63,6 +66,23 @@ func TestLoadFromDefaults(t *testing.T) {
 		if _, ok := config.BlockedPaths[blocked]; !ok {
 			t.Errorf("BlockedPaths does not contain %q", blocked)
 		}
+	}
+}
+
+func TestLoadFromPostgresTenantMode(t *testing.T) {
+	environment := map[string]string{
+		"ZIGGY_UPSTREAM_URL":        "http://127.0.0.1:8765",
+		"ZIGGY_TENANCY_MODE":        "postgres",
+		"ZIGGY_TENANT_DATABASE_URL": "postgres://ziggy:secret@127.0.0.1:5432/ziggy_tenants?sslmode=disable",
+		"ZIGGY_AUTHORIZED_PARTIES":  "https://chat.example.com",
+		"CLERK_SECRET_KEY":          "secret",
+	}
+	config, err := LoadFrom(mapLookup(environment))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.TenantMode != "postgres" || config.TenantDatabaseURL == "" || config.TenantManifest != "" {
+		t.Fatalf("postgres mode config = %+v", config)
 	}
 }
 

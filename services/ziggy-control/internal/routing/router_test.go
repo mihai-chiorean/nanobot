@@ -42,22 +42,22 @@ func TestRouterKeepsCredentialsBoundToTheirRuntime(t *testing.T) {
 	if owner.WorkspaceID == tester.WorkspaceID {
 		t.Fatal("owner and tester resolved to the same workspace")
 	}
-	if err := router.RememberCredentials(owner, []string{"owner-token"}, time.Minute); err != nil {
+	if err := router.RememberCredentials(context.Background(), owner, []string{"owner-token"}, time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	if err := router.RememberCredentials(tester, []string{"tester-token"}, time.Minute); err != nil {
+	if err := router.RememberCredentials(context.Background(), tester, []string{"tester-token"}, time.Minute); err != nil {
 		t.Fatal(err)
 	}
 
-	resolvedOwner, ok := router.ResolveCredential("owner-token")
+	resolvedOwner, ok := router.ResolveCredential(context.Background(), "owner-token")
 	if !ok || resolvedOwner.WorkspaceID != owner.WorkspaceID {
 		t.Fatalf("owner token route = %+v, %v", resolvedOwner, ok)
 	}
-	resolvedTester, ok := router.ResolveCredential("tester-token")
+	resolvedTester, ok := router.ResolveCredential(context.Background(), "tester-token")
 	if !ok || resolvedTester.WorkspaceID != tester.WorkspaceID {
 		t.Fatalf("tester token route = %+v, %v", resolvedTester, ok)
 	}
-	if _, ok := router.ResolveCredential("unknown-token"); ok {
+	if _, ok := router.ResolveCredential(context.Background(), "unknown-token"); ok {
 		t.Fatal("unknown token resolved")
 	}
 	runtimeOwner, ok := router.ResolveRuntimeCredential("owner-bootstrap-secret-with-32-bytes")
@@ -99,11 +99,11 @@ func TestRouterExpiresCredentialWithoutAReaperGoroutine(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := router.RememberCredentials(owner, []string{"short-token"}, time.Minute); err != nil {
+	if err := router.RememberCredentials(context.Background(), owner, []string{"short-token"}, time.Minute); err != nil {
 		t.Fatal(err)
 	}
 	now = now.Add(2 * time.Minute)
-	if _, ok := router.ResolveCredential("short-token"); ok {
+	if _, ok := router.ResolveCredential(context.Background(), "short-token"); ok {
 		t.Fatal("expired token resolved")
 	}
 	if router.count.Load() != 0 {
