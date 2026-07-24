@@ -360,7 +360,7 @@ jobs:
         with:
           go-version: '1.25.x'
           check-latest: true
-          cache-dependency-path: @@{{ matrix.path }}/go.sum
+          cache-dependency-path: services/*/go.sum
       - name: Verify @@{{ matrix.name }}
         working-directory: @@{{ matrix.path }}
         run: @@{{ matrix.command }}
