@@ -147,6 +147,25 @@ func (registry *Registry) Allocations() []Allocation {
 	return append([]Allocation(nil), state.all...)
 }
 
+// ImportAllocations returns a stable manifest snapshot with persisted first
+// login bindings folded into ClerkSubject. It is for one-shot migration tools;
+// runtime routing continues to use the internal snapshot directly.
+func (registry *Registry) ImportAllocations() []Allocation {
+	state := registry.state.Load()
+	if state == nil {
+		return nil
+	}
+	allocations := make([]Allocation, 0, len(state.all))
+	for _, candidate := range state.all {
+		allocation := candidate
+		if binding, ok := state.bindings[allocation.UserID]; ok {
+			allocation.ClerkSubject = binding.ClerkSubject
+		}
+		allocations = append(allocations, allocation)
+	}
+	return allocations
+}
+
 func (registry *Registry) Default() Allocation {
 	state := registry.state.Load()
 	if state == nil {

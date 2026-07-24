@@ -115,6 +115,24 @@ Rollback is setting `ZIGGY_TENANCY_MODE=manifest` with the original immutable
 manifest and bindings intact. Do not run both modes in one process and do not
 copy a Clerk subject or workspace identifier from a client request.
 
+The import is an explicit operator step; it never runs during service startup:
+
+```sh
+make tenant-import
+sudo bin/import-tenant-manifest \
+  --manifest /etc/ziggy/tenants.json \
+  --bindings /var/lib/ziggy-control/tenant-bindings.json \
+  --database-url-file /etc/ziggy/secrets/tenant-database-url \
+  --dry-run
+```
+
+The command loads the same strict manifest and bindings validation as manifest
+mode, prints only aggregate counts, and rolls the dry-run transaction back.
+Repeat without `--dry-run` to import. It preserves user/workspace IDs and bound
+subjects, and refuses any durable conflict without partially importing a batch.
+The staged switch and rollback procedure is in
+[`deploy/runbooks/postgres-tenant-import.md`](deploy/runbooks/postgres-tenant-import.md).
+
 ## Configuration
 
 Required variables:
@@ -287,6 +305,10 @@ sudo install -o root -g root -m 0644 \
 sudo install -o root -g root -m 0644 \
   services/ziggy-control/deploy/systemd/ziggy-control.service.d/30-work-credential.conf \
   /etc/systemd/system/ziggy-control.service.d/30-work-credential.conf
+# Install only immediately before changing to ZIGGY_TENANCY_MODE=postgres:
+sudo install -o root -g root -m 0644 \
+  services/ziggy-control/deploy/systemd/ziggy-control.service.d/40-tenant-database-credential.conf \
+  /etc/systemd/system/ziggy-control.service.d/40-tenant-database-credential.conf
 ```
 
 The base unit loads only Clerk. Its `EnvironmentFile` is read before the
@@ -300,6 +322,10 @@ install, remove, or change a drop-in before the same reload and restart. On the
 first upgrade from the older unit, its inline OTel and connector credentials
 are removed with the base file, so install the desired drop-ins before
 restarting if either integration must remain enabled.
+The tenant database credential is intentionally a separate optional drop-in:
+do not install `40-tenant-database-credential.conf` in manifest mode. It sets
+`ZIGGY_TENANT_DATABASE_URL_FILE` only for PostgreSQL mode, so the unchanged
+manifest deployment never requires a database DSN credential.
 
 Install or upgrade the versioned binary atomically, retain the previous binary
 as `/usr/local/bin/ziggy-control.previous`, then:

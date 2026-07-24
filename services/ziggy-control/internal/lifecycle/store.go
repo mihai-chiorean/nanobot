@@ -25,6 +25,7 @@ var (
 	ErrInvalidTransition  = errors.New("tenant lifecycle transition is invalid")
 	ErrActivationMismatch = errors.New("runtime activation does not match the pending allocation")
 	ErrActivationConflict = errors.New("runtime endpoint allocation is already in use")
+	ErrImportConflict     = errors.New("tenant import conflicts with durable state")
 )
 
 type RuntimeAllocation struct {
@@ -77,7 +78,9 @@ func (s *Store) Ready(ctx context.Context) error {
   to_regclass('public.ziggy_tenant_users') IS NOT NULL
   AND to_regclass('public.ziggy_tenant_workspaces') IS NOT NULL
   AND to_regclass('public.ziggy_tenant_runtime_allocations') IS NOT NULL
-  AND to_regclass('public.ziggy_tenant_lifecycle_events') IS NOT NULL`).Scan(&present)
+  AND to_regclass('public.ziggy_tenant_lifecycle_events') IS NOT NULL
+  AND to_regclass('public.ziggy_tenant_runtime_allocations_upstream_url_unique') IS NOT NULL
+  AND to_regclass('public.ziggy_tenant_runtime_allocations_bootstrap_secret_unique') IS NOT NULL`).Scan(&present)
 	if err != nil {
 		return err
 	}
