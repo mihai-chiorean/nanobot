@@ -53,8 +53,9 @@ Apple references:
 ## Local Preflight
 
 Create `ios/Config/Local.xcconfig` from the checked-in example and set the
-release Clerk publishable key. Run from `ios/` after the release-gate changes
-have landed:
+production Clerk publishable key. TestFlight builds must use a `pk_live_` key;
+the development `pk_test_` instance is only for local and device development.
+Run from `ios/` after the release-gate changes have landed:
 
 ```sh
 xcodegen generate
@@ -110,9 +111,10 @@ App Store Connect users. On a TestFlight-installed build, verify:
 - Server overload returns a bounded retryable response.
 - App version/build and a content-free correlation ID are visible for support.
 
-Never archive a build whose `ZiggyClerkPublishableKey` is empty or points at an
-unintended Clerk instance. The publishable key is not secret, but keeping it in
-the local release configuration prevents accidental cross-environment builds.
+Never archive a build whose `ZiggyClerkPublishableKey` is empty, does not start
+with `pk_live_`, or points at an unintended Clerk instance. The publishable key
+is not secret, but keeping it in the local release configuration prevents
+accidental cross-environment builds.
 
 ## External Pilot
 

@@ -1,9 +1,11 @@
 import Foundation
-import XCTest
+import Testing
 @testable import Ziggy
 
-final class WebSocketLifecycleTests: XCTestCase {
-    func testConnectedWaitsForFirstServerFrame() async throws {
+@Suite
+struct WebSocketLifecycleTests {
+    @Test
+    func `connected waits for the first server frame`() async throws {
         let connection = TestWebSocketConnection()
         let client = makeClient(connection: connection)
         let collector = EventCollector()
@@ -12,19 +14,20 @@ final class WebSocketLifecycleTests: XCTestCase {
         await client.start()
         try await Task.sleep(for: .milliseconds(50))
         let beforeFrame = await collector.events
-        XCTAssertEqual(beforeFrame, [.state(.connecting)])
+        #expect(beforeFrame == [.state(.connecting)])
 
         await connection.receive(.string(#"{"event":"ready","chat_id":"chat-1"}"#))
         try await Task.sleep(for: .milliseconds(50))
         let afterFrame = await collector.events
-        XCTAssertEqual(afterFrame.first, .state(.connecting))
-        XCTAssertTrue(afterFrame.contains(.state(.connected)))
+        #expect(afterFrame.first == .state(.connecting))
+        #expect(afterFrame.contains(.state(.connected)))
 
         await client.stop()
         eventTask.cancel()
     }
 
-    func testUnauthorizedUpgradeIsSurfacedAndDoesNotReportConnected() async throws {
+    @Test
+    func `unauthorized upgrade is surfaced without reporting connected`() async throws {
         let connection = TestWebSocketConnection(statusCode: 401)
         let client = makeClient(connection: connection)
         let collector = EventCollector()
@@ -33,21 +36,22 @@ final class WebSocketLifecycleTests: XCTestCase {
         await client.start()
         try await Task.sleep(for: .milliseconds(50))
         let beforeFrame = await collector.events
-        XCTAssertEqual(beforeFrame, [.state(.connecting)])
+        #expect(beforeFrame == [.state(.connecting)])
 
         await connection.failReceive(with: .upgradeFailed(statusCode: 401))
         try await Task.sleep(for: .milliseconds(50))
         let events = await collector.events
 
-        XCTAssertEqual(events.first, .state(.connecting))
-        XCTAssertTrue(events.contains(.state(.failed("WebSocket upgrade failed (HTTP 401)."))))
-        XCTAssertFalse(events.contains(.state(.connected)))
+        #expect(events.first == .state(.connecting))
+        #expect(events.contains(.state(.failed("WebSocket upgrade failed (HTTP 401)."))))
+        #expect(!events.contains(.state(.connected)))
 
         await client.stop()
         eventTask.cancel()
     }
 
-    func testConnectedSocketSendsPeriodicHeartbeatPings() async throws {
+    @Test
+    func `connected socket sends periodic heartbeat pings`() async throws {
         let connection = TestWebSocketConnection()
         let client = makeClient(connection: connection, heartbeatInterval: .milliseconds(10))
         let collector = EventCollector()
@@ -59,7 +63,36 @@ final class WebSocketLifecycleTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(45))
 
         let pingCount = await connection.pingCount()
-        XCTAssertGreaterThanOrEqual(pingCount, 3)
+        #expect(pingCount >= 3)
+
+        await client.stop()
+        eventTask.cancel()
+    }
+
+    @Test
+    func `outbound frames are written in FIFO order`() async throws {
+        let connection = TestWebSocketConnection()
+        let client = makeClient(connection: connection)
+        let collector = EventCollector()
+        let eventTask = collect(client.events, into: collector)
+
+        await client.start()
+        await connection.receive(.string(#"{"event":"ready","chat_id":"chat-1"}"#))
+        #expect(try await eventually {
+            await collector.events.contains(.state(.connected))
+        })
+
+        await client.send(.message(chatID: "chat-1", content: "first", media: []))
+        await client.send(.message(chatID: "chat-1", content: "second", media: []))
+
+        #expect(try await eventually { await connection.sentPayloads().count == 1 })
+        await connection.permitSend()
+        #expect(try await eventually { await connection.sentPayloads().count == 2 })
+        await connection.permitSend()
+
+        let payloads = await connection.sentPayloads()
+        #expect(payloads[0].contains(#""content":"first""#))
+        #expect(payloads[1].contains(#""content":"second""#))
 
         await client.stop()
         eventTask.cancel()
@@ -84,6 +117,19 @@ final class WebSocketLifecycleTests: XCTestCase {
             }
         }
     }
+
+    private func eventually(
+        timeout: Duration = .seconds(1),
+        _ condition: @escaping @Sendable () async -> Bool
+    ) async throws -> Bool {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while clock.now < deadline {
+            if await condition() { return true }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        return await condition()
+    }
 }
 
 private actor EventCollector {
@@ -107,6 +153,9 @@ private final class TestWebSocketConnection: ZiggyWebSocketConnection, @unchecke
         var pingResult: PingResult?
         var pingWaiter: CheckedContinuation<Void, Error>?
         var pingCount = 0
+        var sendPermits = 0
+        var sendWaiters: [CheckedContinuation<Void, Error>] = []
+        var sentPayloads: [String] = []
 
         func waitForPing() async throws {
             pingCount += 1
@@ -144,6 +193,33 @@ private final class TestWebSocketConnection: ZiggyWebSocketConnection, @unchecke
             }
         }
 
+        func send(_ message: URLSessionWebSocketTask.Message) async throws {
+            switch message {
+            case .string(let payload):
+                sentPayloads.append(payload)
+            case .data(let data):
+                sentPayloads.append(String(decoding: data, as: UTF8.self))
+            @unknown default:
+                sentPayloads.append("")
+            }
+            if sendPermits > 0 {
+                sendPermits -= 1
+                return
+            }
+            try await withCheckedThrowingContinuation { continuation in
+                sendWaiters.append(continuation)
+            }
+        }
+
+        func permitSend() {
+            if let waiter = sendWaiters.first {
+                sendWaiters.removeFirst()
+                waiter.resume()
+            } else {
+                sendPermits += 1
+            }
+        }
+
         func yield(_ message: URLSessionWebSocketTask.Message) {
             if let waiter = waiters.first {
                 waiters.removeFirst()
@@ -167,9 +243,12 @@ private final class TestWebSocketConnection: ZiggyWebSocketConnection, @unchecke
             waiters.removeAll()
             pingWaiter?.resume(throwing: CancellationError())
             pingWaiter = nil
+            for waiter in sendWaiters { waiter.resume(throwing: CancellationError()) }
+            sendWaiters.removeAll()
         }
 
         func currentPingCount() -> Int { pingCount }
+        func currentSentPayloads() -> [String] { sentPayloads }
     }
 
     private let state: State
@@ -195,7 +274,9 @@ private final class TestWebSocketConnection: ZiggyWebSocketConnection, @unchecke
         try await state.waitForPing()
     }
 
-    func send(_ message: URLSessionWebSocketTask.Message) async throws {}
+    func send(_ message: URLSessionWebSocketTask.Message) async throws {
+        try await state.send(message)
+    }
 
     func receive() async throws -> URLSessionWebSocketTask.Message {
         return try await state.next()
@@ -223,5 +304,13 @@ private final class TestWebSocketConnection: ZiggyWebSocketConnection, @unchecke
 
     func failReceive(with error: ZiggyWebSocketClientError) async {
         await state.failNext(error)
+    }
+
+    func permitSend() async {
+        await state.permitSend()
+    }
+
+    func sentPayloads() async -> [String] {
+        await state.currentSentPayloads()
     }
 }

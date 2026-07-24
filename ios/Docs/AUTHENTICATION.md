@@ -26,12 +26,25 @@ code, or reuse the Clerk JWT as a long-lived Ziggy socket credential.
 The Xcode build setting `CLERK_PUBLISHABLE_KEY` is injected into Info.plist as
 `ZiggyClerkPublishableKey`. Put the publishable key in the ignored
 `Config/Local.xcconfig`; do not commit deployment-specific configuration.
+Local builds may use a `pk_test_` development instance. TestFlight builds must
+use the matching `pk_live_` production instance configured for the public web
+domain and native application.
 
 The Clerk Native API application must register:
 
 - App ID prefix: `98KW2QQ963`
 - Bundle ID: `com.mihaichiorean.ziggy`
 - Callback: `com.mihaichiorean.ziggy://callback`
+
+Production builds carry the Associated Domains entitlement
+`webcredentials:clerk.mihaichiorean.com` and the Sign in with Apple entitlement.
+Keep both in `Ziggy/Resources/Ziggy.entitlements`. Register the associated
+domain and native application in Clerk, and enable Sign in with Apple for the
+`com.mihaichiorean.ziggy` App ID in the Apple Developer portal.
+
+`AuthView` renders Sign in with Apple automatically when the Apple social
+connection is enabled in Clerk. The app does not implement a parallel
+AuthenticationServices state machine.
 
 `ZiggyApp` forwards callback URLs to Clerk and observes Clerk session changes
 so sign-in, sign-out, expiry, and account switching rebuild the Ziggy

@@ -1,76 +1,77 @@
+import Foundation
 import Security
-import XCTest
+import Testing
 @testable import Ziggy
 
-final class CredentialStoreTests: XCTestCase {
+@Suite
+struct CredentialStoreTests {
+    @Test
     @MainActor
-    func testStartupRemovesPreviouslyPersistedUntrustedServerURL() async {
+    func `startup removes previously persisted untrusted server URL`() async {
         let store = LegacyCredentialStore(value: "https://attacker.example")
         let model = AppModel(credentialStore: store)
 
         await model.start()
 
-        XCTAssertEqual(model.serverURLText, ZiggyServerURLValidation.productionURL.absoluteString)
-        XCTAssertEqual(model.phase, .needsEnrollment)
+        #expect(model.serverURLText == ZiggyServerURLValidation.productionURL.absoluteString)
+        #expect(model.phase == .needsEnrollment)
         let didRemoveServerURL = await store.didRemoveServerURL
-        XCTAssertTrue(didRemoveServerURL)
+        #expect(didRemoveServerURL)
     }
 
-    func testInMemoryStoreSavesUpdatesAndDeletesServerURL() async throws {
+    @Test
+    func `in-memory store saves updates and deletes server URL`() async throws {
         let store = InMemoryCredentialStore()
-        let url = URL(string: "https://chat.mihaichiorean.com")!
+        let url = try #require(URL(string: "https://chat.mihaichiorean.com"))
 
         try await store.save(serverURL: url)
         let savedURL = try await store.serverURL()
-        XCTAssertEqual(savedURL, url)
+        #expect(savedURL == url)
 
-        let updatedURL = URL(string: "http://127.0.0.1:8080/api")!
+        let updatedURL = try #require(URL(string: "http://127.0.0.1:8080/api"))
         try await store.save(serverURL: updatedURL)
         let savedUpdatedURL = try await store.serverURL()
-        XCTAssertEqual(savedUpdatedURL, updatedURL)
+        #expect(savedUpdatedURL == updatedURL)
 
         try await store.removeServerURL()
         let removedURL = try await store.serverURL()
-        XCTAssertNil(removedURL)
+        #expect(removedURL == nil)
     }
 
-    func testCredentialValidationRejectsInvalidServerURL() async throws {
+    @Test
+    func `credential validation rejects invalid server URL`() async {
         let store = InMemoryCredentialStore()
 
-        do {
+        await #expect(throws: CredentialStoreError.invalidValue(
+            key: .serverURL,
+            reason: .invalidServerURL
+        )) {
             try await store.setValue("localhost:8080", for: .serverURL)
-            XCTFail("Expected invalid URL rejection")
-        } catch let error as CredentialStoreError {
-            XCTAssertEqual(
-                error,
-                .invalidValue(key: .serverURL, reason: .invalidServerURL)
-            )
-        } catch {
-            XCTFail("Unexpected error: \(error)")
         }
     }
 
-    func testKeychainStoreRoundTripsAndDeletesValues() async throws {
+    @Test
+    func `keychain store round trips and deletes values`() async throws {
         let service = "com.mihaichiorean.ziggy.tests.\(UUID().uuidString)"
         let store = KeychainCredentialStore(service: service)
 
-        let url = URL(string: "https://chat.mihaichiorean.com/api")!
+        let url = try #require(URL(string: "https://chat.mihaichiorean.com/api"))
         do {
             try await store.save(serverURL: url)
         } catch CredentialStoreError.keychainFailure(_, _, let status) where status == errSecMissingEntitlement {
-            throw XCTSkip("Unsigned simulator test hosts do not have Keychain entitlements.")
+            try Test.cancel("Unsigned simulator test hosts do not have Keychain entitlements.")
         }
         let savedURL = try await store.serverURL()
-        XCTAssertEqual(savedURL, url)
+        #expect(savedURL == url)
 
-        let updatedURL = URL(string: "http://localhost:8080/v1")!
+        let updatedURL = try #require(URL(string: "http://localhost:8080/v1"))
         try await store.save(serverURL: updatedURL)
         let savedUpdatedURL = try await store.serverURL()
-        XCTAssertEqual(savedUpdatedURL, updatedURL)
+        #expect(savedUpdatedURL == updatedURL)
 
         try await store.removeServerURL()
         let removedURL = try await store.serverURL()
-        XCTAssertNil(removedURL)
+        #expect(removedURL == nil)
     }
 }
 

@@ -2,7 +2,7 @@ import Foundation
 import Testing
 @testable import Ziggy
 
-@Suite("Durable Work REST transport")
+@Suite("Durable Work REST transport", .serialized)
 struct WorkRESTTests {
     @Test
     func `commands use authenticated REST and plural follow up falls back to singular REST`() async throws {

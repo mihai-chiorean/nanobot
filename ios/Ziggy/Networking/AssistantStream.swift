@@ -13,7 +13,7 @@ public protocol AssistantStream: Sendable {
     func cancel()
 }
 
-public final class BufferedAssistantStream: AssistantStream, @unchecked Sendable {
+public final class BufferedAssistantStream: AssistantStream {
     public let events: AsyncStream<AssistantStreamEvent>
     private let cancellation: @Sendable () -> Void
 

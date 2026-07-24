@@ -1,6 +1,8 @@
 name: Ziggy
 
 options:
+  minimumXcodeGenVersion: 2.46.0
+  xcodeVersion: "26.6"
   bundleIdPrefix: com.mihaichiorean
   deploymentTarget:
     iOS: "18.0"
@@ -14,7 +16,7 @@ configs:
 packages:
   Clerk:
     url: https://github.com/clerk/clerk-ios.git
-    from: 1.3.2
+    from: 1.3.3
   Textual:
     url: https://github.com/gonzalezreal/textual.git
     from: 0.5.0
@@ -28,6 +30,7 @@ settings:
     DEVELOPMENT_TEAM: 98KW2QQ963
     SWIFT_VERSION: "6.0"
     SWIFT_STRICT_CONCURRENCY: complete
+    SWIFT_APPROACHABLE_CONCURRENCY: true
     ENABLE_USER_SCRIPT_SANDBOXING: true
     ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
 
@@ -46,18 +49,11 @@ targets:
         product: Textual
     settings:
       base:
+        CODE_SIGN_ENTITLEMENTS: Ziggy/Resources/Ziggy.entitlements
         PRODUCT_BUNDLE_IDENTIFIER: com.mihaichiorean.ziggy
         PRODUCT_NAME: Ziggy
         GENERATE_INFOPLIST_FILE: false
         INFOPLIST_FILE: Ziggy/Resources/Info.plist
-        INFOPLIST_KEY_CFBundleDisplayName: Ziggy
-        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.productivity
-        INFOPLIST_KEY_NSMicrophoneUsageDescription: Ziggy uses the microphone when you dictate a prompt.
-        INFOPLIST_KEY_NSSpeechRecognitionUsageDescription: Ziggy transcribes dictated prompts on your device.
-        INFOPLIST_KEY_NSPhotoLibraryUsageDescription: Ziggy lets you attach selected images to a conversation.
-        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: true
-        INFOPLIST_KEY_UILaunchScreen_Generation: true
-        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone: UIInterfaceOrientationPortrait
         TARGETED_DEVICE_FAMILY: "1"
         SUPPORTS_MACCATALYST: false
     scheme:

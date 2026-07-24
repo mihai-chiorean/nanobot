@@ -22,23 +22,26 @@ final class LiveChatUITests: XCTestCase {
 
         let composer = app.textFields["Message"]
         XCTAssertTrue(composer.waitForExistence(timeout: 5), "The native composer did not open")
+        let assistantMessages = app.descendants(matching: .any).matching(identifier: "assistant-message")
+        let assistantCountBeforeSend = assistantMessages.count
         composer.tap()
         composer.typeText("Reply with exactly IOS_NATIVE_OK and nothing else.")
         app.buttons["Send message"].tap()
 
         let userMessage = app.descendants(matching: .any).matching(identifier: "user-message").firstMatch
-        let assistantMessage = app.descendants(matching: .any).matching(identifier: "assistant-message").firstMatch
         XCTAssertTrue(userMessage.waitForExistence(timeout: 5))
+        let expectedResponse = app.staticTexts["IOS_NATIVE_OK"]
         XCTAssertTrue(
-            assistantMessage.waitForExistence(timeout: 90),
-            "Ziggy did not stream a response back to the native app"
+            expectedResponse.waitForExistence(timeout: 90),
+            "Ziggy did not stream the expected response back to the native app"
         )
+        XCTAssertGreaterThan(assistantMessages.count, assistantCountBeforeSend)
 
         app.buttons["Back to chats"].tap()
         XCTAssertTrue(conversation.waitForExistence(timeout: 5))
         conversation.tap()
         XCTAssertTrue(app.buttons["Back to chats"].waitForExistence(timeout: 5))
-        XCTAssertTrue(assistantMessage.waitForExistence(timeout: 5))
+        XCTAssertTrue(expectedResponse.waitForExistence(timeout: 5))
 
         let screenshot = XCTAttachment(screenshot: app.screenshot())
         screenshot.name = "Live Ziggy chat response"
