@@ -24,6 +24,18 @@ Manager logs contain operation, workspace ID, generation, and result only.
 They do not write prompts, workspace paths, credentials, config, command
 output, or runtime stderr.
 
+The Unix socket is JSON-lines only: one request line per connection, with a
+4 KiB request limit, 16 concurrent requests, five-second read/write deadlines,
+and a 30-second request-scoped driver deadline. Configuration cannot raise
+those limits above 64 KiB, 256 requests, or one minute. Excess connections are
+rejected instead of creating unbounded handler goroutines.
+
+The 15-minute model/MCP capability lifetime is **Phase 1 canary-only**. This
+manager currently reads a static policy at process start. Before production
+migration, implement broker-side atomic credential rotation with overlapping
+generation validation and an atomic manager policy reload that never starts a
+runtime with partially rotated credentials.
+
 ## Profile
 
 Each generated, generation-labeled Quadlet unit uses a pinned image digest, rootless

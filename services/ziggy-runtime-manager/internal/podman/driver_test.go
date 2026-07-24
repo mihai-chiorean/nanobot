@@ -2,6 +2,7 @@ package podman
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -23,6 +24,12 @@ func (f *fakeRunner) Run(_ context.Context, command Command) (Result, error) {
 	if command.Path == "systemctl" && len(command.Args) >= 3 && command.Args[1] == "start" {
 		f.generation = "7"
 	}
+	if command.Path == "podman" && len(command.Args) > 1 && command.Args[0] == "network" && command.Args[1] == "inspect" {
+		return Result{Stdout: prerequisiteJSON(true, lifecycleLabels(runtime.Request{WorkspaceID: "tenant-alpha", Generation: 7}))}, nil
+	}
+	if command.Path == "podman" && len(command.Args) > 1 && command.Args[0] == "volume" && command.Args[1] == "inspect" {
+		return Result{Stdout: prerequisiteJSON(false, lifecycleLabels(runtime.Request{WorkspaceID: "tenant-alpha", Generation: 7}))}, nil
+	}
 	if command.Path == "podman" && len(command.Args) > 1 && command.Args[0] == "inspect" {
 		if strings.Contains(command.Args[2], "io.ziggy.generation") {
 			if f.generation == "" {
@@ -33,6 +40,16 @@ func (f *fakeRunner) Run(_ context.Context, command Command) (Result, error) {
 		return Result{Stdout: f.state}, nil
 	}
 	return Result{}, nil
+}
+
+func prerequisiteJSON(network bool, labels map[string]string) string {
+	value := map[string]any{"Labels": labels}
+	if network {
+		value["internal"] = true
+		value["labels"] = labels
+	}
+	raw, _ := json.Marshal(value)
+	return string(raw)
 }
 
 func TestEnsureRunningStagesOnlyNamedVolumesAndNetworklessConfig(t *testing.T) {
@@ -98,4 +115,83 @@ func TestStopRemainsAvailableAfterCapabilityExpiry(t *testing.T) {
 	if err != nil || status.State != runtime.StateStopped {
 		t.Fatalf("stop must work after capability expiry: status=%+v err=%v", status, err)
 	}
+}
+
+func TestPrerequisitesRejectUnownedExistingResources(t *testing.T) {
+	request := runtime.Request{WorkspaceID: "tenant-alpha", Generation: 7}
+	for _, test := range []struct {
+		name    string
+		network bool
+		payload string
+	}{
+		{"network must have ownership labels", true, prerequisiteJSON(true, map[string]string{managerOwnerLabel: managerOwnerValue})},
+		{"volume must have ownership labels", false, prerequisiteJSON(false, map[string]string{managerOwnerLabel: managerOwnerValue})},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			runner := &prerequisiteRunner{createExit: 125, inspect: test.payload}
+			driver := Driver{Runner: runner}
+			var err error
+			if test.network {
+				err = driver.ensureNetwork(context.Background(), request)
+			} else {
+				err = driver.ensureVolume(context.Background(), request, "ziggy-tenant-tenant-alpha-root")
+			}
+			if err == nil {
+				t.Fatal("pre-existing unowned prerequisite was accepted")
+			}
+		})
+	}
+
+	runner := &prerequisiteRunner{createExit: 125, inspect: `{"internal":false,"labels":{"io.ziggy.owner":"ziggy-runtime-manager","io.ziggy.workspace":"tenant-alpha","io.ziggy.generation":"7"}}`}
+	if err := (Driver{Runner: runner}).ensureNetwork(context.Background(), request); err == nil {
+		t.Fatal("external pre-existing network was accepted")
+	}
+}
+
+func TestPrerequisitesAcceptLabeledExistingResourcesAfterCreateConflict(t *testing.T) {
+	request := runtime.Request{WorkspaceID: "tenant-alpha", Generation: 7}
+	runner := &prerequisiteRunner{createExit: 125, inspect: prerequisiteJSON(true, lifecycleLabels(request))}
+	driver := Driver{Runner: runner}
+	if err := driver.ensureNetwork(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.commands) != 2 || runner.commands[1].Args[0] != "network" || runner.commands[1].Args[1] != "inspect" {
+		t.Fatalf("existing network was not inspected: %+v", runner.commands)
+	}
+	if !strings.Contains(strings.Join(runner.commands[0].Args, " "), "io.ziggy.owner=ziggy-runtime-manager") || !strings.Contains(strings.Join(runner.commands[0].Args, " "), "io.ziggy.generation=7") {
+		t.Fatalf("network create did not carry manager labels: %+v", runner.commands[0])
+	}
+
+	volumeRunner := &prerequisiteRunner{createExit: 125, inspect: prerequisiteJSON(false, lifecycleLabels(request))}
+	if err := (Driver{Runner: volumeRunner}).ensureVolume(context.Background(), request, "ziggy-tenant-tenant-alpha-root"); err != nil {
+		t.Fatal(err)
+	}
+	if len(volumeRunner.commands) != 2 || volumeRunner.commands[1].Args[0] != "volume" || volumeRunner.commands[1].Args[1] != "inspect" {
+		t.Fatalf("existing volume was not inspected: %+v", volumeRunner.commands)
+	}
+}
+
+func TestMalformedWorkspaceIsNotAnInvalidGeneration(t *testing.T) {
+	driver := Driver{Policy: fixturePolicy(), QuadletDir: t.TempDir(), Runner: &fakeRunner{}, Now: func() time.Time { return fixtureNow }}
+	_, err := driver.EnsureRunning(context.Background(), runtime.Request{WorkspaceID: "../tenant-alpha", Generation: 7})
+	if !errors.Is(err, runtime.ErrInvalidWorkspace) {
+		t.Fatalf("error=%v want invalid workspace", err)
+	}
+}
+
+type prerequisiteRunner struct {
+	createExit int
+	inspect    string
+	commands   []Command
+}
+
+func (r *prerequisiteRunner) Run(_ context.Context, command Command) (Result, error) {
+	r.commands = append(r.commands, command)
+	if len(command.Args) >= 2 && command.Args[1] == "create" {
+		return Result{ExitCode: r.createExit}, nil
+	}
+	if len(command.Args) >= 2 && command.Args[1] == "inspect" {
+		return Result{Stdout: r.inspect}, nil
+	}
+	return Result{}, nil
 }

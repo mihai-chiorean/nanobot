@@ -6,12 +6,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log"
 	"net"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/mihai-chiorean/nanobot/services/ziggy-runtime-manager/runtime"
 )
@@ -28,8 +30,52 @@ type Response struct {
 }
 
 type Server struct {
-	Driver runtime.Driver
-	Logger *log.Logger
+	Driver          runtime.Driver
+	Logger          *log.Logger
+	MaxConcurrent   int
+	MaxRequestBytes int64
+	ReadTimeout     time.Duration
+	WriteTimeout    time.Duration
+	DriverTimeout   time.Duration
+}
+
+const (
+	defaultMaxConcurrent   = 16
+	defaultMaxRequestBytes = 4096
+	defaultReadTimeout     = 5 * time.Second
+	defaultWriteTimeout    = 5 * time.Second
+	defaultDriverTimeout   = 30 * time.Second
+	maximumConcurrent      = 256
+	maximumRequestBytes    = 64 << 10
+	maximumTimeout         = time.Minute
+)
+
+type limits struct {
+	maxConcurrent   int
+	maxRequestBytes int64
+	readTimeout     time.Duration
+	writeTimeout    time.Duration
+	driverTimeout   time.Duration
+}
+
+func (s Server) limits() limits {
+	result := limits{defaultMaxConcurrent, defaultMaxRequestBytes, defaultReadTimeout, defaultWriteTimeout, defaultDriverTimeout}
+	if s.MaxConcurrent > 0 && s.MaxConcurrent <= maximumConcurrent {
+		result.maxConcurrent = s.MaxConcurrent
+	}
+	if s.MaxRequestBytes > 0 && s.MaxRequestBytes <= maximumRequestBytes {
+		result.maxRequestBytes = s.MaxRequestBytes
+	}
+	if s.ReadTimeout > 0 && s.ReadTimeout <= maximumTimeout {
+		result.readTimeout = s.ReadTimeout
+	}
+	if s.WriteTimeout > 0 && s.WriteTimeout <= maximumTimeout {
+		result.writeTimeout = s.WriteTimeout
+	}
+	if s.DriverTimeout > 0 && s.DriverTimeout <= maximumTimeout {
+		result.driverTimeout = s.DriverTimeout
+	}
+	return result
 }
 
 func (s Server) ListenAndServe(ctx context.Context, socket string) error {
@@ -56,6 +102,8 @@ func (s Server) ListenAndServe(ctx context.Context, socket string) error {
 		<-ctx.Done()
 		_ = listener.Close()
 	}()
+	limits := s.limits()
+	slots := make(chan struct{}, limits.maxConcurrent)
 	for {
 		connection, err := listener.Accept()
 		if err != nil {
@@ -64,27 +112,70 @@ func (s Server) ListenAndServe(ctx context.Context, socket string) error {
 			}
 			return err
 		}
-		go s.serveConnection(ctx, connection)
+		select {
+		case slots <- struct{}{}:
+			go func() {
+				defer func() { <-slots }()
+				s.serveConnection(ctx, connection, limits)
+			}()
+		default:
+			s.writeResponse(connection, limits, Response{Error: "server_busy"})
+			_ = connection.Close()
+		}
 	}
 }
 
-func (s Server) serveConnection(ctx context.Context, connection net.Conn) {
+func (s Server) serveConnection(ctx context.Context, connection net.Conn, limits limits) {
 	defer connection.Close()
-	decoder := json.NewDecoder(bufio.NewReader(connection))
-	encoder := json.NewEncoder(connection)
-	var request Request
-	if err := decoder.Decode(&request); err != nil {
-		_ = encoder.Encode(Response{Error: "invalid_request"})
+	if err := connection.SetReadDeadline(time.Now().Add(limits.readTimeout)); err != nil {
 		return
 	}
-	status, err := s.dispatch(ctx, request)
+	line, err := bufio.NewReaderSize(connection, int(limits.maxRequestBytes+1)).ReadString('\n')
+	if len(line) > int(limits.maxRequestBytes) || errors.Is(err, bufio.ErrBufferFull) {
+		s.writeResponse(connection, limits, Response{Error: "request_too_large"})
+		return
+	}
+	if err != nil && !errors.Is(err, io.EOF) {
+		s.writeResponse(connection, limits, Response{Error: requestErrorCode(err)})
+		return
+	}
+	decoder := json.NewDecoder(strings.NewReader(line))
+	decoder.DisallowUnknownFields()
+	var request Request
+	if err := decoder.Decode(&request); err != nil {
+		s.writeResponse(connection, limits, Response{Error: requestErrorCode(err)})
+		return
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		s.writeResponse(connection, limits, Response{Error: requestErrorCode(err)})
+		return
+	}
+	if err := connection.SetReadDeadline(time.Time{}); err != nil {
+		return
+	}
+	driverCtx, cancel := context.WithTimeout(ctx, limits.driverTimeout)
+	defer cancel()
+	status, err := s.dispatch(driverCtx, request)
 	if err != nil {
 		s.log(request, "failed")
-		_ = encoder.Encode(Response{Error: errorCode(err)})
+		s.writeResponse(connection, limits, Response{Error: errorCode(err)})
 		return
 	}
 	s.log(request, string(status.State))
-	_ = encoder.Encode(Response{Status: &status})
+	s.writeResponse(connection, limits, Response{Status: &status})
+}
+
+func requestErrorCode(err error) string {
+	if errors.Is(err, os.ErrDeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) {
+		return "request_timeout"
+	}
+	return "invalid_request"
+}
+
+func (s Server) writeResponse(connection net.Conn, limits limits, response Response) {
+	_ = connection.SetWriteDeadline(time.Now().Add(limits.writeTimeout))
+	_ = json.NewEncoder(connection).Encode(response)
 }
 
 func (s Server) dispatch(ctx context.Context, request Request) (runtime.Status, error) {
@@ -128,6 +219,8 @@ func errorCode(err error) string {
 	switch {
 	case errors.Is(err, runtime.ErrUnknownWorkspace):
 		return "unknown_workspace"
+	case errors.Is(err, runtime.ErrInvalidWorkspace):
+		return "invalid_workspace"
 	case errors.Is(err, runtime.ErrInvalidGeneration):
 		return "invalid_generation"
 	case errors.Is(err, runtime.ErrStaleGeneration):

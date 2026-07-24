@@ -131,6 +131,7 @@ HealthTimeout=5s
 HealthRetries=3
 Label=io.ziggy.workspace=%s
 Label=io.ziggy.generation=%d
+Label=io.ziggy.owner=ziggy-runtime-manager
 Label=io.ziggy.egress=enforce-required
 Exec=nanobot gateway --config /run/ziggy/config/config.json
 

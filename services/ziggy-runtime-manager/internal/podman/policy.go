@@ -12,9 +12,10 @@ import (
 )
 
 const (
-	defaultEgressProxy = "http://egress-proxy:18080"
-	minRuntimePort     = 21000
-	maxRuntimePort     = 29999
+	defaultEgressProxy  = "http://egress-proxy:18080"
+	minRuntimePort      = 21000
+	maxRuntimePort      = 29999
+	canaryCapabilityTTL = 15 * time.Minute
 )
 
 var (
@@ -52,6 +53,8 @@ func NewCapability(expiresAt time.Time) (Capability, error) {
 	return Capability{Value: base64.RawURLEncoding.EncodeToString(buf), ExpiresAt: expiresAt.UTC()}, nil
 }
 
+// Validate applies the Phase 1 canary policy. Production must replace this
+// static, short-lived policy file with atomic credential rotation and reload.
 func (p Policy) Validate(now time.Time) error {
 	return p.validate(now, true)
 }
@@ -83,8 +86,8 @@ func (p Policy) validate(now time.Time, requireFreshCapabilities bool) error {
 			if !capabilityPattern.MatchString(capability.Value) {
 				return fmt.Errorf("workspace %s has invalid %s capability", workspaceID, name)
 			}
-			if requireFreshCapabilities && (!capability.ExpiresAt.After(now.UTC()) || capability.ExpiresAt.After(now.UTC().Add(15*time.Minute))) {
-				return fmt.Errorf("workspace %s has %s capability outside the 15 minute window", workspaceID, name)
+			if requireFreshCapabilities && (!capability.ExpiresAt.After(now.UTC()) || capability.ExpiresAt.After(now.UTC().Add(canaryCapabilityTTL))) {
+				return fmt.Errorf("workspace %s has %s capability outside the canary 15 minute window", workspaceID, name)
 			}
 			if other, exists := caps[capability.Value]; exists {
 				return fmt.Errorf("workspace %s reuses capability from %s", workspaceID, other)

@@ -9,6 +9,7 @@ import (
 
 var (
 	ErrUnknownWorkspace   = errors.New("runtime workspace is not allocated")
+	ErrInvalidWorkspace   = errors.New("runtime workspace ID is invalid")
 	ErrInvalidGeneration  = errors.New("runtime generation must be positive")
 	ErrStaleGeneration    = errors.New("runtime request generation is stale")
 	ErrGenerationConflict = errors.New("runtime generation conflicts with a live runtime")

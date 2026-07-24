@@ -55,6 +55,13 @@ type Driver struct {
 	Now        func() time.Time
 }
 
+const (
+	managerOwnerLabel = "io.ziggy.owner"
+	managerOwnerValue = "ziggy-runtime-manager"
+	workspaceLabel    = "io.ziggy.workspace"
+	generationLabel   = "io.ziggy.generation"
+)
+
 func (d Driver) EnsureRunning(ctx context.Context, request runtime.Request) (runtime.Status, error) {
 	if err := d.validateRequest(request, true); err != nil {
 		return runtime.Status{}, err
@@ -176,12 +183,13 @@ func (d Driver) stage(ctx context.Context, request runtime.Request) error {
 	if err != nil {
 		return err
 	}
-	container, rootVolume, configVolume := tenantNames(request)
-	_ = container
-	for _, args := range [][]string{{"network", "create", "--internal", egressNetwork(request)}, {"volume", "create", rootVolume}, {"volume", "create", configVolume}} {
-		result, runErr := d.Runner.Run(ctx, Command{Path: "podman", Args: args})
-		if runErr != nil || (result.ExitCode != 0 && result.ExitCode != 125) {
-			return errors.New("runtime prerequisite creation failed")
+	_, rootVolume, configVolume := tenantNames(request)
+	if err := d.ensureNetwork(ctx, request); err != nil {
+		return err
+	}
+	for _, volume := range []string{rootVolume, configVolume} {
+		if err := d.ensureVolume(ctx, request, volume); err != nil {
+			return err
 		}
 	}
 	stageArgs := []string{"run", "--rm", "--network", "none", "--read-only", "--cap-drop", "all", "--security-opt", "no-new-privileges", "--userns", "auto:size=65536", "--volume", configVolume + ":/run/ziggy/config:rw,U,Z", "--entrypoint", "/usr/local/bin/ziggy-runtime-stage-config", d.Policy.ImageDigest}
@@ -197,6 +205,74 @@ func (d Driver) stage(ctx context.Context, request runtime.Request) error {
 		return err
 	}
 	return d.systemctl(ctx, "daemon-reload")
+}
+
+func (d Driver) ensureNetwork(ctx context.Context, request runtime.Request) error {
+	name := egressNetwork(request)
+	args := append([]string{"network", "create", "--internal"}, labelArgs(request)...)
+	args = append(args, name)
+	return d.createAndVerify(ctx, Command{Path: "podman", Args: args}, Command{Path: "podman", Args: []string{"network", "inspect", "--format", "{{json .}}", name}}, func(raw []byte) error {
+		var inspection struct {
+			Internal bool              `json:"internal"`
+			Labels   map[string]string `json:"labels"`
+		}
+		if err := json.Unmarshal(raw, &inspection); err != nil || !inspection.Internal || !labelsMatch(inspection.Labels, request) {
+			return errors.New("runtime network is not manager-owned and internal")
+		}
+		return nil
+	})
+}
+
+func (d Driver) ensureVolume(ctx context.Context, request runtime.Request, name string) error {
+	args := append([]string{"volume", "create"}, labelArgs(request)...)
+	args = append(args, name)
+	return d.createAndVerify(ctx, Command{Path: "podman", Args: args}, Command{Path: "podman", Args: []string{"volume", "inspect", "--format", "{{json .}}", name}}, func(raw []byte) error {
+		var inspection struct {
+			Labels map[string]string `json:"Labels"`
+		}
+		if err := json.Unmarshal(raw, &inspection); err != nil || !labelsMatch(inspection.Labels, request) {
+			return errors.New("runtime volume is not manager-owned")
+		}
+		return nil
+	})
+}
+
+func (d Driver) createAndVerify(ctx context.Context, create, inspect Command, verify func([]byte) error) error {
+	created, err := d.Runner.Run(ctx, create)
+	if err != nil || (created.ExitCode != 0 && created.ExitCode != 125) {
+		return errors.New("runtime prerequisite creation failed")
+	}
+	observed, err := d.Runner.Run(ctx, inspect)
+	if err != nil || observed.ExitCode != 0 || verify([]byte(observed.Stdout)) != nil {
+		return errors.New("runtime prerequisite ownership verification failed")
+	}
+	return nil
+}
+
+func labelArgs(request runtime.Request) []string {
+	labels := lifecycleLabels(request)
+	return []string{
+		"--label", managerOwnerLabel + "=" + labels[managerOwnerLabel],
+		"--label", workspaceLabel + "=" + labels[workspaceLabel],
+		"--label", generationLabel + "=" + labels[generationLabel],
+	}
+}
+
+func lifecycleLabels(request runtime.Request) map[string]string {
+	return map[string]string{
+		managerOwnerLabel: managerOwnerValue,
+		workspaceLabel:    request.WorkspaceID,
+		generationLabel:   strconv.FormatUint(request.Generation, 10),
+	}
+}
+
+func labelsMatch(actual map[string]string, request runtime.Request) bool {
+	for key, value := range lifecycleLabels(request) {
+		if actual[key] != value {
+			return false
+		}
+	}
+	return true
 }
 
 func (d Driver) currentGeneration(ctx context.Context, request runtime.Request) (uint64, bool, error) {
@@ -239,7 +315,10 @@ func (d Driver) assertCurrent(ctx context.Context, request runtime.Request) erro
 }
 
 func (d Driver) validateRequest(request runtime.Request, requireFreshCapabilities bool) error {
-	if !request.Valid() || !workspaceIDPattern.MatchString(request.WorkspaceID) {
+	if !workspaceIDPattern.MatchString(request.WorkspaceID) {
+		return runtime.ErrInvalidWorkspace
+	}
+	if request.Generation == 0 {
 		return runtime.ErrInvalidGeneration
 	}
 	if err := d.Policy.validate(d.now(), requireFreshCapabilities); err != nil {

@@ -24,6 +24,9 @@ deploy a production runtime, or enable Nanobot shell execution by default.
    Its controlled uplink may reach only the model gateway and tenant MCP broker.
 5. Allocate two disposable workspaces, distinct loopback ports, distinct model
    and MCP capabilities, and different generations. Keep Nanobot exec disabled.
+   The manager's 15-minute capability lifetime is canary-only; issue fresh
+   capabilities immediately before each start and do not treat policy-file
+   replacement as credential rotation.
 
 ## Canary Sequence
 
@@ -55,6 +58,12 @@ deploy a production runtime, or enable Nanobot shell execution by default.
    after every test passes may one disposable tenant enable Nanobot exec with
    bwrap configured to fail closed. Re-run the full matrix before moving from
    one to five canaries.
+
+Production migration is blocked on atomic broker credential rotation and an
+atomic manager policy reload. The reload must preserve a complete old or new
+credential set for each runtime generation, coordinate with the PostgreSQL
+lease/fence, and revoke old capabilities only after the replacement is fenced
+and healthy.
 
 ## Rollback
 
