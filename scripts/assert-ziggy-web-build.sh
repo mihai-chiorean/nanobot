@@ -18,4 +18,3 @@ fi
 
 python3 "$root/scripts/validate-ziggy-product-split.py" --export "$root"
 printf 'web_build_boundary=passed\n'
-

@@ -79,16 +79,22 @@ mkdir -p "$content_secrets/web/src"
 private_key='-----BEGIN '"PRIVATE KEY-----"
 for secret in \
   "$private_key" \
-  'glc_''1234567890' \
-  'sk_live_''1234567890' \
-  'sk_test_''1234567890' \
-  'AIza''SyA12345678901234567890'; do
+  'glc_''12345678901234567890123456789012' \
+  'sk_live_''123456789012345678901234' \
+  'sk_test_''123456789012345678901234' \
+  'AIza''12345678901234567890123456789012345'; do
   printf 'credential = "%s"\n' "$secret" > "$content_secrets/web/src/credential-fixture.ts"
   if python3 "$validator" --export "$content_secrets" >/dev/null 2>&1; then
     printf 'error: validator accepted secret content: %s\n' "$secret" >&2
     exit 1
   fi
 done
+
+printf 'TOKEN=%s\n' "$secret" > "$content_secrets/web/src/.env.example"
+if python3 "$validator" --export "$content_secrets" >/dev/null 2>&1; then
+  printf 'error: validator accepted a realistic token in .env.example\n' >&2
+  exit 1
+fi
 
 examples="$tmp_dir/explicit-examples"
 bad_baseline="$tmp_dir/bad-baseline-lock"
@@ -126,7 +132,7 @@ fi
 
 cp -a "$export_dir" "$examples"
 mkdir -p "$examples/web/src"
-example_token='glc_'"placeholder_1234567890"
+example_token='glc_'"EXAMPLE_PLACEHOLDER"
 printf 'credential = "%s"\n' "$example_token" > "$examples/web/src/credential-fixture.example.ts"
 python3 "$validator" --export "$examples" >/dev/null
 

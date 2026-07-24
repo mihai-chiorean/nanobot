@@ -160,9 +160,10 @@ Secrets and generated artifacts are excluded in two ways: the exporter
 requires a clean source worktree and enumerates git-tracked files only, and
 the validator rejects secret-like names, unknown top-level paths, root
 nanobot/, and generated fork packaging paths. Nested real .env files are
-rejected. Bounded text scans reject private-key headers, glc_ tokens,
-sk_live_/sk_test_ tokens, and Google API key forms; explicit example,
-sample, and placeholder paths are exempt so fixtures remain usable.
+rejected. Bounded text scans include example and sample files and reject
+private-key headers, Grafana Cloud glc_ tokens, sk_live_/sk_test_ tokens, and
+Google API key forms. Fixtures use explicit non-matching placeholders; only
+generated dependency and build directories are skipped from content scanning.
 
 The web CI runs npm audit --audit-level=high as a non-blocking report and then
 validates the product tree again after npm run build. The current lockfile
