@@ -209,6 +209,68 @@ func TestPostgresRuntimeActivationAndDeletionTransitions(t *testing.T) {
 	}
 }
 
+func TestPostgresRuntimeActivationRejectsSharedEndpointOrSecret(t *testing.T) {
+	db, store, ctx := integrationStore(t)
+	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
+	firstID, first := pendingActivation(t, db, store, ctx, "first-"+suffix+"@example.com", "clerk-first-"+suffix)
+	secondID, second := pendingActivation(t, db, store, ctx, "second-"+suffix+"@example.com", "clerk-second-"+suffix)
+	thirdID, third := pendingActivation(t, db, store, ctx, "third-"+suffix+"@example.com", "clerk-third-"+suffix)
+	t.Cleanup(func() { cleanupUser(db, firstID) })
+	t.Cleanup(func() { cleanupUser(db, secondID) })
+	t.Cleanup(func() { cleanupUser(db, thirdID) })
+
+	first.UpstreamURL = "http://127.0.0.1:8765"
+	first.UpstreamBootstrapSecret = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	if err := store.ActivateRuntime(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	second.UpstreamURL = first.UpstreamURL
+	second.UpstreamBootstrapSecret = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	if err := store.ActivateRuntime(ctx, second); !errors.Is(err, ErrActivationConflict) {
+		t.Fatalf("shared upstream URL activation error = %v", err)
+	}
+	third.UpstreamURL = "http://127.0.0.1:8766"
+	third.UpstreamBootstrapSecret = first.UpstreamBootstrapSecret
+	if err := store.ActivateRuntime(ctx, third); !errors.Is(err, ErrActivationConflict) {
+		t.Fatalf("shared bootstrap secret activation error = %v", err)
+	}
+
+	var firstState, firstURL, firstSecret string
+	if err := db.QueryRowContext(ctx, `SELECT allocation_state, upstream_url, upstream_bootstrap_secret FROM ziggy_tenant_runtime_allocations WHERE user_id=$1`, firstID).Scan(&firstState, &firstURL, &firstSecret); err != nil {
+		t.Fatal(err)
+	}
+	if firstState != "active" || firstURL != first.UpstreamURL || firstSecret != first.UpstreamBootstrapSecret {
+		t.Fatalf("first runtime changed after conflict: state=%q url=%q secret=%q", firstState, firstURL, firstSecret)
+	}
+	for _, userID := range []string{secondID, thirdID} {
+		var state, upstreamURL, secret string
+		if err := db.QueryRowContext(ctx, `SELECT allocation_state, upstream_url, upstream_bootstrap_secret FROM ziggy_tenant_runtime_allocations WHERE user_id=$1`, userID).Scan(&state, &upstreamURL, &secret); err != nil {
+			t.Fatal(err)
+		}
+		if state != "pending" || upstreamURL != "" || secret != "" {
+			t.Fatalf("conflicting runtime %q changed: state=%q url=%q secret=%q", userID, state, upstreamURL, secret)
+		}
+	}
+}
+
+func pendingActivation(t *testing.T, db *sql.DB, store *Store, ctx context.Context, email, subject string) (string, RuntimeActivation) {
+	t.Helper()
+	userID, err := store.Invite(ctx, email)
+	if err != nil {
+		t.Fatal(err)
+	}
+	allocation, err := store.Resolve(ctx, identity.Principal{Subject: subject, Email: email})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var runtimeID string
+	var generation int64
+	if err := db.QueryRowContext(ctx, `SELECT runtime_id, generation FROM ziggy_tenant_runtime_allocations WHERE user_id=$1`, userID).Scan(&runtimeID, &generation); err != nil {
+		t.Fatal(err)
+	}
+	return userID, RuntimeActivation{UserID: userID, WorkspaceID: allocation.WorkspaceID, RuntimeID: runtimeID, ExpectedGeneration: generation}
+}
+
 func integrationStore(t *testing.T) (*sql.DB, *Store, context.Context) {
 	t.Helper()
 	databaseURL := os.Getenv("ZIGGY_CONTROL_TEST_DATABASE_URL")
@@ -237,12 +299,16 @@ func integrationStore(t *testing.T) (*sql.DB, *Store, context.Context) {
 }
 
 func applyMigration(ctx context.Context, db *sql.DB) error {
-	contents, err := os.ReadFile(filepath.Join("..", "..", "migrations", "001_tenant_lifecycle_foundation.sql"))
-	if err != nil {
-		return err
+	for _, filename := range []string{"001_tenant_lifecycle_foundation.sql", "002_runtime_allocation_isolation.sql"} {
+		contents, err := os.ReadFile(filepath.Join("..", "..", "migrations", filename))
+		if err != nil {
+			return err
+		}
+		if _, err := db.ExecContext(ctx, string(contents)); err != nil {
+			return err
+		}
 	}
-	_, err = db.ExecContext(ctx, string(contents))
-	return err
+	return nil
 }
 
 func cleanupUser(db *sql.DB, userID string) {

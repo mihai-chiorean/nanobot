@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/mihai-chiorean/nanobot/services/ziggy-control/internal/config"
 	"github.com/mihai-chiorean/nanobot/services/ziggy-control/internal/identity"
 	"github.com/mihai-chiorean/nanobot/services/ziggy-control/internal/tenant"
@@ -23,6 +24,7 @@ var (
 	ErrRuntimeUnavailable = errors.New("tenant runtime is unavailable")
 	ErrInvalidTransition  = errors.New("tenant lifecycle transition is invalid")
 	ErrActivationMismatch = errors.New("runtime activation does not match the pending allocation")
+	ErrActivationConflict = errors.New("runtime endpoint allocation is already in use")
 )
 
 type RuntimeAllocation struct {
@@ -314,7 +316,7 @@ WHERE workspace_id=$1 AND user_id=$2 AND runtime_id=$3 AND generation=$4 AND all
 		activation.WorkspaceID, activation.UserID, activation.RuntimeID, activation.ExpectedGeneration,
 		activation.UpstreamURL, activation.UpstreamBootstrapSecret, now)
 	if err != nil {
-		return err
+		return activationError(err)
 	}
 	if changed, _ := result.RowsAffected(); changed != 1 {
 		return ErrActivationMismatch
@@ -488,6 +490,14 @@ func validActivation(activation RuntimeActivation) error {
 		return fmt.Errorf("runtime activation upstream: %w", err)
 	}
 	return nil
+}
+
+func activationError(err error) error {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+		return ErrActivationConflict
+	}
+	return err
 }
 
 func bootstrapAllowed(status string) bool { return status == "invited" || status == "active" }
