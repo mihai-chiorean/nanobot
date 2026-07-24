@@ -1,0 +1,16 @@
+# Build only with NANOBOT_BASE_IMAGE set to a reviewed, immutable digest.
+ARG NANOBOT_BASE_IMAGE
+FROM ${NANOBOT_BASE_IMAGE}
+
+USER root
+COPY stage-config.sh /usr/local/bin/ziggy-runtime-stage-config
+RUN chmod 0555 /usr/local/bin/ziggy-runtime-stage-config
+
+# The base image provides this non-root user. No package manager or login setup
+# is added by this layer; package changes require a reviewed base-image rebuild.
+USER 1000:1000
+WORKDIR /home/nanobot
+# Clear any inherited entrypoint so both the runtime command and the hard-coded
+# config staging helper have unambiguous execution semantics.
+ENTRYPOINT []
+CMD ["nanobot", "gateway", "--config", "/run/ziggy/config/config.json"]

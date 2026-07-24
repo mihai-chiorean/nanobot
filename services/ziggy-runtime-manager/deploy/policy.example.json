@@ -1,0 +1,17 @@
+{
+  "image_digest": "registry.example.invalid/ziggy/nanobot-runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "tenants": {
+    "canary-tenant-a": {
+      "host_port": 21001,
+      "model": "local/model",
+      "model_capability": {
+        "value": "replace-with-unique-43-char-or-longer-generation-capability",
+        "expires_at": "2026-07-24T00:15:00Z"
+      },
+      "mcp_capability": {
+        "value": "replace-with-a-different-43-char-generation-capability",
+        "expires_at": "2026-07-24T00:15:00Z"
+      }
+    }
+  }
+}

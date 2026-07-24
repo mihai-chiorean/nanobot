@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "enforcement": "enforce",
+  "default_action": "deny",
+  "tenant_network": "internal-only",
+  "deny": {
+    "raw_tcp": true,
+    "udp": true,
+    "direct_ipv4": true,
+    "direct_ipv6": true,
+    "dns_to_external_resolvers": true,
+    "connect_tunnels": true,
+    "redirect_to_unapproved_authority": true
+  },
+  "routes": [
+    {
+      "name": "model",
+      "listener_path": "/model/v1",
+      "methods": ["POST"],
+      "upstream_service": "ziggy-model-gateway",
+      "generation_capability": "required",
+      "tenant_scope": "required"
+    },
+    {
+      "name": "mcp",
+      "listener_path": "/mcp",
+      "methods": ["POST"],
+      "upstream_service": "ziggy-tenant-mcp-broker",
+      "generation_capability": "required",
+      "tenant_scope": "required"
+    }
+  ]
+}
