@@ -35,6 +35,8 @@
 	</array>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.productivity</string>
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Ziggy uses the microphone when you dictate a prompt.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
