@@ -58,4 +58,76 @@ if python3 "$validator" --export "$bulk" >/dev/null 2>&1; then
   exit 1
 fi
 
+web_build="$tmp_dir/web-build"
+cp -a "$export_dir" "$web_build"
+mkdir -p "$web_build/web/dist"
+printf 'fixture build output\n' > "$web_build/web/dist/index.html"
+"$source_dir/scripts/assert-ziggy-web-build.sh" "$web_build" >/dev/null
+
+nested_env="$tmp_dir/nested-env"
+cp -a "$export_dir" "$nested_env"
+mkdir -p "$nested_env/web/src/config"
+printf 'REAL_SECRET=not-an-example\n' > "$nested_env/web/src/config/.env"
+if python3 "$validator" --export "$nested_env" >/dev/null 2>&1; then
+  printf 'error: validator accepted a nested .env file\n' >&2
+  exit 1
+fi
+
+content_secrets="$tmp_dir/content-secrets"
+cp -a "$export_dir" "$content_secrets"
+mkdir -p "$content_secrets/web/src"
+private_key='-----BEGIN '"PRIVATE KEY-----"
+for secret in \
+  "$private_key" \
+  'glc_''1234567890' \
+  'sk_live_''1234567890' \
+  'sk_test_''1234567890' \
+  'AIza''SyA12345678901234567890'; do
+  printf 'credential = "%s"\n' "$secret" > "$content_secrets/web/src/credential-fixture.ts"
+  if python3 "$validator" --export "$content_secrets" >/dev/null 2>&1; then
+    printf 'error: validator accepted secret content: %s\n' "$secret" >&2
+    exit 1
+  fi
+done
+
+examples="$tmp_dir/explicit-examples"
+bad_baseline="$tmp_dir/bad-baseline-lock"
+cp -a "$export_dir" "$bad_baseline"
+python3 - "$bad_baseline/.ziggy/nanobot.lock.json" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+data = json.loads(open(path, encoding="utf-8").read())
+data["upstream_baseline"]["commit"] = "1" * 40
+open(path, "w", encoding="utf-8").write(json.dumps(data, indent=2, sort_keys=True) + "\n")
+PY
+if python3 "$validator" --export "$bad_baseline" >/dev/null 2>&1; then
+  printf 'error: validator accepted a mismatched upstream baseline pin\n' >&2
+  exit 1
+fi
+
+bad_effective="$tmp_dir/bad-effective-lock"
+cp -a "$export_dir" "$bad_effective"
+python3 - "$bad_effective/.ziggy/nanobot.lock.json" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+data = json.loads(open(path, encoding="utf-8").read())
+data["effective_runtime"]["commit"] = "2" * 40
+open(path, "w", encoding="utf-8").write(json.dumps(data, indent=2, sort_keys=True) + "\n")
+PY
+if python3 "$validator" --export "$bad_effective" >/dev/null 2>&1; then
+  printf 'error: validator accepted a mismatched effective runtime pin\n' >&2
+  exit 1
+fi
+
+
+cp -a "$export_dir" "$examples"
+mkdir -p "$examples/web/src"
+example_token='glc_'"placeholder_1234567890"
+printf 'credential = "%s"\n' "$example_token" > "$examples/web/src/credential-fixture.example.ts"
+python3 "$validator" --export "$examples" >/dev/null
+
 printf 'split_validation_tests=passed\n'

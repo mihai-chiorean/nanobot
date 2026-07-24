@@ -24,7 +24,7 @@ scripts/test-ziggy-product-split.sh.
 
 ~~~text
 .
-├── ios/                         SwiftUI client, project, and XCTest targets
+├── ios/                         SwiftUI client, Swift Testing, and UI XCTest target
 ├── web/                         branded PWA, assets, tests, and bridge extension
 ├── services/
 │   ├── ziggy-control/           authenticated product front door
@@ -42,12 +42,14 @@ scripts/test-ziggy-product-split.sh.
 └── .ziggy/                      export metadata and Nanobot lock
 ~~~
 
-The source webui/ directory is renamed to web/. The source bridge/ directory
-is placed at web/bridge/. The three service directories are preserved so their
-Go modules, tests, migrations, and service-local deployment assets remain
-together. observability/ is promoted from services/observability/. Root
-runbooks/ and research/ are indexes only; the canonical documents stay under
-docs/ so existing relative links remain valid.
+The source webui/ directory is renamed to web/. The export transform rewrites
+the copied Vite config so its output is web/dist, never ../nanobot/web/dist.
+The source bridge/ directory is placed at web/bridge/. The three service
+directories are preserved so their Go modules, tests, migrations, and
+service-local deployment assets remain together. observability/ is promoted
+from services/observability/. Root runbooks/ and research/ are indexes only;
+the canonical documents stay under docs/ so existing relative links remain
+valid.
 
 The export intentionally omits root Python tests, pyproject.toml, Dockerfile,
 docker-compose.yml, entrypoint.sh, Nanobot source, and the generated
@@ -56,7 +58,7 @@ subdirectory.
 
 ## Dependency pin and update model
 
-The initial dependency contract is:
+The upstream baseline contract is:
 
 ~~~text
 repository: https://github.com/HKUDS/nanobot.git
@@ -64,16 +66,24 @@ ref:        v0.1.5.post3
 commit:     0b1631f33d8040802aa09d66a01bc731e3cb85a2
 ~~~
 
-The same values are emitted to .ziggy/nanobot.lock.json. A deployment may
-replace the source pin with an immutable container digest or wheel URL; the
-lock schema carries commit, tag, and artifact-digest forms so deployments do
-not need to change product source code.
+This baseline is not the effective production runtime yet. Plain upstream
+v0.1.5.post3 is not runnable for Ziggy while the patch queue in this document
+remains. Until a patched image digest or wheel exists, the exporter emits an
+effective_runtime pin of kind source-export using the source repository, source
+ref, and exact export commit. That pin is the runtime currently being handed
+off to deployment. The lock therefore records both upstream_baseline and
+effective_runtime; validation requires both to agree with the export metadata.
+
+A deployment may replace effective_runtime with an immutable patched container
+digest or wheel URL after the patch queue is packaged. That transition changes
+the effective pin, not Ziggy product history or the upstream baseline.
 
 An update is a dependency change, not a product rebase:
 
 1. Select a Nanobot tag or commit, or build a separately owned runtime artifact
    with an immutable digest.
-2. Update ref and commit together in the split manifest.
+2. Update the upstream baseline ref and commit together in the split manifest;
+   the effective source-export pin is generated from the export source.
 3. Run the product contract tests: WebSocket authentication and transport,
    Work command/event compatibility, MCP OAuth, memory path safety, and the
    three Go service suites.
@@ -149,8 +159,15 @@ module metadata.
 Secrets and generated artifacts are excluded in two ways: the exporter
 requires a clean source worktree and enumerates git-tracked files only, and
 the validator rejects secret-like names, unknown top-level paths, root
-nanobot/, and generated fork packaging paths. .env.example files are allowed;
-real .env files are not.
+nanobot/, and generated fork packaging paths. Nested real .env files are
+rejected. Bounded text scans reject private-key headers, glc_ tokens,
+sk_live_/sk_test_ tokens, and Google API key forms; explicit example,
+sample, and placeholder paths are exempt so fixtures remain usable.
+
+The web CI runs npm audit --audit-level=high as a non-blocking report and then
+validates the product tree again after npm run build. The current lockfile
+reports two high and two critical advisories; they require dependency-owner
+triage and targeted upgrades, not broad force upgrades.
 
 ## History strategy
 

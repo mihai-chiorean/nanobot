@@ -46,14 +46,21 @@ def load_manifest(root: Path) -> dict:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         fail(f"manifest is not valid JSON: {exc}")
-    if manifest.get("schema") != 1:
+    if manifest.get("schema") != 2:
         fail("unsupported manifest schema")
     dependency = manifest.get("nanobot_dependency", {})
-    commit = dependency.get("commit", "")
+    baseline = dependency.get("upstream_baseline", {})
+    commit = baseline.get("commit", "")
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
-        fail("Nanobot dependency must contain a 40-character commit pin")
-    if not dependency.get("repository") or not dependency.get("ref"):
-        fail("Nanobot dependency must contain repository and ref")
+        fail("Nanobot upstream baseline must contain a 40-character commit pin")
+    if not baseline.get("package") or not baseline.get("repository") or not baseline.get("ref"):
+        fail("Nanobot upstream baseline must contain package, repository, and ref")
+    policy = dependency.get("effective_runtime_policy", {})
+    if policy.get("pre_artifact_kind") != "source-export":
+        fail("effective runtime must use source-export until an artifact pin exists")
+    artifact = policy.get("artifact")
+    if not isinstance(artifact, dict) or set(artifact) != {"image", "digest", "wheel"}:
+        fail("effective runtime artifact policy must declare image, digest, and wheel")
     patches = manifest.get("patches", [])
     orders = []
     patch_ids = set()
@@ -76,6 +83,14 @@ def load_manifest(root: Path) -> dict:
         fail("patch entries must be listed in removal order")
     if not manifest.get("entries") or not manifest.get("generated"):
         fail("manifest must contain entries and generated files")
+    for rule in manifest["validation"].get("required_output_text", []):
+        if not rule.get("path") or not rule.get("contains"):
+            fail("required output text rules must contain path and contains")
+    for pattern in manifest["validation"].get("secret_content_patterns", []):
+        try:
+            re.compile(pattern["regex"])
+        except (KeyError, re.error) as exc:
+            fail(f"invalid secret content pattern: {exc}")
     return manifest
 
 
@@ -105,6 +120,48 @@ def all_export_files(export: Path) -> list[Path]:
     return files
 
 
+def path_is_exempt(relative: str, patterns: list[re.Pattern[str]]) -> bool:
+    return any(pattern.search(relative) for pattern in patterns)
+
+
+def validate_text_content(export: Path, manifest: dict, files: list[Path]) -> None:
+    validation = manifest["validation"]
+    max_file_bytes = validation["secret_content_max_file_bytes"]
+    max_total_bytes = validation["secret_content_max_total_bytes"]
+    content_patterns = [
+        (item["id"], re.compile(item["regex"]))
+        for item in validation["secret_content_patterns"]
+    ]
+    exempt_patterns = [
+        re.compile(pattern)
+        for pattern in validation.get("secret_content_exempt_path_patterns", [])
+    ]
+    scanned_bytes = 0
+    for path in files:
+        if not path.is_file() or path.is_symlink():
+            continue
+        relative = path.relative_to(export).as_posix()
+        if path_is_exempt(relative, exempt_patterns):
+            continue
+        size = path.stat().st_size
+        with path.open("rb") as handle:
+            data = handle.read(max_file_bytes + 1)
+        if b"\0" in data[:8192]:
+            continue
+        if size > max_file_bytes:
+            fail(f"text file exceeds bounded secret scan limit: {relative}")
+        scanned_bytes += len(data)
+        if scanned_bytes > max_total_bytes:
+            fail("export exceeds bounded total secret scan limit")
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        for pattern_id, pattern in content_patterns:
+            if pattern.search(text):
+                fail(f"possible secret content ({pattern_id}) is present: {relative}")
+
+
 def validate_export(export: Path, manifest: dict) -> None:
     if not export.is_dir():
         fail(f"export directory does not exist: {export}")
@@ -125,7 +182,8 @@ def validate_export(export: Path, manifest: dict) -> None:
         re.compile(pattern)
         for pattern in manifest["validation"]["secret_filename_patterns"]
     ]
-    for path in all_export_files(export):
+    files = all_export_files(export)
+    for path in files:
         relative = path.relative_to(export).as_posix()
         top_level = relative.split("/", 1)[0]
         if top_level in forbidden:
@@ -139,15 +197,29 @@ def validate_export(export: Path, manifest: dict) -> None:
         if path.is_file() and any(pattern.search(relative) for pattern in filename_patterns):
             fail(f"possible secret path is present: {relative}")
 
+    for rule in manifest["validation"].get("required_output_text", []):
+        rule_path = export / rule["path"]
+        if not rule_path.is_file():
+            fail(f"required output text file is missing: {rule['path']}")
+        content = rule_path.read_text(encoding="utf-8")
+        if rule["contains"] not in content:
+            fail(f"required output text is missing from {rule['path']}: {rule['contains']}")
+        if rule.get("absent") and rule["absent"] in content:
+            fail(f"forbidden output text is present in {rule['path']}: {rule['absent']}")
+
+    validate_text_content(export, manifest, files)
+
     lock_path = export / ".ziggy/nanobot.lock.json"
     try:
         lock = json.loads(lock_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         fail(f"cannot read Nanobot lock metadata: {exc}")
     dependency = manifest["nanobot_dependency"]
-    for key in ("package", "repository", "ref", "commit"):
-        if lock.get(key) != dependency[key]:
-            fail(f"Nanobot lock does not match manifest field: {key}")
+    if lock.get("schema") != 2:
+        fail("Nanobot lock has an unsupported schema")
+    baseline = dependency["upstream_baseline"]
+    if lock.get("upstream_baseline") != baseline:
+        fail("Nanobot lock upstream baseline does not match the manifest")
 
     metadata_path = export / ".ziggy/export-metadata.json"
     try:
@@ -156,8 +228,25 @@ def validate_export(export: Path, manifest: dict) -> None:
         fail(f"cannot read export metadata: {exc}")
     if not re.fullmatch(r"[0-9a-f]{40}", metadata.get("source_commit", "")):
         fail("export metadata does not contain a source commit")
-    if metadata.get("nanobot_dependency", {}).get("commit") != dependency["commit"]:
-        fail("export metadata Nanobot pin does not match manifest")
+    if not metadata.get("source_repository") or not metadata.get("source_ref"):
+        fail("export metadata does not contain a source repository and ref")
+    if metadata.get("schema") != 2:
+        fail("export metadata has an unsupported schema")
+    effective = lock.get("effective_runtime", {})
+    expected_effective = {
+        "kind": dependency["effective_runtime_policy"]["pre_artifact_kind"],
+        "repository": metadata["source_repository"],
+        "ref": metadata["source_ref"],
+        "commit": metadata["source_commit"],
+        "artifact": dependency["effective_runtime_policy"]["artifact"],
+    }
+    if effective != expected_effective:
+        fail("Nanobot lock effective runtime does not match export source metadata")
+    metadata_dependency = metadata.get("nanobot_dependency", {})
+    if metadata_dependency.get("upstream_baseline") != baseline:
+        fail("export metadata upstream baseline does not match the manifest")
+    if metadata_dependency.get("effective_runtime") != expected_effective:
+        fail("export metadata effective runtime does not match the lock")
 
     if (export / "nanobot").exists():
         fail("Nanobot bulk copy detected at export root")

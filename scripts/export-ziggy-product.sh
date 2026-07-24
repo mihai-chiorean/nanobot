@@ -106,12 +106,29 @@ def relative_path(path: str, prefix: str) -> str:
     return path[len(prefix.rstrip("/")) + 1 :]
 
 
-def copy_file(source_path: Path, destination_path: Path) -> None:
+def copy_file(
+    source_path: Path,
+    destination_path: Path,
+    text_replacements: list[dict[str, str]] | None = None,
+) -> None:
     destination_path.parent.mkdir(parents=True, exist_ok=True)
     destination_key = destination_path.relative_to(destination).as_posix()
     if destination_key in copied:
         raise SystemExit(f"error: destination collision: {destination_key}")
-    if source_path.is_symlink():
+    if text_replacements:
+        content = source_path.read_text(encoding="utf-8")
+        for replacement in text_replacements:
+            old = replacement["from"]
+            new = replacement["to"]
+            count = content.count(old)
+            if count != 1:
+                raise SystemExit(
+                    f"error: expected one text replacement in {source_path}: {old} (found {count})"
+                )
+            content = content.replace(old, new)
+        destination_path.write_text(content, encoding="utf-8")
+        shutil.copymode(source_path, destination_path)
+    elif source_path.is_symlink():
         destination_path.symlink_to(os.readlink(source_path))
     else:
         shutil.copy2(source_path, destination_path)
@@ -124,7 +141,10 @@ for entry in manifest["entries"]:
         target_for = lambda _: entry["destination"]
     else:
         prefix = entry["source_prefix"]
-        source_paths = [path for path in tracked if matches(path, prefix)]
+        excluded = set(entry.get("exclude", []))
+        source_paths = [
+            path for path in tracked if matches(path, prefix) and path not in excluded
+        ]
 
         def target_for(path: str, entry: dict = entry) -> str:
             if path == entry["source_prefix"]:
@@ -138,14 +158,18 @@ for entry in manifest["entries"]:
         source_name = entry.get("source", entry.get("source_prefix"))
         raise SystemExit(f"error: required allowlist path has no tracked files: {source_name}")
     for source_path_string in source_paths:
-        copy_file(source / source_path_string, destination / target_for(source_path_string))
+        copy_file(
+            source / source_path_string,
+            destination / target_for(source_path_string),
+            entry.get("text_replacements"),
+        )
 
 
 source_commit = run("git", "rev-parse", "HEAD")
 try:
     source_ref = run("git", "symbolic-ref", "--quiet", "--short", "HEAD")
 except subprocess.CalledProcessError:
-    source_ref = "DETACHED"
+    source_ref = source_commit
 try:
     source_remote = run("git", "config", "--get", "remote.origin.url")
 except subprocess.CalledProcessError:
@@ -157,12 +181,14 @@ def generated(kind: str) -> str:
     if kind == "product_readme":
         return """# Ziggy Product
 
-This repository is the product-only Ziggy tree. Nanobot is consumed as a pinned
-upstream runtime; its source is intentionally not copied here.
+This repository is the product-only Ziggy tree. The Nanobot upstream baseline is
+pinned, but plain upstream is not the production runtime yet. Until the Ziggy
+patch queue is removed or packaged, production uses the effective patched
+runtime pinned in .ziggy/nanobot.lock.json; its source is not copied here.
 
 ## Layout
 
-- ios/: SwiftUI client and XCTest targets.
+- ios/: SwiftUI client, Swift Testing targets, and the UI XCTest target.
 - web/: branded PWA and its bridge extension.
 - services/ziggy-control/: authenticated product front door and tenant control plane.
 - services/ziggy-connectors/: tenant connector and MCP OAuth service.
@@ -172,9 +198,11 @@ upstream runtime; its source is intentionally not copied here.
 
 ## Nanobot dependency
 
-The exact dependency pin is in .ziggy/nanobot.lock.json. Runtime patches that
-have not landed upstream are delivered as a separately pinned runtime artifact or
-patch overlay; this repository must never vendor the full Nanobot tree.
+The upstream baseline and effective runtime pins are both in
+.ziggy/nanobot.lock.json. Plain upstream v0.1.5.post3 must not be deployed by
+itself: runtime patches that have not landed upstream are delivered as a
+separately pinned runtime artifact or patch overlay; this repository must never
+vendor the full Nanobot tree.
 
 ## Checks
 
@@ -183,6 +211,7 @@ patch overlay; this repository must never vendor the full Nanobot tree.
     cd ../services/ziggy-control && make verify
     cd ../ziggy-connectors && make verify
     cd ../ziggy-work && go test ./... && go test -race ./... && go vet ./... && go build ./...
+    cd ../../web && npm audit --audit-level=high
 
 The Swift and service CI mapping is generated at .github/workflows/ziggy-product.yml.
 """
@@ -279,6 +308,15 @@ jobs:
       - run: npm test
       - run: npm run lint
       - run: npm run build
+      - name: Report npm audit findings
+        run: npm audit --audit-level=high
+        continue-on-error: true
+      - name: Validate product tree after web build
+        working-directory: .
+        run: python3 scripts/validate-ziggy-product-split.py --export .
+      - name: Assert web build boundary
+        working-directory: .
+        run: scripts/assert-ziggy-web-build.sh .
 
   swift:
     runs-on: macos-26
@@ -335,29 +373,47 @@ jobs:
 """
         return ci.replace("@@{{", chr(36) + "{{")
     if kind == "export_metadata":
+        dependency = manifest["nanobot_dependency"]
+        baseline = dependency["upstream_baseline"]
+        effective_policy = dependency["effective_runtime_policy"]
         return json.dumps(
             {
-                "schema": 1,
+                "schema": 2,
                 "source_repository": source_remote,
                 "source_ref": source_ref,
                 "source_commit": source_commit,
                 "source_commit_date": run("git", "show", "-s", "--format=%cI", "HEAD"),
                 "manifest_sha256": manifest_sha256,
-                "nanobot_dependency": manifest["nanobot_dependency"],
+                "nanobot_dependency": {
+                    "upstream_baseline": baseline,
+                    "effective_runtime": {
+                        "kind": effective_policy["pre_artifact_kind"],
+                        "repository": source_remote,
+                        "ref": source_ref,
+                        "commit": source_commit,
+                        "artifact": effective_policy["artifact"],
+                    },
+                    "update_rule": dependency["update_rule"],
+                },
             },
             indent=2,
             sort_keys=True,
         ) + "\n"
     if kind == "nanobot_lock":
         dependency = manifest["nanobot_dependency"]
+        baseline = dependency["upstream_baseline"]
+        effective_policy = dependency["effective_runtime_policy"]
         return json.dumps(
             {
-                "schema": 1,
-                "package": dependency["package"],
-                "repository": dependency["repository"],
-                "ref": dependency["ref"],
-                "commit": dependency["commit"],
-                "artifact": dependency["artifact"],
+                "schema": 2,
+                "upstream_baseline": baseline,
+                "effective_runtime": {
+                    "kind": effective_policy["pre_artifact_kind"],
+                    "repository": source_remote,
+                    "ref": source_ref,
+                    "commit": source_commit,
+                    "artifact": effective_policy["artifact"],
+                },
                 "update_rule": dependency["update_rule"],
             },
             indent=2,

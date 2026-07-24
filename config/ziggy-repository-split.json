@@ -1,5 +1,5 @@
 {
-  "schema": 1,
+  "schema": 2,
   "name": "ziggy-product-repository",
   "source": {
     "base_ref": "origin/feat/ziggy-ios",
@@ -7,21 +7,37 @@
     "tracked_files_only": true
   },
   "nanobot_dependency": {
-    "package": "nanobot-ai",
-    "repository": "https://github.com/HKUDS/nanobot.git",
-    "ref": "v0.1.5.post3",
-    "commit": "0b1631f33d8040802aa09d66a01bc731e3cb85a2",
-    "pin_options": ["commit", "tag", "artifact_digest"],
-    "artifact": {
-      "image": null,
-      "digest": null,
-      "wheel": null
+    "upstream_baseline": {
+      "package": "nanobot-ai",
+      "repository": "https://github.com/HKUDS/nanobot.git",
+      "ref": "v0.1.5.post3",
+      "commit": "0b1631f33d8040802aa09d66a01bc731e3cb85a2",
+      "pin_options": ["commit", "tag", "artifact_digest"]
     },
-    "update_rule": "advance the ref and commit together; rerun the product contract tests before merging"
+    "effective_runtime_policy": {
+      "pre_artifact_kind": "source-export",
+      "artifact": {
+        "image": null,
+        "digest": null,
+        "wheel": null
+      }
+    },
+    "update_rule": "advance the upstream baseline and effective runtime together; rerun the product contract tests before merging"
   },
   "entries": [
     {"source_prefix": "ios", "destination_prefix": "ios", "required": true},
-    {"source_prefix": "webui", "destination_prefix": "web", "required": true},
+    {"source_prefix": "webui", "destination_prefix": "web", "exclude": ["webui/vite.config.ts"], "required": true},
+    {
+      "source": "webui/vite.config.ts",
+      "destination": "web/vite.config.ts",
+      "text_replacements": [
+        {
+          "from": "path.resolve(__dirname, \"../nanobot/web/dist\")",
+          "to": "path.resolve(__dirname, \"./dist\")"
+        }
+      ],
+      "required": true
+    },
     {"source_prefix": "bridge", "destination_prefix": "web/bridge", "required": true},
     {"source_prefix": "services/ziggy-control", "destination_prefix": "services/ziggy-control", "required": true},
     {"source_prefix": "services/ziggy-connectors", "destination_prefix": "services/ziggy-connectors", "required": true},
@@ -35,6 +51,7 @@
     {"source_prefix": "scripts/export-ziggy-product.sh", "destination_prefix": "scripts/export-ziggy-product.sh", "required": true},
     {"source_prefix": "scripts/validate-ziggy-product-split.py", "destination_prefix": "scripts/validate-ziggy-product-split.py", "required": true},
     {"source_prefix": "scripts/test-ziggy-product-split.sh", "destination_prefix": "scripts/test-ziggy-product-split.sh", "required": true},
+    {"source_prefix": "scripts/assert-ziggy-web-build.sh", "destination_prefix": "scripts/assert-ziggy-web-build.sh", "required": true},
     {"source": "LICENSE", "destination": "licenses/nanobot-MIT.txt", "required": true},
     {"source": "THIRD_PARTY_NOTICES.md", "destination": "licenses/nanobot-third-party-notices.md", "required": true}
   ],
@@ -67,6 +84,13 @@
       ".ziggy/export-metadata.json",
       ".ziggy/nanobot.lock.json"
     ],
+    "required_output_text": [
+      {
+        "path": "web/vite.config.ts",
+        "contains": "path.resolve(__dirname, \"./dist\")",
+        "absent": "../nanobot/web/dist"
+      }
+    ],
     "forbidden_output_prefixes": [
       "nanobot",
       "tests",
@@ -82,11 +106,36 @@
       "root-fork-copy"
     ],
     "secret_filename_patterns": [
-      "^\\.env$",
+      "(^|/)\\.env$",
       "\\.pem$",
       "\\.p12$",
       "\\.key$",
       "(^|/)(credentials|secrets?)(\\.|/|$)"
+    ],
+    "secret_content_max_file_bytes": 524288,
+    "secret_content_max_total_bytes": 16777216,
+    "secret_content_patterns": [
+      {
+        "id": "private-key-header",
+        "regex": "-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----"
+      },
+      {
+        "id": "clerk-secret-token",
+        "regex": "(?<![A-Za-z0-9])glc_[A-Za-z0-9_-]{8,}"
+      },
+      {
+        "id": "stripe-secret-token",
+        "regex": "(?<![A-Za-z0-9])sk_(?:live|test)_[A-Za-z0-9]{8,}"
+      },
+      {
+        "id": "google-api-key",
+        "regex": "(?<![A-Za-z0-9])AIza[0-9A-Za-z_-]{20,}"
+      }
+    ],
+    "secret_content_exempt_path_patterns": [
+      "(^|/)[^/]*\\.example(?:[^/]*)$",
+      "(^|/)[^/]*(?:sample|placeholder)[^/]*$",
+      "(^|/)(?:node_modules|dist|coverage|\\.vite|bin)(/|$)"
     ]
   },
   "patches": [
