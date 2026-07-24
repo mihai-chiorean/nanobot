@@ -240,39 +240,49 @@ func TestDeleteRequiresStoppedOrVerifiedInactiveUnit(t *testing.T) {
 	}
 }
 
-func TestDeleteAcceptsVerifiedInactiveUnitAfterStopFailure(t *testing.T) {
-	request := runtime.Request{WorkspaceID: "tenant-alpha", Generation: 7}
-	containerExists := true
-	var removed bool
-	runner := runnerFunc(func(_ context.Context, command Command) (Result, error) {
-		switch {
-		case command.Path == "podman" && command.Args[0] == "container" && command.Args[1] == "exists":
-			if !containerExists {
-				return Result{ExitCode: 1}, nil
+func TestDeleteAcceptsVerifiedInactiveOrAbsentUnitAfterStopFailure(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		unitState string
+	}{
+		{name: "loaded but inactive", unitState: "LoadState=loaded\nActiveState=inactive\n"},
+		{name: "unit absent", unitState: "LoadState=not-found\nActiveState=inactive\n"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request := runtime.Request{WorkspaceID: "tenant-alpha", Generation: 7}
+			containerExists := true
+			var removed bool
+			runner := runnerFunc(func(_ context.Context, command Command) (Result, error) {
+				switch {
+				case command.Path == "podman" && command.Args[0] == "container" && command.Args[1] == "exists":
+					if !containerExists {
+						return Result{ExitCode: 1}, nil
+					}
+					return Result{}, nil
+				case command.Path == "podman" && command.Args[0] == "inspect" && strings.Contains(command.Args[2], ".Config.Labels"):
+					return Result{Stdout: labelsJSON(lifecycleLabels(request))}, nil
+				case command.Path == "podman" && command.Args[0] == "rm":
+					containerExists = false
+					removed = true
+					return Result{}, nil
+				case command.Path == "podman" && len(command.Args) > 1 && command.Args[1] == "exists":
+					return Result{ExitCode: 1}, nil
+				case command.Path == "systemctl" && command.Args[1] == "stop":
+					return Result{ExitCode: 1}, nil
+				case command.Path == "systemctl" && command.Args[1] == "show":
+					return Result{Stdout: test.unitState}, nil
+				default:
+					return Result{}, nil
+				}
+			})
+			driver := Driver{Policy: fixturePolicy(), QuadletDir: t.TempDir(), Runner: runner, Now: func() time.Time { return fixtureNow }}
+			if err := driver.Delete(context.Background(), request); err != nil {
+				t.Fatal(err)
 			}
-			return Result{}, nil
-		case command.Path == "podman" && command.Args[0] == "inspect" && strings.Contains(command.Args[2], ".Config.Labels"):
-			return Result{Stdout: labelsJSON(lifecycleLabels(request))}, nil
-		case command.Path == "podman" && command.Args[0] == "rm":
-			containerExists = false
-			removed = true
-			return Result{}, nil
-		case command.Path == "podman" && len(command.Args) > 1 && command.Args[1] == "exists":
-			return Result{ExitCode: 1}, nil
-		case command.Path == "systemctl" && command.Args[1] == "stop":
-			return Result{ExitCode: 1}, nil
-		case command.Path == "systemctl" && command.Args[1] == "show":
-			return Result{Stdout: "LoadState=loaded\nActiveState=inactive\n"}, nil
-		default:
-			return Result{}, nil
-		}
-	})
-	driver := Driver{Policy: fixturePolicy(), QuadletDir: t.TempDir(), Runner: runner, Now: func() time.Time { return fixtureNow }}
-	if err := driver.Delete(context.Background(), request); err != nil {
-		t.Fatal(err)
-	}
-	if !removed {
-		t.Fatal("verified inactive unit did not permit owned container cleanup")
+			if !removed {
+				t.Fatal("verified inactive unit did not permit owned container cleanup")
+			}
+		})
 	}
 }
 
