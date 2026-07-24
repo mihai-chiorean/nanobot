@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -46,8 +47,14 @@ def load_manifest(root: Path) -> dict:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         fail(f"manifest is not valid JSON: {exc}")
-    if manifest.get("schema") != 2:
+    if manifest.get("schema") != 3:
         fail("unsupported manifest schema")
+    source = manifest.get("source", {})
+    repository = source.get("repository", "")
+    if not re.fullmatch(r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\.git", repository):
+        fail("source repository must be a canonical HTTPS GitHub URL")
+    if source.get("revision_policy") != "exact-head-commit":
+        fail("source revision policy must pin the exact HEAD commit")
     dependency = manifest.get("nanobot_dependency", {})
     baseline = dependency.get("upstream_baseline", {})
     commit = baseline.get("commit", "")
@@ -59,8 +66,22 @@ def load_manifest(root: Path) -> dict:
     if policy.get("pre_artifact_kind") != "source-export":
         fail("effective runtime must use source-export until an artifact pin exists")
     artifact = policy.get("artifact")
-    if not isinstance(artifact, dict) or set(artifact) != {"image", "digest", "wheel"}:
-        fail("effective runtime artifact policy must declare image, digest, and wheel")
+    if not isinstance(artifact, dict) or set(artifact) != {
+        "image",
+        "digest",
+        "wheel",
+        "signature",
+    }:
+        fail("effective runtime artifact policy must declare image, digest, wheel, and signature")
+    if any(value is not None for value in artifact.values()):
+        fail("source-export runtime policy cannot claim packaged artifact evidence")
+    deployment = policy.get("independent_deployment", {})
+    if deployment != {
+        "deployable": False,
+        "status": "blocked-no-signed-runtime-artifact",
+        "required_evidence": "signed-image-digest-or-wheel",
+    }:
+        fail("source-export runtime must be blocked from independent deployment")
     patches = manifest.get("patches", [])
     orders = []
     patch_ids = set()
@@ -86,11 +107,29 @@ def load_manifest(root: Path) -> dict:
     for rule in manifest["validation"].get("required_output_text", []):
         if not rule.get("path") or not rule.get("contains"):
             fail("required output text rules must contain path and contains")
+    pattern_ids = set()
     for pattern in manifest["validation"].get("secret_content_patterns", []):
         try:
             re.compile(pattern["regex"])
         except (KeyError, re.error) as exc:
             fail(f"invalid secret content pattern: {exc}")
+        pattern_id = pattern.get("id")
+        if not pattern_id or pattern_id in pattern_ids:
+            fail(f"secret content pattern id is missing or duplicated: {pattern_id}")
+        pattern_ids.add(pattern_id)
+    allowlist_ids = set()
+    for item in manifest["validation"].get("secret_content_allowlist", []):
+        allowlist_id = item.get("id")
+        if not allowlist_id or allowlist_id in allowlist_ids:
+            fail(f"secret content allowlist id is missing or duplicated: {allowlist_id}")
+        allowlist_ids.add(allowlist_id)
+        if item.get("pattern_id") not in pattern_ids:
+            fail(f"secret content allowlist references an unknown pattern: {allowlist_id}")
+        try:
+            re.compile(item["path_regex"])
+            re.compile(item["match_regex"])
+        except (KeyError, re.error) as exc:
+            fail(f"invalid secret content allowlist entry {allowlist_id}: {exc}")
     return manifest
 
 
@@ -132,6 +171,14 @@ def validate_text_content(export: Path, manifest: dict, files: list[Path]) -> No
         (item["id"], re.compile(item["regex"]))
         for item in validation["secret_content_patterns"]
     ]
+    content_allowlist = [
+        (
+            item["pattern_id"],
+            re.compile(item["path_regex"]),
+            re.compile(item["match_regex"]),
+        )
+        for item in validation.get("secret_content_allowlist", [])
+    ]
     exempt_patterns = [
         re.compile(pattern)
         for pattern in validation.get("secret_content_exempt_path_patterns", [])
@@ -158,7 +205,15 @@ def validate_text_content(export: Path, manifest: dict, files: list[Path]) -> No
         except UnicodeDecodeError:
             continue
         for pattern_id, pattern in content_patterns:
-            if pattern.search(text):
+            for match in pattern.finditer(text):
+                allowed = any(
+                    allow_pattern_id == pattern_id
+                    and path_pattern.fullmatch(relative)
+                    and match_pattern.fullmatch(match.group(0))
+                    for allow_pattern_id, path_pattern, match_pattern in content_allowlist
+                )
+                if allowed:
+                    continue
                 fail(f"possible secret content ({pattern_id}) is present: {relative}")
 
 
@@ -215,7 +270,7 @@ def validate_export(export: Path, manifest: dict) -> None:
     except (OSError, json.JSONDecodeError) as exc:
         fail(f"cannot read Nanobot lock metadata: {exc}")
     dependency = manifest["nanobot_dependency"]
-    if lock.get("schema") != 2:
+    if lock.get("schema") != 3:
         fail("Nanobot lock has an unsupported schema")
     baseline = dependency["upstream_baseline"]
     if lock.get("upstream_baseline") != baseline:
@@ -228,17 +283,27 @@ def validate_export(export: Path, manifest: dict) -> None:
         fail(f"cannot read export metadata: {exc}")
     if not re.fullmatch(r"[0-9a-f]{40}", metadata.get("source_commit", "")):
         fail("export metadata does not contain a source commit")
-    if not metadata.get("source_repository") or not metadata.get("source_ref"):
-        fail("export metadata does not contain a source repository and ref")
-    if metadata.get("schema") != 2:
+    canonical_repository = manifest["source"]["repository"]
+    if metadata.get("source_repository") != canonical_repository:
+        fail("export metadata does not contain the canonical source repository")
+    if "source_ref" in metadata:
+        fail("export metadata must not depend on a local branch name")
+    if metadata.get("schema") != 3:
         fail("export metadata has an unsupported schema")
+    manifest_sha256 = hashlib.sha256(
+        (export / "config/ziggy-repository-split.json").read_bytes()
+    ).hexdigest()
+    if metadata.get("manifest_sha256") != manifest_sha256:
+        fail("export metadata manifest digest does not match the exported manifest")
     effective = lock.get("effective_runtime", {})
     expected_effective = {
         "kind": dependency["effective_runtime_policy"]["pre_artifact_kind"],
-        "repository": metadata["source_repository"],
-        "ref": metadata["source_ref"],
+        "repository": canonical_repository,
         "commit": metadata["source_commit"],
         "artifact": dependency["effective_runtime_policy"]["artifact"],
+        "independent_deployment": dependency["effective_runtime_policy"][
+            "independent_deployment"
+        ],
     }
     if effective != expected_effective:
         fail("Nanobot lock effective runtime does not match export source metadata")

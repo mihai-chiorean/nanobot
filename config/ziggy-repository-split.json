@@ -1,8 +1,9 @@
 {
-  "schema": 2,
+  "schema": 3,
   "name": "ziggy-product-repository",
   "source": {
-    "base_ref": "origin/feat/ziggy-ios",
+    "repository": "https://github.com/mihai-chiorean/nanobot.git",
+    "revision_policy": "exact-head-commit",
     "working_tree_policy": "clean_required",
     "tracked_files_only": true
   },
@@ -19,7 +20,13 @@
       "artifact": {
         "image": null,
         "digest": null,
-        "wheel": null
+        "wheel": null,
+        "signature": null
+      },
+      "independent_deployment": {
+        "deployable": false,
+        "status": "blocked-no-signed-runtime-artifact",
+        "required_evidence": "signed-image-digest-or-wheel"
       }
     },
     "update_rule": "advance the upstream baseline and effective runtime together; rerun the product contract tests before merging"
@@ -38,11 +45,10 @@
       ],
       "required": true
     },
-    {"source_prefix": "bridge", "destination_prefix": "web/bridge", "required": true},
-    {"source_prefix": "services/ziggy-control", "destination_prefix": "services/ziggy-control", "required": true},
-    {"source_prefix": "services/ziggy-connectors", "destination_prefix": "services/ziggy-connectors", "required": true},
+    {"source_prefix": "services/ziggy-control", "destination_prefix": "services/ziggy-control", "exclude": ["services/ziggy-control/.env.example"], "required": true},
+    {"source_prefix": "services/ziggy-connectors", "destination_prefix": "services/ziggy-connectors", "exclude": ["services/ziggy-connectors/.env.example"], "required": true},
     {"source_prefix": "services/ziggy-runtime-manager", "destination_prefix": "services/ziggy-runtime-manager", "required": true},
-    {"source_prefix": "services/ziggy-work", "destination_prefix": "services/ziggy-work", "required": true},
+    {"source_prefix": "services/ziggy-work", "destination_prefix": "services/ziggy-work", "exclude": ["services/ziggy-work/.env.example"], "required": true},
     {"source_prefix": "services/observability", "destination_prefix": "observability", "required": true},
     {"source_prefix": "docs/architecture/ziggy-", "destination_prefix": "docs/architecture", "required": true},
     {"source_prefix": "docs/runbooks", "destination_prefix": "docs/runbooks", "required": true},
@@ -53,6 +59,7 @@
     {"source_prefix": "scripts/validate-ziggy-product-split.py", "destination_prefix": "scripts/validate-ziggy-product-split.py", "required": true},
     {"source_prefix": "scripts/test-ziggy-product-split.sh", "destination_prefix": "scripts/test-ziggy-product-split.sh", "required": true},
     {"source_prefix": "scripts/assert-ziggy-web-build.sh", "destination_prefix": "scripts/assert-ziggy-web-build.sh", "required": true},
+    {"source_prefix": "scripts/scan-ziggy-product-secrets.sh", "destination_prefix": "scripts/scan-ziggy-product-secrets.sh", "required": true},
     {"source": "LICENSE", "destination": "licenses/nanobot-MIT.txt", "required": true},
     {"source": "THIRD_PARTY_NOTICES.md", "destination": "licenses/nanobot-third-party-notices.md", "required": true}
   ],
@@ -96,6 +103,11 @@
         "path": "LICENSE",
         "contains": "No license is granted",
         "absent": "Permission is hereby granted"
+      },
+      {
+        "path": "README.md",
+        "contains": "not independently deployable",
+        "absent": "is independently deployable"
       }
     ],
     "forbidden_output_prefixes": [
@@ -113,7 +125,7 @@
       "root-fork-copy"
     ],
     "secret_filename_patterns": [
-      "(^|/)\\.env$",
+      "(^|/)\\.env(?:$|[._-].*)",
       "\\.pem$",
       "\\.p12$",
       "\\.key$",
@@ -137,6 +149,50 @@
       {
         "id": "google-api-key",
         "regex": "(?<![A-Za-z0-9_-])AIza[0-9A-Za-z_-]{35}(?![A-Za-z0-9_-])"
+      },
+      {
+        "id": "postgresql-url-credentials",
+        "regex": "(?i)(?<![A-Za-z0-9])postgres(?:ql)?://[A-Za-z0-9._~%+-]+:(?!\\$)[^\\s/@]{1,256}@"
+      },
+      {
+        "id": "github-token",
+        "regex": "(?<![A-Za-z0-9_])(?:gh[pousr]_[A-Za-z0-9]{36,255}|github_pat_[A-Za-z0-9_]{82,255})(?![A-Za-z0-9_])"
+      },
+      {
+        "id": "aws-access-key",
+        "regex": "(?<![A-Z0-9])(?:AKIA|ASIA)[A-Z0-9]{16}(?![A-Z0-9])"
+      },
+      {
+        "id": "slack-token",
+        "regex": "(?<![A-Za-z0-9-])xox[baprs]-[A-Za-z0-9-]{20,200}(?![A-Za-z0-9-])"
+      },
+      {
+        "id": "anthropic-api-key",
+        "regex": "(?<![A-Za-z0-9_-])sk-ant-(?:api03-)?[A-Za-z0-9_-]{40,200}(?![A-Za-z0-9_-])"
+      },
+      {
+        "id": "openai-project-key",
+        "regex": "(?<![A-Za-z0-9_-])sk-(?:proj-|svcacct-)[A-Za-z0-9_-]{40,200}(?![A-Za-z0-9_-])"
+      },
+      {
+        "id": "gitlab-token",
+        "regex": "(?<![A-Za-z0-9_-])glpat-[A-Za-z0-9_-]{20,200}(?![A-Za-z0-9_-])"
+      },
+      {
+        "id": "npm-access-token",
+        "regex": "(?<![A-Za-z0-9_])npm_[A-Za-z0-9]{36}(?![A-Za-z0-9_])"
+      },
+      {
+        "id": "sendgrid-api-key",
+        "regex": "(?<![A-Za-z0-9_-])SG\\.[A-Za-z0-9_-]{16,32}\\.[A-Za-z0-9_-]{32,100}(?![A-Za-z0-9_-])"
+      }
+    ],
+    "secret_content_allowlist": [
+      {
+        "id": "ziggy-control-postgresql-unit-test-fixture",
+        "pattern_id": "postgresql-url-credentials",
+        "path_regex": "^services/ziggy-control/internal/config/config_test\\.go$",
+        "match_regex": "^postgres:\\/\\/ziggy:secret@$"
       }
     ],
     "secret_content_exempt_path_patterns": [

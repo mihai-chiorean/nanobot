@@ -16,6 +16,22 @@ permissions:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: ziggy_control_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d ziggy_control_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      POSTGRES_PASSWORD: postgres
     defaults:
       run:
         working-directory: services/ziggy-control
@@ -26,4 +42,7 @@ jobs:
         with:
           go-version-file: services/ziggy-control/go.mod
           cache-dependency-path: services/ziggy-control/go.sum
-      - run: make verify linux-amd64 linux-arm64
+      - name: Verify with lifecycle integration tests
+        run: |
+          export ZIGGY_CONTROL_TEST_DATABASE_URL="postgresql://postgres:${POSTGRES_PASSWORD}@127.0.0.1:5432/ziggy_control_test?sslmode=disable"
+          make verify linux-amd64 linux-arm64

@@ -1,0 +1,75 @@
+name: Ziggy product split
+
+on:
+  push:
+    paths:
+      - ".github/workflows/ziggy-product-split.yml"
+      - "config/ziggy-repository-split.json"
+      - "docs/architecture/ziggy-repository-split.md"
+      - "ios/**"
+      - "scripts/*ziggy-product*"
+      - "scripts/assert-ziggy-web-build.sh"
+      - "services/observability/**"
+      - "services/ziggy-connectors/**"
+      - "services/ziggy-control/**"
+      - "services/ziggy-runtime-manager/**"
+      - "services/ziggy-work/**"
+      - "webui/**"
+  pull_request:
+    paths:
+      - ".github/workflows/ziggy-product-split.yml"
+      - "config/ziggy-repository-split.json"
+      - "docs/architecture/ziggy-repository-split.md"
+      - "ios/**"
+      - "scripts/*ziggy-product*"
+      - "scripts/assert-ziggy-web-build.sh"
+      - "services/observability/**"
+      - "services/ziggy-connectors/**"
+      - "services/ziggy-control/**"
+      - "services/ziggy-runtime-manager/**"
+      - "services/ziggy-work/**"
+      - "webui/**"
+
+permissions:
+  contents: read
+
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Export product tree
+        run: scripts/export-ziggy-product.sh --destination "$RUNNER_TEMP/ziggy-product"
+      - name: Test split and deterministic provenance
+        run: |
+          scripts/test-ziggy-product-split.sh \
+            --source . \
+            --export "$RUNNER_TEMP/ziggy-product"
+      - name: Scan staged product tree for secrets
+        run: scripts/scan-ziggy-product-secrets.sh "$RUNNER_TEMP/ziggy-product"
+
+  clean-export-web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: webui/package-lock.json
+      - name: Export product tree
+        run: scripts/export-ziggy-product.sh --destination "$RUNNER_TEMP/ziggy-product"
+      - name: Test, lint, build, and audit exported web client
+        working-directory: ${{ runner.temp }}/ziggy-product/web
+        run: |
+          npm ci
+          npm test
+          npm run lint
+          npm run build
+          npm audit --audit-level=high
+      - name: Assert clean export web boundary
+        run: |
+          "$RUNNER_TEMP/ziggy-product/scripts/assert-ziggy-web-build.sh" \
+            "$RUNNER_TEMP/ziggy-product"

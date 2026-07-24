@@ -166,14 +166,7 @@ for entry in manifest["entries"]:
 
 
 source_commit = run("git", "rev-parse", "HEAD")
-try:
-    source_ref = run("git", "symbolic-ref", "--quiet", "--short", "HEAD")
-except subprocess.CalledProcessError:
-    source_ref = source_commit
-try:
-    source_remote = run("git", "config", "--get", "remote.origin.url")
-except subprocess.CalledProcessError:
-    source_remote = ""
+source_repository = manifest["source"]["repository"]
 manifest_sha256 = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
 
 
@@ -181,15 +174,15 @@ def generated(kind: str) -> str:
     if kind == "product_readme":
         return """# Ziggy Product
 
-This repository is the product-only Ziggy tree. The Nanobot upstream baseline is
-pinned, but plain upstream is not the production runtime yet. Until the Ziggy
-patch queue is removed or packaged, production uses the effective patched
-runtime pinned in .ziggy/nanobot.lock.json; its source is not copied here.
+This repository is the product-only Ziggy tree. It is not independently deployable:
+the required patched Nanobot runtime has no signed image digest or wheel, and its
+source is intentionally not copied here. The exact source commit is recorded for
+provenance, not represented as a self-contained runtime artifact.
 
 ## Layout
 
 - ios/: SwiftUI client, Swift Testing targets, and the UI XCTest target.
-- web/: branded PWA and its bridge extension.
+- web/: branded PWA.
 - services/ziggy-control/: authenticated product front door and tenant control plane.
 - services/ziggy-connectors/: tenant connector and MCP OAuth service.
 - services/ziggy-runtime-manager/: rootless per-tenant runtime supervisor.
@@ -199,15 +192,16 @@ runtime pinned in .ziggy/nanobot.lock.json; its source is not copied here.
 
 ## Nanobot dependency
 
-The upstream baseline and effective runtime pins are both in
+The upstream baseline and effective source provenance are both in
 .ziggy/nanobot.lock.json. Plain upstream v0.1.5.post3 must not be deployed by
-itself: runtime patches that have not landed upstream are delivered as a
-separately pinned runtime artifact or patch overlay; this repository must never
-vendor the full Nanobot tree.
+itself. Independent deployment remains blocked until the lock points to a signed
+image digest or wheel containing the required runtime patches. This repository
+must never vendor the full Nanobot tree.
 
 ## Checks
 
     python3 scripts/validate-ziggy-product-split.py --export .
+    scripts/scan-ziggy-product-secrets.sh .
     cd web && npm ci && npm test && npm run lint && npm run build
     cd ../services/ziggy-control && make verify
     cd ../ziggy-connectors && make verify
@@ -221,7 +215,6 @@ The Swift and service CI mapping is generated at .github/workflows/ziggy-product
         return """# Product build outputs and local configuration
 .env
 .env.*
-!.env.example
 web/node_modules/
 web/dist/
 web/coverage/
@@ -306,6 +299,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Validate product split
         run: python3 scripts/validate-ziggy-product-split.py --export .
+      - name: Scan staged product tree for secrets
+        run: scripts/scan-ziggy-product-secrets.sh .
 
   web:
     runs-on: ubuntu-latest
@@ -334,6 +329,8 @@ jobs:
 
   swift:
     runs-on: macos-26
+    env:
+      ZIGGY_CI_CLERK_LIVE_SUFFIX: ci_release_validation
     steps:
       - uses: actions/checkout@v4
       - name: Select Xcode
@@ -346,16 +343,46 @@ jobs:
           echo "ZIGGY_SIMULATOR_DESTINATION=platform=iOS Simulator,id=$device_id" >> "$GITHUB_ENV"
       - run: xcodebuild -project ios/Ziggy.xcodeproj -scheme Ziggy -destination "$ZIGGY_SIMULATOR_DESTINATION" CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build-for-testing
       - run: xcodebuild -project ios/Ziggy.xcodeproj -scheme Ziggy -destination "$ZIGGY_SIMULATOR_DESTINATION" CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO test-without-building
+      - name: Test Release configuration validation
+        run: ios/Scripts/test-release-configuration.sh
+      - name: Build unsigned Release app
+        run: |
+          xcodebuild \
+            -project ios/Ziggy.xcodeproj \
+            -scheme Ziggy \
+            -configuration Release \
+            -destination "$ZIGGY_SIMULATOR_DESTINATION" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CURRENT_PROJECT_VERSION=1 \
+            CLERK_PUBLISHABLE_KEY="pk_live_${ZIGGY_CI_CLERK_LIVE_SUFFIX}" \
+            build
 
   go:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: ziggy_control_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d ziggy_control_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      POSTGRES_PASSWORD: postgres
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: control
             path: services/ziggy-control
-            command: make verify linux-amd64 linux-arm64
+            command: ZIGGY_CONTROL_TEST_DATABASE_URL="postgresql://postgres:${POSTGRES_PASSWORD}@127.0.0.1:5432/ziggy_control_test?sslmode=disable" make verify linux-amd64 linux-arm64
           - name: connectors
             path: services/ziggy-connectors
             command: make verify linux-amd64 linux-arm64
@@ -377,16 +404,72 @@ jobs:
         run: @@{{ matrix.command }}
 
   observability:
-    runs-on: ubuntu-latest
+    name: Validate collector (@@{{ matrix.arch }})
+    runs-on: @@{{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    env:
+      OTELCOL_VERSION: "0.147.0"
+      GRAFANA_CLOUD_OTLP_ENDPOINT: https://example.invalid/otlp
+      GRAFANA_CLOUD_INSTANCE_ID: "1"
+      HOSTNAME: validation-host
     steps:
       - uses: actions/checkout@v4
-      - name: Validate shell assets
+      - name: Download and verify pinned collector
+        working-directory: observability/otelcol
         run: |
-          sh -n observability/otelcol/generate-otel-credentials
-          sh -n observability/otelcol/install-otelcol-contrib
-          sh -n observability/otelcol/validate-privacy-canary
-          sh -n observability/otelcol/ziggy-otelcol-deploy
-          sh -n observability/otelcol/ziggy-otelcol-start
+          set -eu
+          archive="otelcol-contrib_${OTELCOL_VERSION}_linux_@@{{ matrix.arch }}.tar.gz"
+          curl --fail --show-error --silent --location \
+            --proto '=https' --tlsv1.2 \
+            --output "${archive}" \
+            "https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v${OTELCOL_VERSION}/${archive}"
+          grep " ${archive}$" "otelcol-contrib-${OTELCOL_VERSION}-linux.sha256" | sha256sum --check
+          tar -xzf "${archive}"
+          ./otelcol-contrib --version | grep "${OTELCOL_VERSION}"
+      - name: Create validation-only credentials
+        run: |
+          set -eu
+          printf 'validation-only\n' > "${RUNNER_TEMP}/grafana-token"
+          hash="$(openssl passwd -apr1 validation-password)"
+          printf 'ziggy-control:%s\n' "${hash}" > "${RUNNER_TEMP}/otel-local-users.htpasswd"
+      - name: Parse YAML
+        run: |
+          ruby -e 'require "yaml"; ARGV.each { |path| YAML.safe_load_file(path, aliases: true) }' \
+            .github/workflows/ziggy-product.yml \
+            observability/otelcol/beelink.yaml \
+            observability/otelcol/spark.yaml \
+            observability/otelcol/privacy-canary.yaml
+      - name: Validate collector profiles
+        env:
+          GRAFANA_CLOUD_API_KEY_FILE: @@{{ runner.temp }}/grafana-token
+          ZIGGY_OTLP_HTPASSWD_FILE: @@{{ runner.temp }}/otel-local-users.htpasswd
+          PRIVACY_CANARY_ENDPOINT: 127.0.0.1:24318
+          PRIVACY_CANARY_OUTPUT: @@{{ runner.temp }}/privacy-canary-output.json
+          PRIVACY_CANARY_HTPASSWD_FILE: @@{{ runner.temp }}/otel-local-users.htpasswd
+          PRIVACY_CANARY_UNREACHABLE_ENDPOINT: http://127.0.0.1:24319
+          PRIVACY_CANARY_METRICS_PORT: 24320
+        run: |
+          collector=observability/otelcol/otelcol-contrib
+          "${collector}" validate --config=observability/otelcol/beelink.yaml
+          "${collector}" validate --config=observability/otelcol/spark.yaml
+          "${collector}" validate --config=observability/otelcol/privacy-canary.yaml
+      - name: Validate privacy boundary
+        run: observability/otelcol/validate-privacy-canary observability/otelcol/otelcol-contrib
+      - name: Validate shell scripts
+        run: |
+          sh -n \
+            observability/otelcol/generate-otel-credentials \
+            observability/otelcol/install-otelcol-contrib \
+            observability/otelcol/validate-privacy-canary \
+            observability/otelcol/ziggy-otelcol-deploy \
+            observability/otelcol/ziggy-otelcol-start
 """
         return ci.replace("@@{{", chr(36) + "{{")
     if kind == "export_metadata":
@@ -395,9 +478,8 @@ jobs:
         effective_policy = dependency["effective_runtime_policy"]
         return json.dumps(
             {
-                "schema": 2,
-                "source_repository": source_remote,
-                "source_ref": source_ref,
+                "schema": 3,
+                "source_repository": source_repository,
                 "source_commit": source_commit,
                 "source_commit_date": run("git", "show", "-s", "--format=%cI", "HEAD"),
                 "manifest_sha256": manifest_sha256,
@@ -405,10 +487,12 @@ jobs:
                     "upstream_baseline": baseline,
                     "effective_runtime": {
                         "kind": effective_policy["pre_artifact_kind"],
-                        "repository": source_remote,
-                        "ref": source_ref,
+                        "repository": source_repository,
                         "commit": source_commit,
                         "artifact": effective_policy["artifact"],
+                        "independent_deployment": effective_policy[
+                            "independent_deployment"
+                        ],
                     },
                     "update_rule": dependency["update_rule"],
                 },
@@ -422,14 +506,16 @@ jobs:
         effective_policy = dependency["effective_runtime_policy"]
         return json.dumps(
             {
-                "schema": 2,
+                "schema": 3,
                 "upstream_baseline": baseline,
                 "effective_runtime": {
                     "kind": effective_policy["pre_artifact_kind"],
-                    "repository": source_remote,
-                    "ref": source_ref,
+                    "repository": source_repository,
                     "commit": source_commit,
                     "artifact": effective_policy["artifact"],
+                    "independent_deployment": effective_policy[
+                        "independent_deployment"
+                    ],
                 },
                 "update_rule": dependency["update_rule"],
             },

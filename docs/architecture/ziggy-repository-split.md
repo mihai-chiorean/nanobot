@@ -9,10 +9,12 @@ Nanobot Python tests, Nanobot packaging files, or Nanobot's generated WebUI
 bundle.
 
 The export is a one-way operation. It copies tracked allowlisted files into a
-new directory, writes deterministic metadata and product CI files, and refuses
-to overwrite an existing destination, initializes a new Git repository on its
-main branch, and validates the result. It never deletes or moves the source
-repository.
+new directory, writes deterministic metadata and product CI files, refuses to
+overwrite an existing destination, initializes a new Git repository on its main
+branch, and validates the result. Provenance uses the canonical source
+repository identity in the manifest plus the exact source commit. Local branch
+names and equivalent SSH or HTTPS origin URLs do not affect output. The exporter
+never deletes or moves the source repository.
 
 The contract is machine-readable in
 config/ziggy-repository-split.json. The implementation is
@@ -25,7 +27,7 @@ scripts/test-ziggy-product-split.sh.
 ~~~text
 .
 ├── ios/                         SwiftUI client, Swift Testing, and UI XCTest target
-├── web/                         branded PWA, assets, tests, and bridge extension
+├── web/                         branded PWA, assets, and tests
 ├── services/
 │   ├── ziggy-control/           authenticated product front door
 │   ├── ziggy-connectors/        tenant connectors and MCP OAuth client
@@ -45,12 +47,12 @@ scripts/test-ziggy-product-split.sh.
 
 The source webui/ directory is renamed to web/. The export transform rewrites
 the copied Vite config so its output is web/dist, never ../nanobot/web/dist.
-The source bridge/ directory is placed at web/bridge/. The four service
+The source WhatsApp bridge is not exported: it has no committed dependency
+lock, independent test workflow, or clear Ziggy product owner. The four service
 directories are preserved so their Go modules, tests, migrations, and
 service-local deployment assets remain together. observability/ is promoted
-from services/observability/. Root runbooks/ and research/ are indexes only;
-the canonical documents stay under docs/ so existing relative links remain
-valid.
+from services/observability/. Root runbooks/ and research/ are indexes only; the
+canonical documents stay under docs/ so existing relative links remain valid.
 
 The export intentionally omits root Python tests, pyproject.toml, Dockerfile,
 docker-compose.yml, entrypoint.sh, Nanobot source, and the generated
@@ -69,22 +71,27 @@ commit:     0b1631f33d8040802aa09d66a01bc731e3cb85a2
 
 This baseline is not the effective production runtime yet. Plain upstream
 v0.1.5.post3 is not runnable for Ziggy while the patch queue in this document
-remains. Until a patched image digest or wheel exists, the exporter emits an
-effective_runtime pin of kind source-export using the source repository, source
-ref, and exact export commit. That pin is the runtime currently being handed
-off to deployment. The lock therefore records both upstream_baseline and
-effective_runtime; validation requires both to agree with the export metadata.
+remains. Until a signed patched image digest or wheel exists, the exporter emits
+an effective_runtime provenance record of kind source-export using the canonical
+source repository and exact export commit. This product export is not
+independently deployable: source provenance is not a runtime artifact, and the
+runtime source is intentionally absent. The lock records upstream_baseline,
+effective_runtime, and an explicit blocked independent-deployment status;
+validation requires them to agree with the manifest and export metadata.
 
-A deployment may replace effective_runtime with an immutable patched container
-digest or wheel URL after the patch queue is packaged. That transition changes
-the effective pin, not Ziggy product history or the upstream baseline.
+A deployment may replace effective_runtime with a signed immutable patched
+container digest or wheel after the patch queue is packaged. Only then may the
+product repository claim independent deployment readiness. That transition
+changes the effective pin and readiness evidence, not Ziggy product history or
+the upstream baseline.
 
 An update is a dependency change, not a product rebase:
 
 1. Select a Nanobot tag or commit, or build a separately owned runtime artifact
    with an immutable digest.
 2. Update the upstream baseline ref and commit together in the split manifest;
-   the effective source-export pin is generated from the export source.
+   the effective source-export provenance is generated from the canonical
+   repository identity and exact export commit.
 3. Run the product contract tests: WebSocket authentication and transport,
    Work command/event compatibility, MCP OAuth, memory path safety, and the
    three Go service suites.
@@ -132,13 +139,13 @@ intentionally product-only:
 
 | Component | Working directory | Required checks |
 | --- | --- | --- |
-| Swift client | ios/ | Resolve Swift packages; xcodebuild build-for-testing; simulator test-without-building. |
-| PWA | web/ | npm ci, npm test, npm run lint, npm run build. |
-| ziggy-control | services/ziggy-control/ | make verify, linux-amd64, linux-arm64. |
+| Swift client | ios/ | Resolve Swift packages; Debug build-for-testing and simulator tests; Release configuration script tests; unsigned Release build with a `pk_live_` key and positive build number. |
+| PWA | web/ | npm ci, npm test, npm run lint, npm run build, blocking high-severity npm audit. |
+| ziggy-control | services/ziggy-control/ | PostgreSQL-backed make verify, linux-amd64, linux-arm64; lifecycle integration tests may not skip. |
 | ziggy-connectors | services/ziggy-connectors/ | make verify, linux-amd64, linux-arm64. |
 | ziggy-runtime-manager | services/ziggy-runtime-manager/ | make verify. |
 | ziggy-work | services/ziggy-work/ | go test, go test -race, go vet, go build. |
-| Observability | observability/otelcol/ | shell syntax checks; profile and privacy-canary validation in deployment CI. |
+| Observability | observability/otelcol/ | amd64 and arm64 pinned collector verification; YAML parse; Beelink, Spark, and privacy-canary profile validation; live privacy boundary test; shell syntax checks. |
 
 Each Go service keeps its own go.mod, go.sum, Makefile, migrations, tests,
 and deployment assets. The product repository does not add a Go workspace
@@ -160,14 +167,17 @@ to redistribute Nanobot source.
 Web and Go dependency notices remain governed by their package lockfiles and
 module metadata.
 
-Secrets and generated artifacts are excluded in two ways: the exporter
-requires a clean source worktree and enumerates git-tracked files only, and
-the validator rejects secret-like names, unknown top-level paths, root
-nanobot/, and generated fork packaging paths. Nested real .env files are
-rejected. Bounded text scans include example and sample files and reject
-private-key headers, Grafana Cloud glc_ tokens, sk_live_/sk_test_ tokens, and
-Google API key forms. Fixtures use explicit non-matching placeholders; only
-generated dependency and build directories are skipped from content scanning.
+Secrets and generated artifacts are excluded in three ways: the exporter
+requires a clean source worktree and enumerates git-tracked files only; the
+validator rejects secret-like names, unknown top-level paths, root nanobot/,
+and generated fork packaging paths; and CI runs pinned Gitleaks in directory
+mode against the staged product tree rather than inherited history. Nested
+`.env` files and variants such as `.env.local` and `.env.example` are rejected.
+Bounded text scans reject private-key headers, credentialed PostgreSQL URLs,
+GitHub, AWS, Slack, Anthropic, OpenAI, GitLab, npm, SendGrid, Grafana Cloud,
+Stripe or Clerk secret keys, and Google API key forms. One exact PostgreSQL
+unit-test fixture has a path- and value-specific allowlist. Only generated
+dependency and build directories are skipped from bounded content scanning.
 
 The web CI blocks on `npm audit --audit-level=high` and then validates the
 product tree again after `npm run build`. The current lockfile has no high or
@@ -179,7 +189,10 @@ updates rather than a forced Clerk downgrade.
 
 The first private repository should be created from one verified export
 commit. This gives a reviewable boundary and avoids importing all Nanobot
-history. The source commit is recorded in .ziggy/export-metadata.json.
+history. The canonical source repository and exact source commit are recorded
+in .ziggy/export-metadata.json. Split tests reproduce the export from a renamed
+branch and detached HEAD in a separate clone with different origin URL forms,
+then require identical Git tree IDs.
 
 Useful Ziggy history can be prepared separately in a disposable clone. Do not
 run history filtering in the active source worktree:
@@ -190,7 +203,6 @@ cd /tmp/ziggy-history
 git filter-repo --force \
   --path ios/ \
   --path webui/ \
-  --path bridge/ \
   --path services/ziggy-control/ \
   --path services/ziggy-connectors/ \
   --path services/ziggy-runtime-manager/ \
@@ -203,7 +215,6 @@ git filter-repo --force \
   --path LICENSE \
   --path THIRD_PARTY_NOTICES.md \
   --path-rename webui/:web/ \
-  --path-rename bridge/:web/bridge/ \
   --path-rename services/observability/:observability/
 ~~~
 
@@ -224,6 +235,7 @@ scripts/export-ziggy-product.sh --destination /tmp/ziggy-product-export
 scripts/test-ziggy-product-split.sh \
   --source . \
   --export /tmp/ziggy-product-export
+scripts/scan-ziggy-product-secrets.sh /tmp/ziggy-product-export
 ~~~
 
 The exporter refuses an existing destination. This is intentional: choose a

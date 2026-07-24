@@ -4,6 +4,32 @@ import Testing
 @Suite
 struct SmokeTests {
     @Test
+    func `app version reads marketing version and build number`() {
+        let version = AppVersion(
+            infoDictionary: [
+                "CFBundleShortVersionString": " 1.4.2 ",
+                "CFBundleVersion": "87",
+            ]
+        )
+
+        #expect(version.marketingVersion == "1.4.2")
+        #expect(version.buildNumber == "87")
+    }
+
+    @Test
+    func `app version reports unknown for missing or invalid values`() {
+        let version = AppVersion(
+            infoDictionary: [
+                "CFBundleShortVersionString": " ",
+                "CFBundleVersion": 87,
+            ]
+        )
+
+        #expect(version.marketingVersion == "Unknown")
+        #expect(version.buildNumber == "Unknown")
+    }
+
+    @Test
     @MainActor
     func `app model starts on chats`() {
         #expect(AppModel().selectedTab == .chats)
