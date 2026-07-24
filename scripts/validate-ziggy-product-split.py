@@ -32,7 +32,17 @@ def matches(path: str, prefix: str) -> bool:
 def tracked_paths(repo: Path) -> set[str]:
     try:
         output = subprocess.check_output(
-            ["git", "-C", str(repo), "ls-files", "-z"], stderr=subprocess.PIPE
+            [
+                "git",
+                "-C",
+                str(repo),
+                "ls-tree",
+                "-rz",
+                "--name-only",
+                "--full-tree",
+                "HEAD",
+            ],
+            stderr=subprocess.PIPE,
         )
     except (OSError, subprocess.CalledProcessError) as exc:
         fail(f"cannot list tracked source paths in {repo}: {exc}")
@@ -104,6 +114,21 @@ def load_manifest(root: Path) -> dict:
         fail("patch entries must be listed in removal order")
     if not manifest.get("entries") or not manifest.get("generated"):
         fail("manifest must contain entries and generated files")
+    rewrite_ids = set()
+    for rewrite in manifest.get("export_text_replacements", []):
+        rewrite_id = rewrite.get("id")
+        if not rewrite_id or rewrite_id in rewrite_ids:
+            fail(f"export text replacement id is missing or duplicated: {rewrite_id}")
+        rewrite_ids.add(rewrite_id)
+        try:
+            re.compile(rewrite["path_regex"])
+        except (KeyError, re.error) as exc:
+            fail(f"invalid export text replacement {rewrite_id}: {exc}")
+        if not rewrite.get("from") or not rewrite.get("to"):
+            fail(f"export text replacement is incomplete: {rewrite_id}")
+        minimum_matches = rewrite.get("minimum_matches", 1)
+        if not isinstance(minimum_matches, int) or minimum_matches < 1:
+            fail(f"export text replacement minimum is invalid: {rewrite_id}")
     for rule in manifest["validation"].get("required_output_text", []):
         if not rule.get("path") or not rule.get("contains"):
             fail("required output text rules must contain path and contains")
@@ -130,21 +155,27 @@ def load_manifest(root: Path) -> dict:
             re.compile(item["match_regex"])
         except (KeyError, re.error) as exc:
             fail(f"invalid secret content allowlist entry {allowlist_id}: {exc}")
+    for signature in manifest["validation"].get(
+        "nanobot_source_tree_signatures", []
+    ):
+        if (
+            not isinstance(signature, list)
+            or len(signature) < 3
+            or any(not isinstance(path, str) or not path for path in signature)
+        ):
+            fail("Nanobot source-tree signatures must contain at least three paths")
     return manifest
 
 
 def validate_source(source: Path, manifest: dict) -> None:
+    tracked = tracked_paths(source)
     for entry in manifest["entries"]:
         if "source" in entry:
-            present = (source / entry["source"]).exists()
             name = entry["source"]
+            present = name in tracked
         else:
             name = entry["source_prefix"]
-            if name.endswith("-"):
-                parent = source / name.rsplit("/", 1)[0]
-                present = any(parent.glob(name.rsplit("/", 1)[1] + "*"))
-            else:
-                present = (source / name).exists()
+            present = any(matches(path, name) for path in tracked)
         if entry.get("required") and not present:
             fail(f"required source path is missing: {name}")
     print(f"validated_source={source}")
@@ -217,6 +248,66 @@ def validate_text_content(export: Path, manifest: dict, files: list[Path]) -> No
                 fail(f"possible secret content ({pattern_id}) is present: {relative}")
 
 
+def validate_export_rewrites(export: Path, manifest: dict, files: list[Path]) -> None:
+    for rewrite in manifest.get("export_text_replacements", []):
+        path_pattern = re.compile(rewrite["path_regex"])
+        replacement_count = 0
+        for path in files:
+            if not path.is_file() or path.is_symlink():
+                continue
+            relative = path.relative_to(export).as_posix()
+            if not path_pattern.fullmatch(relative):
+                continue
+            try:
+                text = path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                fail(
+                    f"export text replacement targets non-UTF-8 output: "
+                    f"{rewrite['id']} ({relative})"
+                )
+            if rewrite["from"] in text:
+                fail(
+                    f"export text replacement left source identity behind: "
+                    f"{rewrite['id']} ({relative})"
+                )
+            replacement_count += text.count(rewrite["to"])
+        minimum_matches = rewrite.get("minimum_matches", 1)
+        if replacement_count < minimum_matches:
+            fail(
+                f"export text replacement output is missing: {rewrite['id']} "
+                f"(found {replacement_count}, expected at least {minimum_matches})"
+            )
+
+
+def validate_no_nanobot_source_tree(
+    export: Path,
+    manifest: dict,
+    files: list[Path],
+) -> None:
+    relative_files = {
+        path.relative_to(export).as_posix()
+        for path in files
+        if path.is_file() or path.is_symlink()
+    }
+    signatures = manifest["validation"].get("nanobot_source_tree_signatures", [])
+    for signature in signatures:
+        anchor = signature[0]
+        for relative in relative_files:
+            if relative == anchor:
+                root = ""
+            elif relative.endswith("/" + anchor):
+                root = relative[: -(len(anchor) + 1)]
+            else:
+                continue
+            candidate_paths = {
+                f"{root}/{signature_path}" if root else signature_path
+                for signature_path in signature
+            }
+            if candidate_paths.issubset(relative_files):
+                display_root = root or "."
+                fail(f"Nanobot source tree detected at: {display_root}")
+
+
 def validate_export(export: Path, manifest: dict) -> None:
     if not export.is_dir():
         fail(f"export directory does not exist: {export}")
@@ -252,6 +343,8 @@ def validate_export(export: Path, manifest: dict) -> None:
         if path.is_file() and any(pattern.search(relative) for pattern in filename_patterns):
             fail(f"possible secret path is present: {relative}")
 
+    validate_no_nanobot_source_tree(export, manifest, files)
+
     for rule in manifest["validation"].get("required_output_text", []):
         rule_path = export / rule["path"]
         if not rule_path.is_file():
@@ -263,6 +356,7 @@ def validate_export(export: Path, manifest: dict) -> None:
             fail(f"forbidden output text is present in {rule['path']}: {rule['absent']}")
 
     validate_text_content(export, manifest, files)
+    validate_export_rewrites(export, manifest, files)
 
     lock_path = export / ".ziggy/nanobot.lock.json"
     try:
@@ -313,8 +407,6 @@ def validate_export(export: Path, manifest: dict) -> None:
     if metadata_dependency.get("effective_runtime") != expected_effective:
         fail("export metadata effective runtime does not match the lock")
 
-    if (export / "nanobot").exists():
-        fail("Nanobot bulk copy detected at export root")
     print(f"validated_export={export}")
 
 

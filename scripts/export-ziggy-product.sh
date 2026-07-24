@@ -42,9 +42,8 @@ fi
 
 source_dir=$(cd "$source_dir" && pwd -P)
 destination=$(python3 -c 'import os, sys; print(os.path.abspath(sys.argv[1]))' "$destination")
-manifest="$source_dir/config/ziggy-repository-split.json"
+manifest_path="config/ziggy-repository-split.json"
 
-[[ -f "$manifest" ]] || { printf 'error: manifest not found: %s\n' "$manifest" >&2; exit 1; }
 [[ -d "$source_dir/.git" || -f "$source_dir/.git" ]] || {
   printf 'error: source is not a Git worktree: %s\n' "$source_dir" >&2
   exit 1
@@ -60,33 +59,62 @@ if [[ -n "$dirty" ]]; then
   exit 1
 fi
 
+source_commit=$(git -C "$source_dir" rev-parse --verify 'HEAD^{commit}')
+git -C "$source_dir" cat-file -e "$source_commit:$manifest_path" 2>/dev/null || {
+  printf 'error: manifest is not present in source commit %s: %s\n' \
+    "$source_commit" "$manifest_path" >&2
+  exit 1
+}
+
 mkdir -p "$destination"
 
-python3 - "$source_dir" "$destination" "$manifest" <<'PY'
+python3 - "$source_dir" "$destination" "$source_commit" "$manifest_path" <<'PY'
 import hashlib
 import json
-import os
-import shutil
+import re
 import subprocess
 import sys
 from pathlib import Path
 
 source = Path(sys.argv[1]).resolve()
 destination = Path(sys.argv[2]).resolve()
-manifest_path = Path(sys.argv[3]).resolve()
-manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+source_commit = sys.argv[3]
+manifest_path = sys.argv[4]
 
 
-def run(*args: str) -> str:
-    return subprocess.check_output(args, cwd=source, text=True).strip()
+def git_bytes(*args: str) -> bytes:
+    return subprocess.check_output(["git", *args], cwd=source)
 
 
-tracked = subprocess.check_output(
-    ["git", "ls-files", "-z"], cwd=source
-).decode("utf-8").split("\0")
-tracked = [item for item in tracked if item]
-tracked_set = set(tracked)
+def git_text(*args: str) -> str:
+    return git_bytes(*args).decode("utf-8").strip()
+
+
+manifest_bytes = git_bytes("cat-file", "blob", f"{source_commit}:{manifest_path}")
+manifest = json.loads(manifest_bytes.decode("utf-8"))
+
+tree_entries: dict[str, tuple[str, str, str]] = {}
+for record in git_bytes(
+    "ls-tree", "-rz", "--full-tree", source_commit
+).split(b"\0"):
+    if not record:
+        continue
+    metadata, raw_path = record.split(b"\t", 1)
+    mode, object_type, object_id = metadata.decode("ascii").split()
+    path = raw_path.decode("utf-8")
+    tree_entries[path] = (mode, object_type, object_id)
+
+tracked = sorted(tree_entries)
+tracked_set = set(tree_entries)
 copied: set[str] = set()
+rewrite_rules = [
+    {
+        **rule,
+        "compiled_path_regex": re.compile(rule["path_regex"]),
+        "matches": 0,
+    }
+    for rule in manifest.get("export_text_replacements", [])
+]
 
 
 def matches(path: str, prefix: str) -> bool:
@@ -106,8 +134,8 @@ def relative_path(path: str, prefix: str) -> str:
     return path[len(prefix.rstrip("/")) + 1 :]
 
 
-def copy_file(
-    source_path: Path,
+def copy_blob(
+    source_path: str,
     destination_path: Path,
     text_replacements: list[dict[str, str]] | None = None,
 ) -> None:
@@ -115,23 +143,60 @@ def copy_file(
     destination_key = destination_path.relative_to(destination).as_posix()
     if destination_key in copied:
         raise SystemExit(f"error: destination collision: {destination_key}")
+
+    mode, object_type, object_id = tree_entries[source_path]
+    if object_type != "blob":
+        raise SystemExit(
+            f"error: unsupported Git object in product export: "
+            f"{source_path} ({object_type})"
+        )
+    content = git_bytes("cat-file", "blob", object_id)
+
+    if mode == "120000":
+        if text_replacements:
+            raise SystemExit(
+                f"error: text replacement cannot target a symlink: {source_path}"
+            )
+        destination_path.symlink_to(content.decode("utf-8"))
+        copied.add(destination_key)
+        return
+
+    matching_rules = [
+        rule
+        for rule in rewrite_rules
+        if rule["compiled_path_regex"].fullmatch(source_path)
+    ]
+    needs_text = bool(text_replacements) or bool(matching_rules)
+    if needs_text:
+        try:
+            text = content.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise SystemExit(
+                f"error: text transformation targeted non-UTF-8 blob: {source_path}"
+            ) from exc
+
     if text_replacements:
-        content = source_path.read_text(encoding="utf-8")
         for replacement in text_replacements:
             old = replacement["from"]
             new = replacement["to"]
-            count = content.count(old)
+            count = text.count(old)
             if count != 1:
                 raise SystemExit(
-                    f"error: expected one text replacement in {source_path}: {old} (found {count})"
+                    f"error: expected one text replacement in {source_path}: "
+                    f"{old} (found {count})"
                 )
-            content = content.replace(old, new)
-        destination_path.write_text(content, encoding="utf-8")
-        shutil.copymode(source_path, destination_path)
-    elif source_path.is_symlink():
-        destination_path.symlink_to(os.readlink(source_path))
-    else:
-        shutil.copy2(source_path, destination_path)
+            text = text.replace(old, new)
+
+    for rule in matching_rules:
+        count = text.count(rule["from"])
+        if count:
+            text = text.replace(rule["from"], rule["to"])
+            rule["matches"] += count
+
+    if needs_text:
+        content = text.encode("utf-8")
+    destination_path.write_bytes(content)
+    destination_path.chmod(0o755 if mode == "100755" else 0o644)
     copied.add(destination_key)
 
 
@@ -158,16 +223,23 @@ for entry in manifest["entries"]:
         source_name = entry.get("source", entry.get("source_prefix"))
         raise SystemExit(f"error: required allowlist path has no tracked files: {source_name}")
     for source_path_string in source_paths:
-        copy_file(
-            source / source_path_string,
+        copy_blob(
+            source_path_string,
             destination / target_for(source_path_string),
             entry.get("text_replacements"),
         )
 
 
-source_commit = run("git", "rev-parse", "HEAD")
+for rule in rewrite_rules:
+    minimum_matches = rule.get("minimum_matches", 1)
+    if rule["matches"] < minimum_matches:
+        raise SystemExit(
+            f"error: export rewrite {rule['id']} matched {rule['matches']} values; "
+            f"expected at least {minimum_matches}"
+        )
+
 source_repository = manifest["source"]["repository"]
-manifest_sha256 = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
 
 
 def generated(kind: str) -> str:
@@ -281,7 +353,7 @@ The canonical runbooks are in ../docs/runbooks/.
 The canonical research notes are in ../docs/research/.
 """
     if kind == "product_ci":
-        ci = """name: Ziggy Product CI
+        ci = r"""name: Ziggy Product CI
 
 on:
   push:
@@ -347,6 +419,7 @@ jobs:
         run: ios/Scripts/test-release-configuration.sh
       - name: Build unsigned Release app
         run: |
+          build_number=$((GITHUB_RUN_NUMBER + 1))
           xcodebuild \
             -project ios/Ziggy.xcodeproj \
             -scheme Ziggy \
@@ -354,7 +427,8 @@ jobs:
             -destination "$ZIGGY_SIMULATOR_DESTINATION" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
-            CURRENT_PROJECT_VERSION=1 \
+            CURRENT_PROJECT_VERSION="${build_number}" \
+            ZIGGY_ARCHIVE_BUILD_NUMBER="${build_number}" \
             CLERK_PUBLISHABLE_KEY="pk_live_${ZIGGY_CI_CLERK_LIVE_SUFFIX}" \
             build
 
@@ -481,7 +555,9 @@ jobs:
                 "schema": 3,
                 "source_repository": source_repository,
                 "source_commit": source_commit,
-                "source_commit_date": run("git", "show", "-s", "--format=%cI", "HEAD"),
+                "source_commit_date": git_text(
+                    "show", "-s", "--format=%cI", source_commit
+                ),
                 "manifest_sha256": manifest_sha256,
                 "nanobot_dependency": {
                     "upstream_baseline": baseline,
@@ -544,5 +620,5 @@ if ! git -C "$destination" init --initial-branch=main >/dev/null 2>&1; then
   git -C "$destination" symbolic-ref HEAD refs/heads/main
 fi
 
-python3 "$source_dir/scripts/validate-ziggy-product-split.py" --export "$destination"
+python3 "$destination/scripts/validate-ziggy-product-split.py" --export "$destination"
 printf 'validated_export=%s\n' "$destination"

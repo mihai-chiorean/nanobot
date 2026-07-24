@@ -164,6 +164,7 @@ jobs:
 
       - name: Build unsigned Release app
         run: |
+          build_number=$((GITHUB_RUN_NUMBER + 1))
           xcodebuild \
             -project ios/Ziggy.xcodeproj \
             -scheme Ziggy \
@@ -173,6 +174,7 @@ jobs:
             -clonedSourcePackagesDirPath "$RUNNER_TEMP/ziggy-source-packages" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
-            CURRENT_PROJECT_VERSION=1 \
+            CURRENT_PROJECT_VERSION="${build_number}" \
+            ZIGGY_ARCHIVE_BUILD_NUMBER="${build_number}" \
             CLERK_PUBLISHABLE_KEY="pk_live_${ZIGGY_CI_CLERK_LIVE_SUFFIX}" \
             build

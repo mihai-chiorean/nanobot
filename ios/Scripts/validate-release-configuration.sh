@@ -12,8 +12,13 @@ if [[ ! "$publishable_key" =~ ^pk_live_[A-Za-z0-9_-]{8,}$ ]]; then
 fi
 
 build_number=${CURRENT_PROJECT_VERSION:-}
-if [[ ! "$build_number" =~ ^[1-9][0-9]*$ ]]; then
-  printf 'error: Release builds require a positive integer CURRENT_PROJECT_VERSION\n' >&2
+archive_build_number=${ZIGGY_ARCHIVE_BUILD_NUMBER:-}
+if [[ ! "$archive_build_number" =~ ^([2-9]|[1-9][0-9]+)$ ]]; then
+  printf 'error: Release builds require an explicit ZIGGY_ARCHIVE_BUILD_NUMBER greater than 1\n' >&2
+  exit 1
+fi
+if [[ "$build_number" != "$archive_build_number" ]]; then
+  printf 'error: CURRENT_PROJECT_VERSION must match ZIGGY_ARCHIVE_BUILD_NUMBER\n' >&2
   exit 1
 fi
 

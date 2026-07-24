@@ -63,6 +63,36 @@
     {"source": "LICENSE", "destination": "licenses/nanobot-MIT.txt", "required": true},
     {"source": "THIRD_PARTY_NOTICES.md", "destination": "licenses/nanobot-third-party-notices.md", "required": true}
   ],
+  "export_text_replacements": [
+    {
+      "id": "ziggy-control-module-identity",
+      "path_regex": "^services/ziggy-control/(?:go\\.mod|.*\\.go)$",
+      "from": "github.com/mihai-chiorean/nanobot/services/ziggy-control",
+      "to": "github.com/mihai-chiorean/ziggy/services/ziggy-control",
+      "minimum_matches": 1
+    },
+    {
+      "id": "ziggy-connectors-module-identity",
+      "path_regex": "^services/ziggy-connectors/(?:go\\.mod|.*\\.go)$",
+      "from": "github.com/mihai-chiorean/nanobot/services/ziggy-connectors",
+      "to": "github.com/mihai-chiorean/ziggy/services/ziggy-connectors",
+      "minimum_matches": 1
+    },
+    {
+      "id": "ziggy-runtime-manager-module-identity",
+      "path_regex": "^services/ziggy-runtime-manager/(?:go\\.mod|.*\\.go)$",
+      "from": "github.com/mihai-chiorean/nanobot/services/ziggy-runtime-manager",
+      "to": "github.com/mihai-chiorean/ziggy/services/ziggy-runtime-manager",
+      "minimum_matches": 1
+    },
+    {
+      "id": "ziggy-work-module-identity",
+      "path_regex": "^services/ziggy-work/(?:go\\.mod|.*\\.go)$",
+      "from": "github.com/mihai-chiorean/nanobot/services/ziggy-work",
+      "to": "github.com/mihai-chiorean/ziggy/services/ziggy-work",
+      "minimum_matches": 1
+    }
+  ],
   "generated": [
     {"destination": "README.md", "kind": "product_readme"},
     {"destination": ".gitignore", "kind": "product_gitignore"},
@@ -197,6 +227,14 @@
     ],
     "secret_content_exempt_path_patterns": [
       "(^|/)(?:node_modules|dist|coverage|\\.vite|bin)(/|$)"
+    ],
+    "nanobot_source_tree_signatures": [
+      [
+        "agent/loop.py",
+        "channels/websocket.py",
+        "config/schema.py",
+        "session/manager.py"
+      ]
     ]
   },
   "patches": [

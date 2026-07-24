@@ -5,29 +5,31 @@ on:
     paths:
       - ".github/workflows/ziggy-product-split.yml"
       - "config/ziggy-repository-split.json"
-      - "docs/architecture/ziggy-repository-split.md"
+      - "docs/**"
       - "ios/**"
-      - "scripts/*ziggy-product*"
-      - "scripts/assert-ziggy-web-build.sh"
+      - "LICENSE"
+      - "scripts/**"
       - "services/observability/**"
       - "services/ziggy-connectors/**"
       - "services/ziggy-control/**"
       - "services/ziggy-runtime-manager/**"
       - "services/ziggy-work/**"
+      - "THIRD_PARTY_NOTICES.md"
       - "webui/**"
   pull_request:
     paths:
       - ".github/workflows/ziggy-product-split.yml"
       - "config/ziggy-repository-split.json"
-      - "docs/architecture/ziggy-repository-split.md"
+      - "docs/**"
       - "ios/**"
-      - "scripts/*ziggy-product*"
-      - "scripts/assert-ziggy-web-build.sh"
+      - "LICENSE"
+      - "scripts/**"
       - "services/observability/**"
       - "services/ziggy-connectors/**"
       - "services/ziggy-control/**"
       - "services/ziggy-runtime-manager/**"
       - "services/ziggy-work/**"
+      - "THIRD_PARTY_NOTICES.md"
       - "webui/**"
 
 permissions:
@@ -47,6 +49,11 @@ jobs:
           scripts/test-ziggy-product-split.sh \
             --source . \
             --export "$RUNNER_TEMP/ziggy-product"
+      - name: Parse generated workflow
+        run: |
+          ruby -e \
+            'require "yaml"; YAML.safe_load_file(ARGV.fetch(0), aliases: true)' \
+            "$RUNNER_TEMP/ziggy-product/.github/workflows/ziggy-product.yml"
       - name: Scan staged product tree for secrets
         run: scripts/scan-ziggy-product-secrets.sh "$RUNNER_TEMP/ziggy-product"
 

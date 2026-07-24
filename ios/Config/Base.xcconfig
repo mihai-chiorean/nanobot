@@ -1,5 +1,7 @@
 CODE_SIGN_STYLE = Automatic
 MARKETING_VERSION = 0.1.0
+// Sentinel only. Release CI and archives must explicitly provide a matching
+// CURRENT_PROJECT_VERSION and ZIGGY_ARCHIVE_BUILD_NUMBER greater than 1.
 CURRENT_PROJECT_VERSION = 1
 SWIFT_EMIT_LOC_STRINGS = YES
 ENABLE_PREVIEWS = YES

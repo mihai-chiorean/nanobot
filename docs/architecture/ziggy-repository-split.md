@@ -8,13 +8,14 @@ reviewed, but the product repository must not contain a root nanobot/ tree,
 Nanobot Python tests, Nanobot packaging files, or Nanobot's generated WebUI
 bundle.
 
-The export is a one-way operation. It copies tracked allowlisted files into a
-new directory, writes deterministic metadata and product CI files, refuses to
-overwrite an existing destination, initializes a new Git repository on its main
-branch, and validates the result. Provenance uses the canonical source
-repository identity in the manifest plus the exact source commit. Local branch
-names and equivalent SSH or HTTPS origin URLs do not affect output. The exporter
-never deletes or moves the source repository.
+The export is a one-way operation. It captures `HEAD` once, reads allowlisted
+blob bytes and executable modes directly from that Git tree, writes
+deterministic metadata and product CI files, refuses to overwrite an existing
+destination, initializes a new Git repository on its main branch, and validates
+the result. Provenance uses the canonical source repository identity in the
+manifest plus the exact source commit. Working-tree filters, masked local
+changes, local branch names, and equivalent SSH or HTTPS origin URLs do not
+affect output. The exporter never deletes or moves the source repository.
 
 The contract is machine-readable in
 config/ziggy-repository-split.json. The implementation is
@@ -47,6 +48,11 @@ scripts/test-ziggy-product-split.sh.
 
 The source webui/ directory is renamed to web/. The export transform rewrites
 the copied Vite config so its output is web/dist, never ../nanobot/web/dist.
+It also rewrites each exported Go module, internal import, and instrumentation
+identity from `github.com/mihai-chiorean/nanobot/services/ziggy-*` to
+`github.com/mihai-chiorean/ziggy/services/ziggy-*`. Source modules retain their
+current fork paths; the deterministic export owns the product repository
+identity.
 The source WhatsApp bridge is not exported: it has no committed dependency
 lock, independent test workflow, or clear Ziggy product owner. The four service
 directories are preserved so their Go modules, tests, migrations, and
@@ -94,7 +100,7 @@ An update is a dependency change, not a product rebase:
    repository identity and exact export commit.
 3. Run the product contract tests: WebSocket authentication and transport,
    Work command/event compatibility, MCP OAuth, memory path safety, and the
-   three Go service suites.
+   four Go service suites.
 4. Record which patch entries disappeared or changed classification.
 5. Export again and review the generated .ziggy metadata.
 
@@ -139,7 +145,7 @@ intentionally product-only:
 
 | Component | Working directory | Required checks |
 | --- | --- | --- |
-| Swift client | ios/ | Resolve Swift packages; Debug build-for-testing and simulator tests; Release configuration script tests; unsigned Release build with a `pk_live_` key and positive build number. |
+| Swift client | ios/ | Resolve Swift packages; Debug build-for-testing and simulator tests; Release configuration script tests; unsigned Release build with a `pk_live_` key and an explicitly supplied archive build number greater than the already-used build 1. |
 | PWA | web/ | npm ci, npm test, npm run lint, npm run build, blocking high-severity npm audit. |
 | ziggy-control | services/ziggy-control/ | PostgreSQL-backed make verify, linux-amd64, linux-arm64; lifecycle integration tests may not skip. |
 | ziggy-connectors | services/ziggy-connectors/ | make verify, linux-amd64, linux-arm64. |
@@ -168,10 +174,13 @@ Web and Go dependency notices remain governed by their package lockfiles and
 module metadata.
 
 Secrets and generated artifacts are excluded in three ways: the exporter
-requires a clean source worktree and enumerates git-tracked files only; the
-validator rejects secret-like names, unknown top-level paths, root nanobot/,
-and generated fork packaging paths; and CI runs pinned Gitleaks in directory
-mode against the staged product tree rather than inherited history. Nested
+requires a clean source worktree but reads only blobs from the captured Git
+commit; the validator rejects secret-like names, unknown top-level paths,
+structurally identified Nanobot source trees at any depth, and generated fork
+packaging paths; and CI runs pinned Gitleaks in directory mode against the
+staged product tree rather than inherited history. Gitleaks archives are pinned
+by digest, with portable digest comparison that works with both BSD and GNU
+SHA-256 tools. Nested
 `.env` files and variants such as `.env.local` and `.env.example` are rejected.
 Bounded text scans reject private-key headers, credentialed PostgreSQL URLs,
 GitHub, AWS, Slack, Anthropic, OpenAI, GitLab, npm, SendGrid, Grafana Cloud,
@@ -191,8 +200,9 @@ The first private repository should be created from one verified export
 commit. This gives a reviewable boundary and avoids importing all Nanobot
 history. The canonical source repository and exact source commit are recorded
 in .ziggy/export-metadata.json. Split tests reproduce the export from a renamed
-branch and detached HEAD in a separate clone with different origin URL forms,
-then require identical Git tree IDs.
+branch, a status-clean worktree with masked non-HEAD bytes, and detached HEAD
+in a separate clone with different origin URL forms, then require identical Git
+tree IDs. They also parse the generated workflow before publication.
 
 Useful Ziggy history can be prepared separately in a disposable clone. Do not
 run history filtering in the active source worktree:

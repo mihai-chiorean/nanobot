@@ -36,10 +36,90 @@ export_dir=$(cd "$export_dir" && pwd -P)
 validator="$source_dir/scripts/validate-ziggy-product-split.py"
 
 python3 "$validator" --source "$source_dir" --export "$export_dir"
+ruby -e \
+  'require "yaml"; ARGV.each { |path| YAML.safe_load_file(path, aliases: true) }' \
+  "$source_dir/.github/workflows/ziggy-product-split.yml" \
+  "$export_dir/.github/workflows/ziggy-product.yml"
+"$source_dir/scripts/scan-ziggy-product-secrets.sh" --self-test-checksum
+
+python3 - "$source_dir" <<'PY'
+import fnmatch
+import json
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+source = Path(sys.argv[1])
+manifest = json.loads(
+    (source / "config/ziggy-repository-split.json").read_text(encoding="utf-8")
+)
+workflow_lines = (
+    source / ".github/workflows/ziggy-product-split.yml"
+).read_text(encoding="utf-8").splitlines()
+
+path_sections = []
+for index, line in enumerate(workflow_lines):
+    if line.strip() != "paths:":
+        continue
+    patterns = []
+    for candidate in workflow_lines[index + 1 :]:
+        match = re.fullmatch(r'\s+- "([^"]+)"', candidate)
+        if not match:
+            break
+        patterns.append(match.group(1))
+    path_sections.append(patterns)
+
+if len(path_sections) != 2 or path_sections[0] != path_sections[1]:
+    raise SystemExit("error: push and pull_request export path filters must match")
+
+tracked = subprocess.check_output(
+    ["git", "-C", str(source), "ls-tree", "-rz", "--name-only", "HEAD"]
+).decode("utf-8").split("\0")
+tracked = [path for path in tracked if path]
+
+
+def in_entry(path: str, entry: dict) -> bool:
+    if "source" in entry:
+        return path == entry["source"]
+    prefix = entry["source_prefix"]
+    if path == prefix:
+        return True
+    if prefix.endswith("-"):
+        return path.startswith(prefix)
+    return path.startswith(prefix.rstrip("/") + "/")
+
+
+exported_sources = {
+    path
+    for entry in manifest["entries"]
+    for path in tracked
+    if in_entry(path, entry)
+}
+uncovered = sorted(
+    path
+    for path in exported_sources
+    if not any(fnmatch.fnmatchcase(path, pattern) for pattern in path_sections[0])
+)
+if uncovered:
+    raise SystemExit(
+        "error: product split CI path filters do not cover exported sources:\n"
+        + "\n".join(uncovered)
+    )
+PY
+
 if [[ -e "$export_dir/web/bridge" ]]; then
   printf 'error: product export contains the unowned WhatsApp bridge\n' >&2
   exit 1
 fi
+
+for service in control connectors runtime-manager work; do
+  expected="module github.com/mihai-chiorean/ziggy/services/ziggy-$service"
+  if ! grep -Fx "$expected" "$export_dir/services/ziggy-$service/go.mod" >/dev/null; then
+    printf 'error: exported Go module identity is incorrect: %s\n' "$service" >&2
+    exit 1
+  fi
+done
 
 tmp_root=$(printenv TMPDIR || printf '/tmp')
 tmp_dir=$(mktemp -d "$tmp_root/ziggy-split-test.XXXXXX")
@@ -61,6 +141,29 @@ if python3 "$validator" --export "$bulk" >/dev/null 2>&1; then
   printf 'error: validator accepted a Nanobot bulk copy\n' >&2
   exit 1
 fi
+
+nested_bulk="$tmp_dir/nested-nanobot-bulk-copy"
+cp -a "$export_dir" "$nested_bulk"
+nested_root="$nested_bulk/services/vendor/runtime"
+mkdir -p \
+  "$nested_root/agent" \
+  "$nested_root/channels" \
+  "$nested_root/config" \
+  "$nested_root/session"
+printf 'source tree fixture\n' > "$nested_root/agent/loop.py"
+printf 'source tree fixture\n' > "$nested_root/channels/websocket.py"
+printf 'source tree fixture\n' > "$nested_root/config/schema.py"
+printf 'source tree fixture\n' > "$nested_root/session/manager.py"
+if python3 "$validator" --export "$nested_bulk" >/dev/null 2>&1; then
+  printf 'error: validator accepted a relocated Nanobot source tree\n' >&2
+  exit 1
+fi
+
+nanobot_near_miss="$tmp_dir/nanobot-name-near-miss"
+cp -a "$export_dir" "$nanobot_near_miss"
+mkdir -p "$nanobot_near_miss/services/nanobot"
+printf 'Nanobot integration notes only.\n' > "$nanobot_near_miss/services/nanobot/README.md"
+python3 "$validator" --export "$nanobot_near_miss" >/dev/null
 
 web_build="$tmp_dir/web-build"
 cp -a "$export_dir" "$web_build"
@@ -173,6 +276,18 @@ git -C "$clone" remote set-url origin https://github.com/mihai-chiorean/nanobot.
 branch_export="$tmp_dir/branch-export"
 "$clone/scripts/export-ziggy-product.sh" --source "$clone" --destination "$branch_export" >/dev/null
 
+masked_path="docs/research/selective-agent-memory.md"
+git -C "$clone" update-index --assume-unchanged "$masked_path"
+printf '\nworking tree bytes that are not in HEAD\n' >> "$clone/$masked_path"
+if [[ -n "$(git -C "$clone" status --porcelain=v1 --untracked-files=all)" ]]; then
+  printf 'error: assume-unchanged provenance fixture is not status-clean\n' >&2
+  exit 1
+fi
+masked_export="$tmp_dir/masked-worktree-export"
+"$clone/scripts/export-ziggy-product.sh" \
+  --source "$clone" \
+  --destination "$masked_export" >/dev/null
+
 git -C "$clone" checkout --quiet --detach "$source_commit"
 git -C "$clone" remote set-url origin git@github.com:mihai-chiorean/nanobot.git
 detached_export="$tmp_dir/detached-export"
@@ -186,11 +301,14 @@ tree_id() {
 
 expected_tree=$(tree_id "$export_dir")
 branch_tree=$(tree_id "$branch_export")
+masked_tree=$(tree_id "$masked_export")
 detached_tree=$(tree_id "$detached_export")
-if [[ "$expected_tree" != "$branch_tree" || "$expected_tree" != "$detached_tree" ]]; then
-  printf 'error: export changes across clone, branch, detached HEAD, or remote URL forms\n' >&2
-  printf 'expected=%s branch=%s detached=%s\n' \
-    "$expected_tree" "$branch_tree" "$detached_tree" >&2
+if [[ "$expected_tree" != "$branch_tree" \
+  || "$expected_tree" != "$masked_tree" \
+  || "$expected_tree" != "$detached_tree" ]]; then
+  printf 'error: export changes across worktree bytes, clone, branch, detached HEAD, or remote URL forms\n' >&2
+  printf 'expected=%s branch=%s masked=%s detached=%s\n' \
+    "$expected_tree" "$branch_tree" "$masked_tree" "$detached_tree" >&2
   exit 1
 fi
 

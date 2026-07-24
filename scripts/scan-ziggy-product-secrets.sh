@@ -1,6 +1,56 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+verify_sha256() {
+  local expected=$1
+  local file=$2
+  local output
+  local actual
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    output=$(sha256sum "$file")
+  elif command -v shasum >/dev/null 2>&1; then
+    output=$(shasum -a 256 "$file")
+  else
+    printf 'error: no SHA-256 implementation is available\n' >&2
+    return 1
+  fi
+  actual=${output%%[[:space:]]*}
+  if [[ ! "$actual" =~ ^[0-9a-fA-F]{64}$ ]]; then
+    printf 'error: SHA-256 implementation returned an invalid digest\n' >&2
+    return 1
+  fi
+  actual=$(printf '%s' "$actual" | tr '[:upper:]' '[:lower:]')
+  expected=$(printf '%s' "$expected" | tr '[:upper:]' '[:lower:]')
+  if [[ "$actual" != "$expected" ]]; then
+    printf 'error: SHA-256 mismatch for %s\n' "$file" >&2
+    return 1
+  fi
+}
+
+if [[ "${1:-}" == "--self-test-checksum" ]]; then
+  temp_dir=$(mktemp -d "${TMPDIR:-/tmp}/ziggy-checksum-test.XXXXXX")
+  trap 'rm -rf "$temp_dir"' EXIT
+  fixture="$temp_dir/fixture"
+  printf 'ziggy-checksum-fixture\n' > "$fixture"
+  verify_sha256 \
+    a6447bde01269eefc3b5d19f592dc421e2fd4c8825d9364a71594a47d9efc521 \
+    "$fixture"
+  if verify_sha256 \
+    0000000000000000000000000000000000000000000000000000000000000000 \
+    "$fixture" >/dev/null 2>&1; then
+    printf 'error: checksum verifier accepted an incorrect digest\n' >&2
+    exit 1
+  fi
+  printf 'checksum_self_test=passed\n'
+  exit 0
+fi
+
+if (($# > 1)); then
+  printf 'Usage: %s [ROOT|--self-test-checksum]\n' "$0" >&2
+  exit 2
+fi
+
 root=${1:-.}
 root=$(cd "$root" && pwd -P)
 
@@ -42,11 +92,7 @@ else
     --output "$archive" \
     "$url"
 
-  if command -v sha256sum >/dev/null 2>&1; then
-    printf '%s  %s\n' "$checksum" "$archive" | sha256sum --check
-  else
-    printf '%s  %s\n' "$checksum" "$archive" | shasum -a 256 --check
-  fi
+  verify_sha256 "$checksum" "$archive"
   tar -xzf "$archive" -C "$temp_dir" gitleaks
   gitleaks="$temp_dir/gitleaks"
 fi
