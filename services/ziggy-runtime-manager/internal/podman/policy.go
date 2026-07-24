@@ -16,6 +16,7 @@ const (
 	minRuntimePort      = 21000
 	maxRuntimePort      = 29999
 	canaryCapabilityTTL = 15 * time.Minute
+	maxCanaryTenants    = 4
 )
 
 var (
@@ -65,6 +66,9 @@ func (p Policy) validate(now time.Time, requireFreshCapabilities bool) error {
 	}
 	if len(p.Tenants) == 0 {
 		return errors.New("policy must allocate at least one workspace")
+	}
+	if len(p.Tenants) > maxCanaryTenants {
+		return fmt.Errorf("Phase 1 policy exceeds the %d workspace canary limit", maxCanaryTenants)
 	}
 	ports := map[int]string{}
 	caps := map[string]string{}

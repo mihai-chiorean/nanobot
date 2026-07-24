@@ -3,6 +3,7 @@ package podman
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -73,6 +74,20 @@ func TestRenderQuadletRejectsUnsafeNetworkAndMounts(t *testing.T) {
 	if err := ValidateRenderedQuadlet(string(quadlet)); err != nil {
 		t.Fatalf("generated quadlet rejected: %v", err)
 	}
+	if strings.Contains(string(quadlet), "socket.create_connection") {
+		t.Fatal("raw TCP health probe remained in generated Quadlet")
+	}
+	for _, required := range []string{
+		`c.request("GET","/health"`,
+		`json.loads(b) == {"status":"ok"}`,
+		"ProtectHome=read-only",
+		"ReadWritePaths=%h/.local/share/containers",
+		"ReadWritePaths=%t/containers",
+	} {
+		if !strings.Contains(string(quadlet), required) {
+			t.Fatalf("generated Quadlet missing %q", required)
+		}
+	}
 	for _, unsafe := range []struct {
 		name   string
 		change func(string) string
@@ -91,6 +106,31 @@ func TestRenderQuadletRejectsUnsafeNetworkAndMounts(t *testing.T) {
 				t.Fatal("unsafe Quadlet was accepted")
 			}
 		})
+	}
+}
+
+func TestPolicyCapsPhaseOneFleetAtFourWorkspaces(t *testing.T) {
+	policy := fixturePolicy()
+	for index := 0; index < 3; index++ {
+		policy.Tenants[fmt.Sprintf("tenant-extra-%d", index)] = TenantPolicy{
+			HostPort: 22000 + index,
+			Model:    "local/model",
+			ModelCapability: Capability{
+				Value:     strings.Repeat(string(rune('A'+index*2)), 43),
+				ExpiresAt: fixtureNow.Add(10 * time.Minute),
+			},
+			MCPCapability: Capability{
+				Value:     strings.Repeat(string(rune('B'+index*2)), 43),
+				ExpiresAt: fixtureNow.Add(10 * time.Minute),
+			},
+		}
+	}
+	if err := policy.Validate(fixtureNow); err == nil || !strings.Contains(err.Error(), "4 workspace") {
+		t.Fatalf("five-workspace policy error=%v", err)
+	}
+	delete(policy.Tenants, "tenant-extra-2")
+	if err := policy.Validate(fixtureNow); err != nil {
+		t.Fatalf("four-workspace canary policy rejected: %v", err)
 	}
 }
 

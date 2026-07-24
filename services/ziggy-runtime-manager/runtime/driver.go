@@ -4,6 +4,7 @@ package runtime
 import (
 	"context"
 	"errors"
+	"regexp"
 	"time"
 )
 
@@ -14,6 +15,8 @@ var (
 	ErrStaleGeneration    = errors.New("runtime request generation is stale")
 	ErrGenerationConflict = errors.New("runtime generation conflicts with a live runtime")
 	ErrNotFound           = errors.New("runtime not found")
+	ErrTenantDataDeleted  = errors.New("runtime tenant data was permanently deleted")
+	workspaceIDPattern    = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{2,62}$`)
 )
 
 // Request carries identity and a monotonic fence only. The manager policy, rather
@@ -58,4 +61,12 @@ type Driver interface {
 	DeleteTenantData(context.Context, Request) error
 }
 
-func (r Request) Valid() bool { return r.WorkspaceID != "" && r.Generation > 0 }
+// RequestValidator authorizes workspace membership before Manager allocates a
+// keyed lock or creates durable state for a request.
+type RequestValidator interface {
+	ValidateRequest(Request) error
+}
+
+func (r Request) Valid() bool {
+	return workspaceIDPattern.MatchString(r.WorkspaceID) && r.Generation > 0
+}

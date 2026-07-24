@@ -82,8 +82,22 @@ func TestEnsureRunningStagesOnlyNamedVolumesAndNetworklessConfig(t *testing.T) {
 	if !staged {
 		t.Fatal("config was not staged through the restricted helper")
 	}
-	if _, err := os.Stat(filepath.Join(driver.QuadletDir, "ziggy-tenant-tenant-alpha.container")); err != nil {
+	quadletPath := filepath.Join(driver.QuadletDir, "ziggy-tenant-tenant-alpha.container")
+	info, err := os.Stat(quadletPath)
+	if err != nil {
 		t.Fatalf("Quadlet was not staged: %v", err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("Quadlet mode=%o want=600", info.Mode().Perm())
+	}
+	entries, err := os.ReadDir(driver.QuadletDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.Contains(entry.Name(), ".tmp-") {
+			t.Fatalf("temporary Quadlet was published: %s", entry.Name())
+		}
 	}
 }
 

@@ -5,14 +5,14 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/ziggy-runtime-manager -policy %h/.config/ziggy-runtime-manager/policy.json -quadlet-dir %h/.config/containers/systemd -socket %t/ziggy-runtime-manager/manager.sock
+ExecStart=%h/.local/bin/ziggy-runtime-manager -policy %h/.config/ziggy-runtime-manager/policy.json -quadlet-dir %h/.config/containers/systemd -state-dir %h/.local/state/ziggy-runtime-manager -socket /run/ziggy-runtime-manager/manager.sock -socket-group ziggy-control
 Restart=on-failure
 RestartSec=3s
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=read-only
 ProtectSystem=strict
-ReadWritePaths=%h/.config/containers/systemd %h/.local/share/containers %h/.cache/containers %t/containers %t/ziggy-runtime-manager
+ReadWritePaths=%h/.config/containers/systemd %h/.local/state/ziggy-runtime-manager %h/.local/share/containers %h/.cache/containers %t/containers /run/ziggy-runtime-manager
 ProtectControlGroups=true
 ProtectKernelTunables=true
 ProtectKernelModules=true

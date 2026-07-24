@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -13,6 +14,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/mihai-chiorean/nanobot/services/ziggy-runtime-manager/runtime"
@@ -37,6 +39,10 @@ type Server struct {
 	ReadTimeout     time.Duration
 	WriteTimeout    time.Duration
 	DriverTimeout   time.Duration
+	SocketGroupID   int
+	SocketGroupSet  bool
+	DestructiveUID  int
+	DestructiveSet  bool
 }
 
 const (
@@ -56,6 +62,12 @@ type limits struct {
 	readTimeout     time.Duration
 	writeTimeout    time.Duration
 	driverTimeout   time.Duration
+}
+
+type peerIdentity struct {
+	UID int
+	GID int
+	PID int
 }
 
 func (s Server) limits() limits {
@@ -82,22 +94,42 @@ func (s Server) ListenAndServe(ctx context.Context, socket string) error {
 	if s.Driver == nil {
 		return errors.New("runtime driver is required")
 	}
-	if err := os.MkdirAll(filepath.Dir(socket), 0o700); err != nil {
+	if s.SocketGroupSet && s.SocketGroupID < 0 {
+		return errors.New("socket group ID must not be negative")
+	}
+	if s.DestructiveSet && s.DestructiveUID < 0 {
+		return errors.New("destructive peer UID must not be negative")
+	}
+	if err := s.prepareSocketDirectory(filepath.Dir(socket)); err != nil {
 		return err
 	}
-	if err := os.Remove(socket); err != nil && !errors.Is(err, os.ErrNotExist) {
+	lock, err := acquireSocketLock(socket + ".lock")
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	if err := removeStaleSocket(socket); err != nil {
 		return err
 	}
 	listener, err := net.Listen("unix", socket)
 	if err != nil {
 		return err
 	}
-	if err := os.Chmod(socket, 0o660); err != nil {
+	defer listener.Close()
+	defer os.Remove(socket)
+	if s.SocketGroupSet {
+		if err := os.Chown(socket, -1, s.SocketGroupID); err != nil {
+			return err
+		}
+	}
+	socketMode := os.FileMode(0o600)
+	if s.SocketGroupSet {
+		socketMode = 0o660
+	}
+	if err := os.Chmod(socket, socketMode); err != nil {
 		listener.Close()
 		return err
 	}
-	defer os.Remove(socket)
-	defer listener.Close()
 	go func() {
 		<-ctx.Done()
 		_ = listener.Close()
@@ -112,11 +144,17 @@ func (s Server) ListenAndServe(ctx context.Context, socket string) error {
 			}
 			return err
 		}
+		peer, err := socketPeerIdentity(connection)
+		if err != nil || !s.authorizePeer(peer) {
+			s.writeResponse(connection, limits, Response{Error: "unauthorized_peer"})
+			_ = connection.Close()
+			continue
+		}
 		select {
 		case slots <- struct{}{}:
 			go func() {
 				defer func() { <-slots }()
-				s.serveConnection(ctx, connection, limits)
+				s.serveConnection(ctx, connection, limits, peer)
 			}()
 		default:
 			s.writeResponse(connection, limits, Response{Error: "server_busy"})
@@ -125,7 +163,7 @@ func (s Server) ListenAndServe(ctx context.Context, socket string) error {
 	}
 }
 
-func (s Server) serveConnection(ctx context.Context, connection net.Conn, limits limits) {
+func (s Server) serveConnection(ctx context.Context, connection net.Conn, limits limits, peer peerIdentity) {
 	defer connection.Close()
 	if err := connection.SetReadDeadline(time.Now().Add(limits.readTimeout)); err != nil {
 		return
@@ -154,6 +192,11 @@ func (s Server) serveConnection(ctx context.Context, connection net.Conn, limits
 	if err := connection.SetReadDeadline(time.Time{}); err != nil {
 		return
 	}
+	if request.Operation == "delete_tenant_data" && !s.authorizeDestructivePeer(peer) {
+		s.log(request, "forbidden")
+		s.writeResponse(connection, limits, Response{Error: "destructive_operation_forbidden"})
+		return
+	}
 	driverCtx, cancel := context.WithTimeout(ctx, limits.driverTimeout)
 	defer cancel()
 	status, err := s.dispatch(driverCtx, request)
@@ -164,6 +207,81 @@ func (s Server) serveConnection(ctx context.Context, connection net.Conn, limits
 	}
 	s.log(request, string(status.State))
 	s.writeResponse(connection, limits, Response{Status: &status})
+}
+
+func (s Server) prepareSocketDirectory(dir string) error {
+	mode := os.FileMode(0o700)
+	if s.SocketGroupSet {
+		mode = 0o750
+	}
+	if err := os.MkdirAll(dir, mode); err != nil {
+		return err
+	}
+	info, err := os.Lstat(dir)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("runtime socket parent must be a directory")
+	}
+	if s.SocketGroupSet {
+		if err := os.Chown(dir, -1, s.SocketGroupID); err != nil {
+			return err
+		}
+	}
+	return os.Chmod(dir, mode)
+}
+
+func (s Server) authorizePeer(peer peerIdentity) bool {
+	if peer.UID == os.Geteuid() {
+		return true
+	}
+	return s.SocketGroupSet && peer.GID == s.SocketGroupID
+}
+
+func (s Server) authorizeDestructivePeer(peer peerIdentity) bool {
+	allowedUID := os.Geteuid()
+	if s.DestructiveSet {
+		allowedUID = s.DestructiveUID
+	}
+	return peer.UID == allowedUID
+}
+
+func acquireSocketLock(path string) (*os.File, error) {
+	lock, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		lock.Close()
+		return nil, errors.New("runtime manager socket is already owned")
+	}
+	return lock, nil
+}
+
+func removeStaleSocket(path string) error {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSocket == 0 {
+		return errors.New("runtime socket path exists and is not a socket")
+	}
+	connection, err := net.DialTimeout("unix", path, 100*time.Millisecond)
+	if err == nil {
+		connection.Close()
+		return errors.New("runtime manager socket is already accepting connections")
+	}
+	if !errors.Is(err, syscall.ECONNREFUSED) && !errors.Is(err, syscall.ENOENT) {
+		return fmt.Errorf("refusing to replace unprobeable runtime socket: %w", err)
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 func requestErrorCode(err error) string {
@@ -234,6 +352,8 @@ func errorCode(err error) string {
 		return "generation_conflict"
 	case errors.Is(err, runtime.ErrNotFound):
 		return "not_found"
+	case errors.Is(err, runtime.ErrTenantDataDeleted):
+		return "tenant_data_deleted"
 	default:
 		return "lifecycle_failed"
 	}

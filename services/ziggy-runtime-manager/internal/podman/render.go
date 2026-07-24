@@ -127,7 +127,7 @@ Tmpfs=/dev/shm:rw,nosuid,nodev,noexec,size=64m,mode=1777
 Environment=HOME=/home/nanobot
 Environment=LANG=C.UTF-8
 Environment=PYTHONDONTWRITEBYTECODE=1
-HealthCmd=CMD-SHELL python3 -c 'import socket; s=socket.create_connection(("127.0.0.1",18790),2); s.close()'
+HealthCmd=CMD-SHELL python3 -c 'import http.client,json; c=http.client.HTTPConnection("127.0.0.1",18790,timeout=2); c.request("GET","/health",headers={"Accept":"application/json"}); r=c.getresponse(); b=r.read(256); assert r.status == 200 and json.loads(b) == {"status":"ok"}'
 HealthInterval=30s
 HealthTimeout=5s
 HealthRetries=3
@@ -146,8 +146,11 @@ TimeoutStopSec=30s
 KillMode=control-group
 NoNewPrivileges=true
 PrivateTmp=true
-ProtectHome=true
+ProtectHome=read-only
 ProtectSystem=strict
+ReadWritePaths=%%h/.local/share/containers
+ReadWritePaths=%%h/.cache/containers
+ReadWritePaths=%%t/containers
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 RestrictSUIDSGID=true
 LockPersonality=true
@@ -179,13 +182,15 @@ func ValidateRenderedQuadlet(quadlet string) error {
 		"PidsLimit=256", "Memory=1G", "PodmanArgs=--cpus=1.0", "PublishPort=127.0.0.1:",
 		"ReadOnlyTmpfs=false", "ImageVolume=ignore", "Pull=never", "LogDriver=journald", "SecurityLabelDisable=false",
 		"Volume=ziggy-tenant-", "Network=ziggy-tenant-", "io.ziggy.egress=enforce-required",
+		`c.request("GET","/health"`, `json.loads(b) == {"status":"ok"}`,
+		"ProtectHome=read-only", "ReadWritePaths=%h/.local/share/containers", "ReadWritePaths=%t/containers",
 	}
 	for _, value := range required {
 		if !strings.Contains(quadlet, value) {
 			return fmt.Errorf("quadlet missing required control %q", value)
 		}
 	}
-	for _, forbidden := range []string{"Network=host", "Privileged=true", "AddCapability=", "/Users/", "/etc/", "/var/run/docker.sock", "/run/podman/podman.sock", "EnvironmentFile="} {
+	for _, forbidden := range []string{"Network=host", "Privileged=true", "AddCapability=", "/Users/", "/etc/", "/var/run/docker.sock", "/run/podman/podman.sock", "EnvironmentFile=", "socket.create_connection"} {
 		if strings.Contains(quadlet, forbidden) {
 			return fmt.Errorf("quadlet contains unsafe setting %q", forbidden)
 		}

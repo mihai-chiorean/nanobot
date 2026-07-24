@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -136,10 +137,81 @@ func TestSocketDriverUsesRequestDeadline(t *testing.T) {
 	}
 }
 
+func TestPeerPolicyRestrictsDestructiveDataDeletion(t *testing.T) {
+	server := Server{
+		SocketGroupID:  4242,
+		SocketGroupSet: true,
+		DestructiveUID: 1001,
+		DestructiveSet: true,
+	}
+	controlPeer := peerIdentity{UID: 1002, GID: 4242, PID: 99}
+	if !server.authorizePeer(controlPeer) {
+		t.Fatal("configured control group peer was rejected")
+	}
+	if server.authorizeDestructivePeer(controlPeer) {
+		t.Fatal("control group peer was allowed to delete tenant data")
+	}
+	if !server.authorizeDestructivePeer(peerIdentity{UID: 1001, GID: 1001}) {
+		t.Fatal("configured destructive peer was rejected")
+	}
+	if server.authorizePeer(peerIdentity{UID: 1002, GID: 4343}) {
+		t.Fatal("peer outside the configured primary group was accepted")
+	}
+}
+
+func TestSecondServerCannotReplaceLiveSocket(t *testing.T) {
+	socket := testSocketPath(t, "manager.sock")
+	server := Server{Driver: &fakeDriver{}}
+	stop := startServerAt(t, server, socket)
+	defer stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := server.ListenAndServe(ctx, socket); err == nil || !strings.Contains(err.Error(), "already owned") {
+		t.Fatalf("second server error=%v", err)
+	}
+
+	connection := dial(t, socket)
+	defer connection.Close()
+	writeRequest(t, connection, Request{Operation: "ensure_running", WorkspaceID: "tenant-alpha", Generation: 7})
+	if response := readResponse(t, connection); response.Status == nil || response.Status.State != runtime.StateRunning {
+		t.Fatalf("first server socket was replaced: %+v", response)
+	}
+}
+
+func TestServerRecoversStaleSocketWhileHoldingLock(t *testing.T) {
+	socket := testSocketPath(t, "manager.sock")
+	stale, err := net.ListenUnix("unix", &net.UnixAddr{Name: socket, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale.SetUnlinkOnClose(false)
+	if err := stale.Close(); err != nil {
+		t.Fatal(err)
+	}
+	stop := startServerAt(t, Server{Driver: &fakeDriver{}}, socket)
+	stop()
+}
+
 func startServer(t *testing.T, server Server) (string, func()) {
 	t.Helper()
+	socket := testSocketPath(t, fmt.Sprintf("zrm-%d.sock", time.Now().UnixNano()))
+	return socket, startServerAt(t, server, socket)
+}
+
+func testSocketPath(t *testing.T, name string) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "zrm-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return filepath.Join(dir, name)
+}
+
+func startServerAt(t *testing.T, server Server, socket string) func() {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
-	socket := fmt.Sprintf("%s/zrm-%d.sock", os.TempDir(), time.Now().UnixNano())
 	errs := make(chan error, 1)
 	go func() { errs <- server.ListenAndServe(ctx, socket) }()
 	deadline := time.Now().Add(time.Second)
@@ -159,7 +231,7 @@ func startServer(t *testing.T, server Server) (string, func()) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	return socket, func() {
+	return func() {
 		cancel()
 		select {
 		case err := <-errs:

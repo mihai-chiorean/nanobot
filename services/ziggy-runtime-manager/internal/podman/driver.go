@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mihai-chiorean/nanobot/services/ziggy-runtime-manager/internal/atomicfile"
 	"github.com/mihai-chiorean/nanobot/services/ziggy-runtime-manager/runtime"
 )
 
@@ -61,6 +62,12 @@ const (
 	workspaceLabel    = "io.ziggy.workspace"
 	generationLabel   = "io.ziggy.generation"
 )
+
+// ValidateRequest authorizes policy membership without requiring capabilities
+// to still be fresh, so stop/delete remain available after credential expiry.
+func (d Driver) ValidateRequest(request runtime.Request) error {
+	return d.validateRequest(request, false)
+}
 
 func (d Driver) EnsureRunning(ctx context.Context, request runtime.Request) (runtime.Status, error) {
 	if err := d.validateRequest(request, true); err != nil {
@@ -229,8 +236,11 @@ func (d Driver) stage(ctx context.Context, request runtime.Request) error {
 	if err := os.MkdirAll(d.QuadletDir, 0o700); err != nil {
 		return err
 	}
+	if err := os.Chmod(d.QuadletDir, 0o700); err != nil {
+		return err
+	}
 	path := filepath.Join(d.QuadletDir, strings.TrimSuffix(UnitName(request), ".service")+".container")
-	if err := os.WriteFile(path, quadlet, 0o600); err != nil {
+	if err := atomicfile.Write(path, quadlet, 0o600); err != nil {
 		return err
 	}
 	return d.systemctl(ctx, "daemon-reload")

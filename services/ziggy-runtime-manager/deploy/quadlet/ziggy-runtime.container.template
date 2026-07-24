@@ -23,5 +23,13 @@ PublishPort=127.0.0.1:<unique-port>:18790/tcp
 Tmpfs=/tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777
 Tmpfs=/run:rw,nosuid,nodev,noexec,size=16m,mode=755
 Tmpfs=/dev/shm:rw,nosuid,nodev,noexec,size=64m,mode=1777
+HealthCmd=CMD-SHELL python3 -c '<GET /health; require HTTP 200 and exact JSON {"status":"ok"}>'
 Label=io.ziggy.owner=ziggy-runtime-manager
 Exec=nanobot gateway --config /run/ziggy/config/config.json
+
+[Service]
+ProtectHome=read-only
+ProtectSystem=strict
+ReadWritePaths=%h/.local/share/containers
+ReadWritePaths=%h/.cache/containers
+ReadWritePaths=%t/containers
