@@ -91,6 +91,11 @@
         "path": "web/vite.config.ts",
         "contains": "path.resolve(__dirname, \"./dist\")",
         "absent": "../nanobot/web/dist"
+      },
+      {
+        "path": "LICENSE",
+        "contains": "No license is granted",
+        "absent": "Permission is hereby granted"
       }
     ],
     "forbidden_output_prefixes": [

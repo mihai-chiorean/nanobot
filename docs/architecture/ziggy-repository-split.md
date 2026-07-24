@@ -153,8 +153,10 @@ Collector assets move to observability/. Runbooks and research remain under
 docs/runbooks/ and docs/research/ and receive root indexes for discoverability.
 
 The Nanobot MIT license and original third-party notice are copied under
-licenses/. The generated root LICENSE and THIRD_PARTY_NOTICES.md make the
-dependency boundary visible without claiming to redistribute Nanobot source.
+licenses/. The generated root LICENSE reserves the private Ziggy product code
+while explicitly preserving the Nanobot MIT terms for derived portions.
+THIRD_PARTY_NOTICES.md makes that dependency boundary visible without claiming
+to redistribute Nanobot source.
 Web and Go dependency notices remain governed by their package lockfiles and
 module metadata.
 

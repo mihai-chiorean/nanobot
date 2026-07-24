@@ -242,7 +242,19 @@ services/*/bin/
 .idea/
 """
     if kind == "license_index":
-        return (source / "LICENSE").read_text(encoding="utf-8")
+        return """Ziggy Product Source License Notice
+
+Copyright (c) 2026 Mihai Chiorean. All rights reserved.
+
+No license is granted to copy, modify, distribute, sublicense, or sell the
+Ziggy product source in this repository unless a separate written license says
+otherwise.
+
+Portions derived from Nanobot remain subject to Nanobot's MIT license. The
+complete Nanobot license and original third-party notices are preserved in the
+licenses/ directory. Other third-party dependencies remain subject to their
+respective license terms.
+"""
     if kind == "third_party_index":
         return """# Third-Party Notices
 
