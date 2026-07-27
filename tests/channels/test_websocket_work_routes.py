@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import functools
 import json
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
@@ -49,6 +50,21 @@ def bus() -> MagicMock:
     value = MagicMock()
     value.publish_inbound = AsyncMock()
     return value
+
+
+def test_work_media_accepts_typed_document(tmp_path: Path) -> None:
+    payload = base64.b64encode(b"%PDF-1.4\n%%EOF").decode()
+    media = [{
+        "data_url": f"data:application/pdf;base64,{payload}",
+        "name": "work-report.pdf",
+    }]
+
+    with patch("nanobot.channels.websocket.get_media_dir", return_value=tmp_path):
+        paths, reason = WebSocketChannel._work_media(media)
+
+    assert reason is None
+    assert len(paths) == 1
+    assert Path(paths[0]).name.endswith("-work-report.pdf")
 
 
 @pytest.mark.asyncio
