@@ -124,6 +124,55 @@ async def test_message_without_media_backward_compatible() -> None:
 
 
 @pytest.mark.asyncio
+async def test_message_forwards_per_request_generation_options() -> None:
+    channel = _make_channel()
+    mock_conn = AsyncMock()
+    envelope = {
+        "type": "message",
+        "chat_id": "abc123",
+        "content": "think carefully",
+        "reasoning_effort": "high",
+        "max_tokens": 16384,
+    }
+
+    await channel._dispatch_envelope(mock_conn, "client-1", envelope)
+
+    metadata = channel._handle_message.call_args.kwargs["metadata"]
+    assert metadata["reasoning_effort"] == "high"
+    assert metadata["max_tokens"] == 16384
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value", "detail"),
+    [
+        ("reasoning_effort", "extreme", "invalid reasoning_effort"),
+        ("reasoning_effort", 1, "invalid reasoning_effort"),
+        ("max_tokens", True, "invalid max_tokens"),
+        ("max_tokens", 0, "invalid max_tokens"),
+        ("max_tokens", 262145, "invalid max_tokens"),
+    ],
+)
+async def test_message_rejects_invalid_generation_options(
+    field: str, value: Any, detail: str
+) -> None:
+    channel = _make_channel()
+    mock_conn = AsyncMock()
+    envelope = {
+        "type": "message",
+        "chat_id": "abc123",
+        "content": "hello",
+        field: value,
+    }
+
+    await channel._dispatch_envelope(mock_conn, "client-1", envelope)
+
+    channel._handle_message.assert_not_awaited()
+    error = json.loads(mock_conn.send.call_args.args[0])
+    assert error == {"event": "error", "detail": detail}
+
+
+@pytest.mark.asyncio
 async def test_message_with_single_image_forwards_saved_path(tmp_path) -> None:
     channel = _make_channel()
     mock_conn = AsyncMock()

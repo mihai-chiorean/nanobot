@@ -9,6 +9,7 @@ from nanobot.providers.openai_compat_provider import (
     OpenAICompatProvider,
     _deep_merge,
 )
+from nanobot.providers.registry import find_by_name
 
 # ---------------------------------------------------------------------------
 # _deep_merge unit tests
@@ -91,6 +92,18 @@ def _make_provider(extra_body: dict[str, Any] | None = None) -> OpenAICompatProv
 
 def _simple_messages() -> list[dict[str, Any]]:
     return [{"role": "user", "content": "hello"}]
+
+
+def _make_local_qwen(
+    extra_body: dict[str, Any] | None = None,
+) -> OpenAICompatProvider:
+    return OpenAICompatProvider(
+        api_key="local-placeholder",
+        api_base="http://127.0.0.1:8001/v1",
+        default_model="qwen3.6-35b",
+        spec=find_by_name("custom"),
+        extra_body=extra_body,
+    )
 
 
 class TestBuildKwargsExtraBody:
@@ -183,6 +196,84 @@ class TestBuildKwargsExtraBody:
             temperature=0.1, reasoning_effort=None, tool_choice=None,
         )
         assert kwargs["extra_body"]["repetition_penalty"] == 1.15
+
+
+class TestLocalQwenThinkingMode:
+    def test_default_is_explicitly_non_thinking(self) -> None:
+        kwargs = _make_local_qwen()._build_kwargs(
+            messages=_simple_messages(),
+            tools=None,
+            model=None,
+            max_tokens=8192,
+            temperature=0.1,
+            reasoning_effort=None,
+            tool_choice=None,
+        )
+
+        assert kwargs["extra_body"]["chat_template_kwargs"] == {
+            "enable_thinking": False
+        }
+        assert kwargs["max_tokens"] == 8192
+        assert "reasoning_effort" not in kwargs
+
+    def test_per_request_thinking_overrides_static_default(self) -> None:
+        kwargs = _make_local_qwen(
+            {"chat_template_kwargs": {"enable_thinking": False}}
+        )._build_kwargs(
+            messages=_simple_messages(),
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "description": "Look up a value",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ],
+            model=None,
+            max_tokens=16384,
+            temperature=0.1,
+            reasoning_effort="high",
+            tool_choice=None,
+        )
+
+        assert kwargs["extra_body"]["chat_template_kwargs"] == {
+            "enable_thinking": True
+        }
+        assert kwargs["max_tokens"] == 16384
+        assert kwargs["tool_choice"] == "auto"
+        assert "reasoning_effort" not in kwargs
+
+    def test_multimodal_qwen_request_remains_on_qwen(self) -> None:
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe this"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,AAAA"},
+                    },
+                ],
+            }
+        ]
+
+        kwargs = _make_local_qwen()._build_kwargs(
+            messages=messages,
+            tools=None,
+            model=None,
+            max_tokens=8192,
+            temperature=0.1,
+            reasoning_effort="none",
+            tool_choice=None,
+        )
+
+        assert kwargs["model"] == "qwen3.6-35b"
+        assert kwargs["messages"][0]["content"][1] == messages[0]["content"][1]
+        assert kwargs["extra_body"]["chat_template_kwargs"] == {
+            "enable_thinking": False
+        }
 
 
 # ---------------------------------------------------------------------------

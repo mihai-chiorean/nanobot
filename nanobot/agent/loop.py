@@ -919,6 +919,17 @@ class AgentLoop:
             return items
 
         active_session_key = session.key if session else session_key
+        run_reasoning_effort = None
+        run_max_tokens = None
+        if isinstance(metadata, dict):
+            candidate_effort = metadata.get("reasoning_effort")
+            if isinstance(candidate_effort, str):
+                run_reasoning_effort = candidate_effort
+            candidate_max_tokens = metadata.get("max_tokens")
+            if isinstance(candidate_max_tokens, int) and not isinstance(
+                candidate_max_tokens, bool
+            ):
+                run_max_tokens = candidate_max_tokens
         file_state_token = bind_file_states(self._file_state_store.for_session(active_session_key))
         work_tokens = set_work_context(
             store=self.work_store if task_id else None,
@@ -940,6 +951,8 @@ class AgentLoop:
                 context_window_tokens=self.context_window_tokens,
                 context_block_limit=self.context_block_limit,
                 provider_retry_mode=self.provider_retry_mode,
+                reasoning_effort=run_reasoning_effort,
+                max_tokens=run_max_tokens,
                 progress_callback=on_progress,
                 retry_wait_callback=on_retry_wait,
                 checkpoint_callback=_checkpoint,

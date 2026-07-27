@@ -62,6 +62,24 @@ curl http://127.0.0.1:8900/v1/chat/completions \
   }'
 ```
 
+For a single run, select reasoning mode and reserve enough output budget with
+the standard request fields:
+
+```json
+{
+  "model": "qwen3.6-35b",
+  "messages": [{"role": "user", "content": "Analyze the tradeoffs."}],
+  "reasoning_effort": "high",
+  "max_tokens": 16384,
+  "stream": true
+}
+```
+
+`reasoning_effort: "none"` explicitly disables thinking. Local Qwen/vLLM
+requests default to non-thinking mode and use `chat_template_kwargs` on the
+wire; per-request mode works for streaming and tool-using runs without
+changing the configured default for later requests.
+
 ## File Upload (multipart/form-data)
 
 Upload any supported file type (images, PDF, Word, Excel, PPT) via multipart:

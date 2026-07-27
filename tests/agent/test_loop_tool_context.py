@@ -88,3 +88,31 @@ async def test_loop_hook_preserves_metadata_when_resetting_tool_context(tmp_path
         "metadata": metadata,
         "session_key": "slack:C123:111.222",
     }
+
+
+@pytest.mark.asyncio
+async def test_loop_applies_per_run_generation_options(tmp_path: Path) -> None:
+    provider = MagicMock()
+    request_kwargs: dict = {}
+
+    async def chat_with_retry(**kwargs):
+        request_kwargs.update(kwargs)
+        return LLMResponse(content="done", tool_calls=[])
+
+    provider.chat_with_retry = chat_with_retry
+    provider.get_default_model.return_value = "test-model"
+    loop = AgentLoop(
+        bus=MessageBus(),
+        provider=provider,
+        workspace=tmp_path,
+        model="test-model",
+    )
+    loop.tools.get_definitions = MagicMock(return_value=[])
+
+    await loop._run_agent_loop(
+        [{"role": "user", "content": "think carefully"}],
+        metadata={"reasoning_effort": "high", "max_tokens": 16384},
+    )
+
+    assert request_kwargs["reasoning_effort"] == "high"
+    assert request_kwargs["max_tokens"] == 16384

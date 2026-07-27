@@ -412,6 +412,9 @@ _API_KEY_RE = re.compile(r"^[A-Za-z0-9_:.-]{1,128}$")
 _WORK_ID_RE = re.compile(r"^work_[0-9a-f]{32}$")
 _COMMAND_ID_RE = re.compile(r"^cmd_[0-9a-f]{32}$")
 _ARTIFACT_ID_RE = re.compile(r"^artifact_[0-9a-f]{32}$")
+_REASONING_EFFORTS = frozenset(
+    {"none", "minimal", "minimum", "low", "medium", "high", "max", "adaptive"}
+)
 
 
 def _decode_api_key(raw_key: str) -> str | None:
@@ -1966,6 +1969,33 @@ class WebSocketChannel(BaseChannel):
                 await self._send_event(connection, "error", detail="missing content")
                 return
 
+            metadata: dict[str, Any] = {
+                "remote": getattr(connection, "remote_address", None)
+            }
+            reasoning_effort = envelope.get("reasoning_effort")
+            if reasoning_effort is not None:
+                if (
+                    not isinstance(reasoning_effort, str)
+                    or reasoning_effort.lower() not in _REASONING_EFFORTS
+                ):
+                    await self._send_event(
+                        connection, "error", detail="invalid reasoning_effort"
+                    )
+                    return
+                metadata["reasoning_effort"] = reasoning_effort.lower()
+            max_tokens = envelope.get("max_tokens")
+            if max_tokens is not None:
+                if (
+                    not isinstance(max_tokens, int)
+                    or isinstance(max_tokens, bool)
+                    or not 1 <= max_tokens <= 262_144
+                ):
+                    await self._send_event(
+                        connection, "error", detail="invalid max_tokens"
+                    )
+                    return
+                metadata["max_tokens"] = max_tokens
+
             raw_media = envelope.get("media")
             media_paths: list[str] = []
             if raw_media is not None:
@@ -2001,7 +2031,7 @@ class WebSocketChannel(BaseChannel):
                 chat_id=cid,
                 content=content,
                 media=media_paths or None,
-                metadata={"remote": getattr(connection, "remote_address", None)},
+                metadata=metadata,
             )
             return
         if t == "work.create":

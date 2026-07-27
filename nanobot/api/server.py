@@ -40,6 +40,9 @@ __all__ = (
 
 API_SESSION_KEY = "api:default"
 API_CHAT_ID = "default"
+_REASONING_EFFORTS = frozenset(
+    {"none", "minimal", "minimum", "low", "medium", "high", "max", "adaptive"}
+)
 
 
 # ---------------------------------------------------------------------------
@@ -149,6 +152,30 @@ def _parse_json_content(body: dict) -> tuple[str, list[str]]:
     return text, media_paths
 
 
+def _parse_generation_options(body: dict[str, Any]) -> dict[str, Any]:
+    """Validate optional per-request generation controls."""
+    options: dict[str, Any] = {}
+    reasoning_effort = body.get("reasoning_effort")
+    if reasoning_effort is not None:
+        if (
+            not isinstance(reasoning_effort, str)
+            or reasoning_effort.lower() not in _REASONING_EFFORTS
+        ):
+            raise ValueError("reasoning_effort is invalid")
+        options["reasoning_effort"] = reasoning_effort.lower()
+
+    max_tokens = body.get("max_tokens")
+    if max_tokens is not None:
+        if (
+            not isinstance(max_tokens, int)
+            or isinstance(max_tokens, bool)
+            or not 1 <= max_tokens <= 262_144
+        ):
+            raise ValueError("max_tokens must be an integer between 1 and 262144")
+        options["max_tokens"] = max_tokens
+    return options
+
+
 async def _parse_multipart(request: web.Request) -> tuple[str, list[str], str | None, str | None]:
     """Parse multipart/form-data. Returns (text, media_paths, session_id, model)."""
     media_dir = get_media_dir("api")
@@ -202,6 +229,7 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
     model_name: str = request.app.get("model_name", "nanobot")
 
     stream = False
+    generation_options: dict[str, Any] = {}
     try:
         if content_type.startswith("multipart/"):
             text, media_paths, session_id, requested_model = await _parse_multipart(request)
@@ -213,6 +241,7 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
             stream = body.get("stream", False)
             requested_model = body.get("model")
             text, media_paths = _parse_json_content(body)
+            generation_options = _parse_generation_options(body)
             session_id = body.get("session_id")
     except ValueError as e:
         return _error_json(400, str(e))
@@ -225,6 +254,9 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
     if requested_model and requested_model != model_name:
         return _error_json(400, f"Only configured model '{model_name}' is available")
 
+    generation_kwargs = (
+        {"metadata": generation_options} if generation_options else {}
+    )
     session_key = f"api:{session_id}" if session_id else API_SESSION_KEY
     session_locks: dict[str, asyncio.Lock] = request.app["session_locks"]
     session_lock = session_locks.setdefault(session_key, asyncio.Lock())
@@ -272,6 +304,7 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
                             chat_id=API_CHAT_ID,
                             on_stream=_on_stream,
                             on_stream_end=_on_stream_end,
+                            **generation_kwargs,
                         ),
                         timeout=timeout_s,
                     )
@@ -316,6 +349,7 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
                         session_key=session_key,
                         channel="api",
                         chat_id=API_CHAT_ID,
+                        **generation_kwargs,
                     ),
                     timeout=timeout_s,
                 )
@@ -330,6 +364,7 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
                             session_key=session_key,
                             channel="api",
                             chat_id=API_CHAT_ID,
+                            **generation_kwargs,
                         ),
                         timeout=timeout_s,
                     )

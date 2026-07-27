@@ -533,6 +533,11 @@ class OpenAICompatProvider(LLMProvider):
     ) -> dict[str, Any]:
         model_name = model or self.default_model
         spec = self._spec
+        local_qwen = (
+            "qwen" in model_name.lower()
+            and bool(spec and spec.name == "custom")
+            and _is_local_endpoint(spec, self.api_base)
+        )
 
         if spec and spec.supports_prompt_caching:
             model_name = model or self.default_model
@@ -583,7 +588,7 @@ class OpenAICompatProvider(LLMProvider):
             # DashScope accepts none/minimum/low/medium/high/xhigh; "minimal" 400s.
             wire_effort = "minimum"
 
-        if wire_effort and semantic_effort != "none":
+        if wire_effort and semantic_effort != "none" and not local_qwen:
             kwargs["reasoning_effort"] = wire_effort
 
         # Provider-specific thinking parameters.
@@ -639,6 +644,20 @@ class OpenAICompatProvider(LLMProvider):
         if self._extra_body:
             existing = kwargs.get("extra_body", {})
             kwargs["extra_body"] = _deep_merge(existing, self._extra_body)
+
+        if local_qwen:
+            chat_template_kwargs = kwargs.setdefault("extra_body", {}).setdefault(
+                "chat_template_kwargs", {}
+            )
+            if (
+                reasoning_effort is not None
+                or "enable_thinking" not in chat_template_kwargs
+            ):
+                chat_template_kwargs["enable_thinking"] = semantic_effort not in (
+                    None,
+                    "none",
+                    "minimal",
+                )
 
         return kwargs
 

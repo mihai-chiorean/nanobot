@@ -289,6 +289,60 @@ async def test_health_endpoint(aiohttp_client, app) -> None:
 
 @pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
 @pytest.mark.asyncio
+async def test_generation_options_are_scoped_to_request(
+    aiohttp_client, mock_agent
+) -> None:
+    app = create_app(mock_agent, model_name="m")
+    client = await aiohttp_client(app)
+
+    resp = await client.post(
+        "/v1/chat/completions",
+        json={
+            "messages": [{"role": "user", "content": "think carefully"}],
+            "reasoning_effort": "high",
+            "max_tokens": 16384,
+        },
+    )
+
+    assert resp.status == 200
+    assert mock_agent.process_direct.call_args.kwargs["metadata"] == {
+        "reasoning_effort": "high",
+        "max_tokens": 16384,
+    }
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("reasoning_effort", "extreme"),
+        ("reasoning_effort", 1),
+        ("max_tokens", True),
+        ("max_tokens", 0),
+        ("max_tokens", 262145),
+    ],
+)
+async def test_invalid_generation_options_return_400(
+    aiohttp_client, mock_agent, field, value
+) -> None:
+    app = create_app(mock_agent, model_name="m")
+    client = await aiohttp_client(app)
+
+    resp = await client.post(
+        "/v1/chat/completions",
+        json={
+            "messages": [{"role": "user", "content": "hello"}],
+            field: value,
+        },
+    )
+
+    assert resp.status == 400
+    mock_agent.process_direct.assert_not_called()
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
+@pytest.mark.asyncio
 async def test_multimodal_content_extracts_text(aiohttp_client, mock_agent) -> None:
     app = create_app(mock_agent, model_name="m")
     client = await aiohttp_client(app)
