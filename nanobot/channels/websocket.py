@@ -2046,8 +2046,9 @@ class WebSocketChannel(BaseChannel):
             await self._send_event(
                 connection,
                 "error",
-                detail="image_rejected",
+                detail="attachment_rejected",
                 reason=media_error,
+                message=_attachment_rejection_message(media_error),
             )
             return
         task = await self._work_store.run_io(
