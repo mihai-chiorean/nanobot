@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import base64
+from pathlib import Path
 
 import pytest
 
 from nanobot.utils.media_decode import (
     DEFAULT_MAX_BYTES,
-    FileSizeExceeded,
     MAX_FILE_SIZE,
+    FileSizeExceeded,
     save_base64_data_url,
 )
 
@@ -73,3 +74,16 @@ def test_legacy_symbols_reexported_from_api_server() -> None:
     assert server._save_base64_data_url is save_base64_data_url
     assert server._FileSizeExceeded is FileSizeExceeded
     assert server.MAX_FILE_SIZE == MAX_FILE_SIZE
+
+
+def test_preserves_safe_display_filename(tmp_path) -> None:
+    result = save_base64_data_url(
+        _data_url(b"%PDF-1.4", mime="application/pdf"),
+        tmp_path,
+        filename="../../quarterly:report.pdf",
+    )
+
+    assert result is not None
+    saved = Path(result)
+    assert saved.parent == tmp_path
+    assert saved.name.endswith("-quarterly_report.pdf")

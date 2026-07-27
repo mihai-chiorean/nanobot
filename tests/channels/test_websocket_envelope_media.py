@@ -9,7 +9,9 @@ forwarding saved paths to ``_handle_message``.
 from __future__ import annotations
 
 import base64
+import io
 import json
+import zipfile
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -36,6 +38,14 @@ def _tiny_png_data_url() -> str:
 
 def _data_url(mime: str, payload: bytes) -> str:
     return f"data:{mime};base64,{base64.b64encode(payload).decode()}"
+
+
+def _ooxml_payload(required_entry: str) -> bytes:
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w") as archive:
+        archive.writestr("[Content_Types].xml", "<Types/>")
+        archive.writestr(required_entry, "<document/>")
+    return output.getvalue()
 
 
 def _make_channel() -> WebSocketChannel:
@@ -198,7 +208,7 @@ async def test_message_rejected_when_more_than_four_images(tmp_path) -> None:
     mock_conn.send.assert_awaited_once()
     err = json.loads(mock_conn.send.call_args[0][0])
     assert err["event"] == "error"
-    assert err["detail"] == "image_rejected"
+    assert err["detail"] == "attachment_rejected"
     assert err["reason"] == "too_many_images"
 
 
@@ -221,19 +231,23 @@ async def test_message_rejected_on_oversize_payload(tmp_path) -> None:
 
     channel._handle_message.assert_not_awaited()
     err = json.loads(mock_conn.send.call_args[0][0])
-    assert err["detail"] == "image_rejected"
+    assert err["detail"] == "attachment_rejected"
     assert err["reason"] == "size"
+    assert err["message"] == "An attachment exceeds the per-file size limit."
 
 
 @pytest.mark.asyncio
-async def test_message_rejected_on_non_image_mime(tmp_path) -> None:
+async def test_message_accepts_pdf_and_preserves_safe_filename(tmp_path) -> None:
     channel = _make_channel()
     mock_conn = AsyncMock()
     envelope = {
         "type": "message",
         "chat_id": "abc123",
         "content": "pdf?",
-        "media": [{"data_url": _data_url("application/pdf", b"%PDF-1.4")}],
+        "media": [{
+            "data_url": _data_url("application/pdf", b"%PDF-1.4\n%%EOF"),
+            "name": "quarterly-report.pdf",
+        }],
     }
 
     with patch(
@@ -241,10 +255,121 @@ async def test_message_rejected_on_non_image_mime(tmp_path) -> None:
     ):
         await channel._dispatch_envelope(mock_conn, "client-1", envelope)
 
+    channel._handle_message.assert_awaited_once()
+    paths = channel._handle_message.call_args.kwargs["media"]
+    assert len(paths) == 1
+    assert Path(paths[0]).name.endswith("-quarterly-report.pdf")
+
+
+@pytest.mark.parametrize(
+    ("mime", "name", "required_entry"),
+    [
+        (
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "notes.docx",
+            "word/document.xml",
+        ),
+        (
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "budget.xlsx",
+            "xl/workbook.xml",
+        ),
+        (
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            "briefing.pptx",
+            "ppt/presentation.xml",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_message_accepts_valid_ooxml_document(
+    tmp_path, mime: str, name: str, required_entry: str
+) -> None:
+    channel = _make_channel()
+    envelope = {
+        "type": "message",
+        "chat_id": "abc123",
+        "content": "summarize",
+        "media": [{
+            "data_url": _data_url(mime, _ooxml_payload(required_entry)),
+            "name": name,
+        }],
+    }
+
+    with patch("nanobot.channels.websocket.get_media_dir", return_value=tmp_path):
+        await channel._dispatch_envelope(AsyncMock(), "client-1", envelope)
+
+    channel._handle_message.assert_awaited_once()
+    saved = Path(channel._handle_message.call_args.kwargs["media"][0])
+    assert saved.name.endswith(f"-{name}")
+
+
+@pytest.mark.asyncio
+async def test_message_rejects_document_extension_mismatch(tmp_path) -> None:
+    channel = _make_channel()
+    connection = AsyncMock()
+    envelope = {
+        "type": "message",
+        "chat_id": "abc123",
+        "content": "summarize",
+        "media": [{
+            "data_url": _data_url("application/pdf", b"%PDF-1.4\n%%EOF"),
+            "name": "not-a-pdf.docx",
+        }],
+    }
+
+    with patch("nanobot.channels.websocket.get_media_dir", return_value=tmp_path):
+        await channel._dispatch_envelope(connection, "client-1", envelope)
+
     channel._handle_message.assert_not_awaited()
-    err = json.loads(mock_conn.send.call_args[0][0])
-    assert err["detail"] == "image_rejected"
-    assert err["reason"] == "mime"
+    error = json.loads(connection.send.call_args[0][0])
+    assert error["reason"] == "extension"
+
+
+@pytest.mark.asyncio
+async def test_message_rejects_invalid_document_content(tmp_path) -> None:
+    channel = _make_channel()
+    connection = AsyncMock()
+    envelope = {
+        "type": "message",
+        "chat_id": "abc123",
+        "content": "summarize",
+        "media": [{
+            "data_url": _data_url("application/pdf", b"not a pdf"),
+            "name": "fake.pdf",
+        }],
+    }
+
+    with patch("nanobot.channels.websocket.get_media_dir", return_value=tmp_path):
+        await channel._dispatch_envelope(connection, "client-1", envelope)
+
+    channel._handle_message.assert_not_awaited()
+    error = json.loads(connection.send.call_args[0][0])
+    assert error["reason"] == "content"
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_message_rejects_more_than_three_documents(tmp_path) -> None:
+    channel = _make_channel()
+    connection = AsyncMock()
+    document = {
+        "data_url": _data_url("application/pdf", b"%PDF-1.4\n%%EOF"),
+        "name": "report.pdf",
+    }
+    envelope = {
+        "type": "message",
+        "chat_id": "abc123",
+        "content": "summarize",
+        "media": [document] * 4,
+    }
+
+    with patch("nanobot.channels.websocket.get_media_dir", return_value=tmp_path):
+        await channel._dispatch_envelope(connection, "client-1", envelope)
+
+    channel._handle_message.assert_not_awaited()
+    error = json.loads(connection.send.call_args[0][0])
+    assert error["reason"] == "too_many_documents"
 
 
 @pytest.mark.asyncio
@@ -348,7 +473,7 @@ async def test_message_rejected_when_media_field_is_not_list() -> None:
 
     channel._handle_message.assert_not_awaited()
     err = json.loads(mock_conn.send.call_args[0][0])
-    assert err["detail"] == "image_rejected"
+    assert err["detail"] == "attachment_rejected"
     assert err["reason"] == "malformed"
 
 
@@ -367,7 +492,7 @@ async def test_failed_media_does_not_partially_persist(tmp_path) -> None:
         "content": "mixed",
         "media": [
             {"data_url": _tiny_png_data_url()},
-            {"data_url": _data_url("application/pdf", b"%PDF-1.4")},
+            {"data_url": _data_url("application/octet-stream", b"not allowed")},
         ],
     }
 
