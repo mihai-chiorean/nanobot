@@ -17,6 +17,7 @@ import shutil
 import ssl
 import time
 import uuid
+import zipfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self
 from urllib.parse import parse_qs, unquote, urlparse
@@ -236,6 +237,11 @@ _MAX_IMAGES_PER_MESSAGE = 4
 _MAX_IMAGE_BYTES = 8 * 1024 * 1024
 _MAX_VIDEOS_PER_MESSAGE = 1
 _MAX_VIDEO_BYTES = 20 * 1024 * 1024
+_MAX_DOCUMENTS_PER_MESSAGE = 3
+_MAX_DOCUMENT_BYTES = 10 * 1024 * 1024
+_MAX_DOCUMENT_BYTES_PER_MESSAGE = 24 * 1024 * 1024
+_MAX_OFFICE_UNCOMPRESSED_BYTES = 100 * 1024 * 1024
+_MAX_OFFICE_ENTRIES = 10_000
 
 # Image MIME whitelist — matches the Composer's ``accept`` list. SVG is
 # explicitly excluded to avoid the XSS surface inside embedded scripts.
@@ -252,7 +258,32 @@ _VIDEO_MIME_ALLOWED: frozenset[str] = frozenset({
     "video/quicktime",
 })
 
-_UPLOAD_MIME_ALLOWED: frozenset[str] = _IMAGE_MIME_ALLOWED | _VIDEO_MIME_ALLOWED
+_DOCUMENT_MIME_EXTENSIONS: dict[str, frozenset[str]] = {
+    "application/pdf": frozenset({".pdf"}),
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": frozenset(
+        {".docx"}
+    ),
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": frozenset(
+        {".xlsx"}
+    ),
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": frozenset(
+        {".pptx"}
+    ),
+    "text/plain": frozenset({".txt", ".log", ".ini", ".cfg"}),
+    "text/markdown": frozenset({".md"}),
+    "text/csv": frozenset({".csv"}),
+    "application/json": frozenset({".json"}),
+    "application/xml": frozenset({".xml"}),
+    "text/xml": frozenset({".xml"}),
+    "text/html": frozenset({".html", ".htm"}),
+    "application/yaml": frozenset({".yaml", ".yml"}),
+    "text/yaml": frozenset({".yaml", ".yml"}),
+    "application/toml": frozenset({".toml"}),
+}
+_DOCUMENT_MIME_ALLOWED: frozenset[str] = frozenset(_DOCUMENT_MIME_EXTENSIONS)
+_UPLOAD_MIME_ALLOWED: frozenset[str] = (
+    _IMAGE_MIME_ALLOWED | _VIDEO_MIME_ALLOWED | _DOCUMENT_MIME_ALLOWED
+)
 
 _DATA_URL_MIME_RE = re.compile(r"^data:([^;]+);base64,", re.DOTALL)
 
@@ -265,6 +296,73 @@ def _extract_data_url_mime(url: str) -> str | None:
     if not m:
         return None
     return m.group(1).strip().lower() or None
+
+
+def _document_filename(mime: str, name: Any) -> str | None:
+    """Return a safe document name, rejecting MIME/extension mismatches."""
+    extensions = _DOCUMENT_MIME_EXTENSIONS[mime]
+    if name is None:
+        return f"attachment{sorted(extensions)[0]}"
+    if not isinstance(name, str) or not name.strip():
+        return None
+    basename = Path(name).name
+    if Path(basename).suffix.lower() not in extensions:
+        return None
+    return basename
+
+
+def _document_content_is_valid(path: Path, mime: str) -> bool:
+    """Apply cheap container checks before a parser sees untrusted input."""
+    if mime == "application/pdf":
+        try:
+            with path.open("rb") as handle:
+                return handle.read(1_024).lstrip().startswith(b"%PDF-")
+        except OSError:
+            return False
+
+    office_entry = {
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+            "word/document.xml",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":
+            "xl/workbook.xml",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation":
+            "ppt/presentation.xml",
+    }.get(mime)
+    if office_entry is not None:
+        try:
+            with zipfile.ZipFile(path) as archive:
+                infos = archive.infolist()
+                if len(infos) > _MAX_OFFICE_ENTRIES:
+                    return False
+                if any(info.flag_bits & 0x1 for info in infos):
+                    return False
+                if sum(info.file_size for info in infos) > _MAX_OFFICE_UNCOMPRESSED_BYTES:
+                    return False
+                names = {info.filename for info in infos}
+                return "[Content_Types].xml" in names and office_entry in names
+        except (OSError, zipfile.BadZipFile):
+            return False
+
+    try:
+        with path.open("rb") as handle:
+            return b"\x00" not in handle.read(8_192)
+    except OSError:
+        return False
+
+
+def _attachment_rejection_message(reason: str) -> str:
+    return {
+        "malformed": "The attachment request was malformed.",
+        "too_many_images": "You can attach up to 4 images to one message.",
+        "too_many_videos": "You can attach one video to a message.",
+        "too_many_documents": "You can attach up to 3 documents to one message.",
+        "mime": "That attachment type is not supported.",
+        "extension": "The document extension does not match its content type.",
+        "size": "An attachment exceeds the per-file size limit.",
+        "total_size": "Documents can total up to 24 MB per message.",
+        "content": "The document is malformed or has an unsafe container.",
+        "decode": "An attachment could not be decoded.",
+    }.get(reason, "An attachment was rejected.")
 
 
 _LOCALHOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
@@ -1078,19 +1176,25 @@ class WebSocketChannel(BaseChannel):
         """
         image_count = 0
         video_count = 0
+        document_count = 0
         for item in media:
             mime = _extract_data_url_mime(item.get("data_url", "")) if isinstance(item, dict) else None
             if mime in _VIDEO_MIME_ALLOWED:
                 video_count += 1
             elif mime in _IMAGE_MIME_ALLOWED:
                 image_count += 1
+            elif mime in _DOCUMENT_MIME_ALLOWED:
+                document_count += 1
         if image_count > _MAX_IMAGES_PER_MESSAGE:
             return [], "too_many_images"
         if video_count > _MAX_VIDEOS_PER_MESSAGE:
             return [], "too_many_videos"
+        if document_count > _MAX_DOCUMENTS_PER_MESSAGE:
+            return [], "too_many_documents"
 
         media_dir = get_media_dir("websocket")
         paths: list[str] = []
+        document_bytes = 0
 
         def _abort(reason: str) -> tuple[list[str], str]:
             for p in paths:
@@ -1114,10 +1218,24 @@ class WebSocketChannel(BaseChannel):
             if mime not in _UPLOAD_MIME_ALLOWED:
                 return _abort("mime")
             is_video = mime in _VIDEO_MIME_ALLOWED
-            max_bytes = _MAX_VIDEO_BYTES if is_video else _MAX_IMAGE_BYTES
+            is_document = mime in _DOCUMENT_MIME_ALLOWED
+            filename = None
+            if is_document:
+                filename = _document_filename(mime, item.get("name"))
+                if filename is None:
+                    return _abort("extension")
+            if is_video:
+                max_bytes = _MAX_VIDEO_BYTES
+            elif is_document:
+                max_bytes = _MAX_DOCUMENT_BYTES
+            else:
+                max_bytes = _MAX_IMAGE_BYTES
             try:
                 saved = save_base64_data_url(
-                    data_url, media_dir, max_bytes=max_bytes,
+                    data_url,
+                    media_dir,
+                    max_bytes=max_bytes,
+                    filename=filename,
                 )
             except FileSizeExceeded:
                 return _abort("size")
@@ -1127,6 +1245,13 @@ class WebSocketChannel(BaseChannel):
             if saved is None:
                 return _abort("decode")
             paths.append(saved)
+            if is_document:
+                saved_path = Path(saved)
+                if not _document_content_is_valid(saved_path, mime):
+                    return _abort("content")
+                document_bytes += saved_path.stat().st_size
+                if document_bytes > _MAX_DOCUMENT_BYTES_PER_MESSAGE:
+                    return _abort("total_size")
         return paths, None
 
     async def _dispatch_envelope(
@@ -1166,18 +1291,22 @@ class WebSocketChannel(BaseChannel):
                 if not isinstance(raw_media, list):
                     await self._send_event(
                         connection, "error",
-                        detail="image_rejected", reason="malformed",
+                        detail="attachment_rejected",
+                        reason="malformed",
+                        message=_attachment_rejection_message("malformed"),
                     )
                     return
                 media_paths, reason = self._save_envelope_media(raw_media)
                 if reason is not None:
                     await self._send_event(
                         connection, "error",
-                        detail="image_rejected", reason=reason,
+                        detail="attachment_rejected",
+                        reason=reason,
+                        message=_attachment_rejection_message(reason),
                     )
                     return
 
-            # Allow image-only turns (content may be empty when media is attached).
+            # Allow attachment-only turns (content may be empty when media is attached).
             if not content.strip() and not media_paths:
                 await self._send_event(connection, "error", detail="missing content")
                 return

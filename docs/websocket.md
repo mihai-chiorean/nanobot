@@ -160,9 +160,33 @@ Recognized fields: `content`, `text`, `message` (checked in that order). Invalid
 |--------|--------|--------|
 | `new_chat` | — | Server mints a new `chat_id`, subscribes this connection, replies with `attached`. |
 | `attach` | `chat_id` | Subscribe to an existing `chat_id` (e.g. after a page reload). Replies with `attached`. |
-| `message` | `chat_id`, `content` | Send `content` on `chat_id`. First use auto-attaches; no explicit `attach` needed. |
+| `message` | `chat_id`, `content`, `media` (optional) | Send `content` and validated attachments on `chat_id`. First use auto-attaches; no explicit `attach` needed. |
 
 See [Multi-chat multiplexing](#multi-chat-multiplexing) for the full flow.
+
+### Inbound attachments
+
+Typed `message` envelopes may include a `media` array. Each item contains a
+base64 data URL and, for documents, the original filename:
+
+```json
+{
+  "type": "message",
+  "chat_id": "uuid-v4",
+  "content": "Summarize this report",
+  "media": [{
+    "data_url": "data:application/pdf;base64,JVBERi0...",
+    "name": "quarterly-report.pdf"
+  }]
+}
+```
+
+The channel accepts PNG, JPEG, WebP, GIF, MP4, WebM, QuickTime, PDF, DOCX,
+XLSX, PPTX, and common text formats. It permits up to four images (8 MB each),
+one video (20 MB), and three documents (10 MB each, 24 MB total) per message.
+Document MIME types must match their filename extensions. PDF and Office
+container signatures are checked before parser dispatch. The configured
+WebSocket frame limit still applies after base64 expansion.
 
 ## Configuration Reference
 
