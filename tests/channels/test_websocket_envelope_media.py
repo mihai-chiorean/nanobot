@@ -48,6 +48,14 @@ def _ooxml_payload(required_entry: str) -> bytes:
     return output.getvalue()
 
 
+def _expanded_ooxml_payload(required_entry: str, expanded_bytes: int) -> bytes:
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("[Content_Types].xml", "<Types/>")
+        archive.writestr(required_entry, b"x" * expanded_bytes)
+    return output.getvalue()
+
+
 def _make_channel() -> WebSocketChannel:
     bus = MagicMock()
     bus.publish_inbound = AsyncMock()
@@ -302,6 +310,33 @@ async def test_message_accepts_valid_ooxml_document(
     channel._handle_message.assert_awaited_once()
     saved = Path(channel._handle_message.call_args.kwargs["media"][0])
     assert saved.name.endswith(f"-{name}")
+
+
+@pytest.mark.asyncio
+async def test_message_rejects_ooxml_with_excessive_expansion(tmp_path) -> None:
+    channel = _make_channel()
+    connection = AsyncMock()
+    mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    envelope = {
+        "type": "message",
+        "chat_id": "abc123",
+        "content": "summarize",
+        "media": [{
+            "data_url": _data_url(
+                mime,
+                _expanded_ooxml_payload("word/document.xml", 33 * 1024 * 1024),
+            ),
+            "name": "expanded.docx",
+        }],
+    }
+
+    with patch("nanobot.channels.websocket.get_media_dir", return_value=tmp_path):
+        await channel._dispatch_envelope(connection, "client-1", envelope)
+
+    channel._handle_message.assert_not_awaited()
+    error = json.loads(connection.send.call_args[0][0])
+    assert error["reason"] == "content"
+    assert list(tmp_path.iterdir()) == []
 
 
 @pytest.mark.asyncio

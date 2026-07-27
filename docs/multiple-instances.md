@@ -118,6 +118,20 @@ nanobot gateway --config ~/.nanobot-telegram/config.json --workspace /tmp/nanobo
 - Use different models or providers for different teams
 - Serve multiple tenants with separate configs and runtime data
 
+## Security Boundary
+
+A Nanobot process is a single trust domain. Its transport tokens authorize
+instance-wide sessions, Work state, and signed media capabilities; they are not
+row-level tenant credentials. Do not put mutually untrusted users in one
+process.
+
+For multi-tenant products, route each authenticated tenant to a separate
+Nanobot process with a unique config directory, workspace, runtime-data
+directory, bootstrap secret, and OS/container isolation. Keep the process on a
+private address behind the tenant-routing gateway. A signed media URL is a
+bearer capability for one file inside that process, remains valid until the
+process restarts, and should not be logged or shared.
+
 ## Notes
 
 - Each instance must use a different port if they run at the same time

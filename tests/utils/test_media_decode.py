@@ -31,9 +31,12 @@ def test_returns_none_for_malformed_data_url(tmp_path) -> None:
 
 
 def test_returns_none_for_broken_base64(tmp_path) -> None:
-    # Python's b64decode strips non-alphabet chars by default, so we need a
-    # payload whose alphabet-filtered length breaks padding.
     assert save_base64_data_url("data:image/png;base64,not-valid-base64!!!", tmp_path) is None
+
+
+def test_returns_none_when_valid_base64_has_an_invalid_suffix(tmp_path) -> None:
+    valid = base64.b64encode(b"fake png").decode()
+    assert save_base64_data_url(f"data:image/png;base64,{valid}!", tmp_path) is None
 
 
 def test_unknown_mime_falls_back_to_bin(tmp_path) -> None:

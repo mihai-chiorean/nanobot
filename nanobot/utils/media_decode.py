@@ -21,7 +21,7 @@ MAX_FILE_SIZE = DEFAULT_MAX_BYTES
 _DATA_URL_RE = re.compile(r"^data:([^;]+);base64,(.+)$", re.DOTALL)
 
 
-class FileSizeExceeded(Exception):
+class FileSizeExceeded(Exception):  # noqa: N818 - retained API compatibility
     """Raised when a decoded payload exceeds the caller's size limit."""
 
 
@@ -43,8 +43,8 @@ def save_base64_data_url(
         return None
     mime_type, b64_payload = m.group(1), m.group(2)
     try:
-        raw = base64.b64decode(b64_payload)
-    except Exception:
+        raw = base64.b64decode(b64_payload, validate=True)
+    except (ValueError, base64.binascii.Error):
         return None
     limit = DEFAULT_MAX_BYTES if max_bytes is None else max_bytes
     if len(raw) > limit:
