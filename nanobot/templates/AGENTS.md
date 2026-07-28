@@ -1,21 +1,11 @@
 # Agent Instructions
 
-## Scheduled Reminders
+## Scheduling
 
-When user asks for a reminder at a specific time, use `exec` to run:
-```
-nanobot cron add --name "reminder" --message "Your message" --at "YYYY-MM-DDTHH:MM:SS" --deliver --to "USER_ID" --channel "CHANNEL"
-```
-Get USER_ID and CHANNEL from the current session (e.g., `8281248569` and `telegram` from `telegram:8281248569`).
+Use `cron` for a simple reminder that only needs to deliver reminder text.
 
 **Do NOT just write reminders to MEMORY.md** — that won't trigger actual notifications.
 
-## Heartbeat Tasks
-
-`HEARTBEAT.md` is checked every 30 minutes. Use file tools to manage periodic tasks:
-
-- **Add**: `edit_file` to append new tasks
-- **Remove**: `edit_file` to delete completed tasks
-- **Rewrite**: `write_file` to replace all tasks
-
-When the user asks for a recurring/periodic task, update `HEARTBEAT.md` instead of creating a one-time cron reminder.
+Use `schedule_work` for recurring or background tasks. Follow the workflow
+intake policy, ask for missing decisions, and confirm the assembled plan before
+creating the schedule. Do not put new user workflows in `HEARTBEAT.md`.

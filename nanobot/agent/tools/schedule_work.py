@@ -39,9 +39,37 @@ _PARAMETERS = tool_parameters_schema(
     cron_expr=StringSchema("Cron expression when schedule_kind='cron', e.g. 0 9 * * *."),
     tz=StringSchema("Optional IANA timezone for cron schedules."),
     deliverable=StringSchema("Expected durable output, e.g. markdown_digest or report."),
+    success_criteria=StringSchema(
+        "Observable conditions that make a run successful and useful to the user."
+    ),
+    delivery=StringSchema(
+        "Where and how the durable result should be delivered or made visible."
+    ),
     tools_needed=ArraySchema(
         StringSchema("Tool or connector likely needed."),
         description="Likely tools/connectors, e.g. web_search, gmail, or shell.",
+    ),
+    assumptions=ArraySchema(
+        StringSchema("A material assumption included in the assembled workflow."),
+        description="Material assumptions the user will confirm with the final plan.",
+        max_items=12,
+    ),
+    open_questions=ArraySchema(
+        StringSchema("A material unresolved decision that requires the user's answer."),
+        description=(
+            "Unresolved questions. If non-empty, do not schedule; ask the highest-value "
+            "question with ask_user."
+        ),
+        max_items=12,
+    ),
+    context_confidence=IntegerSchema(
+        0,
+        description=(
+            "Confidence from 0 to 100 that the assembled workflow matches the user's intent. "
+            "Values below 80 require more interviewing."
+        ),
+        minimum=0,
+        maximum=100,
     ),
     risk_level=StringSchema("Risk level for this scheduled work.", enum=["low", "medium", "high"]),
     risk_notes=StringSchema("Why this is safe or risky."),
@@ -49,7 +77,19 @@ _PARAMETERS = tool_parameters_schema(
         description="Set true only after the user explicitly confirms work that requires it.",
         default=False,
     ),
-    required=["title", "goal", "instructions", "schedule_kind", "deliverable", "risk_level"],
+    required=[
+        "title",
+        "goal",
+        "instructions",
+        "schedule_kind",
+        "deliverable",
+        "success_criteria",
+        "delivery",
+        "assumptions",
+        "open_questions",
+        "context_confidence",
+        "risk_level",
+    ],
     description="Create a first-class scheduled Work plan and a cron job that runs it.",
 )
 
@@ -91,9 +131,14 @@ class ScheduleWorkTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Create a visible scheduled Work plan and schedule it to run in the background. "
-            "Ask the user for confirmation when the work is recurring, risky, ambiguous, "
-            "externally visible, uses private data, or may spend money."
+            "Create a visible background Work workflow after intake is complete. Recognize "
+            "automation, monitoring, recurring summaries, and later/background execution as "
+            "workflow intent. Before calling, establish outcome, success criteria, schedule "
+            "and timezone, source scope, delivery, tools, side effects, and assumptions. Use "
+            "ask_user when a material decision is missing, an assumption is uncertain, or "
+            "context confidence is below 80. Never guess those details merely to satisfy the "
+            "schema. Recurring, risky, private, external, paid, or assumption-bearing plans "
+            "also require explicit confirmation of the final assembled workflow."
         )
 
     async def execute(
@@ -103,6 +148,11 @@ class ScheduleWorkTool(Tool):
         instructions: str,
         schedule_kind: str,
         deliverable: str,
+        success_criteria: str,
+        delivery: str,
+        assumptions: list[str],
+        open_questions: list[str],
+        context_confidence: int,
         risk_level: str,
         at: str | None = None,
         every_seconds: int | None = None,
@@ -117,13 +167,42 @@ class ScheduleWorkTool(Tool):
         goal = self._clean(goal, 300)
         instructions = self._clean(instructions, 4000)
         deliverable = self._clean(deliverable, 120)
+        success_criteria = self._clean(success_criteria, 500)
+        delivery = self._clean(delivery, 300)
         risk_level = (risk_level or "").strip().lower()
         risk_notes = self._clean(risk_notes or "", 500)
         tools = [self._clean(str(item), 64) for item in (tools_needed or []) if str(item).strip()]
-        if not title or not goal or not instructions:
-            return "Error: title, goal, and instructions are required."
+        assumptions = self._clean_list(assumptions, item_limit=300, max_items=12)
+        open_questions = self._clean_list(open_questions, item_limit=300, max_items=12)
+        if (
+            not title
+            or not goal
+            or not instructions
+            or not deliverable
+            or not success_criteria
+            or not delivery
+        ):
+            return (
+                "Error: title, goal, instructions, deliverable, success_criteria, "
+                "and delivery are required."
+            )
         if risk_level not in {"low", "medium", "high"}:
             return "Error: risk_level must be low, medium, or high."
+        if isinstance(context_confidence, bool) or not isinstance(context_confidence, int):
+            return "Error: context_confidence must be an integer from 0 to 100."
+        if context_confidence < 0 or context_confidence > 100:
+            return "Error: context_confidence must be an integer from 0 to 100."
+
+        if open_questions:
+            return self._interview_required(
+                reason="material workflow decisions remain unresolved",
+                questions=open_questions,
+            )
+        if context_confidence < 80:
+            return self._interview_required(
+                reason=f"context confidence is only {context_confidence} percent",
+                questions=[],
+            )
 
         schedule, label, delete_after_run, error = self._build_schedule(
             schedule_kind=schedule_kind,
@@ -141,6 +220,7 @@ class ScheduleWorkTool(Tool):
                 risk_level=risk_level,
                 tools_needed=tools,
                 risk_notes=risk_notes,
+                assumptions=assumptions,
             )
             and not confirmed
         ):
@@ -152,9 +232,13 @@ class ScheduleWorkTool(Tool):
                     goal=goal,
                     schedule_label=label,
                     deliverable=deliverable,
+                    success_criteria=success_criteria,
+                    delivery=delivery,
                     risk_level=risk_level,
                     risk_notes=risk_notes,
                     tools_needed=tools,
+                    assumptions=assumptions,
+                    context_confidence=context_confidence,
                 )
             )
 
@@ -176,7 +260,11 @@ class ScheduleWorkTool(Tool):
                 "timezone": tz or self._default_timezone,
             },
             "deliverable": deliverable,
+            "success_criteria": success_criteria,
+            "delivery": delivery,
             "tools_needed": tools,
+            "assumptions": assumptions,
+            "context_confidence": context_confidence,
             "risk_level": risk_level,
             "risk_notes": risk_notes,
             "confirmed": bool(confirmed),
@@ -260,6 +348,35 @@ class ScheduleWorkTool(Tool):
     def _clean(value: str | None, limit: int) -> str:
         return " ".join((value or "").split())[:limit]
 
+    @classmethod
+    def _clean_list(
+        cls,
+        values: list[str] | None,
+        *,
+        item_limit: int,
+        max_items: int,
+    ) -> list[str]:
+        return [
+            cleaned
+            for value in (values or [])[:max_items]
+            if (cleaned := cls._clean(str(value), item_limit))
+        ]
+
+    @staticmethod
+    def _interview_required(*, reason: str, questions: list[str]) -> str:
+        result = (
+            f"Workflow interview required because {reason}. No plan or schedule was created. "
+            "Use ask_user for the highest-value missing decision"
+        )
+        if questions:
+            result += f": {questions[0]}"
+        else:
+            result += (
+                ". Identify the uncertain assumption and ask a concrete question before "
+                "calling schedule_work again"
+            )
+        return result + "."
+
     def _build_schedule(
         self,
         *,
@@ -342,9 +459,18 @@ class ScheduleWorkTool(Tool):
 
     @staticmethod
     def _requires_confirmation(
-        *, schedule_kind: str, risk_level: str, tools_needed: list[str], risk_notes: str
+        *,
+        schedule_kind: str,
+        risk_level: str,
+        tools_needed: list[str],
+        risk_notes: str,
+        assumptions: list[str],
     ) -> bool:
-        if schedule_kind in {"cron", "every"} or risk_level in {"medium", "high"}:
+        if (
+            schedule_kind in {"cron", "every"}
+            or risk_level in {"medium", "high"}
+            or assumptions
+        ):
             return True
         joined = " ".join([*tools_needed, risk_notes]).lower()
         markers = (
@@ -370,24 +496,40 @@ class ScheduleWorkTool(Tool):
         goal: str,
         schedule_label: str,
         deliverable: str,
+        success_criteria: str,
+        delivery: str,
         risk_level: str,
         risk_notes: str,
         tools_needed: list[str],
+        assumptions: list[str],
+        context_confidence: int,
     ) -> str:
         tools = ", ".join(tools_needed) if tools_needed else "none declared"
         notes = risk_notes or "No extra risk notes provided."
+        assumption_text = "; ".join(assumptions) if assumptions else "none"
         return (
             f"Title: {title}\nGoal: {goal}\nSchedule: {schedule_label}\n"
-            f"Deliverable: {deliverable}\nTools: {tools}\nRisk: {risk_level} - {notes}"
+            f"Deliverable: {deliverable}\nDelivery: {delivery}\n"
+            f"Success: {success_criteria}\nTools: {tools}\n"
+            f"Assumptions: {assumption_text}\nContext confidence: {context_confidence}%\n"
+            f"Risk: {risk_level} - {notes}"
         )
 
     @staticmethod
     def _format_plan_markdown(plan: dict[str, Any]) -> str:
         tools = ", ".join(plan.get("tools_needed") or []) or "None declared"
+        assumptions = "\n".join(
+            f"- {item}" for item in plan.get("assumptions") or []
+        ) or "None"
         return (
             f"# {plan['title']}\n\n## Goal\n{plan['goal']}\n\n"
             f"## Schedule\n{plan['schedule']['label']}\n\n"
-            f"## Deliverable\n{plan['deliverable']}\n\n## Tools\n{tools}\n\n"
+            f"## Deliverable\n{plan['deliverable']}\n\n"
+            f"## Delivery\n{plan['delivery']}\n\n"
+            f"## Success Criteria\n{plan['success_criteria']}\n\n"
+            f"## Assumptions\n{assumptions}\n\n"
+            f"## Context Confidence\n{plan['context_confidence']}%\n\n"
+            f"## Tools\n{tools}\n\n"
             f"## Risk\n{plan['risk_level']}: {plan.get('risk_notes') or 'No notes'}\n\n"
             f"## Instructions\n{plan['instructions']}\n\n## JSON\n```json\n"
             f"{json.dumps(plan, indent=2, ensure_ascii=False)}\n```\n"

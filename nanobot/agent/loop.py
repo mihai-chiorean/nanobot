@@ -416,7 +416,12 @@ class AgentLoop:
         self._last_usage: dict[str, int] = {}
         self._extra_hooks: list[AgentHook] = hooks or []
 
-        self.context = ContextBuilder(workspace, timezone=timezone, disabled_skills=disabled_skills)
+        self.context = ContextBuilder(
+            workspace,
+            timezone=timezone,
+            disabled_skills=disabled_skills,
+            workflow_scheduling=cron_service is not None,
+        )
         self.sessions = session_manager or SessionManager(workspace)
         self.work_store = WorkStore(workspace)
         self.tools = ToolRegistry()

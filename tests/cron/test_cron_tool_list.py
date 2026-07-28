@@ -350,7 +350,7 @@ def test_add_job_can_disable_delivery(tmp_path) -> None:
     assert job.payload.deliver is False
 
 
-def test_add_job_can_schedule_work_task(tmp_path) -> None:
+def test_add_job_cannot_bypass_workflow_intake(tmp_path) -> None:
     tool = _make_tool(tmp_path)
     tool.set_context(
         "websocket",
@@ -370,16 +370,8 @@ def test_add_job_can_schedule_work_task(tmp_path) -> None:
         work_title="Daily research digest",
     )
 
-    assert result.startswith("Created scheduled Work job")
-    job = tool._cron.list_jobs()[0]
-    assert job.payload.kind == "work_task"
-    assert job.payload.deliver is False
-    assert job.payload.channel == "websocket"
-    assert job.payload.to == "chat-1"
-    assert job.payload.session_key == "websocket:chat-1"
-    assert job.payload.channel_meta["request_id"] == "request-1"
-    assert job.payload.channel_meta["work_title"] == "Daily research digest"
-    assert job.payload.channel_meta["work_chat_id"] == "chat-1"
+    assert "Use schedule_work" in result
+    assert tool._cron.list_jobs() == []
 
 
 def test_cron_schema_advertises_action_specific_requirements(tmp_path) -> None:

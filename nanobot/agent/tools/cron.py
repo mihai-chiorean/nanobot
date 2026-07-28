@@ -41,8 +41,8 @@ _CRON_PARAMETERS = tool_parameters_schema(
     ),
     as_work=BooleanSchema(
         description=(
-            "When true, run the scheduled instruction as a background Work task "
-            "instead of a chat reminder."
+            "Deprecated and rejected. Use schedule_work for background Work so workflow "
+            "intake and confirmation cannot be bypassed."
         ),
         default=False,
     ),
@@ -118,7 +118,9 @@ class CronTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Schedule reminders and recurring tasks. Actions: add, list, remove. "
+            "Schedule simple reminder delivery, or list and remove existing jobs. "
+            "Use schedule_work for automation, monitoring, background execution, or any "
+            "recurring task that does work; cron(as_work=true) is rejected. "
             f"If tz is omitted, cron expressions and naive ISO times default to {self._default_timezone}."
         )
 
@@ -178,6 +180,11 @@ class CronTool(Tool):
         as_work: bool = False,
         work_title: str | None = None,
     ) -> str:
+        if as_work:
+            return (
+                "Error: cron(as_work=true) cannot create background Work. Use schedule_work "
+                "so missing context, assumptions, risk, and confirmation are handled first."
+            )
         if not message:
             return (
                 "Error: cron action='add' requires a non-empty 'message' parameter "
@@ -222,24 +229,19 @@ class CronTool(Tool):
 
         clean_name = name or message[:30]
         channel_meta = dict(self._metadata.get() or {})
-        if as_work:
-            channel_meta.setdefault("work_title", work_title or clean_name)
-            channel_meta.setdefault("work_chat_id", chat_id)
 
         job = self._cron.add_job(
             name=clean_name,
             schedule=schedule,
             message=message,
-            payload_kind="work_task" if as_work else "agent_turn",
-            deliver=False if as_work else deliver,
+            payload_kind="agent_turn",
+            deliver=deliver,
             channel=channel,
             to=chat_id,
             delete_after_run=delete_after,
             channel_meta=channel_meta,
             session_key=self._session_key.get() or None,
         )
-        if as_work:
-            return f"Created scheduled Work job '{job.name}' (id: {job.id})"
         return f"Created job '{job.name}' (id: {job.id})"
 
     def _format_timing(self, schedule: CronSchedule) -> str:

@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+import datetime as datetime_module
 import re
 from datetime import datetime as real_datetime
 from importlib.resources import files as pkg_files
 from pathlib import Path
-import datetime as datetime_module
 
 from nanobot.agent.context import ContextBuilder
 
@@ -183,7 +183,7 @@ def test_partial_dream_processing_shows_only_remainder(tmp_path) -> None:
     workspace = _make_workspace(tmp_path)
     builder = ContextBuilder(workspace)
 
-    c1 = builder.memory.append_history("old conversation about Python")
+    builder.memory.append_history("old conversation about Python")
     c2 = builder.memory.append_history("old conversation about Rust")
     builder.memory.append_history("recent question about Docker")
     builder.memory.append_history("recent question about K8s")
@@ -211,6 +211,26 @@ def test_execution_rules_in_system_prompt(tmp_path) -> None:
     assert "multi-step tasks" in prompt
     assert "Read before you write" in prompt
     assert "verify the result" in prompt
+
+
+def test_workflow_policy_is_injected_when_scheduling_is_enabled(tmp_path) -> None:
+    workspace = _make_workspace(tmp_path)
+    builder = ContextBuilder(workspace, workflow_scheduling=True)
+
+    prompt = builder.build_system_prompt()
+    normalized = " ".join(prompt.split())
+
+    assert "# Workflow Scheduling Policy" in prompt
+    assert "below 80 percent" in normalized
+    assert "Use `cron` only for simple reminder delivery" in normalized
+    assert "supersedes conflicting scheduling guidance" in normalized
+
+
+def test_workflow_policy_is_absent_without_scheduling_tools(tmp_path) -> None:
+    workspace = _make_workspace(tmp_path)
+    builder = ContextBuilder(workspace)
+
+    assert "# Workflow Scheduling Policy" not in builder.build_system_prompt()
 
 
 def test_identity_has_no_behavioral_instructions(tmp_path) -> None:
