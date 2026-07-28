@@ -213,6 +213,12 @@ class TestLocalQwenThinkingMode:
         assert kwargs["extra_body"]["chat_template_kwargs"] == {
             "enable_thinking": False
         }
+        assert kwargs["temperature"] == 0.7
+        assert kwargs["top_p"] == 0.8
+        assert kwargs["presence_penalty"] == 1.5
+        assert kwargs["extra_body"]["top_k"] == 20
+        assert kwargs["extra_body"]["min_p"] == 0
+        assert kwargs["extra_body"]["repetition_penalty"] == 1.0
         assert kwargs["max_tokens"] == 8192
         assert "reasoning_effort" not in kwargs
 
@@ -241,9 +247,37 @@ class TestLocalQwenThinkingMode:
         assert kwargs["extra_body"]["chat_template_kwargs"] == {
             "enable_thinking": True
         }
+        assert kwargs["temperature"] == 1.0
+        assert kwargs["top_p"] == 0.95
+        assert kwargs["presence_penalty"] == 1.5
+        assert kwargs["extra_body"]["top_k"] == 20
+        assert kwargs["extra_body"]["min_p"] == 0
+        assert kwargs["extra_body"]["repetition_penalty"] == 1.0
         assert kwargs["max_tokens"] == 16384
         assert kwargs["tool_choice"] == "auto"
         assert "reasoning_effort" not in kwargs
+
+    def test_precise_coding_profile_uses_qwen_recommended_sampling(self) -> None:
+        kwargs = _make_local_qwen()._build_kwargs(
+            messages=_simple_messages(),
+            tools=None,
+            model=None,
+            max_tokens=32768,
+            temperature=0.1,
+            reasoning_effort="max",
+            tool_choice=None,
+        )
+
+        assert kwargs["temperature"] == 0.6
+        assert kwargs["top_p"] == 0.95
+        assert kwargs["presence_penalty"] == 0.0
+        assert kwargs["max_tokens"] == 32768
+        assert kwargs["extra_body"] == {
+            "top_k": 20,
+            "min_p": 0,
+            "repetition_penalty": 1.0,
+            "chat_template_kwargs": {"enable_thinking": True},
+        }
 
     def test_multimodal_qwen_request_remains_on_qwen(self) -> None:
         messages = [

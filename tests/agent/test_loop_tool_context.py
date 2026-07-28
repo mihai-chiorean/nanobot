@@ -116,3 +116,31 @@ async def test_loop_applies_per_run_generation_options(tmp_path: Path) -> None:
 
     assert request_kwargs["reasoning_effort"] == "high"
     assert request_kwargs["max_tokens"] == 16384
+
+
+@pytest.mark.asyncio
+async def test_loop_preserves_legacy_max_tokens_without_effort(tmp_path: Path) -> None:
+    provider = MagicMock()
+    request_kwargs: dict = {}
+
+    async def chat_with_retry(**kwargs):
+        request_kwargs.update(kwargs)
+        return LLMResponse(content="done", tool_calls=[])
+
+    provider.chat_with_retry = chat_with_retry
+    provider.get_default_model.return_value = "test-model"
+    loop = AgentLoop(
+        bus=MessageBus(),
+        provider=provider,
+        workspace=tmp_path,
+        model="test-model",
+    )
+    loop.tools.get_definitions = MagicMock(return_value=[])
+
+    await loop._run_agent_loop(
+        [{"role": "user", "content": "hello"}],
+        metadata={"max_tokens": 4096},
+    )
+
+    assert request_kwargs["max_tokens"] == 4096
+    assert "reasoning_effort" not in request_kwargs

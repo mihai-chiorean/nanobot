@@ -636,9 +636,10 @@ class OpenAICompatProvider(LLMProvider):
                 if msg.get("role") == "assistant" and "reasoning_content" not in msg:
                     msg["reasoning_content"] = ""
 
-        # Merge user-configured extra_body last so it can override or
-        # extend provider-specific defaults (e.g. chat_template_kwargs,
-        # guided_json, repetition_penalty).  Uses recursive merge so
+        # Merge user-configured extra_body after generic provider defaults so it
+        # can extend them (e.g. guided_json). The complete local-Qwen profile
+        # below intentionally wins over conflicting static sampling settings.
+        # Uses recursive merge so
         # nested dicts like {"chat_template_kwargs": {"enable_thinking": false}}
         # do not clobber sibling keys already set by thinking-style logic.
         if self._extra_body:
@@ -646,18 +647,19 @@ class OpenAICompatProvider(LLMProvider):
             kwargs["extra_body"] = _deep_merge(existing, self._extra_body)
 
         if local_qwen:
-            chat_template_kwargs = kwargs.setdefault("extra_body", {}).setdefault(
+            thinking_enabled = semantic_effort not in (None, "none", "minimal")
+            precise_coding = semantic_effort in {"max", "xhigh"}
+            kwargs["temperature"] = 0.6 if precise_coding else (1.0 if thinking_enabled else 0.7)
+            kwargs["top_p"] = 0.95 if thinking_enabled else 0.8
+            kwargs["presence_penalty"] = 0.0 if precise_coding else 1.5
+            extra_body = kwargs.setdefault("extra_body", {})
+            extra_body["top_k"] = 20
+            extra_body["min_p"] = 0
+            extra_body["repetition_penalty"] = 1.0
+            chat_template_kwargs = extra_body.setdefault(
                 "chat_template_kwargs", {}
             )
-            if (
-                reasoning_effort is not None
-                or "enable_thinking" not in chat_template_kwargs
-            ):
-                chat_template_kwargs["enable_thinking"] = semantic_effort not in (
-                    None,
-                    "none",
-                    "minimal",
-                )
+            chat_template_kwargs["enable_thinking"] = thinking_enabled
 
         return kwargs
 

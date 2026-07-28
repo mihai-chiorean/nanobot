@@ -313,9 +313,33 @@ async def test_generation_options_are_scoped_to_request(
 
 @pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
 @pytest.mark.asyncio
+async def test_reasoning_profile_is_scoped_to_request(
+    aiohttp_client, mock_agent
+) -> None:
+    app = create_app(mock_agent, model_name="m")
+    client = await aiohttp_client(app)
+
+    resp = await client.post(
+        "/v1/chat/completions",
+        json={
+            "messages": [{"role": "user", "content": "debug this"}],
+            "reasoning_profile": "think-code",
+        },
+    )
+
+    assert resp.status == 200
+    assert mock_agent.process_direct.call_args.kwargs["metadata"] == {
+        "reasoning_profile": "think-code",
+    }
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("field", "value"),
     [
+        ("reasoning_profile", "slow"),
+        ("reasoning_profile", 1),
         ("reasoning_effort", "extreme"),
         ("reasoning_effort", 1),
         ("max_tokens", True),
@@ -333,6 +357,33 @@ async def test_invalid_generation_options_return_400(
         "/v1/chat/completions",
         json={
             "messages": [{"role": "user", "content": "hello"}],
+            field: value,
+        },
+    )
+
+    assert resp.status == 400
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("reasoning_effort", "none"),
+        ("max_tokens", 8192),
+    ],
+)
+async def test_reasoning_profile_and_raw_controls_are_mutually_exclusive(
+    aiohttp_client, mock_agent, field, value
+) -> None:
+    app = create_app(mock_agent, model_name="m")
+    client = await aiohttp_client(app)
+
+    resp = await client.post(
+        "/v1/chat/completions",
+        json={
+            "messages": [{"role": "user", "content": "hello"}],
+            "reasoning_profile": "fast",
             field: value,
         },
     )

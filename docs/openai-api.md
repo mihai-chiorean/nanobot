@@ -62,23 +62,25 @@ curl http://127.0.0.1:8900/v1/chat/completions \
   }'
 ```
 
-For a single run, select reasoning mode and reserve enough output budget with
-the standard request fields:
+For a single run, select a complete reasoning profile:
 
 ```json
 {
   "model": "qwen3.6-35b",
   "messages": [{"role": "user", "content": "Analyze the tradeoffs."}],
-  "reasoning_effort": "high",
-  "max_tokens": 16384,
+  "reasoning_profile": "auto",
   "stream": true
 }
 ```
 
-`reasoning_effort: "none"` explicitly disables thinking. Local Qwen/vLLM
-requests default to non-thinking mode and use `chat_template_kwargs` on the
-wire; per-request mode works for streaming and tool-using runs without
-changing the configured default for later requests.
+Valid values are `auto`, `fast`, `think`, and `think-code`. The profile selects
+thinking mode, sampling parameters, and a matching output budget for local
+Qwen/vLLM requests. Per-request profiles work for streaming and tool-using
+runs without changing the configured default for later requests.
+
+The legacy `reasoning_effort` and `max_tokens` controls remain available for
+API compatibility. Do not combine either raw control with
+`reasoning_profile`.
 
 ## File Upload (multipart/form-data)
 

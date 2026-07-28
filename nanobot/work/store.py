@@ -94,6 +94,7 @@ class WorkStore:
                     status TEXT NOT NULL,
                     mode TEXT NOT NULL,
                     model TEXT NOT NULL DEFAULT '',
+                    reasoning_profile TEXT NOT NULL DEFAULT 'auto',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     started_at TEXT,
@@ -168,6 +169,11 @@ class WorkStore:
                 connection.execute("ALTER TABLE work_tasks ADD COLUMN request_id TEXT")
             if "dispatched_at" not in task_columns:
                 connection.execute("ALTER TABLE work_tasks ADD COLUMN dispatched_at TEXT")
+            if "reasoning_profile" not in task_columns:
+                connection.execute(
+                    "ALTER TABLE work_tasks "
+                    "ADD COLUMN reasoning_profile TEXT NOT NULL DEFAULT 'auto'"
+                )
             connection.execute(
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_work_tasks_request_id
@@ -203,6 +209,7 @@ class WorkStore:
         mode: str = "background",
         title: str | None = None,
         model: str = "",
+        reasoning_profile: str = "auto",
         status: str = "queued",
         request_id: str | None = None,
     ) -> dict[str, Any]:
@@ -221,6 +228,7 @@ class WorkStore:
             "status",
             "mode",
             "model",
+            "reasoning_profile",
             "created_at",
             "updated_at",
             "last_seq",
@@ -234,6 +242,7 @@ class WorkStore:
             clean_status,
             mode,
             model,
+            reasoning_profile,
             now,
             now,
             0,

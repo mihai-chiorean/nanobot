@@ -143,9 +143,28 @@ async def test_message_forwards_per_request_generation_options() -> None:
 
 
 @pytest.mark.asyncio
+async def test_message_forwards_reasoning_profile() -> None:
+    channel = _make_channel()
+    mock_conn = AsyncMock()
+    envelope = {
+        "type": "message",
+        "chat_id": "abc123",
+        "content": "debug this",
+        "reasoning_profile": "think-code",
+    }
+
+    await channel._dispatch_envelope(mock_conn, "client-1", envelope)
+
+    metadata = channel._handle_message.call_args.kwargs["metadata"]
+    assert metadata["reasoning_profile"] == "think-code"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("field", "value", "detail"),
     [
+        ("reasoning_profile", "slow", "invalid reasoning_profile"),
+        ("reasoning_profile", 1, "invalid reasoning_profile"),
         ("reasoning_effort", "extreme", "invalid reasoning_effort"),
         ("reasoning_effort", 1, "invalid reasoning_effort"),
         ("max_tokens", True, "invalid max_tokens"),
@@ -170,6 +189,50 @@ async def test_message_rejects_invalid_generation_options(
     channel._handle_message.assert_not_awaited()
     error = json.loads(mock_conn.send.call_args.args[0])
     assert error == {"event": "error", "detail": detail}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value", "detail"),
+    [
+        (
+            "reasoning_effort",
+            "none",
+            "reasoning_profile cannot be combined with reasoning_effort",
+        ),
+        (
+            "max_tokens",
+            8192,
+            "reasoning_profile cannot be combined with max_tokens",
+        ),
+    ],
+)
+async def test_message_rejects_profile_combined_with_raw_controls(
+    field: str,
+    value: Any,
+    detail: str,
+) -> None:
+    channel = _make_channel()
+    mock_conn = AsyncMock()
+
+    await channel._dispatch_envelope(
+        mock_conn,
+        "client-1",
+        {
+            "type": "message",
+            "chat_id": "abc123",
+            "content": "hello",
+            "reasoning_profile": "fast",
+            field: value,
+        },
+    )
+
+    channel._handle_message.assert_not_awaited()
+    error = json.loads(mock_conn.send.call_args.args[0])
+    assert error == {
+        "event": "error",
+        "detail": detail,
+    }
 
 
 @pytest.mark.asyncio

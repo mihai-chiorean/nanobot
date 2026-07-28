@@ -7,13 +7,14 @@ import inspect
 import os
 import time
 from contextlib import suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
 from loguru import logger
 
 from nanobot.agent.hook import AgentHook, AgentHookContext
+from nanobot.agent.reasoning_policy import escalation_profile
 from nanobot.agent.tools.ask import AskUserInterrupt
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.observability import observe_llm_iteration, observe_tool
@@ -66,6 +67,8 @@ class AgentRunSpec:
     temperature: float | None = None
     max_tokens: int | None = None
     reasoning_effort: str | None = None
+    reasoning_profile: str | None = None
+    allow_reasoning_escalation: bool = False
     hook: AgentHook | None = None
     error_message: str | None = _DEFAULT_ERROR_MESSAGE
     max_iterations_message: str | None = None
@@ -233,6 +236,7 @@ class AgentRunner:
 
     async def run(self, spec: AgentRunSpec) -> AgentRunResult:
         hook = spec.hook or AgentHook()
+        active_spec = spec
         messages = list(spec.initial_messages)
         final_content: str | None = None
         tools_used: list[str] = []
@@ -253,7 +257,11 @@ class AgentRunner:
             # both nest under this span, yielding the hierarchy the
             # MIT-186 sketch specifies.  The context manager cleanly
             # exits on every continue/break path below.
-            with observe_llm_iteration(iteration=iteration, model=spec.model):
+            with observe_llm_iteration(
+                iteration=iteration,
+                model=spec.model,
+                reasoning_profile=active_spec.reasoning_profile,
+            ):
                 try:
                     # Keep the persisted conversation untouched. Context governance
                     # may repair or compact historical messages for the model, but
@@ -282,7 +290,7 @@ class AgentRunner:
                 context = AgentHookContext(iteration=iteration, messages=messages)
                 await hook.before_iteration(context)
                 _t0 = time.perf_counter()
-                response = await self._request_model(spec, messages_for_model, hook, context)
+                response = await self._request_model(active_spec, messages_for_model, hook, context)
                 context.latency_ms = (time.perf_counter() - _t0) * 1000
                 raw_usage = self._usage_dict(response.usage)
                 context.response = response
@@ -403,6 +411,33 @@ class AgentRunner:
                     )
 
                 clean = hook.finalize_content(context, response.content)
+                if (
+                    response.finish_reason != "error"
+                    and is_blank_text(clean)
+                    and active_spec.allow_reasoning_escalation
+                ):
+                    stronger = escalation_profile(active_spec.reasoning_profile or "")
+                    if stronger is not None:
+                        logger.info(
+                            "Escalating reasoning profile from {} to {} after empty {} response for {}",
+                            active_spec.reasoning_profile,
+                            stronger.name.value,
+                            response.finish_reason,
+                            spec.session_key or "default",
+                        )
+                        active_spec = replace(
+                            active_spec,
+                            reasoning_profile=stronger.name.value,
+                            reasoning_effort=stronger.reasoning_effort,
+                            temperature=stronger.temperature,
+                            max_tokens=stronger.max_tokens,
+                            allow_reasoning_escalation=False,
+                        )
+                        empty_content_retries = 0
+                        if hook.wants_streaming():
+                            await hook.on_stream_end(context, resuming=True)
+                        await hook.after_iteration(context)
+                        continue
                 if response.finish_reason != "error" and is_blank_text(clean):
                     empty_content_retries += 1
                     if empty_content_retries < _MAX_EMPTY_RETRIES:
@@ -425,7 +460,7 @@ class AgentRunner:
                     )
                     if hook.wants_streaming():
                         await hook.on_stream_end(context, resuming=False)
-                    response = await self._request_finalization_retry(spec, messages_for_model)
+                    response = await self._request_finalization_retry(active_spec, messages_for_model)
                     retry_usage = self._usage_dict(response.usage)
                     self._accumulate_usage(usage, retry_usage)
                     raw_usage = self._merge_usage(raw_usage, retry_usage)
@@ -435,6 +470,23 @@ class AgentRunner:
                     clean = hook.finalize_content(context, response.content)
 
                 if response.finish_reason == "length" and not is_blank_text(clean):
+                    if active_spec.allow_reasoning_escalation:
+                        stronger = escalation_profile(active_spec.reasoning_profile or "")
+                        if stronger is not None:
+                            logger.info(
+                                "Escalating reasoning profile from {} to {} after truncated response for {}",
+                                active_spec.reasoning_profile,
+                                stronger.name.value,
+                                spec.session_key or "default",
+                            )
+                            active_spec = replace(
+                                active_spec,
+                                reasoning_profile=stronger.name.value,
+                                reasoning_effort=stronger.reasoning_effort,
+                                temperature=stronger.temperature,
+                                max_tokens=stronger.max_tokens,
+                                allow_reasoning_escalation=False,
+                            )
                     length_recovery_count += 1
                     if length_recovery_count <= _MAX_LENGTH_RECOVERIES:
                         logger.info(

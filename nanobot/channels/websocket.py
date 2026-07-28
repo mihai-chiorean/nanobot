@@ -32,6 +32,7 @@ from websockets.exceptions import ConnectionClosed
 from websockets.http11 import Request as WsRequest
 from websockets.http11 import Response
 
+from nanobot.agent.reasoning_policy import ReasoningProfile, parse_reasoning_profile
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
@@ -415,6 +416,7 @@ _ARTIFACT_ID_RE = re.compile(r"^artifact_[0-9a-f]{32}$")
 _REASONING_EFFORTS = frozenset(
     {"none", "minimal", "minimum", "low", "medium", "high", "max", "adaptive"}
 )
+_REASONING_PROFILES = frozenset(profile.value for profile in ReasoningProfile)
 
 
 def _decode_api_key(raw_key: str) -> str | None:
@@ -1085,6 +1087,11 @@ class WebSocketChannel(BaseChannel):
             return _http_error(400, "invalid chat_id")
         if not isinstance(content, str) or not content.strip():
             return _http_error(400, "content is required")
+        reasoning_profile = parse_reasoning_profile(
+            body.get("reasoning_profile", ReasoningProfile.AUTO.value)
+        )
+        if reasoning_profile is None:
+            return _http_error(400, "invalid reasoning_profile")
         media_paths, media_error = self._work_media(body.get("media"))
         if media_error is not None:
             return _http_error(400, f"media rejected: {media_error}")
@@ -1095,6 +1102,7 @@ class WebSocketChannel(BaseChannel):
             mode="background",
             title=body.get("title") if isinstance(body.get("title"), str) else None,
             model=_read_webui_model_name() or "",
+            reasoning_profile=reasoning_profile.value,
         )
         task_id = str(task["task_id"])
         try:
@@ -1231,6 +1239,9 @@ class WebSocketChannel(BaseChannel):
             "_wants_stream": True,
             "work_task_id": task_id,
             "work_mode": "background",
+            "reasoning_profile": str(
+                task.get("reasoning_profile") or ReasoningProfile.AUTO.value
+            ),
         }
         if remote is not None:
             metadata["remote"] = remote
@@ -1972,8 +1983,26 @@ class WebSocketChannel(BaseChannel):
             metadata: dict[str, Any] = {
                 "remote": getattr(connection, "remote_address", None)
             }
+            reasoning_profile = envelope.get("reasoning_profile")
+            if reasoning_profile is not None:
+                if (
+                    not isinstance(reasoning_profile, str)
+                    or reasoning_profile.lower() not in _REASONING_PROFILES
+                ):
+                    await self._send_event(
+                        connection, "error", detail="invalid reasoning_profile"
+                    )
+                    return
+                metadata["reasoning_profile"] = reasoning_profile.lower()
             reasoning_effort = envelope.get("reasoning_effort")
             if reasoning_effort is not None:
+                if reasoning_profile is not None:
+                    await self._send_event(
+                        connection,
+                        "error",
+                        detail="reasoning_profile cannot be combined with reasoning_effort",
+                    )
+                    return
                 if (
                     not isinstance(reasoning_effort, str)
                     or reasoning_effort.lower() not in _REASONING_EFFORTS
@@ -1985,6 +2014,13 @@ class WebSocketChannel(BaseChannel):
                 metadata["reasoning_effort"] = reasoning_effort.lower()
             max_tokens = envelope.get("max_tokens")
             if max_tokens is not None:
+                if reasoning_profile is not None:
+                    await self._send_event(
+                        connection,
+                        "error",
+                        detail="reasoning_profile cannot be combined with max_tokens",
+                    )
+                    return
                 if (
                     not isinstance(max_tokens, int)
                     or isinstance(max_tokens, bool)
@@ -2066,6 +2102,14 @@ class WebSocketChannel(BaseChannel):
         if not isinstance(content, str) or not content.strip():
             await self._send_event(connection, "error", detail="missing content")
             return
+        reasoning_profile = parse_reasoning_profile(
+            envelope.get("reasoning_profile", ReasoningProfile.AUTO.value)
+        )
+        if reasoning_profile is None:
+            await self._send_event(
+                connection, "error", detail="invalid reasoning_profile"
+            )
+            return
         if request_id is not None and (
             not isinstance(request_id, str) or _WORK_ID_RE.fullmatch(request_id) is None
         ):
@@ -2088,6 +2132,7 @@ class WebSocketChannel(BaseChannel):
             mode="background",
             title=(envelope.get("title") if isinstance(envelope.get("title"), str) else None),
             model=_read_webui_model_name() or "",
+            reasoning_profile=reasoning_profile.value,
             request_id=request_id,
         )
         was_created = bool(task.pop("_was_created", True))

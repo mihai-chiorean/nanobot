@@ -19,6 +19,10 @@ from nanobot.agent.autocompact import AutoCompact
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.hook import AgentHook, AgentHookContext, CompositeHook
 from nanobot.agent.memory import Consolidator, Dream
+from nanobot.agent.reasoning_policy import (
+    parse_reasoning_profile,
+    resolve_reasoning_profile,
+)
 from nanobot.agent.runner import _MAX_INJECTIONS_PER_TURN, AgentRunner, AgentRunSpec
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 from nanobot.agent.subagent import SubagentManager
@@ -921,15 +925,41 @@ class AgentLoop:
         active_session_key = session.key if session else session_key
         run_reasoning_effort = None
         run_max_tokens = None
+        run_temperature = None
+        run_reasoning_profile = None
+        allow_reasoning_escalation = False
         if isinstance(metadata, dict):
-            candidate_effort = metadata.get("reasoning_effort")
-            if isinstance(candidate_effort, str):
-                run_reasoning_effort = candidate_effort
-            candidate_max_tokens = metadata.get("max_tokens")
-            if isinstance(candidate_max_tokens, int) and not isinstance(
-                candidate_max_tokens, bool
-            ):
-                run_max_tokens = candidate_max_tokens
+            requested_profile = parse_reasoning_profile(metadata.get("reasoning_profile"))
+            uses_raw_generation_controls = (
+                "reasoning_effort" in metadata or "max_tokens" in metadata
+            )
+            if requested_profile is not None and not uses_raw_generation_controls:
+                decision = resolve_reasoning_profile(
+                    requested_profile,
+                    initial_messages,
+                    background_work=metadata.get("work_mode") == "background",
+                )
+                run_reasoning_profile = decision.generation.name.value
+                run_reasoning_effort = decision.generation.reasoning_effort
+                run_temperature = decision.generation.temperature
+                run_max_tokens = decision.generation.max_tokens
+                allow_reasoning_escalation = decision.allow_escalation
+                logger.info(
+                    "Reasoning profile requested={} resolved={} source={} classifier_candidate={}",
+                    decision.requested.value,
+                    decision.generation.name.value,
+                    decision.source,
+                    decision.classifier_candidate,
+                )
+            else:
+                candidate_effort = metadata.get("reasoning_effort")
+                if isinstance(candidate_effort, str):
+                    run_reasoning_effort = candidate_effort
+                candidate_max_tokens = metadata.get("max_tokens")
+                if isinstance(candidate_max_tokens, int) and not isinstance(
+                    candidate_max_tokens, bool
+                ):
+                    run_max_tokens = candidate_max_tokens
         file_state_token = bind_file_states(self._file_state_store.for_session(active_session_key))
         work_tokens = set_work_context(
             store=self.work_store if task_id else None,
@@ -951,8 +981,11 @@ class AgentLoop:
                 context_window_tokens=self.context_window_tokens,
                 context_block_limit=self.context_block_limit,
                 provider_retry_mode=self.provider_retry_mode,
+                temperature=run_temperature,
                 reasoning_effort=run_reasoning_effort,
                 max_tokens=run_max_tokens,
+                reasoning_profile=run_reasoning_profile,
+                allow_reasoning_escalation=allow_reasoning_escalation,
                 progress_callback=on_progress,
                 retry_wait_callback=on_retry_wait,
                 checkpoint_callback=_checkpoint,

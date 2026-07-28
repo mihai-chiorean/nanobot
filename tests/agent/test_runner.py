@@ -1342,6 +1342,86 @@ async def test_length_recovery_continues_from_truncated_output():
 
 
 @pytest.mark.asyncio
+async def test_auto_fast_escalates_once_after_truncation() -> None:
+    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+
+    provider = MagicMock()
+    requests: list[dict] = []
+
+    async def chat_with_retry(*, messages, **kwargs):
+        requests.append(kwargs)
+        if len(requests) == 1:
+            return LLMResponse(
+                content="partial",
+                finish_reason="length",
+                usage={},
+            )
+        return LLMResponse(content="done", finish_reason="stop", usage={})
+
+    provider.chat_with_retry = chat_with_retry
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+
+    result = await AgentRunner(provider).run(AgentRunSpec(
+        initial_messages=[{"role": "user", "content": "go"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=5,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+        reasoning_profile="fast",
+        reasoning_effort="none",
+        temperature=0.7,
+        max_tokens=8_192,
+        allow_reasoning_escalation=True,
+    ))
+
+    assert result.final_content == "done"
+    assert requests[0]["reasoning_effort"] == "none"
+    assert requests[0]["max_tokens"] == 8_192
+    assert requests[1]["reasoning_effort"] == "high"
+    assert requests[1]["temperature"] == 1.0
+    assert requests[1]["max_tokens"] == 32_768
+
+
+@pytest.mark.asyncio
+async def test_explicit_fast_does_not_escalate_after_truncation() -> None:
+    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+
+    provider = MagicMock()
+    requests: list[dict] = []
+
+    async def chat_with_retry(*, messages, **kwargs):
+        requests.append(kwargs)
+        if len(requests) == 1:
+            return LLMResponse(
+                content="partial",
+                finish_reason="length",
+                usage={},
+            )
+        return LLMResponse(content="done", finish_reason="stop", usage={})
+
+    provider.chat_with_retry = chat_with_retry
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+
+    await AgentRunner(provider).run(AgentRunSpec(
+        initial_messages=[{"role": "user", "content": "go"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=5,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+        reasoning_profile="fast",
+        reasoning_effort="none",
+        temperature=0.7,
+        max_tokens=8_192,
+        allow_reasoning_escalation=False,
+    ))
+
+    assert [request["reasoning_effort"] for request in requests] == ["none", "none"]
+    assert [request["max_tokens"] for request in requests] == [8_192, 8_192]
+
+
+@pytest.mark.asyncio
 async def test_length_recovery_streaming_calls_on_stream_end_with_resuming():
     """During length recovery with streaming, on_stream_end should be called
     with resuming=True so the hook knows the conversation is continuing."""

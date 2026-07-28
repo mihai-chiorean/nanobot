@@ -43,6 +43,19 @@ def test_list_tasks_supports_stable_offset_pages(tmp_path: Path) -> None:
     assert [item["task_id"] for item in store.list_tasks(limit=1, offset=1)] == [first["task_id"]]
 
 
+def test_task_persists_reasoning_profile(tmp_path: Path) -> None:
+    store = WorkStore(tmp_path)
+
+    task = store.create_task(
+        chat_id="chat-1",
+        content="Implement the feature",
+        reasoning_profile="think-code",
+    )
+
+    assert task["reasoning_profile"] == "think-code"
+    assert store.get_task(task["task_id"])["reasoning_profile"] == "think-code"
+
+
 def test_create_and_message_command_ids_are_idempotent(tmp_path: Path) -> None:
     store = WorkStore(tmp_path)
     request_id = "work_" + "a" * 32

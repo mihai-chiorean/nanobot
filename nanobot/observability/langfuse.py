@@ -187,6 +187,7 @@ def observe_llm_iteration(
     *,
     iteration: int,
     model: str | None = None,
+    reasoning_profile: str | None = None,
 ) -> Iterator[Any]:
     """Wrap one LLM iteration so tool calls + the auto-traced generation
     nest under it.
@@ -206,6 +207,8 @@ def observe_llm_iteration(
     metadata: dict[str, Any] = {"iteration": iteration}
     if model:
         metadata["model"] = model
+    if reasoning_profile:
+        metadata["reasoning_profile"] = reasoning_profile
 
     try:
         cm = client.start_as_current_observation(

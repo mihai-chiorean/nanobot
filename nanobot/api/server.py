@@ -16,6 +16,7 @@ from typing import Any
 from aiohttp import web
 from loguru import logger
 
+from nanobot.agent.reasoning_policy import parse_reasoning_profile
 from nanobot.config.paths import get_media_dir
 from nanobot.utils.helpers import safe_filename
 from nanobot.utils.media_decode import (
@@ -155,8 +156,19 @@ def _parse_json_content(body: dict) -> tuple[str, list[str]]:
 def _parse_generation_options(body: dict[str, Any]) -> dict[str, Any]:
     """Validate optional per-request generation controls."""
     options: dict[str, Any] = {}
+    requested_profile = body.get("reasoning_profile")
+    if requested_profile is not None:
+        profile = parse_reasoning_profile(requested_profile)
+        if profile is None:
+            raise ValueError("reasoning_profile is invalid")
+        options["reasoning_profile"] = profile.value
+
     reasoning_effort = body.get("reasoning_effort")
     if reasoning_effort is not None:
+        if requested_profile is not None:
+            raise ValueError(
+                "reasoning_profile cannot be combined with reasoning_effort"
+            )
         if (
             not isinstance(reasoning_effort, str)
             or reasoning_effort.lower() not in _REASONING_EFFORTS
@@ -166,6 +178,10 @@ def _parse_generation_options(body: dict[str, Any]) -> dict[str, Any]:
 
     max_tokens = body.get("max_tokens")
     if max_tokens is not None:
+        if requested_profile is not None:
+            raise ValueError(
+                "reasoning_profile cannot be combined with max_tokens"
+            )
         if (
             not isinstance(max_tokens, int)
             or isinstance(max_tokens, bool)
