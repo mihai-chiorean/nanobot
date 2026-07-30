@@ -1124,6 +1124,7 @@ class WebSocketChannel(BaseChannel):
                     "title": title,
                     "owner_display_name": owner_display_name,
                 },
+                shared_room_owner=owner_display_name,
             )
         except FileNotFoundError:
             return _http_error(404, "source session not found")

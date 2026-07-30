@@ -34,7 +34,21 @@ async def test_room_token_is_scoped_and_messages_fan_out(tmp_path: Path) -> None
     sessions = SessionManager(tmp_path)
     source = Session(key="websocket:source")
     source.add_message("user", "Existing shared context")
-    source.add_message("assistant", "Existing answer")
+    source.add_message(
+        "assistant",
+        "",
+        tool_calls=[{
+            "id": "private-tool-call",
+            "function": {"name": "exec", "arguments": "{\"command\":\"cat /private/key\"}"},
+        }],
+    )
+    source.add_message(
+        "tool",
+        "PRIVATE TOOL RESULT",
+        tool_call_id="private-tool-call",
+        media=["/home/mihai/private.pdf"],
+    )
+    source.add_message("assistant", "Existing answer", reasoning_content="PRIVATE REASONING")
     sessions.save(source)
     channel = WebSocketChannel(
         {
@@ -108,6 +122,18 @@ async def test_room_token_is_scoped_and_messages_fan_out(tmp_path: Path) -> None
         )
         assert exact.status_code == 200
         assert exact.json()["metadata"]["shared_room"] is True
+        serialized_history = json.dumps(exact.json())
+        assert "PRIVATE TOOL RESULT" not in serialized_history
+        assert "PRIVATE REASONING" not in serialized_history
+        assert "/private/key" not in serialized_history
+        assert "/home/mihai/private.pdf" not in serialized_history
+        existing_user = next(
+            message
+            for message in exact.json()["messages"]
+            if message["content"] == "Existing shared context"
+        )
+        assert existing_user["participant_id"] == "owner"
+        assert existing_user["participant_display_name"] == "Owner"
 
         async with websockets.connect(
             f"ws://127.0.0.1:29924/?token={token}"

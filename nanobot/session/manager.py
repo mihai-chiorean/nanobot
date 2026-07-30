@@ -524,6 +524,7 @@ class SessionManager:
         destination_key: str,
         *,
         metadata: dict[str, Any] | None = None,
+        shared_room_owner: str | None = None,
     ) -> Session:
         """Create a durable conversation branch without sharing future source turns."""
         if self._get_session_path(destination_key).exists():
@@ -532,16 +533,53 @@ class SessionManager:
         if not self._get_session_path(source_key).exists():
             raise FileNotFoundError(source_key)
         now = datetime.now()
+        messages = deepcopy(source.messages)
+        if shared_room_owner is not None:
+            messages = self._shareable_messages(messages, shared_room_owner)
         clone = Session(
             key=destination_key,
-            messages=deepcopy(source.messages),
+            messages=messages,
             created_at=now,
             updated_at=now,
             metadata={**deepcopy(source.metadata), **(metadata or {})},
-            last_consolidated=source.last_consolidated,
+            last_consolidated=0 if shared_room_owner is not None else source.last_consolidated,
         )
         self.save(clone, fsync=True)
         return clone
+
+    @staticmethod
+    def _shareable_messages(
+        messages: list[dict[str, Any]],
+        owner_display_name: str,
+    ) -> list[dict[str, Any]]:
+        """Copy only the transcript users could see before a room was shared."""
+        allowed = {
+            "role",
+            "content",
+            "timestamp",
+            "client_message_id",
+            "client_message_ids",
+            "participant_id",
+            "participant_display_name",
+        }
+        shareable: list[dict[str, Any]] = []
+        owner = owner_display_name.strip()[:64] or "Owner"
+        for message in messages:
+            if message.get("role") not in {"user", "assistant"}:
+                continue
+            visible = {
+                key: deepcopy(value)
+                for key, value in message.items()
+                if key in allowed
+            }
+            content = visible.get("content")
+            if not isinstance(content, str) or not content.strip():
+                continue
+            if visible.get("role") == "user":
+                visible.setdefault("participant_id", "owner")
+                visible.setdefault("participant_display_name", owner)
+            shareable.append(visible)
+        return shareable
 
     def read_session_file(self, key: str) -> dict[str, Any] | None:
         """Load a session from disk without caching; intended for read-only HTTP endpoints.
