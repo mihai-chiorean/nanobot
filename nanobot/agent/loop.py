@@ -50,6 +50,7 @@ from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.agent.tools.work import PublishArtifactTool, ReportProgressTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
+from nanobot.channels.chat_inbox import ChatInboxStore
 from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
 from nanobot.config.schema import AgentDefaults
 from nanobot.observability import observe_turn
@@ -351,6 +352,8 @@ class AgentLoop:
 
     _RUNTIME_CHECKPOINT_KEY = "runtime_checkpoint"
     _PENDING_USER_TURN_KEY = "pending_user_turn"
+    _MAX_CHAT_PROCESSING_RETRIES = 5
+    _TERMINAL_CHAT_RETRY = -1
 
     def __init__(
         self,
@@ -423,6 +426,7 @@ class AgentLoop:
             workflow_scheduling=cron_service is not None,
         )
         self.sessions = session_manager or SessionManager(workspace)
+        self.chat_inbox = ChatInboxStore(workspace)
         self.work_store = WorkStore(workspace)
         self.tools = ToolRegistry()
         self._audit_logger = AuditLogger(self.workspace / "audit.jsonl")
@@ -674,9 +678,49 @@ class AgentLoop:
         dispatch_fn: Callable[[CommandContext], Awaitable[OutboundMessage | None]],
     ) -> None:
         """Dispatch a command directly from the run() loop and publish the result."""
+        msg.metadata["_command_at_most_once"] = True
+        try:
+            command_started = await self._begin_at_most_once_command(msg)
+        except Exception:
+            logger.exception(
+                "Could not persist at-most-once marker for command '{}'",
+                raw,
+            )
+            msg.metadata.pop("_command_at_most_once", None)
+            await self.bus.publish_outbound(OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=self._command_not_started_message(),
+                metadata=dict(msg.metadata or {}),
+            ))
+            return
+        if not command_started:
+            msg.metadata.pop("_command_at_most_once", None)
+            await self.bus.publish_outbound(OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=self._command_failure_message(),
+                metadata=dict(msg.metadata or {}),
+            ))
+            return
         ctx = CommandContext(msg=msg, session=None, key=key, raw=raw, loop=self)
-        result = await dispatch_fn(ctx)
+        try:
+            result = await dispatch_fn(ctx)
+        except Exception:
+            logger.exception("At-most-once command '{}' failed during dispatch", raw)
+            await self._record_command_failure_safely(msg)
+            msg.metadata.pop("_command_at_most_once", None)
+            await self.bus.publish_outbound(OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=self._command_failure_message(),
+                metadata=dict(msg.metadata or {}),
+            ))
+            return
+        await self._complete_at_most_once_command(msg, result)
+        msg.metadata.pop("_command_at_most_once", None)
         if result:
+            result.metadata.pop("_command_at_most_once", None)
             await self.bus.publish_outbound(result)
         else:
             logger.warning("Command '{}' matched but dispatch returned None", raw)
@@ -895,7 +939,11 @@ class AgentLoop:
                     merged: str | list[dict[str, Any]] = f"{runtime_ctx}\n\n{user_content}"
                 else:
                     merged = [{"type": "text", "text": runtime_ctx}] + user_content
-                return {"role": "user", "content": merged}
+                result: dict[str, Any] = {"role": "user", "content": merged}
+                client_message_id = pending_msg.metadata.get("client_message_id")
+                if isinstance(client_message_id, str):
+                    result["_client_message_ids"] = [client_message_id]
+                return result
 
             items: list[dict[str, Any]] = []
             while len(items) < limit:
@@ -1014,6 +1062,7 @@ class AgentLoop:
     async def run(self) -> None:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
         self._running = True
+        await self._recover_interrupted_commands()
         await self._connect_mcp()
         logger.info("Agent loop started")
 
@@ -1062,19 +1111,12 @@ class AgentLoop:
                         msg,
                         session_key_override=effective_key,
                     )
-                try:
-                    self._pending_queues[effective_key].put_nowait(pending_msg)
-                except asyncio.QueueFull:
-                    logger.warning(
-                        "Pending queue full for session {}, falling back to queued task",
-                        effective_key,
-                    )
-                else:
-                    logger.info(
-                        "Routed follow-up message to pending queue for session {}",
-                        effective_key,
-                    )
-                    continue
+                self._pending_queues[effective_key].put_nowait(pending_msg)
+                logger.info(
+                    "Routed follow-up message to pending queue for session {}",
+                    effective_key,
+                )
+                continue
             # Compute the effective session key before dispatching
             # This ensures /stop command can find tasks correctly when unified session is enabled
             task = asyncio.create_task(self._dispatch(msg))
@@ -1103,12 +1145,14 @@ class AgentLoop:
                             "Only my owner can authorize that. Let me know if there's something "
                             "else I can help you with!",
                 ))
+                await self._mark_chat_message_processed(msg)
                 return
 
         # Register a pending queue so follow-up messages for this session are
         # routed here (mid-turn injection) instead of spawning a new task.
-        pending = asyncio.Queue(maxsize=20)
+        pending: asyncio.Queue[InboundMessage] = asyncio.Queue()
         self._pending_queues[session_key] = pending
+        retry_delay: int | None = None
 
         try:
             async with lock, gate:
@@ -1193,6 +1237,14 @@ class AgentLoop:
                             session_key,
                             exc_info=True,
                         )
+                    if msg.metadata.get("_command_at_most_once"):
+                        try:
+                            await self._record_command_failure(msg)
+                        except Exception:
+                            logger.exception(
+                                "Could not persist cancelled command outcome for session {}",
+                                session_key,
+                            )
                     await self._record_work_status(msg, "cancelled")
                     raise
                 except Exception:
@@ -1202,11 +1254,57 @@ class AgentLoop:
                         "failed",
                         error="Sorry, I encountered an error.",
                     )
-                    await self.bus.publish_outbound(OutboundMessage(
-                        channel=msg.channel, chat_id=msg.chat_id,
-                        content="Sorry, I encountered an error.",
-                    ))
+                    is_command_failure = bool(
+                        msg.metadata.get("_command_at_most_once")
+                    )
+                    retry_delay = (
+                        None
+                        if is_command_failure
+                        else await self._prepare_chat_message_retry(msg)
+                    )
+                    if is_command_failure:
+                        await self._record_command_failure_safely(msg)
+                        msg.metadata.pop("_command_at_most_once", None)
+                        await self.bus.publish_outbound(OutboundMessage(
+                            channel=msg.channel,
+                            chat_id=msg.chat_id,
+                            content=self._command_failure_message(),
+                            metadata=dict(msg.metadata or {}),
+                        ))
+                    elif retry_delay is None:
+                        await self.bus.publish_outbound(OutboundMessage(
+                            channel=msg.channel, chat_id=msg.chat_id,
+                            content="Sorry, I encountered an error.",
+                        ))
+                    elif retry_delay == self._TERMINAL_CHAT_RETRY:
+                        await self.bus.publish_outbound(OutboundMessage(
+                            channel=msg.channel,
+                            chat_id=msg.chat_id,
+                            content=self._terminal_chat_failure_message(),
+                            metadata=dict(msg.metadata or {}),
+                        ))
+                    else:
+                        await self.bus.publish_outbound(OutboundMessage(
+                            channel=msg.channel,
+                            chat_id=msg.chat_id,
+                            content=f"Retrying in {retry_delay} seconds.",
+                            metadata={
+                                **dict(msg.metadata or {}),
+                                "_status_delta": True,
+                            },
+                        ))
         finally:
+            # Keep the pending queue registered while backing off so later
+            # prompts remain behind the failed one without holding a model
+            # concurrency slot or a session lock.
+            while retry_delay is not None and retry_delay >= 0:
+                await asyncio.sleep(retry_delay)
+                retry_delay = await self._retry_chat_message_in_place(
+                    msg,
+                    session_key,
+                    pending,
+                    lock,
+                )
             # Drain any messages still in the pending queue and re-publish
             # them to the bus so they are processed as fresh inbound messages
             # rather than silently lost.
@@ -1405,17 +1503,71 @@ class AgentLoop:
 
         key = session_key or msg.session_key
         session = self.sessions.get_or_create(key)
-        if self._restore_runtime_checkpoint(session):
+        client_message_id = msg.metadata.get("client_message_id")
+        has_client_message = (
+            isinstance(client_message_id, str)
+            and self._session_has_client_message(session, client_message_id)
+        )
+        pending_client_message_ids = self._pending_user_turn_client_message_ids(session)
+        resumes_pending_receipt = bool(
+            has_client_message
+            and isinstance(client_message_id, str)
+            and client_message_id in pending_client_message_ids
+        )
+        if has_client_message and not resumes_pending_receipt:
+            logger.info(
+                "Skipping duplicate client message {} for session {}",
+                client_message_id,
+                key,
+            )
+            await self._mark_chat_message_processed(msg)
+            return None
+        if resumes_pending_receipt and isinstance(
+            session.metadata.get(self._RUNTIME_CHECKPOINT_KEY),
+            dict,
+        ):
+            self._restore_runtime_checkpoint(session)
+            interrupted = (
+                "The server restarted while this request was using tools. "
+                "I preserved the partial result and did not repeat those tool calls."
+            )
+            session.add_message("assistant", interrupted)
             self.sessions.save(session)
-        if self._restore_pending_user_turn(session):
-            self.sessions.save(session)
+            await self._mark_chat_message_processed(msg)
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=interrupted,
+                metadata=dict(msg.metadata or {}),
+            )
+        if not resumes_pending_receipt:
+            if self._restore_runtime_checkpoint(session):
+                self.sessions.save(session)
+            if self._restore_pending_user_turn(session):
+                self.sessions.save(session)
 
         session, pending = self.auto_compact.prepare_session(session, key)
 
         # Slash commands
         raw = msg.content.strip()
         ctx = CommandContext(msg=msg, session=session, key=key, raw=raw, loop=self)
+        is_known_command = self.commands.is_dispatchable_command(raw)
+        if is_known_command:
+            msg.metadata["_command_at_most_once"] = True
+            if not await self._begin_at_most_once_command(msg):
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content=self._command_failure_message(),
+                    metadata=dict(msg.metadata or {}),
+                )
         if result := await self.commands.dispatch(ctx):
+            if is_known_command:
+                await self._complete_at_most_once_command(msg, result)
+                msg.metadata.pop("_command_at_most_once", None)
+                result.metadata.pop("_command_at_most_once", None)
+            else:
+                await self._mark_chat_message_processed(msg)
             return result
 
         await self.consolidator.maybe_consolidate_by_tokens(
@@ -1437,6 +1589,16 @@ class AgentLoop:
             "include_timestamps": True,
         }
         history = session.get_history(**_hist_kwargs)
+        if resumes_pending_receipt and isinstance(client_message_id, str):
+            last_persisted = session.messages[-1] if session.messages else None
+            if (
+                history
+                and isinstance(last_persisted, dict)
+                and last_persisted.get("role") == "user"
+                and self._message_has_client_id(last_persisted, client_message_id)
+                and history[-1].get("role") == "user"
+            ):
+                history = history[:-1]
 
         pending_ask_id = pending_ask_user_id(history)
         if pending_ask_id:
@@ -1446,6 +1608,8 @@ class AgentLoop:
                 pending_ask_id,
                 msg.content,
             )
+            if isinstance(client_message_id, str):
+                initial_messages[-1]["_client_message_ids"] = [client_message_id]
         else:
             initial_messages = self.context.build_messages(
                 history=history,
@@ -1456,6 +1620,11 @@ class AgentLoop:
                 chat_id=self._runtime_chat_id(msg),
                 sender_id=msg.sender_id,
             )
+        if isinstance(client_message_id, str):
+            for message in reversed(initial_messages):
+                if message.get("role") == "user":
+                    message["_client_message_ids"] = [client_message_id]
+                    break
 
         async def _bus_progress(
             content: str,
@@ -1493,14 +1662,19 @@ class AgentLoop:
         # doesn't silently lose the prompt on recovery. ``media`` rides along
         # as raw on-disk paths — sanitized image blocks are stripped from
         # JSONL, and webui replay needs the paths to mint signed URLs.
-        user_persisted_early = False
+        user_persisted_early = resumes_pending_receipt
         media_paths = [p for p in (msg.media or []) if isinstance(p, str) and p]
         has_text = isinstance(msg.content, str) and msg.content.strip()
-        if not pending_ask_id and (has_text or media_paths):
+        if not resumes_pending_receipt and not pending_ask_id and (has_text or media_paths):
             extra: dict[str, Any] = {"media": list(media_paths)} if media_paths else {}
+            if isinstance(client_message_id, str):
+                extra["client_message_id"] = client_message_id
             text = msg.content if isinstance(msg.content, str) else ""
             session.add_message("user", text, **extra)
-            self._mark_pending_user_turn(session)
+            self._mark_pending_user_turn(
+                session,
+                [client_message_id] if isinstance(client_message_id, str) else [],
+            )
             self.sessions.save(session)
             user_persisted_early = True
 
@@ -1530,6 +1704,13 @@ class AgentLoop:
         self._clear_pending_user_turn(session)
         self._clear_runtime_checkpoint(session)
         self.sessions.save(session)
+        completed_client_message_ids = self._client_message_ids(all_msgs)
+        if isinstance(client_message_id, str):
+            completed_client_message_ids.insert(0, client_message_id)
+        await self._mark_chat_message_ids_processed(
+            msg.chat_id,
+            list(dict.fromkeys(completed_client_message_ids)),
+        )
         self._schedule_background(self.consolidator.maybe_consolidate_by_tokens(session))
 
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
@@ -1631,6 +1812,13 @@ class AgentLoop:
 
         for m in messages[skip:]:
             entry = dict(m)
+            client_message_ids = self._normalized_client_message_ids(
+                entry.pop("_client_message_ids", None)
+            )
+            if len(client_message_ids) == 1:
+                entry["client_message_id"] = client_message_ids[0]
+            elif client_message_ids:
+                entry["client_message_ids"] = client_message_ids
             role, content = entry.get("role"), entry.get("content")
             if role == "assistant" and not content and not entry.get("tool_calls"):
                 continue  # skip empty assistant messages — they poison session context
@@ -1670,6 +1858,343 @@ class AgentLoop:
             session.messages.append(entry)
         session.updated_at = datetime.now()
 
+    @staticmethod
+    def _session_has_client_message(session: Session, client_message_id: str) -> bool:
+        return any(
+            AgentLoop._message_has_client_id(message, client_message_id)
+            for message in session.messages
+            if isinstance(message, dict)
+        )
+
+    @staticmethod
+    def _message_has_client_id(
+        message: dict[str, Any],
+        client_message_id: str,
+    ) -> bool:
+        return (
+            message.get("client_message_id") == client_message_id
+            or client_message_id
+            in AgentLoop._normalized_client_message_ids(
+                message.get("client_message_ids")
+            )
+        )
+
+    @staticmethod
+    def _normalized_client_message_ids(value: Any) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        return list(dict.fromkeys(item for item in value if isinstance(item, str)))
+
+    @classmethod
+    def _client_message_ids(cls, messages: list[dict[str, Any]]) -> list[str]:
+        result: list[str] = []
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            result.extend(
+                cls._normalized_client_message_ids(message.get("_client_message_ids"))
+            )
+        return list(dict.fromkeys(result))
+
+    async def _mark_chat_message_processed(self, msg: InboundMessage) -> None:
+        client_message_id = msg.metadata.get("client_message_id")
+        if not isinstance(client_message_id, str):
+            return
+        await self._mark_chat_message_ids_processed(msg.chat_id, [client_message_id])
+
+    async def _begin_at_most_once_command(self, msg: InboundMessage) -> bool:
+        """Durably prevent automatic replay before dispatching a command."""
+        client_message_id = msg.metadata.get("client_message_id")
+        if not isinstance(client_message_id, str):
+            return True
+        return await self.chat_inbox.mark_command_started(
+            msg.chat_id,
+            client_message_id,
+        )
+
+    async def _finish_at_most_once_command(self, msg: InboundMessage) -> None:
+        """Complete a command receipt without swallowing durability failures."""
+        client_message_id = msg.metadata.get("client_message_id")
+        if not isinstance(client_message_id, str):
+            return
+        await self.chat_inbox.mark_processed(msg.chat_id, client_message_id)
+
+    async def _complete_at_most_once_command(
+        self,
+        msg: InboundMessage,
+        result: OutboundMessage | None,
+    ) -> None:
+        """Complete a command, preserving its known result if SQLite is unavailable."""
+        try:
+            await self._finish_at_most_once_command(msg)
+        except Exception:
+            logger.exception(
+                "Could not complete command receipt for session {}",
+                self._effective_session_key(msg),
+            )
+            if result is None:
+                return
+            try:
+                self._persist_command_outcome(msg, result)
+            except Exception:
+                logger.exception(
+                    "Could not persist known command outcome for session {}",
+                    self._effective_session_key(msg),
+                )
+
+    def _persist_command_outcome(
+        self,
+        msg: InboundMessage,
+        result: OutboundMessage,
+    ) -> None:
+        """Durably retain a successful command result for later reconciliation."""
+        client_message_id = msg.metadata.get("client_message_id")
+        if not isinstance(client_message_id, str):
+            return
+        session = self.sessions.get_or_create(self._effective_session_key(msg))
+        if not self._session_has_client_message(session, client_message_id):
+            session.add_message(
+                "user",
+                msg.content,
+                client_message_id=client_message_id,
+            )
+        already_recorded = any(
+            message.get("command_outcome_id") == client_message_id
+            for message in session.messages
+            if isinstance(message, dict)
+        )
+        if not already_recorded:
+            session.add_message(
+                "assistant",
+                result.content,
+                command_outcome_id=client_message_id,
+            )
+        self.sessions.save(session, fsync=True)
+
+    async def _record_command_failure(self, msg: InboundMessage) -> None:
+        """Persist an uncertain command outcome before closing its receipt."""
+        client_message_id = msg.metadata.get("client_message_id")
+        session = self.sessions.get_or_create(self._effective_session_key(msg))
+        if (
+            isinstance(client_message_id, str)
+            and not self._session_has_client_message(session, client_message_id)
+        ):
+            session.add_message(
+                "user",
+                msg.content,
+                client_message_id=client_message_id,
+            )
+        already_recorded = bool(
+            isinstance(client_message_id, str)
+            and any(
+                message.get("command_failure_id") == client_message_id
+                for message in session.messages
+                if isinstance(message, dict)
+            )
+        )
+        if not already_recorded:
+            session.add_message(
+                "assistant",
+                self._command_failure_message(),
+                command_failure_id=client_message_id,
+            )
+        self.sessions.save(session, fsync=True)
+        await self._finish_at_most_once_command(msg)
+
+    async def _record_command_failure_safely(self, msg: InboundMessage) -> None:
+        """Best-effort visible command failure; leave the marker for recovery."""
+        try:
+            await self._record_command_failure(msg)
+        except Exception:
+            logger.exception(
+                "Could not durably record command failure for session {}",
+                self._effective_session_key(msg),
+            )
+
+    async def _recover_interrupted_commands(self) -> None:
+        """Surface command outcomes made uncertain by a previous process exit."""
+        records = await self.chat_inbox.interrupted_commands()
+        for record in records:
+            try:
+                session = self.sessions.get_or_create(
+                    self._effective_session_key(record.message)
+                )
+                known_outcome = any(
+                    message.get("command_outcome_id")
+                    == record.client_message_id
+                    for message in session.messages
+                    if isinstance(message, dict)
+                )
+                if known_outcome:
+                    await self._finish_at_most_once_command(record.message)
+                    continue
+                await self._record_command_failure(record.message)
+            except Exception:
+                logger.exception(
+                    "Failed to recover interrupted command receipt {}:{}",
+                    record.message.chat_id,
+                    record.client_message_id,
+                )
+
+    async def _prepare_chat_message_retry(self, msg: InboundMessage) -> int | None:
+        client_message_id = msg.metadata.get("client_message_id")
+        if not isinstance(client_message_id, str):
+            return None
+        try:
+            record = await self.chat_inbox.prepare_retry(
+                msg.chat_id,
+                client_message_id,
+            )
+        except KeyError:
+            logger.debug(
+                "No durable chat receipt to retry for {}:{}",
+                msg.chat_id,
+                client_message_id,
+            )
+            return None
+        except Exception:
+            logger.exception(
+                "Failed to prepare durable chat retry for {}:{}",
+                msg.chat_id,
+                client_message_id,
+            )
+            return None
+        if record.state == "processed":
+            return None
+        if record.retry_count >= self._MAX_CHAT_PROCESSING_RETRIES:
+            await self._finalize_terminal_chat_failure(msg)
+            return self._TERMINAL_CHAT_RETRY
+        return min(30, 1 << min(record.retry_count, 5))
+
+    async def _retry_chat_message_in_place(
+        self,
+        msg: InboundMessage,
+        session_key: str,
+        pending: asyncio.Queue,
+        lock: asyncio.Lock,
+    ) -> int | None:
+        client_message_id = msg.metadata.get("client_message_id")
+        if not isinstance(client_message_id, str):
+            return None
+        try:
+            claimed = await self.chat_inbox.claim_retry_for_enqueue(
+                msg.chat_id,
+                client_message_id,
+            )
+            if not claimed:
+                return None
+            gate = self._concurrency_gate or nullcontext()
+            async with lock, gate:
+                response = await self._process_message(
+                    msg,
+                    pending_queue=pending,
+                )
+                if response is not None:
+                    await self.bus.publish_outbound(response)
+            return None
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "Retry failed while processing message for session {}",
+                session_key,
+            )
+            retry_delay = await self._prepare_chat_message_retry(msg)
+            if retry_delay == self._TERMINAL_CHAT_RETRY:
+                await self.bus.publish_outbound(OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content=self._terminal_chat_failure_message(),
+                    metadata=dict(msg.metadata or {}),
+                ))
+            elif retry_delay is not None:
+                await self.bus.publish_outbound(OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content=f"Retrying in {retry_delay} seconds.",
+                    metadata={
+                        **dict(msg.metadata or {}),
+                        "_status_delta": True,
+                    },
+                ))
+            else:
+                await self.bus.publish_outbound(OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="Sorry, I encountered an error.",
+                    metadata=dict(msg.metadata or {}),
+                ))
+            return retry_delay
+
+    @staticmethod
+    def _terminal_chat_failure_message() -> str:
+        return (
+            "I could not complete this request after several attempts. "
+            "It was saved, but processing has stopped so later messages can continue."
+        )
+
+    @staticmethod
+    def _command_failure_message() -> str:
+        return (
+            "This command did not finish, and Ziggy did not replay it because "
+            "commands may have side effects. Check the current state before trying again."
+        )
+
+    @staticmethod
+    def _command_not_started_message() -> str:
+        return (
+            "This command could not be started safely because its durable receipt "
+            "was unavailable. It was not executed and remains queued for recovery."
+        )
+
+    async def _finalize_terminal_chat_failure(self, msg: InboundMessage) -> None:
+        session = self.sessions.get_or_create(self._effective_session_key(msg))
+        message = self._terminal_chat_failure_message()
+        if self._restore_runtime_checkpoint(session):
+            pass
+        elif session.metadata.get(self._PENDING_USER_TURN_KEY):
+            self._clear_pending_user_turn(session)
+        if not self._session_has_client_message(
+            session,
+            str(msg.metadata.get("client_message_id") or ""),
+        ):
+            extra: dict[str, Any] = {}
+            client_message_id = msg.metadata.get("client_message_id")
+            if isinstance(client_message_id, str):
+                extra["client_message_id"] = client_message_id
+            if msg.media:
+                extra["media"] = list(msg.media)
+            session.add_message("user", msg.content, **extra)
+        if not (
+            session.messages
+            and session.messages[-1].get("role") == "assistant"
+            and session.messages[-1].get("content") == message
+        ):
+            session.add_message("assistant", message)
+        self.sessions.save(session)
+        await self._mark_chat_message_processed(msg)
+
+    async def _mark_chat_message_ids_processed(
+        self,
+        chat_id: str,
+        client_message_ids: list[str],
+    ) -> None:
+        for client_message_id in client_message_ids:
+            try:
+                await self.chat_inbox.mark_processed(chat_id, client_message_id)
+            except KeyError:
+                logger.debug(
+                    "No durable chat receipt for {}:{}",
+                    chat_id,
+                    client_message_id,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to mark durable chat receipt processed for {}:{}",
+                    chat_id,
+                    client_message_id,
+                )
+
     def _persist_subagent_followup(self, session: Session, msg: InboundMessage) -> bool:
         """Persist subagent follow-ups before prompt assembly so history stays durable.
 
@@ -1699,11 +2224,41 @@ class AgentLoop:
         session.metadata[self._RUNTIME_CHECKPOINT_KEY] = payload
         self.sessions.save(session)
 
-    def _mark_pending_user_turn(self, session: Session) -> None:
-        session.metadata[self._PENDING_USER_TURN_KEY] = True
+    def _mark_pending_user_turn(
+        self,
+        session: Session,
+        client_message_ids: list[str] | None = None,
+    ) -> None:
+        normalized = self._normalized_client_message_ids(client_message_ids or [])
+        session.metadata[self._PENDING_USER_TURN_KEY] = (
+            {"client_message_ids": normalized}
+            if normalized
+            else True
+        )
 
     def _clear_pending_user_turn(self, session: Session) -> None:
         session.metadata.pop(self._PENDING_USER_TURN_KEY, None)
+
+    def _pending_user_turn_client_message_ids(self, session: Session) -> list[str]:
+        pending = session.metadata.get(self._PENDING_USER_TURN_KEY)
+        if isinstance(pending, dict):
+            return self._normalized_client_message_ids(
+                pending.get("client_message_ids")
+            )
+        if pending is not True:
+            return []
+        for message in reversed(session.messages):
+            if not isinstance(message, dict) or message.get("role") != "user":
+                continue
+            singular = message.get("client_message_id")
+            result = [singular] if isinstance(singular, str) else []
+            result.extend(
+                self._normalized_client_message_ids(
+                    message.get("client_message_ids")
+                )
+            )
+            return list(dict.fromkeys(result))
+        return []
 
     def _clear_runtime_checkpoint(self, session: Session) -> None:
         if self._RUNTIME_CHECKPOINT_KEY in session.metadata:

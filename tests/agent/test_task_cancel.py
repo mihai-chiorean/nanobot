@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import time
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -22,8 +24,8 @@ def _make_loop(*, exec_config=None):
     bus = MessageBus()
     provider = MagicMock()
     provider.get_default_model.return_value = "test-model"
-    workspace = MagicMock()
-    workspace.__truediv__ = MagicMock(return_value=MagicMock())
+    temporary_workspace = TemporaryDirectory()
+    workspace = Path(temporary_workspace.name)
 
     with patch("nanobot.agent.loop.ContextBuilder"), \
          patch("nanobot.agent.loop.SessionManager"), \
@@ -31,6 +33,7 @@ def _make_loop(*, exec_config=None):
          patch("nanobot.agent.loop.SubagentManager") as mock_subagent_manager:
         mock_subagent_manager.return_value.cancel_by_session = AsyncMock(return_value=0)
         loop = AgentLoop(bus=bus, provider=provider, workspace=workspace, exec_config=exec_config)
+    loop._test_workspace = temporary_workspace
     return loop, bus
 
 
@@ -359,7 +362,8 @@ class TestSubagentCancellation:
         assert "Completed steps:" in args[3]
         assert "- list_dir: first result" in args[3]
         assert "Failure:" in args[3]
-        assert "- list_dir: boom" in args[3]
+        assert "- list_dir:" in args[3]
+        assert "boom" in args[3]
         assert args[5] == "error"
 
     @pytest.mark.asyncio

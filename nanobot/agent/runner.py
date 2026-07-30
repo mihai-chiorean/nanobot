@@ -141,9 +141,33 @@ class AgentRunner:
                     merged.get("content"),
                     injection.get("content"),
                 )
+                merged["_client_message_ids"] = list(
+                    dict.fromkeys(
+                        [
+                            *cls._client_message_ids(merged),
+                            *cls._client_message_ids(injection),
+                        ]
+                    )
+                )
                 messages[-1] = merged
                 continue
             messages.append(injection)
+
+    @staticmethod
+    def _client_message_ids(message: dict[str, Any]) -> list[str]:
+        value = message.get("_client_message_ids")
+        if not isinstance(value, list):
+            return []
+        return [item for item in value if isinstance(item, str)]
+
+    @staticmethod
+    def _strip_internal_message_metadata(
+        messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        return [
+            {key: value for key, value in message.items() if not key.startswith("_client_")}
+            for message in messages
+        ]
 
     async def _try_drain_injections(
         self,
@@ -287,6 +311,7 @@ class AgentRunner:
                         messages_for_model = self._backfill_missing_tool_results(messages_for_model)
                     except Exception:
                         messages_for_model = messages
+                messages_for_model = self._strip_internal_message_metadata(messages_for_model)
                 context = AgentHookContext(iteration=iteration, messages=messages)
                 await hook.before_iteration(context)
                 _t0 = time.perf_counter()

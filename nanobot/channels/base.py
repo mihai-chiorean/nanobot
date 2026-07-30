@@ -16,11 +16,11 @@ from nanobot.utils.security import sanitize_input
 class BaseChannel(ABC):
     """
     Abstract base class for chat channel implementations.
-    
+
     Each channel (Telegram, Discord, etc.) should implement this interface
     to integrate with the nanobot message bus.
     """
-    
+
     name: str = "base"
     display_name: str = "Base"
     transcription_provider: str = "groq"
@@ -33,7 +33,7 @@ class BaseChannel(ABC):
     def __init__(self, config: Any, bus: MessageBus):
         """
         Initialize the channel.
-        
+
         Args:
             config: Channel-specific configuration.
             bus: The message bus for communication.
@@ -82,24 +82,24 @@ class BaseChannel(ABC):
     async def start(self) -> None:
         """
         Start the channel and begin listening for messages.
-        
+
         This should be a long-running async task that:
         1. Connects to the chat platform
         2. Listens for incoming messages
         3. Forwards messages to the bus via _handle_message()
         """
         pass
-    
+
     @abstractmethod
     async def stop(self) -> None:
         """Stop the channel and clean up resources."""
         pass
-    
+
     @abstractmethod
     async def send(self, msg: OutboundMessage) -> None:
         """
         Send a message through this channel.
-        
+
         Args:
             msg: The message to send.
 
@@ -130,10 +130,10 @@ class BaseChannel(ABC):
     def is_allowed(self, sender_id: str) -> bool:
         """
         Check if a sender is allowed to use this bot.
-        
+
         Args:
             sender_id: The sender's identifier.
-        
+
         Returns:
             True if allowed, False otherwise.
         """
@@ -150,15 +150,8 @@ class BaseChannel(ABC):
         if "*" in allow_list:
             return True
 
-        sender_str = str(sender_id)
-        if sender_str in allow_list:
-            return True
-        if "|" in sender_str:
-            for part in sender_str.split("|"):
-                if part and part in allow_list:
-                    return True
-        return False
-    
+        return str(sender_id) in allow_list
+
     async def _handle_message(
         self,
         sender_id: str,
@@ -167,12 +160,12 @@ class BaseChannel(ABC):
         media: list[str] | None = None,
         metadata: dict[str, Any] | None = None,
         session_key: str | None = None,
-    ) -> None:
+    ) -> bool:
         """
         Handle an incoming message from the chat platform.
-        
+
         This method checks permissions and forwards to the bus.
-        
+
         Args:
             sender_id: The sender's identifier.
             chat_id: The chat/channel identifier.
@@ -181,14 +174,37 @@ class BaseChannel(ABC):
             metadata: Optional channel-specific metadata.
             session_key: Optional session key override (e.g. thread-scoped sessions).
         """
+        msg = await self._prepare_message(
+            sender_id=sender_id,
+            chat_id=chat_id,
+            content=content,
+            media=media,
+            metadata=metadata,
+            session_key=session_key,
+        )
+        if msg is None:
+            return False
+        await self.bus.publish_inbound(msg)
+        return True
+
+    async def _prepare_message(
+        self,
+        sender_id: str,
+        chat_id: str,
+        content: str,
+        media: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+        session_key: str | None = None,
+    ) -> InboundMessage | None:
+        """Authorize and sanitize a message without publishing it."""
         if not self.is_allowed(sender_id):
             logger.warning(
                 "Access denied for sender {} on channel {}. "
                 "Add them to allowFrom list in config to grant access.",
                 sender_id, self.name,
             )
-            return
-        
+            return None
+
         # Sanitize input for prompt injection defense
         sanitized_content, was_injection = sanitize_input(content)
 
@@ -209,7 +225,7 @@ class BaseChannel(ABC):
                 )
             except Exception:
                 pass  # Best effort
-            return
+            return None
 
         meta = metadata or {}
         if self.supports_streaming:
@@ -224,8 +240,8 @@ class BaseChannel(ABC):
             metadata=meta,
             session_key_override=session_key,
         )
-        
-        await self.bus.publish_inbound(msg)
+
+        return msg
 
     @classmethod
     def default_config(cls) -> dict[str, Any]:

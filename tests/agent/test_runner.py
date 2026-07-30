@@ -1983,6 +1983,32 @@ def test_governance_fallback_still_repairs_orphans():
 # ── Mid-turn injection tests ──────────────────────────────────────────────
 
 
+def test_injected_message_ids_merge_but_do_not_reach_provider_payload():
+    from nanobot.agent.runner import AgentRunner
+
+    first_id = "7fbf82b5-37de-4df0-b2bb-749bb6fd2306"
+    second_id = "06eab632-f2ec-48f2-901b-0aa0a7f2a4c7"
+    messages = [{
+        "role": "user",
+        "content": "first",
+        "_client_message_ids": [first_id],
+    }]
+
+    AgentRunner._append_injected_messages(
+        messages,
+        [{
+            "role": "user",
+            "content": "second",
+            "_client_message_ids": [second_id],
+        }],
+    )
+
+    assert messages[0]["_client_message_ids"] == [first_id, second_id]
+    provider_messages = AgentRunner._strip_internal_message_metadata(messages)
+    assert provider_messages == [{"role": "user", "content": "first\n\nsecond"}]
+    assert messages[0]["_client_message_ids"] == [first_id, second_id]
+
+
 @pytest.mark.asyncio
 async def test_drain_injections_returns_empty_when_no_callback():
     """No injection_callback → empty list."""
@@ -2582,15 +2608,21 @@ async def test_pending_queue_preserves_overflow_for_next_injection_cycle(tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_pending_queue_full_falls_back_to_queued_task(tmp_path):
-    """QueueFull should preserve the message by dispatching a queued task."""
+async def test_pending_queue_keeps_more_than_twenty_messages_ordered(tmp_path):
+    """An active session must retain every follow-up in its single ordered queue."""
     from nanobot.bus.events import InboundMessage
 
     loop = _make_loop(tmp_path)
     loop._dispatch = AsyncMock()  # type: ignore[method-assign]
 
-    pending = asyncio.Queue(maxsize=1)
-    pending.put_nowait(InboundMessage(channel="cli", sender_id="u", chat_id="c", content="already queued"))
+    pending = asyncio.Queue()
+    for index in range(20):
+        pending.put_nowait(InboundMessage(
+            channel="cli",
+            sender_id="u",
+            chat_id="c",
+            content=f"already queued {index}",
+        ))
     loop._pending_queues["cli:c"] = pending
 
     run_task = asyncio.create_task(loop.run())
@@ -2598,16 +2630,18 @@ async def test_pending_queue_full_falls_back_to_queued_task(tmp_path):
     await loop.bus.publish_inbound(msg)
 
     deadline = time.time() + 2
-    while loop._dispatch.await_count == 0 and time.time() < deadline:
+    while pending.qsize() < 21 and time.time() < deadline:
         await asyncio.sleep(0.01)
 
     loop.stop()
     await asyncio.wait_for(run_task, timeout=2)
 
-    assert loop._dispatch.await_count == 1
-    dispatched_msg = loop._dispatch.await_args.args[0]
-    assert dispatched_msg.content == "follow-up"
-    assert pending.qsize() == 1
+    loop._dispatch.assert_not_awaited()
+    assert pending.qsize() == 21
+    assert [pending.get_nowait().content for _ in range(21)] == [
+        *(f"already queued {index}" for index in range(20)),
+        "follow-up",
+    ]
 
 
 @pytest.mark.asyncio

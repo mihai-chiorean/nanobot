@@ -8,6 +8,7 @@ forwarding saved paths to ``_handle_message``.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import json
@@ -22,6 +23,7 @@ from nanobot.channels.websocket import (
     WebSocketChannel,
     _extract_data_url_mime,
 )
+from nanobot.session.manager import SessionManager
 
 
 def _tiny_png_data_url() -> str:
@@ -65,6 +67,16 @@ def _make_channel() -> WebSocketChannel:
     )
     channel._handle_message = AsyncMock()  # type: ignore[method-assign]
     return channel
+
+
+def _make_durable_channel(tmp_path: Path) -> WebSocketChannel:
+    bus = MagicMock()
+    bus.publish_inbound = AsyncMock()
+    return WebSocketChannel(
+        {"enabled": True, "allowFrom": ["*"], "websocketRequiresToken": False},
+        bus,
+        session_manager=SessionManager(tmp_path),
+    )
 
 
 # -- Pure helpers --------------------------------------------------------------
@@ -121,6 +133,105 @@ async def test_message_without_media_backward_compatible() -> None:
     assert call.kwargs["content"] == "hello"
     # When no media, we pass ``media=None`` so downstream treats it as absent.
     assert call.kwargs["media"] is None
+
+
+@pytest.mark.asyncio
+async def test_message_client_id_is_acknowledged_and_deduplicated() -> None:
+    channel = _make_channel()
+    mock_conn = AsyncMock()
+    envelope = {
+        "type": "message",
+        "chat_id": "abc123",
+        "client_message_id": "7fbf82b5-37de-4df0-b2bb-749bb6fd2306",
+        "content": "hello once",
+    }
+
+    await channel._dispatch_envelope(mock_conn, "client-1", envelope)
+    await channel._dispatch_envelope(mock_conn, "client-1", envelope)
+
+    channel._handle_message.assert_not_awaited()
+    channel.bus.publish_inbound.assert_awaited_once()
+    published = channel.bus.publish_inbound.call_args.args[0]
+    assert published.metadata["client_message_id"] == envelope["client_message_id"]
+    acknowledgements = [json.loads(call.args[0]) for call in mock_conn.send.await_args_list]
+    assert [item["status"] for item in acknowledgements] == ["accepted", "duplicate"]
+    assert all(item["event"] == "message.ack" for item in acknowledgements)
+
+
+@pytest.mark.asyncio
+async def test_message_client_id_rejection_is_correlated() -> None:
+    channel = _make_channel()
+    mock_conn = AsyncMock()
+    envelope = {
+        "type": "message",
+        "chat_id": "abc123",
+        "client_message_id": "06eab632-f2ec-48f2-901b-0aa0a7f2a4c7",
+        "content": "hello",
+        "reasoning_profile": "invalid",
+    }
+
+    await channel._dispatch_envelope(mock_conn, "client-1", envelope)
+
+    channel._handle_message.assert_not_awaited()
+    acknowledgement = json.loads(mock_conn.send.call_args.args[0])
+    assert acknowledgement == {
+        "event": "message.ack",
+        "chat_id": "abc123",
+        "client_message_id": envelope["client_message_id"],
+        "status": "rejected",
+        "detail": "invalid reasoning_profile",
+    }
+
+
+@pytest.mark.asyncio
+async def test_message_ack_survives_channel_restart(tmp_path: Path) -> None:
+    envelope = {
+        "type": "message",
+        "chat_id": "abc123",
+        "client_message_id": "7fbf82b5-37de-4df0-b2bb-749bb6fd2306",
+        "content": "durable hello",
+    }
+    first = _make_durable_channel(tmp_path)
+    first_connection = AsyncMock()
+
+    await first._dispatch_envelope(first_connection, "client-1", envelope)
+
+    first.bus.publish_inbound.assert_awaited_once()
+    first_ack = json.loads(first_connection.send.call_args.args[0])
+    assert first_ack["status"] == "accepted"
+
+    restarted = _make_durable_channel(tmp_path)
+    retry_connection = AsyncMock()
+    await restarted._dispatch_envelope(retry_connection, "client-2", envelope)
+
+    restarted.bus.publish_inbound.assert_not_awaited()
+    retry_ack = json.loads(retry_connection.send.call_args.args[0])
+    assert retry_ack["status"] == "duplicate"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_identical_messages_are_published_once(tmp_path: Path) -> None:
+    envelope = {
+        "type": "message",
+        "chat_id": "abc123",
+        "client_message_id": "7fbf82b5-37de-4df0-b2bb-749bb6fd2306",
+        "content": "deliver once",
+    }
+    channel = _make_durable_channel(tmp_path)
+    first_connection = AsyncMock()
+    second_connection = AsyncMock()
+
+    await asyncio.gather(
+        channel._dispatch_envelope(first_connection, "client-1", envelope),
+        channel._dispatch_envelope(second_connection, "client-2", envelope),
+    )
+
+    channel.bus.publish_inbound.assert_awaited_once()
+    statuses = {
+        json.loads(first_connection.send.call_args.args[0])["status"],
+        json.loads(second_connection.send.call_args.args[0])["status"],
+    }
+    assert statuses == {"accepted", "duplicate"}
 
 
 @pytest.mark.asyncio

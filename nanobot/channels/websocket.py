@@ -36,6 +36,7 @@ from nanobot.agent.reasoning_policy import ReasoningProfile, parse_reasoning_pro
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
+from nanobot.channels.chat_inbox import ChatInboxStore
 from nanobot.config.paths import get_media_dir, get_workspace_path
 from nanobot.config.schema import Base
 from nanobot.security.clerk import (
@@ -411,6 +412,8 @@ _LOCALHOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 # so the API can address sessions whose keys came from non-WebSocket channels.
 _API_KEY_RE = re.compile(r"^[A-Za-z0-9_:.-]{1,128}$")
 _WORK_ID_RE = re.compile(r"^work_[0-9a-f]{32}$")
+_CLIENT_MESSAGE_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
+_MAX_ACCEPTED_CLIENT_MESSAGES = 4_096
 _COMMAND_ID_RE = re.compile(r"^cmd_[0-9a-f]{32}$")
 _ARTIFACT_ID_RE = re.compile(r"^artifact_[0-9a-f]{32}$")
 _REASONING_EFFORTS = frozenset(
@@ -570,6 +573,10 @@ class WebSocketChannel(BaseChannel):
         # task_id -> WebSocket subscribers for durable Work events.
         self._work_subs: dict[str, set[Any]] = {}
         self._conn_work: dict[Any, set[str]] = {}
+        # Stable client IDs suppress transport retries while this runtime is
+        # alive. Persisted session IDs provide the second dedupe boundary after
+        # a restart.
+        self._accepted_client_messages: dict[tuple[str, str], None] = {}
         # Single-use tokens consumed at WebSocket handshake.
         self._issued_tokens: dict[str, float] = {}
         # Multi-use tokens for the embedded webui's REST surface; checked but not consumed.
@@ -588,6 +595,9 @@ class WebSocketChannel(BaseChannel):
         self._active_session_keys = active_session_keys
         self._work_store = (
             WorkStore(session_manager.workspace) if session_manager is not None else None
+        )
+        self._chat_inbox = (
+            ChatInboxStore(session_manager.workspace) if session_manager is not None else None
         )
         self._static_dist_path: Path | None = (
             static_dist_path.resolve() if static_dist_path is not None else None
@@ -636,6 +646,59 @@ class WebSocketChannel(BaseChannel):
             self._cleanup_connection(connection)
         except Exception as e:
             logger.warning("websocket: failed to send {} event: {}", event, e)
+
+    async def _send_message_ack(
+        self,
+        connection: Any,
+        *,
+        chat_id: str,
+        client_message_id: str,
+        status: str,
+        detail: str | None = None,
+    ) -> None:
+        fields: dict[str, Any] = {
+            "chat_id": chat_id,
+            "client_message_id": client_message_id,
+            "status": status,
+        }
+        if detail:
+            fields["detail"] = detail
+        await self._send_event(connection, "message.ack", **fields)
+
+    def _remember_client_message(self, chat_id: str, client_message_id: str) -> None:
+        key = (chat_id, client_message_id)
+        self._accepted_client_messages.pop(key, None)
+        self._accepted_client_messages[key] = None
+        while len(self._accepted_client_messages) > _MAX_ACCEPTED_CLIENT_MESSAGES:
+            oldest = next(iter(self._accepted_client_messages))
+            self._accepted_client_messages.pop(oldest, None)
+
+    async def _recover_chat_inbox(self) -> None:
+        if self._chat_inbox is None:
+            return
+        records = await self._chat_inbox.recoverable()
+        recovered = 0
+        for record in records:
+            if record.state in {"stored", "retry_wait"}:
+                claim = (
+                    self._chat_inbox.claim_for_enqueue
+                    if record.state == "stored"
+                    else self._chat_inbox.claim_retry_for_enqueue
+                )
+                claimed = await claim(record.message.chat_id, record.client_message_id)
+                if not claimed:
+                    continue
+            try:
+                await self.bus.publish_inbound(record.message)
+            except Exception:
+                await self._chat_inbox.release_enqueue_claim(
+                    record.message.chat_id,
+                    record.client_message_id,
+                )
+                raise
+            recovered += 1
+        if recovered:
+            logger.info("Recovered {} durable WebSocket message(s)", recovered)
 
     def _attach_work(self, connection: Any, task_id: str) -> None:
         self._work_subs.setdefault(task_id, set()).add(connection)
@@ -1763,6 +1826,7 @@ class WebSocketChannel(BaseChannel):
 
         self._running = True
         self._stop_event = asyncio.Event()
+        await self._recover_chat_inbox()
 
         ssl_context = self._build_ssl_context()
         scheme = "wss" if ssl_context else "ws"
@@ -1973,62 +2037,91 @@ class WebSocketChannel(BaseChannel):
         if t == "message":
             cid = envelope.get("chat_id")
             content = envelope.get("content")
+            raw_client_message_id = envelope.get("client_message_id")
+            if raw_client_message_id is not None and (
+                not isinstance(raw_client_message_id, str)
+                or _CLIENT_MESSAGE_ID_RE.fullmatch(raw_client_message_id.lower()) is None
+            ):
+                await self._send_event(
+                    connection,
+                    "error",
+                    detail="invalid client_message_id",
+                )
+                return
+            client_message_id = (
+                raw_client_message_id.lower()
+                if isinstance(raw_client_message_id, str)
+                else None
+            )
+
+            async def reject(detail: str, **fields: Any) -> None:
+                if client_message_id is None:
+                    await self._send_event(connection, "error", detail=detail, **fields)
+                    return
+                await self._send_message_ack(
+                    connection,
+                    chat_id=cid if isinstance(cid, str) else "",
+                    client_message_id=client_message_id,
+                    status="rejected",
+                    detail=fields.get("message") or detail,
+                )
+
             if not _is_valid_chat_id(cid):
-                await self._send_event(connection, "error", detail="invalid chat_id")
+                await reject("invalid chat_id")
                 return
             if not isinstance(content, str):
-                await self._send_event(connection, "error", detail="missing content")
+                await reject("missing content")
+                return
+            if (
+                client_message_id is not None
+                and self._chat_inbox is None
+                and (cid, client_message_id) in self._accepted_client_messages
+            ):
+                await self._send_message_ack(
+                    connection,
+                    chat_id=cid,
+                    client_message_id=client_message_id,
+                    status="duplicate",
+                )
                 return
 
             metadata: dict[str, Any] = {
                 "remote": getattr(connection, "remote_address", None)
             }
+            if client_message_id is not None:
+                metadata["client_message_id"] = client_message_id
             reasoning_profile = envelope.get("reasoning_profile")
             if reasoning_profile is not None:
                 if (
                     not isinstance(reasoning_profile, str)
                     or reasoning_profile.lower() not in _REASONING_PROFILES
                 ):
-                    await self._send_event(
-                        connection, "error", detail="invalid reasoning_profile"
-                    )
+                    await reject("invalid reasoning_profile")
                     return
                 metadata["reasoning_profile"] = reasoning_profile.lower()
             reasoning_effort = envelope.get("reasoning_effort")
             if reasoning_effort is not None:
                 if reasoning_profile is not None:
-                    await self._send_event(
-                        connection,
-                        "error",
-                        detail="reasoning_profile cannot be combined with reasoning_effort",
-                    )
+                    await reject("reasoning_profile cannot be combined with reasoning_effort")
                     return
                 if (
                     not isinstance(reasoning_effort, str)
                     or reasoning_effort.lower() not in _REASONING_EFFORTS
                 ):
-                    await self._send_event(
-                        connection, "error", detail="invalid reasoning_effort"
-                    )
+                    await reject("invalid reasoning_effort")
                     return
                 metadata["reasoning_effort"] = reasoning_effort.lower()
             max_tokens = envelope.get("max_tokens")
             if max_tokens is not None:
                 if reasoning_profile is not None:
-                    await self._send_event(
-                        connection,
-                        "error",
-                        detail="reasoning_profile cannot be combined with max_tokens",
-                    )
+                    await reject("reasoning_profile cannot be combined with max_tokens")
                     return
                 if (
                     not isinstance(max_tokens, int)
                     or isinstance(max_tokens, bool)
                     or not 1 <= max_tokens <= 262_144
                 ):
-                    await self._send_event(
-                        connection, "error", detail="invalid max_tokens"
-                    )
+                    await reject("invalid max_tokens")
                     return
                 metadata["max_tokens"] = max_tokens
 
@@ -2036,20 +2129,16 @@ class WebSocketChannel(BaseChannel):
             media_paths: list[str] = []
             if raw_media is not None:
                 if not isinstance(raw_media, list):
-                    await self._send_event(
-                        connection,
-                        "error",
-                        detail="attachment_rejected",
+                    await reject(
+                        "attachment_rejected",
                         reason="malformed",
                         message=_attachment_rejection_message("malformed"),
                     )
                     return
                 media_paths, reason = self._save_envelope_media(raw_media)
                 if reason is not None:
-                    await self._send_event(
-                        connection,
-                        "error",
-                        detail="attachment_rejected",
+                    await reject(
+                        "attachment_rejected",
                         reason=reason,
                         message=_attachment_rejection_message(reason),
                     )
@@ -2057,17 +2146,78 @@ class WebSocketChannel(BaseChannel):
 
             # Allow attachment-only turns (content may be empty when media is attached).
             if not content.strip() and not media_paths:
-                await self._send_event(connection, "error", detail="missing content")
+                await reject("missing content")
                 return
 
             # Auto-attach on first use so clients can one-shot without a separate attach.
             self._attach(connection, cid)
-            await self._handle_message(
+            if client_message_id is None:
+                await self._handle_message(
+                    sender_id=client_id,
+                    chat_id=cid,
+                    content=content,
+                    media=media_paths or None,
+                    metadata=metadata,
+                )
+                return
+
+            prepared = await self._prepare_message(
                 sender_id=client_id,
                 chat_id=cid,
                 content=content,
                 media=media_paths or None,
                 metadata=metadata,
+            )
+            if prepared is None:
+                await reject("Message was not accepted.")
+                return
+
+            if self._chat_inbox is not None:
+                disposition, record = await self._chat_inbox.accept(
+                    prepared,
+                    client_message_id,
+                )
+                if disposition == "conflict":
+                    self._discard_duplicate_media(prepared.media, record.message.media)
+                    await reject(
+                        "client_message_id was already used for different content"
+                    )
+                    return
+                if disposition == "existing":
+                    self._discard_duplicate_media(prepared.media, record.message.media)
+                claimed = await self._chat_inbox.claim_for_enqueue(
+                    cid,
+                    client_message_id,
+                )
+                if not claimed:
+                    await self._send_message_ack(
+                        connection,
+                        chat_id=cid,
+                        client_message_id=client_message_id,
+                        status="duplicate",
+                    )
+                    return
+                try:
+                    await self.bus.publish_inbound(record.message)
+                except Exception:
+                    await self._chat_inbox.release_enqueue_claim(
+                        cid,
+                        client_message_id,
+                    )
+                    raise
+            else:
+                self._remember_client_message(cid, client_message_id)
+                try:
+                    await self.bus.publish_inbound(prepared)
+                except Exception:
+                    self._accepted_client_messages.pop((cid, client_message_id), None)
+                    raise
+
+            await self._send_message_ack(
+                connection,
+                chat_id=cid,
+                client_message_id=client_message_id,
+                status="accepted",
             )
             return
         if t == "work.create":
@@ -2083,6 +2233,17 @@ class WebSocketChannel(BaseChannel):
             await self._handle_work_message_envelope(connection, client_id, envelope)
             return
         await self._send_event(connection, "error", detail=f"unknown type: {t!r}")
+
+    @staticmethod
+    def _discard_duplicate_media(candidate: list[str], retained: list[str]) -> None:
+        retained_paths = set(retained)
+        for item in candidate:
+            if item in retained_paths:
+                continue
+            try:
+                Path(item).unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning("websocket: failed to remove duplicate media {}: {}", item, exc)
 
     async def _handle_work_create_envelope(
         self,

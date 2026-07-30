@@ -85,7 +85,7 @@ class TestStopPreservesContext:
 
 
 @pytest.mark.asyncio
-async def test_dispatch_cancellation_restores_checkpoint():
+async def test_dispatch_cancellation_restores_checkpoint(tmp_path):
     """Regression for #2966: /stop interrupting _dispatch must materialize the
     in-flight runtime checkpoint into session.messages before the cancellation
     unwinds, so the next turn can see the partial work.
@@ -101,8 +101,7 @@ async def test_dispatch_cancellation_restores_checkpoint():
     bus = MessageBus()
     provider = MagicMock()
     provider.get_default_model.return_value = "test-model"
-    workspace = MagicMock()
-    workspace.__truediv__ = MagicMock(return_value=MagicMock())
+    workspace = tmp_path
 
     with patch("nanobot.agent.loop.ContextBuilder"), \
          patch("nanobot.agent.loop.SessionManager"), \

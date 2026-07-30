@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import os
 import time
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -22,14 +24,15 @@ def _make_loop():
     bus = MessageBus()
     provider = MagicMock()
     provider.get_default_model.return_value = "test-model"
-    workspace = MagicMock()
-    workspace.__truediv__ = MagicMock(return_value=MagicMock())
+    temporary_workspace = TemporaryDirectory()
+    workspace = Path(temporary_workspace.name)
 
     with patch("nanobot.agent.loop.ContextBuilder"), \
          patch("nanobot.agent.loop.SessionManager"), \
          patch("nanobot.agent.loop.WorkStore"), \
          patch("nanobot.agent.loop.SubagentManager"):
         loop = AgentLoop(bus=bus, provider=provider, workspace=workspace)
+    loop._test_workspace = temporary_workspace
     return loop, bus
 
 

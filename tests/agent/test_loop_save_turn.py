@@ -6,7 +6,7 @@ import pytest
 
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.loop import AgentLoop
-from nanobot.bus.events import InboundMessage
+from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.session.manager import Session
 
@@ -238,6 +238,410 @@ async def test_process_message_persists_user_message_before_turn_completes(tmp_p
     assert persisted.messages[0]["content"] == "persist me"
     assert persisted.metadata.get(AgentLoop._PENDING_USER_TURN_KEY) is True
     assert persisted.updated_at >= persisted.created_at
+
+
+@pytest.mark.asyncio
+async def test_process_message_retries_pending_client_message_after_crash(
+    tmp_path: Path,
+) -> None:
+    loop = _make_full_loop(tmp_path)
+    loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=False)  # type: ignore[method-assign]
+    loop._run_agent_loop = AsyncMock(side_effect=RuntimeError("interrupt"))  # type: ignore[method-assign]
+    client_message_id = "c5e597cc-1adb-4aa8-bde0-ac0edb92c5f5"
+    msg = InboundMessage(
+        channel="websocket",
+        sender_id="u1",
+        chat_id="dedupe",
+        content="persist once",
+        metadata={"client_message_id": client_message_id},
+    )
+    await loop.chat_inbox.accept(msg, client_message_id)
+    await loop.chat_inbox.mark_enqueued(msg.chat_id, client_message_id)
+
+    with pytest.raises(RuntimeError, match="interrupt"):
+        await loop._process_message(msg)
+
+    persisted = loop.sessions.get_or_create("websocket:dedupe")
+    assert persisted.messages[0]["client_message_id"] == client_message_id
+    assert persisted.metadata[AgentLoop._PENDING_USER_TURN_KEY] == {
+        "client_message_ids": [client_message_id]
+    }
+    assert [record.client_message_id for record in await loop.chat_inbox.recoverable()] == [
+        client_message_id
+    ]
+
+    async def complete(initial_messages, **_kwargs):
+        return (
+            "done",
+            [],
+            [*initial_messages, {"role": "assistant", "content": "done"}],
+            "completed",
+            False,
+        )
+
+    loop._run_agent_loop = complete  # type: ignore[method-assign]
+    result = await loop._process_message(msg)
+
+    assert result is not None
+    assert result.content == "done"
+    loop.sessions.invalidate("websocket:dedupe")
+    completed = loop.sessions.get_or_create("websocket:dedupe")
+    assert [
+        (message["role"], message["content"])
+        for message in completed.messages
+    ] == [
+        ("user", "persist once"),
+        ("assistant", "done"),
+    ]
+    assert await loop.chat_inbox.recoverable() == []
+
+
+@pytest.mark.asyncio
+async def test_checkpointed_tool_turn_is_not_replayed_after_crash(
+    tmp_path: Path,
+) -> None:
+    loop = _make_full_loop(tmp_path)
+    loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=False)  # type: ignore[method-assign]
+    client_message_id = "c5e597cc-1adb-4aa8-bde0-ac0edb92c5f5"
+    msg = InboundMessage(
+        channel="websocket",
+        sender_id="u1",
+        chat_id="tool-crash",
+        content="change something",
+        metadata={"client_message_id": client_message_id},
+    )
+    await loop.chat_inbox.accept(msg, client_message_id)
+    await loop.chat_inbox.mark_enqueued(msg.chat_id, client_message_id)
+
+    async def crash_after_checkpoint(_initial_messages, *, session, **_kwargs):
+        loop._set_runtime_checkpoint(
+            session,
+            {
+                "assistant_message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "exec", "arguments": "{}"},
+                    }],
+                },
+                "completed_tool_results": [],
+                "pending_tool_calls": [{
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "exec", "arguments": "{}"},
+                }],
+            },
+        )
+        raise RuntimeError("crash")
+
+    loop._run_agent_loop = crash_after_checkpoint  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="crash"):
+        await loop._process_message(msg)
+
+    loop._run_agent_loop = AsyncMock()  # type: ignore[method-assign]
+    result = await loop._process_message(msg)
+
+    assert result is not None
+    assert "did not repeat" in result.content
+    loop._run_agent_loop.assert_not_awaited()
+    assert await loop.chat_inbox.recoverable() == []
+
+
+@pytest.mark.asyncio
+async def test_command_receipt_is_completed_before_non_idempotent_dispatch(
+    tmp_path: Path,
+) -> None:
+    loop = _make_full_loop(tmp_path)
+    client_message_id = "c5e597cc-1adb-4aa8-bde0-ac0edb92c5f5"
+    msg = InboundMessage(
+        channel="websocket",
+        sender_id="u1",
+        chat_id="command-crash",
+        content="/dream-restore deadbeef",
+        metadata={"client_message_id": client_message_id},
+    )
+    await loop.chat_inbox.accept(msg, client_message_id)
+    await loop.chat_inbox.mark_enqueued(msg.chat_id, client_message_id)
+
+    async def crash_during_command(_ctx):
+        raise RuntimeError("command crashed")
+
+    await loop._dispatch_command_inline(
+        msg,
+        msg.session_key,
+        msg.content,
+        crash_during_command,
+    )
+
+    assert await loop.chat_inbox.recoverable() == []
+    response = await loop.bus.consume_outbound()
+    assert response.content == loop._command_failure_message()
+    loop.sessions.invalidate(msg.session_key)
+    session = loop.sessions.get_or_create(msg.session_key)
+    assert session.messages[-1]["content"] == loop._command_failure_message()
+
+
+@pytest.mark.asyncio
+async def test_interrupted_command_is_not_replayed_and_is_visible_after_restart(
+    tmp_path: Path,
+) -> None:
+    loop = _make_full_loop(tmp_path)
+    client_message_id = "c5e597cc-1adb-4aa8-bde0-ac0edb92c5f5"
+    msg = InboundMessage(
+        channel="websocket",
+        sender_id="u1",
+        chat_id="command-crash",
+        content="/dream-restore deadbeef",
+        metadata={"client_message_id": client_message_id},
+    )
+    await loop.chat_inbox.accept(msg, client_message_id)
+    await loop.chat_inbox.mark_enqueued(msg.chat_id, client_message_id)
+    assert await loop.chat_inbox.mark_command_started(
+        msg.chat_id,
+        client_message_id,
+    )
+
+    restarted = _make_full_loop(tmp_path)
+    await restarted._recover_interrupted_commands()
+    await restarted._recover_interrupted_commands()
+
+    restarted.sessions.invalidate(msg.session_key)
+    session = restarted.sessions.get_or_create(msg.session_key)
+    assert [(item["role"], item["content"]) for item in session.messages] == [
+        ("user", msg.content),
+        ("assistant", restarted._command_failure_message()),
+    ]
+    assert await restarted.chat_inbox.recoverable() == []
+    assert await restarted.chat_inbox.interrupted_commands() == []
+
+
+@pytest.mark.asyncio
+async def test_command_does_not_run_when_started_marker_cannot_be_persisted(
+    tmp_path: Path,
+) -> None:
+    loop = _make_full_loop(tmp_path)
+    msg = InboundMessage(
+        channel="websocket",
+        sender_id="u1",
+        chat_id="command-no-marker",
+        content="/dream-restore deadbeef",
+        metadata={"client_message_id": "c5e597cc-1adb-4aa8-bde0-ac0edb92c5f5"},
+    )
+    dispatch = AsyncMock()
+    loop.chat_inbox.mark_command_started = AsyncMock(  # type: ignore[method-assign]
+        side_effect=OSError("disk unavailable")
+    )
+
+    await loop._dispatch_command_inline(
+        msg,
+        msg.session_key,
+        msg.content,
+        dispatch,
+    )
+
+    dispatch.assert_not_awaited()
+    response = await loop.bus.consume_outbound()
+    assert response.content == loop._command_not_started_message()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_command_persists_uncertain_outcome_immediately(
+    tmp_path: Path,
+) -> None:
+    loop = _make_full_loop(tmp_path)
+    client_message_id = "c5e597cc-1adb-4aa8-bde0-ac0edb92c5f5"
+    msg = InboundMessage(
+        channel="websocket",
+        sender_id="u1",
+        chat_id="command-cancelled",
+        content="/dream-restore deadbeef",
+        metadata={
+            "client_message_id": client_message_id,
+            "_command_at_most_once": True,
+        },
+    )
+    await loop.chat_inbox.accept(msg, client_message_id)
+    await loop.chat_inbox.mark_enqueued(msg.chat_id, client_message_id)
+    assert await loop.chat_inbox.mark_command_started(
+        msg.chat_id,
+        client_message_id,
+    )
+    loop._process_message = AsyncMock(  # type: ignore[method-assign]
+        side_effect=asyncio.CancelledError
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await loop._dispatch(msg)
+
+    loop.sessions.invalidate(msg.session_key)
+    session = loop.sessions.get_or_create(msg.session_key)
+    assert session.messages[-1]["content"] == loop._command_failure_message()
+    assert await loop.chat_inbox.interrupted_commands() == []
+
+
+@pytest.mark.asyncio
+async def test_command_completion_failure_returns_and_recovers_known_result(
+    tmp_path: Path,
+) -> None:
+    loop = _make_full_loop(tmp_path)
+    client_message_id = "c5e597cc-1adb-4aa8-bde0-ac0edb92c5f5"
+    msg = InboundMessage(
+        channel="websocket",
+        sender_id="u1",
+        chat_id="command-completion",
+        content="/status",
+        metadata={"client_message_id": client_message_id},
+    )
+    await loop.chat_inbox.accept(msg, client_message_id)
+    await loop.chat_inbox.mark_enqueued(msg.chat_id, client_message_id)
+    original_mark_processed = loop.chat_inbox.mark_processed
+    loop.chat_inbox.mark_processed = AsyncMock(  # type: ignore[method-assign]
+        side_effect=OSError("disk unavailable")
+    )
+    result = OutboundMessage(
+        channel="websocket",
+        chat_id=msg.chat_id,
+        content="known result",
+    )
+
+    await loop._dispatch_command_inline(
+        msg,
+        msg.session_key,
+        msg.content,
+        AsyncMock(return_value=result),
+    )
+
+    response = await loop.bus.consume_outbound()
+    assert response.content == "known result"
+    loop.sessions.invalidate(msg.session_key)
+    session = loop.sessions.get_or_create(msg.session_key)
+    assert session.messages[-1]["content"] == "known result"
+
+    loop.chat_inbox.mark_processed = original_mark_processed  # type: ignore[method-assign]
+    restarted = _make_full_loop(tmp_path)
+    await restarted._recover_interrupted_commands()
+    restarted.sessions.invalidate(msg.session_key)
+    recovered = restarted.sessions.get_or_create(msg.session_key)
+    assert [item["content"] for item in recovered.messages] == [
+        msg.content,
+        "known result",
+    ]
+    assert await restarted.chat_inbox.interrupted_commands() == []
+
+
+@pytest.mark.asyncio
+async def test_dispatch_retries_in_place_before_republishing_later_prompt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loop = _make_full_loop(tmp_path)
+    first_id = "c5e597cc-1adb-4aa8-bde0-ac0edb92c5f5"
+    first = InboundMessage(
+        channel="websocket",
+        sender_id="u1",
+        chat_id="ordered",
+        content="first",
+        metadata={"client_message_id": first_id},
+    )
+    second = InboundMessage(
+        channel="websocket",
+        sender_id="u1",
+        chat_id="ordered",
+        content="second",
+        metadata={"client_message_id": "06eab632-f2ec-48f2-901b-0aa0a7f2a4c7"},
+    )
+    await loop.chat_inbox.accept(first, first_id)
+    await loop.chat_inbox.mark_enqueued(first.chat_id, first_id)
+    loop._process_message = AsyncMock(  # type: ignore[method-assign]
+        side_effect=[
+            RuntimeError("transient"),
+            OutboundMessage(
+                channel="websocket",
+                chat_id="ordered",
+                content="first done",
+            ),
+        ]
+    )
+
+    async def no_wait(_delay):
+        loop._pending_queues[first.session_key].put_nowait(second)
+
+    monkeypatch.setattr("nanobot.agent.loop.asyncio.sleep", no_wait)
+
+    await loop._dispatch(first)
+
+    assert loop._process_message.await_count == 2
+    outbound = await loop.bus.consume_outbound()
+    assert outbound.content == "Retrying in 2 seconds."
+    completed = await loop.bus.consume_outbound()
+    assert completed.content == "first done"
+    assert await loop.bus.consume_inbound() == second
+
+
+@pytest.mark.asyncio
+async def test_permanent_processing_failure_is_closed_after_retry_limit(
+    tmp_path: Path,
+) -> None:
+    loop = _make_full_loop(tmp_path)
+    client_message_id = "c5e597cc-1adb-4aa8-bde0-ac0edb92c5f5"
+    msg = InboundMessage(
+        channel="websocket",
+        sender_id="u1",
+        chat_id="terminal",
+        content="never succeeds",
+        metadata={"client_message_id": client_message_id},
+    )
+    await loop.chat_inbox.accept(msg, client_message_id)
+    await loop.chat_inbox.mark_enqueued(msg.chat_id, client_message_id)
+    session = loop.sessions.get_or_create(msg.session_key)
+    session.add_message(
+        "user",
+        msg.content,
+        client_message_id=client_message_id,
+    )
+    loop._mark_pending_user_turn(session, [client_message_id])
+    loop.sessions.save(session)
+
+    for attempt in range(1, loop._MAX_CHAT_PROCESSING_RETRIES + 1):
+        result = await loop._prepare_chat_message_retry(msg)
+        if attempt < loop._MAX_CHAT_PROCESSING_RETRIES:
+            assert result is not None and result > 0
+            assert await loop.chat_inbox.claim_retry_for_enqueue(
+                msg.chat_id,
+                client_message_id,
+            )
+        else:
+            assert result == loop._TERMINAL_CHAT_RETRY
+
+    assert await loop.chat_inbox.recoverable() == []
+    loop.sessions.invalidate(msg.session_key)
+    completed = loop.sessions.get_or_create(msg.session_key)
+    assert completed.messages[-1]["content"] == loop._terminal_chat_failure_message()
+    assert AgentLoop._PENDING_USER_TURN_KEY not in completed.metadata
+
+
+def test_save_turn_preserves_merged_client_message_ids() -> None:
+    loop = _mk_loop()
+    session = Session(key="websocket:merged")
+    client_message_ids = [
+        "7fbf82b5-37de-4df0-b2bb-749bb6fd2306",
+        "06eab632-f2ec-48f2-901b-0aa0a7f2a4c7",
+    ]
+
+    loop._save_turn(
+        session,
+        [{
+            "role": "user",
+            "content": "first\n\nsecond",
+            "_client_message_ids": client_message_ids,
+        }],
+        skip=0,
+    )
+
+    assert session.messages[0]["client_message_ids"] == client_message_ids
+    assert "_client_message_ids" not in session.messages[0]
 
 
 # 1x1 PNG used by the media-persistence tests. ``extract_documents`` runs
