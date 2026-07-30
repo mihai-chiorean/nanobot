@@ -214,6 +214,24 @@ class TestAutoCompact:
         await loop.close_mcp()
 
     @pytest.mark.asyncio
+    async def test_check_expired_never_archives_shared_rooms(self, tmp_path):
+        loop = _make_loop(tmp_path, session_ttl_minutes=15)
+        room = loop.sessions.get_or_create("websocket:room")
+        room.metadata["shared_room"] = True
+        room.add_message("user", "guest context")
+        room.updated_at = datetime.now() - timedelta(minutes=20)
+        loop.sessions.save(room)
+        loop.consolidator.archive = AsyncMock(return_value="must not run")
+
+        loop.auto_compact.check_expired(loop._schedule_background)
+        await asyncio.sleep(0.1)
+
+        loop.consolidator.archive.assert_not_awaited()
+        persisted = loop.sessions.get_or_create("websocket:room")
+        assert persisted.messages[0]["content"] == "guest context"
+        await loop.close_mcp()
+
+    @pytest.mark.asyncio
     async def test_auto_compact_archives_prefix_and_keeps_recent_suffix(self, tmp_path):
         """_archive should summarize the old prefix and keep a recent legal suffix."""
         loop = _make_loop(tmp_path, session_ttl_minutes=15)

@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 from contextlib import suppress
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -108,6 +109,14 @@ class Session:
         out: list[dict[str, Any]] = []
         for message in sliced:
             content = message.get("content", "")
+            participant = message.get("participant_display_name")
+            if (
+                message.get("role") == "user"
+                and isinstance(content, str)
+                and isinstance(participant, str)
+                and participant.strip()
+            ):
+                content = f"{participant.strip()}: {content}"
             # Synthesize an ``[image: path]`` breadcrumb from the persisted
             # ``media`` kwarg so LLM replay still sees *something* where the
             # image used to be. Without this, an image-only user turn
@@ -509,6 +518,31 @@ class SessionManager:
             logger.warning("Failed to delete session file {}: {}", path, e)
             return False
 
+    def clone_session(
+        self,
+        source_key: str,
+        destination_key: str,
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> Session:
+        """Create a durable conversation branch without sharing future source turns."""
+        if self._get_session_path(destination_key).exists():
+            raise FileExistsError(destination_key)
+        source = self.get_or_create(source_key)
+        if not self._get_session_path(source_key).exists():
+            raise FileNotFoundError(source_key)
+        now = datetime.now()
+        clone = Session(
+            key=destination_key,
+            messages=deepcopy(source.messages),
+            created_at=now,
+            updated_at=now,
+            metadata={**deepcopy(source.metadata), **(metadata or {})},
+            last_consolidated=source.last_consolidated,
+        )
+        self.save(clone, fsync=True)
+        return clone
+
     def read_session_file(self, key: str) -> dict[str, Any] | None:
         """Load a session from disk without caching; intended for read-only HTTP endpoints.
 
@@ -616,6 +650,7 @@ class SessionManager:
                                 "key": key,
                                 "created_at": data.get("created_at"),
                                 "updated_at": data.get("updated_at"),
+                                "metadata": data.get("metadata", {}),
                                 "path": str(path)
                             })
             except Exception:
@@ -625,6 +660,7 @@ class SessionManager:
                         "key": repaired.key,
                         "created_at": repaired.created_at.isoformat(),
                         "updated_at": repaired.updated_at.isoformat(),
+                        "metadata": repaired.metadata,
                         "path": str(path)
                     })
                 continue

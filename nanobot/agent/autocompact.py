@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any, Callable, Coroutine
 
 from loguru import logger
+
 from nanobot.session.manager import Session, SessionManager
 
 if TYPE_CHECKING:
@@ -66,6 +67,9 @@ class AutoCompact:
             key = info.get("key", "")
             if not key or key in self._archiving:
                 continue
+            metadata = info.get("metadata")
+            if isinstance(metadata, dict) and metadata.get("shared_room") is True:
+                continue
             if key in active_session_keys:
                 continue
             if self._is_expired(info.get("updated_at"), now):
@@ -76,6 +80,8 @@ class AutoCompact:
         try:
             self.sessions.invalidate(key)
             session = self.sessions.get_or_create(key)
+            if session.metadata.get("shared_room") is True:
+                return
             archive_msgs, kept_msgs = self._split_unconsolidated(session)
             if not archive_msgs and not kept_msgs:
                 session.updated_at = datetime.now()

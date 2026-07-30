@@ -21,6 +21,8 @@ import time
 import uuid
 import zipfile
 from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self
 from urllib.parse import parse_qs, unquote, urlparse
@@ -420,6 +422,18 @@ _REASONING_EFFORTS = frozenset(
     {"none", "minimal", "minimum", "low", "medium", "high", "max", "adaptive"}
 )
 _REASONING_PROFILES = frozenset(profile.value for profile in ReasoningProfile)
+_ROOM_ID_RE = re.compile(r"^room_[0-9a-f]{32}$")
+_PARTICIPANT_ID_RE = re.compile(r"^participant_[0-9a-f]{32}$")
+
+
+@dataclass(frozen=True)
+class _RoomCredential:
+    expires_at: float
+    room_id: str
+    chat_id: str
+    participant_id: str
+    display_name: str
+    role: str
 
 
 def _decode_api_key(raw_key: str) -> str | None:
@@ -581,6 +595,12 @@ class WebSocketChannel(BaseChannel):
         self._issued_tokens: dict[str, float] = {}
         # Multi-use tokens for the embedded webui's REST surface; checked but not consumed.
         self._api_tokens: dict[str, float] = {}
+        # Room tokens are separate from tenant-wide tokens. The WebSocket copy
+        # is consumed at handshake while the REST copy remains valid for the
+        # exact room history until expiry.
+        self._room_ws_tokens: dict[str, _RoomCredential] = {}
+        self._room_api_tokens: dict[str, _RoomCredential] = {}
+        self._conn_room: dict[Any, _RoomCredential] = {}
         self._clerk_verifier = ClerkTokenVerifier(
             issuer=config.auth_issuer,
             jwks_url=config.auth_jwks_url,
@@ -626,6 +646,7 @@ class WebSocketChannel(BaseChannel):
             if not subs:
                 self._subs.pop(cid, None)
         self._conn_default.pop(connection, None)
+        self._conn_room.pop(connection, None)
         task_ids = self._conn_work.pop(connection, set())
         for task_id in task_ids:
             subscribers = self._work_subs.get(task_id)
@@ -646,6 +667,18 @@ class WebSocketChannel(BaseChannel):
             self._cleanup_connection(connection)
         except Exception as e:
             logger.warning("websocket: failed to send {} event: {}", event, e)
+
+    async def _broadcast_event(self, chat_id: str, event: str, **fields: Any) -> None:
+        """Fan a room event out to a stable snapshot of current subscribers."""
+        subscribers = list(self._subs.get(chat_id, set()))
+        if not subscribers:
+            return
+        await asyncio.gather(
+            *(
+                self._send_event(connection, event, chat_id=chat_id, **fields)
+                for connection in subscribers
+            )
+        )
 
     async def _send_message_ack(
         self,
@@ -732,6 +765,10 @@ class WebSocketChannel(BaseChannel):
         for token_key, expiry in list(self._issued_tokens.items()):
             if now > expiry:
                 self._issued_tokens.pop(token_key, None)
+        for pool in (self._room_ws_tokens, self._room_api_tokens):
+            for token_key, credential in list(pool.items()):
+                if now > credential.expires_at:
+                    pool.pop(token_key, None)
 
     def _take_issued_token_if_valid(self, token_value: str | None) -> bool:
         """Validate and consume one issued token (single use per connection attempt).
@@ -748,6 +785,69 @@ class WebSocketChannel(BaseChannel):
         if time.monotonic() > expiry:
             return False
         return True
+
+    def _take_room_token_if_valid(
+        self,
+        connection: Any,
+        token_value: str | None,
+    ) -> bool:
+        if not token_value:
+            return False
+        self._purge_expired_issued_tokens()
+        credential = self._room_ws_tokens.pop(token_value, None)
+        if credential is None or time.monotonic() > credential.expires_at:
+            return False
+        self._conn_room[connection] = credential
+        return True
+
+    def _room_api_credential(self, request: WsRequest) -> _RoomCredential | None:
+        self._purge_expired_issued_tokens()
+        token = _bearer_token(request.headers)
+        if not token:
+            return None
+        credential = self._room_api_tokens.get(token)
+        if credential is None or time.monotonic() > credential.expires_at:
+            self._room_api_tokens.pop(token, None)
+            return None
+        return credential
+
+    def _mint_room_transport_token(
+        self,
+        *,
+        room_id: str,
+        chat_id: str,
+        participant_id: str,
+        display_name: str,
+        role: str,
+    ) -> Response:
+        self._purge_expired_issued_tokens()
+        if (
+            len(self._room_ws_tokens) >= self._MAX_ISSUED_TOKENS
+            or len(self._room_api_tokens) >= self._MAX_ISSUED_TOKENS
+        ):
+            return _http_json_response(
+                {"error": "too many outstanding room tokens"},
+                status=429,
+            )
+        token = f"nbrt_{secrets.token_urlsafe(32)}"
+        credential = _RoomCredential(
+            expires_at=time.monotonic() + float(self.config.token_ttl_s),
+            room_id=room_id,
+            chat_id=chat_id,
+            participant_id=participant_id,
+            display_name=display_name,
+            role=role,
+        )
+        self._room_ws_tokens[token] = credential
+        self._room_api_tokens[token] = credential
+        return _http_json_response(
+            {
+                "token": token,
+                "ws_path": self._expected_path(),
+                "expires_in": self.config.token_ttl_s,
+                "model_name": _read_webui_model_name(),
+            }
+        )
 
     def _handle_token_issue_http(self, connection: Any, request: Any) -> Any:
         secret = self.config.token_issue_secret.strip()
@@ -805,6 +905,21 @@ class WebSocketChannel(BaseChannel):
             if method != "GET":
                 return _http_error(405, "Method Not Allowed")
             return await self._handle_auth_bootstrap(request)
+
+        if got == "/auth/shared-rooms":
+            if method != "POST":
+                return _http_error(405, "Method Not Allowed")
+            return await self._handle_shared_room_create(request)
+
+        if got == "/auth/shared-room-token":
+            if method != "POST":
+                return _http_error(405, "Method Not Allowed")
+            return self._handle_shared_room_token(request)
+
+        if got == "/auth/shared-room-revoke":
+            if method != "POST":
+                return _http_error(405, "Method Not Allowed")
+            return await self._handle_shared_room_revoke(request)
 
         # 2. WebUI bootstrap: localhost-only, mints tokens for the embedded UI.
         if got == "/webui/bootstrap":
@@ -967,6 +1082,187 @@ class WebSocketChannel(BaseChannel):
             return _http_json_response({"error": "identity verification unavailable"}, status=503)
         return self._mint_transport_token()
 
+    async def _handle_shared_room_create(self, request: WsRequest) -> Response:
+        if not _issue_route_secret_matches(
+            request.headers,
+            self.config.token_issue_secret.strip(),
+        ):
+            return _http_error(401, "Unauthorized")
+        if not self.config.token_issue_secret.strip():
+            return _http_error(503, "room issuance is unavailable")
+        if self._session_manager is None:
+            return _http_error(503, "session manager unavailable")
+        body = _request_json(request)
+        if body is None:
+            return _http_error(400, "invalid JSON body")
+        source_key = body.get("source_session_key")
+        chat_id = body.get("chat_id")
+        room_id = body.get("room_id")
+        if (
+            not isinstance(source_key, str)
+            or _API_KEY_RE.fullmatch(source_key) is None
+            or not source_key.startswith("websocket:")
+        ):
+            return _http_error(400, "invalid source_session_key")
+        if not _is_valid_chat_id(chat_id):
+            return _http_error(400, "invalid chat_id")
+        if not isinstance(room_id, str) or _ROOM_ID_RE.fullmatch(room_id) is None:
+            return _http_error(400, "invalid room_id")
+        title = str(body.get("title") or "Shared conversation").strip()
+        owner_display_name = str(body.get("owner_display_name") or "Owner").strip()
+        if not 1 <= len(title) <= 120 or not 1 <= len(owner_display_name) <= 64:
+            return _http_error(400, "invalid room metadata")
+        destination_key = f"websocket:{chat_id}"
+        try:
+            await asyncio.to_thread(
+                self._session_manager.clone_session,
+                source_key,
+                destination_key,
+                metadata={
+                    "shared_room": True,
+                    "room_id": room_id,
+                    "title": title,
+                    "owner_display_name": owner_display_name,
+                },
+            )
+        except FileNotFoundError:
+            return _http_error(404, "source session not found")
+        except FileExistsError:
+            return _http_error(409, "room session already exists")
+        except Exception:
+            logger.exception("failed to create shared room session {}", room_id)
+            return _http_error(500, "failed to create room")
+        return _http_json_response(
+            {
+                "room_id": room_id,
+                "session_key": destination_key,
+                "chat_id": chat_id,
+                "title": title,
+            },
+            status=201,
+        )
+
+    def _handle_shared_room_token(self, request: WsRequest) -> Response:
+        if not _issue_route_secret_matches(
+            request.headers,
+            self.config.token_issue_secret.strip(),
+        ):
+            return _http_error(401, "Unauthorized")
+        if not self.config.token_issue_secret.strip():
+            return _http_error(503, "room issuance is unavailable")
+        if self._session_manager is None:
+            return _http_error(503, "session manager unavailable")
+        body = _request_json(request)
+        if body is None:
+            return _http_error(400, "invalid JSON body")
+        room_id = body.get("room_id")
+        chat_id = body.get("chat_id")
+        participant_id = body.get("participant_id")
+        display_name = str(body.get("display_name") or "").strip()
+        role = str(body.get("role") or "contributor").strip().lower()
+        if not isinstance(room_id, str) or _ROOM_ID_RE.fullmatch(room_id) is None:
+            return _http_error(400, "invalid room_id")
+        if not _is_valid_chat_id(chat_id):
+            return _http_error(400, "invalid chat_id")
+        if (
+            not isinstance(participant_id, str)
+            or _PARTICIPANT_ID_RE.fullmatch(participant_id) is None
+        ):
+            return _http_error(400, "invalid participant_id")
+        if not 1 <= len(display_name) <= 64 or role != "contributor":
+            return _http_error(400, "invalid participant")
+        payload = self._session_manager.read_session_file(f"websocket:{chat_id}")
+        metadata = payload.get("metadata", {}) if isinstance(payload, dict) else {}
+        if (
+            not isinstance(metadata, dict)
+            or metadata.get("shared_room") is not True
+            or metadata.get("room_id") != room_id
+        ):
+            return _http_error(404, "room not found")
+        return self._mint_room_transport_token(
+            room_id=room_id,
+            chat_id=chat_id,
+            participant_id=participant_id,
+            display_name=display_name,
+            role=role,
+        )
+
+    async def _handle_shared_room_revoke(self, request: WsRequest) -> Response:
+        if not _issue_route_secret_matches(
+            request.headers,
+            self.config.token_issue_secret.strip(),
+        ):
+            return _http_error(401, "Unauthorized")
+        if not self.config.token_issue_secret.strip():
+            return _http_error(503, "room revocation is unavailable")
+        if self._session_manager is None:
+            return _http_error(503, "session manager unavailable")
+        body = _request_json(request)
+        if body is None:
+            return _http_error(400, "invalid JSON body")
+        room_id = body.get("room_id")
+        chat_id = body.get("chat_id")
+        if not isinstance(room_id, str) or _ROOM_ID_RE.fullmatch(room_id) is None:
+            return _http_error(400, "invalid room_id")
+        if not _is_valid_chat_id(chat_id):
+            return _http_error(400, "invalid chat_id")
+        payload = self._session_manager.read_session_file(f"websocket:{chat_id}")
+        metadata = payload.get("metadata", {}) if isinstance(payload, dict) else {}
+        if (
+            not isinstance(metadata, dict)
+            or metadata.get("shared_room") is not True
+            or metadata.get("room_id") != room_id
+        ):
+            return _http_error(404, "room not found")
+
+        invalidated_tokens = 0
+        for pool in (self._room_ws_tokens, self._room_api_tokens):
+            for token, credential in list(pool.items()):
+                if credential.room_id == room_id and credential.chat_id == chat_id:
+                    pool.pop(token, None)
+                    invalidated_tokens += 1
+
+        connections = [
+            connection
+            for connection, credential in list(self._conn_room.items())
+            if credential.room_id == room_id and credential.chat_id == chat_id
+        ]
+        for connection in connections:
+            self._cleanup_connection(connection)
+            asyncio.create_task(
+                connection.close(code=1008, reason="shared room revoked")
+            )
+        return _http_json_response(
+            {
+                "room_id": room_id,
+                "invalidated_tokens": invalidated_tokens,
+                "closed_connections": len(connections),
+            }
+        )
+
+    def _shared_room_owner_credential(
+        self,
+        chat_id: str,
+    ) -> _RoomCredential | None:
+        if self._session_manager is None:
+            return None
+        payload = self._session_manager.read_session_file(f"websocket:{chat_id}")
+        metadata = payload.get("metadata", {}) if isinstance(payload, dict) else {}
+        if not isinstance(metadata, dict) or metadata.get("shared_room") is not True:
+            return None
+        room_id = metadata.get("room_id")
+        if not isinstance(room_id, str) or _ROOM_ID_RE.fullmatch(room_id) is None:
+            return None
+        display_name = str(metadata.get("owner_display_name") or "Owner").strip()
+        return _RoomCredential(
+            expires_at=float("inf"),
+            room_id=room_id,
+            chat_id=chat_id,
+            participant_id="owner",
+            display_name=display_name[:64] or "Owner",
+            role="owner",
+        )
+
     def _mint_transport_token(self) -> Response:
         # Cap outstanding tokens to avoid runaway growth from a misbehaving client.
         self._purge_expired_issued_tokens()
@@ -1016,6 +1312,13 @@ class WebSocketChannel(BaseChannel):
             if not isinstance(key, str) or not key.startswith("websocket:"):
                 continue
             summary = {k: v for k, v in session.items() if k != "path"}
+            metadata = summary.get("metadata")
+            if isinstance(metadata, dict):
+                title = metadata.get("title")
+                if isinstance(title, str) and title.strip():
+                    summary["title"] = title.strip()
+                if metadata.get("shared_room") is True:
+                    summary["shared_room"] = True
             preview = self._session_manager.read_session_preview(key)
             if preview:
                 summary["preview"] = preview
@@ -1520,13 +1823,18 @@ class WebSocketChannel(BaseChannel):
         return key.startswith("websocket:")
 
     def _handle_session_messages(self, request: WsRequest, key: str) -> Response:
-        if not self._check_api_token(request):
-            return _http_error(401, "Unauthorized")
         if self._session_manager is None:
             return _http_error(503, "session manager unavailable")
         decoded_key = _decode_api_key(key)
         if decoded_key is None:
             return _http_error(400, "invalid session key")
+        room_credential = self._room_api_credential(request)
+        tenant_authorized = self._check_api_token(request)
+        if not tenant_authorized and (
+            room_credential is None
+            or decoded_key != f"websocket:{room_credential.chat_id}"
+        ):
+            return _http_error(401, "Unauthorized")
         # The embedded webui only understands websocket-channel sessions. Keep
         # its read surface aligned with ``/api/sessions`` instead of letting a
         # caller probe arbitrary CLI / Slack / Lark history by handcrafted URL.
@@ -1808,17 +2116,22 @@ class WebSocketChannel(BaseChannel):
         if static_token:
             if supplied and hmac.compare_digest(supplied, static_token):
                 return None
+            if supplied and self._take_room_token_if_valid(connection, supplied):
+                return None
             if supplied and self._take_issued_token_if_valid(supplied):
                 return None
             return connection.respond(401, "Unauthorized")
 
         if self.config.websocket_requires_token:
+            if supplied and self._take_room_token_if_valid(connection, supplied):
+                return None
             if supplied and self._take_issued_token_if_valid(supplied):
                 return None
             return connection.respond(401, "Unauthorized")
 
         if supplied:
-            self._take_issued_token_if_valid(supplied)
+            if not self._take_room_token_if_valid(connection, supplied):
+                self._take_issued_token_if_valid(supplied)
         return None
 
     async def start(self) -> None:
@@ -1874,7 +2187,12 @@ class WebSocketChannel(BaseChannel):
             logger.warning("websocket: client_id too long ({} chars), truncating", len(client_id))
             client_id = client_id[:128]
 
-        default_chat_id = str(uuid.uuid4())
+        room_credential = self._conn_room.get(connection)
+        default_chat_id = (
+            room_credential.chat_id
+            if room_credential is not None
+            else str(uuid.uuid4())
+        )
 
         try:
             await connection.send(
@@ -1907,11 +2225,26 @@ class WebSocketChannel(BaseChannel):
                 content = _parse_inbound_payload(raw)
                 if content is None:
                     continue
+                room = self._conn_room.get(connection)
+                metadata: dict[str, Any] = {
+                    "remote": getattr(connection, "remote_address", None)
+                }
+                sender_id = client_id
+                if room is not None:
+                    sender_id = room.participant_id
+                    metadata.update(
+                        {
+                            "shared_room": True,
+                            "room_id": room.room_id,
+                            "participant_id": room.participant_id,
+                            "participant_display_name": room.display_name,
+                        }
+                    )
                 await self._handle_message(
-                    sender_id=client_id,
+                    sender_id=sender_id,
                     chat_id=default_chat_id,
                     content=content,
-                    metadata={"remote": getattr(connection, "remote_address", None)},
+                    metadata=metadata,
                 )
         except Exception as e:
             logger.debug("websocket connection ended: {}", e)
@@ -2021,7 +2354,11 @@ class WebSocketChannel(BaseChannel):
     ) -> None:
         """Route one typed inbound envelope (``new_chat`` / ``attach`` / ``message``)."""
         t = envelope.get("type")
+        scoped_room = self._conn_room.get(connection)
         if t == "new_chat":
+            if scoped_room is not None:
+                await self._send_event(connection, "error", detail="room scope violation")
+                return
             new_id = str(uuid.uuid4())
             self._attach(connection, new_id)
             await self._send_event(connection, "attached", chat_id=new_id)
@@ -2030,6 +2367,9 @@ class WebSocketChannel(BaseChannel):
             cid = envelope.get("chat_id")
             if not _is_valid_chat_id(cid):
                 await self._send_event(connection, "error", detail="invalid chat_id")
+                return
+            if scoped_room is not None and cid != scoped_room.chat_id:
+                await self._send_event(connection, "error", detail="room scope violation")
                 return
             self._attach(connection, cid)
             await self._send_event(connection, "attached", chat_id=cid)
@@ -2069,6 +2409,9 @@ class WebSocketChannel(BaseChannel):
             if not _is_valid_chat_id(cid):
                 await reject("invalid chat_id")
                 return
+            if scoped_room is not None and cid != scoped_room.chat_id:
+                await reject("room scope violation")
+                return
             if not isinstance(content, str):
                 await reject("missing content")
                 return
@@ -2088,6 +2431,18 @@ class WebSocketChannel(BaseChannel):
             metadata: dict[str, Any] = {
                 "remote": getattr(connection, "remote_address", None)
             }
+            room = scoped_room or self._shared_room_owner_credential(cid)
+            sender_id = client_id
+            if room is not None:
+                sender_id = room.participant_id
+                metadata.update(
+                    {
+                        "shared_room": True,
+                        "room_id": room.room_id,
+                        "participant_id": room.participant_id,
+                        "participant_display_name": room.display_name,
+                    }
+                )
             if client_message_id is not None:
                 metadata["client_message_id"] = client_message_id
             reasoning_profile = envelope.get("reasoning_profile")
@@ -2135,6 +2490,12 @@ class WebSocketChannel(BaseChannel):
                         message=_attachment_rejection_message("malformed"),
                     )
                     return
+                if room is not None and raw_media:
+                    await reject(
+                        "attachment_rejected",
+                        message="Attachments are not available in shared rooms yet.",
+                    )
+                    return
                 media_paths, reason = self._save_envelope_media(raw_media)
                 if reason is not None:
                     await reject(
@@ -2153,7 +2514,7 @@ class WebSocketChannel(BaseChannel):
             self._attach(connection, cid)
             if client_message_id is None:
                 await self._handle_message(
-                    sender_id=client_id,
+                    sender_id=sender_id,
                     chat_id=cid,
                     content=content,
                     media=media_paths or None,
@@ -2162,7 +2523,7 @@ class WebSocketChannel(BaseChannel):
                 return
 
             prepared = await self._prepare_message(
-                sender_id=client_id,
+                sender_id=sender_id,
                 chat_id=cid,
                 content=content,
                 media=media_paths or None,
@@ -2219,6 +2580,24 @@ class WebSocketChannel(BaseChannel):
                 client_message_id=client_message_id,
                 status="accepted",
             )
+            if room is not None:
+                await self._broadcast_event(
+                    cid,
+                    "participant.message",
+                    client_message_id=client_message_id,
+                    participant_id=room.participant_id,
+                    display_name=room.display_name,
+                    content=content,
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                )
+            return
+        if scoped_room is not None and t in {
+            "work.create",
+            "work.subscribe",
+            "work.cancel",
+            "work.message",
+        }:
+            await self._send_event(connection, "error", detail="room scope violation")
             return
         if t == "work.create":
             await self._handle_work_create_envelope(connection, client_id, envelope)

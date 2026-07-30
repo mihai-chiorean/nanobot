@@ -70,6 +70,13 @@ class AiohttpConnection:
         else:
             await self._websocket.send_str(data)
 
+    async def close(self, *, code: int = 1000, reason: str = "") -> None:
+        if self._websocket is not None:
+            await self._websocket.close(
+                code=code,
+                message=reason.encode("utf-8"),
+            )
+
     def __aiter__(self) -> AsyncIterator[str | bytes]:
         return self._messages()
 

@@ -976,6 +976,11 @@ class AgentLoop:
             return items
 
         active_session_key = session.key if session else session_key
+        run_tools = (
+            ToolRegistry()
+            if isinstance(metadata, dict) and metadata.get("shared_room")
+            else self.tools
+        )
         run_reasoning_effort = None
         run_max_tokens = None
         run_temperature = None
@@ -1022,7 +1027,7 @@ class AgentLoop:
         try:
             result = await self.runner.run(AgentRunSpec(
                 initial_messages=initial_messages,
-                tools=self.tools,
+                tools=run_tools,
                 model=self.model,
                 max_iterations=self.max_iterations,
                 max_tool_result_chars=self.max_tool_result_chars,
@@ -1203,7 +1208,9 @@ class AgentLoop:
                     response = await self._process_message(
                         msg, on_stream=on_stream, on_stream_end=on_stream_end,
                         on_status=on_status,
-                        pending_queue=pending,
+                        pending_queue=(
+                            None if msg.metadata.get("shared_room") else pending
+                        ),
                     )
                     if response is not None:
                         await self.bus.publish_outbound(response)
@@ -1503,6 +1510,7 @@ class AgentLoop:
 
         key = session_key or msg.session_key
         session = self.sessions.get_or_create(key)
+        shared_room = bool(msg.metadata.get("shared_room"))
         client_message_id = msg.metadata.get("client_message_id")
         has_client_message = (
             isinstance(client_message_id, str)
@@ -1551,7 +1559,9 @@ class AgentLoop:
         # Slash commands
         raw = msg.content.strip()
         ctx = CommandContext(msg=msg, session=session, key=key, raw=raw, loop=self)
-        is_known_command = self.commands.is_dispatchable_command(raw)
+        is_known_command = (
+            not shared_room and self.commands.is_dispatchable_command(raw)
+        )
         if is_known_command:
             msg.metadata["_command_at_most_once"] = True
             if not await self._begin_at_most_once_command(msg):
@@ -1561,7 +1571,7 @@ class AgentLoop:
                     content=self._command_failure_message(),
                     metadata=dict(msg.metadata or {}),
                 )
-        if result := await self.commands.dispatch(ctx):
+        if not shared_room and (result := await self.commands.dispatch(ctx)):
             if is_known_command:
                 await self._complete_at_most_once_command(msg, result)
                 msg.metadata.pop("_command_at_most_once", None)
@@ -1570,18 +1580,19 @@ class AgentLoop:
                 await self._mark_chat_message_processed(msg)
             return result
 
-        await self.consolidator.maybe_consolidate_by_tokens(
-            session,
-            session_summary=pending,
-        )
+        if not shared_room:
+            await self.consolidator.maybe_consolidate_by_tokens(
+                session,
+                session_summary=pending,
+            )
 
-        self._set_tool_context(
-            msg.channel, msg.chat_id, msg.metadata.get("message_id"),
-            msg.metadata, session_key=key,
-        )
-        if message_tool := self.tools.get("message"):
-            if isinstance(message_tool, MessageTool):
-                message_tool.start_turn()
+            self._set_tool_context(
+                msg.channel, msg.chat_id, msg.metadata.get("message_id"),
+                msg.metadata, session_key=key,
+            )
+            if message_tool := self.tools.get("message"):
+                if isinstance(message_tool, MessageTool):
+                    message_tool.start_turn()
 
         _hist_kwargs: dict[str, Any] = {
             "max_messages": self._max_messages,
@@ -1600,7 +1611,7 @@ class AgentLoop:
             ):
                 history = history[:-1]
 
-        pending_ask_id = pending_ask_user_id(history)
+        pending_ask_id = None if shared_room else pending_ask_user_id(history)
         if pending_ask_id:
             initial_messages = ask_user_tool_result_messages(
                 self.context.build_system_prompt(channel=msg.channel),
@@ -1619,6 +1630,11 @@ class AgentLoop:
                 channel=msg.channel,
                 chat_id=self._runtime_chat_id(msg),
                 sender_id=msg.sender_id,
+                shared_room=shared_room,
+                participant_display_name=(
+                    str(msg.metadata.get("participant_display_name") or "").strip()
+                    or None
+                ),
             )
         if isinstance(client_message_id, str):
             for message in reversed(initial_messages):
@@ -1669,6 +1685,12 @@ class AgentLoop:
             extra: dict[str, Any] = {"media": list(media_paths)} if media_paths else {}
             if isinstance(client_message_id, str):
                 extra["client_message_id"] = client_message_id
+            if shared_room:
+                for field in ("participant_id", "participant_display_name"):
+                    value = msg.metadata.get(field)
+                    if isinstance(value, str) and value:
+                        extra[field] = value
+                extra["shared_room"] = True
             text = msg.content if isinstance(msg.content, str) else ""
             session.add_message("user", text, **extra)
             self._mark_pending_user_turn(
@@ -1700,7 +1722,9 @@ class AgentLoop:
         # Skip the already-persisted user message when saving the turn
         save_skip = 1 + len(history) + (1 if user_persisted_early else 0)
         self._save_turn(session, all_msgs, save_skip)
-        session.enforce_file_cap(on_archive=self.context.memory.raw_archive)
+        session.enforce_file_cap(
+            on_archive=None if shared_room else self.context.memory.raw_archive
+        )
         self._clear_pending_user_turn(session)
         self._clear_runtime_checkpoint(session)
         self.sessions.save(session)
@@ -1711,7 +1735,10 @@ class AgentLoop:
             msg.chat_id,
             list(dict.fromkeys(completed_client_message_ids)),
         )
-        self._schedule_background(self.consolidator.maybe_consolidate_by_tokens(session))
+        if not shared_room:
+            self._schedule_background(
+                self.consolidator.maybe_consolidate_by_tokens(session)
+            )
 
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
@@ -2087,7 +2114,9 @@ class AgentLoop:
             async with lock, gate:
                 response = await self._process_message(
                     msg,
-                    pending_queue=pending,
+                    pending_queue=(
+                        None if msg.metadata.get("shared_room") else pending
+                    ),
                 )
                 if response is not None:
                     await self.bus.publish_outbound(response)
