@@ -228,12 +228,41 @@ async def test_server_send_tags_tool_hint_with_kind(bus: MagicMock) -> None:
                     channel="websocket",
                     chat_id=ready.chat_id,
                     content='weather("get")',
-                    metadata={"_progress": True, "_tool_hint": True},
+                    metadata={
+                        "_progress": True,
+                        "_tool_hint": True,
+                        "_tool_events": [
+                            {
+                                "version": 1,
+                                "phase": "start",
+                                "call_id": "call-1",
+                                "name": "weather",
+                                "arguments": {"location": "San Francisco"},
+                                "result": None,
+                                "error": None,
+                                "files": [],
+                                "embeds": [],
+                            }
+                        ],
+                    },
                 )
             )
             hint = await c.recv_message()
             assert hint.raw.get("kind") == "tool_hint"
             assert hint.text == 'weather("get")'
+            assert hint.raw["tool_events"] == [
+                {
+                    "version": 1,
+                    "phase": "start",
+                    "call_id": "call-1",
+                    "name": "weather",
+                    "arguments": {"location": "San Francisco"},
+                    "result": None,
+                    "error": None,
+                    "files": [],
+                    "embeds": [],
+                }
+            ]
 
             # Generic progress (non-tool-hint) gets the softer "progress" label.
             await ch.send(
