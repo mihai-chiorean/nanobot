@@ -57,6 +57,7 @@ class TestToolEventProgress:
                     "phase": "start",
                     "call_id": "call1",
                     "name": "custom_tool",
+                    "summary": 'custom_tool("foo.txt")',
                     "arguments": {"path": "foo.txt"},
                     "result": None,
                     "error": None,
@@ -72,6 +73,7 @@ class TestToolEventProgress:
                     "phase": "end",
                     "call_id": "call1",
                     "name": "custom_tool",
+                    "summary": 'custom_tool("foo.txt")',
                     "arguments": {"path": "foo.txt"},
                     "result": "ok",
                     "error": None,
@@ -122,11 +124,13 @@ class TestToolEventProgress:
 
         start = start_msgs[0].metadata["_tool_events"][0]
         assert start["name"] == "exec"
+        assert start["summary"] == "$ ls"
         assert start["call_id"] == "tc1"
         assert start["result"] is None
 
         finish = finish_msgs[0].metadata["_tool_events"][0]
         assert finish["phase"] == "end"
+        assert finish["summary"] == "$ ls"
         assert finish["result"] == "file.txt"
 
     @pytest.mark.asyncio

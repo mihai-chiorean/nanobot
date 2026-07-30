@@ -7,6 +7,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from nanobot.agent.hook import AgentHookContext
+from nanobot.utils.tool_hints import format_tool_hints
 
 
 def on_progress_accepts_tool_events(cb: Callable[..., Any]) -> bool:
@@ -38,6 +39,7 @@ def build_tool_event_start_payload(tool_call: Any) -> dict[str, Any]:
         "phase": "start",
         "call_id": str(getattr(tool_call, "id", "") or ""),
         "name": getattr(tool_call, "name", ""),
+        "summary": format_tool_hints([tool_call]),
         "arguments": getattr(tool_call, "arguments", {}) or {},
         "result": None,
         "error": None,
@@ -69,6 +71,7 @@ def build_tool_event_finish_payloads(context: AgentHookContext) -> list[dict[str
             "phase": phase,
             "call_id": str(getattr(tool_call, "id", "") or ""),
             "name": getattr(tool_call, "name", ""),
+            "summary": format_tool_hints([tool_call]),
             "arguments": getattr(tool_call, "arguments", {}) or {},
             "result": result if phase == "end" else None,
             "error": None,
