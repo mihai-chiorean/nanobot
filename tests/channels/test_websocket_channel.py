@@ -339,7 +339,11 @@ async def test_send_delta_emits_delta_and_stream_end() -> None:
     channel._attach(mock_ws, "chat-1")
 
     await channel.send_delta("chat-1", "part", {"_stream_delta": True, "_stream_id": "sid"})
-    await channel.send_delta("chat-1", "", {"_stream_end": True, "_stream_id": "sid"})
+    await channel.send_delta(
+        "chat-1",
+        "",
+        {"_stream_end": True, "_stream_id": "sid", "_resuming": True},
+    )
 
     assert mock_ws.send.await_count == 2
     first = json.loads(mock_ws.send.call_args_list[0][0][0])
@@ -351,6 +355,7 @@ async def test_send_delta_emits_delta_and_stream_end() -> None:
     assert second["event"] == "stream_end"
     assert second["chat_id"] == "chat-1"
     assert second["stream_id"] == "sid"
+    assert second["resuming"] is True
 
 
 @pytest.mark.asyncio
@@ -608,6 +613,7 @@ async def test_end_to_end_server_pushes_streaming_deltas_to_client(bus: MagicMoc
             end = json.loads(await client.recv())
             assert end["event"] == "stream_end"
             assert end["stream_id"] == "s1"
+            assert end["resuming"] is False
     finally:
         await channel.stop()
         await server_task
