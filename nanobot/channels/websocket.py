@@ -2093,6 +2093,9 @@ class WebSocketChannel(BaseChannel):
         # JSONL, so keep the blast radius narrow and explicit.
         if not self._is_webui_session_key(decoded_key):
             return _http_error(404, "session not found")
+        active_keys = self._active_session_keys() if self._active_session_keys else set()
+        if decoded_key in active_keys:
+            return _http_error(409, "conversation is active")
         deleted = self._session_manager.delete_session(decoded_key)
         return _http_json_response({"deleted": bool(deleted)})
 

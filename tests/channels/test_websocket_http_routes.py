@@ -295,6 +295,36 @@ async def test_session_delete_removes_file(bus: MagicMock, tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
+async def test_session_delete_rejects_active_conversation(
+    bus: MagicMock, tmp_path: Path
+) -> None:
+    sm = _seed_session(tmp_path, key="websocket:active-delete")
+    channel = _ch(
+        bus,
+        session_manager=sm,
+        active_session_keys=lambda: {"websocket:active-delete"},
+        port=29928,
+    )
+    server_task = asyncio.create_task(channel.start())
+    await asyncio.sleep(0.3)
+    try:
+        boot = await _http_get("http://127.0.0.1:29928/webui/bootstrap")
+        auth = {"Authorization": f"Bearer {boot.json()['token']}"}
+
+        path = sm._get_session_path("websocket:active-delete")
+        response = await _http_get(
+            "http://127.0.0.1:29928/api/sessions/websocket:active-delete/delete",
+            headers=auth,
+        )
+
+        assert response.status_code == 409
+        assert path.exists()
+    finally:
+        await channel.stop()
+        await server_task
+
+
+@pytest.mark.asyncio
 async def test_session_routes_accept_percent_encoded_websocket_keys(
     bus: MagicMock, tmp_path: Path
 ) -> None:
