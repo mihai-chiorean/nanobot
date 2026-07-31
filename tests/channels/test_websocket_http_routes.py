@@ -171,6 +171,66 @@ async def test_sessions_list_only_returns_websocket_sessions_by_default(
 
 
 @pytest.mark.asyncio
+async def test_conversation_search_is_bounded_and_user_visible_only(
+    bus: MagicMock, tmp_path: Path
+) -> None:
+    sm = SessionManager(tmp_path)
+    recent = Session(
+        key="websocket:recent",
+        metadata={"title": "Local inference notes"},
+    )
+    recent.add_message("system", "needle hidden system prompt")
+    recent.add_message("tool", "needle hidden tool output")
+    recent.add_message("user", "Compare prefix caching for the local model")
+    recent.add_message("assistant", "Prefix caching reduces repeated prompt work")
+    sm.save(recent)
+    hidden = Session(key="cli:hidden")
+    hidden.add_message("user", "prefix caching in a hidden channel")
+    sm.save(hidden)
+
+    channel = _ch(bus, session_manager=sm, port=29927)
+    server_task = asyncio.create_task(channel.start())
+    await asyncio.sleep(0.3)
+    try:
+        denied = await _http_get(
+            "http://127.0.0.1:29927/api/search/conversations?q=prefix"
+        )
+        assert denied.status_code == 401
+        boot = await _http_get("http://127.0.0.1:29927/webui/bootstrap")
+        auth = {"Authorization": f"Bearer {boot.json()['token']}"}
+
+        response = await _http_get(
+            "http://127.0.0.1:29927/api/search/conversations?q=prefix&limit=10",
+            headers=auth,
+        )
+
+        assert response.status_code == 200
+        results = response.json()["results"]
+        assert len(results) == 2
+        assert {item["role"] for item in results} == {"user", "assistant"}
+        assert {item["session_key"] for item in results} == {"websocket:recent"}
+        assert all(item["title"] == "Local inference notes" for item in results)
+        assert all(len(item["snippet"]) <= 246 for item in results)
+        assert all("path" not in item for item in results)
+
+        hidden_result = await _http_get(
+            "http://127.0.0.1:29927/api/search/conversations?q=needle",
+            headers=auth,
+        )
+        assert hidden_result.status_code == 200
+        assert hidden_result.json()["results"] == []
+
+        short = await _http_get(
+            "http://127.0.0.1:29927/api/search/conversations?q=x",
+            headers=auth,
+        )
+        assert short.status_code == 400
+    finally:
+        await channel.stop()
+        await server_task
+
+
+@pytest.mark.asyncio
 async def test_activity_route_matches_webui_contract(bus: MagicMock, tmp_path: Path) -> None:
     sm = _seed_many(tmp_path, ["websocket:active", "websocket:waiting", "cli:hidden"])
     waiting = sm.get_or_create("websocket:waiting")

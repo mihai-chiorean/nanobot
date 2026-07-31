@@ -25,6 +25,9 @@ FILE_MAX_MESSAGES = 2000
 SESSION_PREVIEW_MAX_BYTES = 256 * 1024
 SESSION_PREVIEW_MAX_LINES = 128
 SESSION_PREVIEW_MAX_CHARS = 160
+SESSION_SEARCH_MAX_RESULTS = 50
+SESSION_SEARCH_MATCHES_PER_SESSION = 5
+SESSION_SEARCH_SNIPPET_CHARS = 240
 
 
 @dataclass
@@ -704,3 +707,121 @@ class SessionManager:
                 continue
 
         return sorted(sessions, key=lambda x: x.get("updated_at", ""), reverse=True)
+
+    def search_sessions(self, query: str, *, limit: int = 20) -> list[dict[str, Any]]:
+        """Search user-visible websocket conversation text.
+
+        Results are message-level, newest-session first, and intentionally
+        exclude system, tool, reasoning, and filesystem metadata.
+        """
+        normalized_query = " ".join(query.split())
+        if len(normalized_query) < 2:
+            return []
+        limit = min(max(1, limit), SESSION_SEARCH_MAX_RESULTS)
+        folded_query = normalized_query.casefold()
+        results: list[dict[str, Any]] = []
+
+        for summary in self.list_sessions():
+            key = summary.get("key")
+            if not isinstance(key, str) or not key.startswith("websocket:"):
+                continue
+            payload = self.read_session_file(key)
+            if not isinstance(payload, dict):
+                continue
+            metadata = payload.get("metadata")
+            title = metadata.get("title") if isinstance(metadata, dict) else None
+            title = title.strip() if isinstance(title, str) else ""
+            matches: list[dict[str, Any]] = []
+
+            if title and folded_query in title.casefold():
+                matches.append(self._search_result(
+                    key=key,
+                    title=title,
+                    text=title,
+                    folded_query=folded_query,
+                    role="title",
+                    message_index=None,
+                    timestamp=summary.get("updated_at"),
+                    updated_at=summary.get("updated_at"),
+                ))
+
+            messages = payload.get("messages")
+            if isinstance(messages, list):
+                for index in range(len(messages) - 1, -1, -1):
+                    if len(matches) >= SESSION_SEARCH_MATCHES_PER_SESSION:
+                        break
+                    message = messages[index]
+                    if not isinstance(message, dict):
+                        continue
+                    role = message.get("role")
+                    if role not in {"user", "assistant"}:
+                        continue
+                    text = self._search_message_text(message.get("content"))
+                    if not text or folded_query not in text.casefold():
+                        continue
+                    matches.append(self._search_result(
+                        key=key,
+                        title=title,
+                        text=text,
+                        folded_query=folded_query,
+                        role=role,
+                        message_index=index,
+                        timestamp=message.get("timestamp"),
+                        updated_at=summary.get("updated_at"),
+                    ))
+
+            results.extend(matches[: max(0, limit - len(results))])
+            if len(results) >= limit:
+                break
+
+        return results
+
+    @staticmethod
+    def _search_message_text(content: Any) -> str:
+        if isinstance(content, str):
+            raw = content
+        elif isinstance(content, list):
+            raw = " ".join(
+                item["text"]
+                for item in content
+                if isinstance(item, dict) and isinstance(item.get("text"), str)
+            )
+        else:
+            return ""
+        return " ".join(raw.split())
+
+    @staticmethod
+    def _search_result(
+        *,
+        key: str,
+        title: str,
+        text: str,
+        folded_query: str,
+        role: str,
+        message_index: int | None,
+        timestamp: Any,
+        updated_at: Any,
+    ) -> dict[str, Any]:
+        folded_text = text.casefold()
+        match = folded_text.find(folded_query)
+        context = SESSION_SEARCH_SNIPPET_CHARS // 2
+        start = max(0, match - context) if match >= 0 else 0
+        end = min(len(text), start + SESSION_SEARCH_SNIPPET_CHARS)
+        start = max(0, end - SESSION_SEARCH_SNIPPET_CHARS)
+        snippet = text[start:end]
+        if start:
+            snippet = "..." + snippet.lstrip()
+        if end < len(text):
+            snippet = snippet.rstrip() + "..."
+        result: dict[str, Any] = {
+            "session_key": key,
+            "title": title,
+            "snippet": snippet,
+            "role": role,
+            "updated_at": updated_at,
+        }
+        if message_index is not None:
+            result["message_index"] = message_index
+        if isinstance(timestamp, str) and timestamp:
+            result["timestamp"] = timestamp
+        return result

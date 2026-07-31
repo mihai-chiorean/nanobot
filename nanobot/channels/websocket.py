@@ -933,6 +933,11 @@ class WebSocketChannel(BaseChannel):
                 return _http_error(405, "Method Not Allowed")
             return await self._handle_sessions_list(request)
 
+        if got == "/api/search/conversations":
+            if method != "GET":
+                return _http_error(405, "Method Not Allowed")
+            return await self._handle_conversation_search(request, query)
+
         if got == "/api/activity":
             if method != "GET":
                 return _http_error(405, "Method Not Allowed")
@@ -1299,6 +1304,31 @@ class WebSocketChannel(BaseChannel):
             return _http_error(503, "session manager unavailable")
         cleaned = await asyncio.to_thread(self._webui_session_summaries)
         return _http_json_response({"sessions": cleaned})
+
+    async def _handle_conversation_search(
+        self,
+        request: WsRequest,
+        query: dict[str, list[str]],
+    ) -> Response:
+        if not self._check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        if self._session_manager is None:
+            return _http_error(503, "session manager unavailable")
+        search_query = " ".join((_query_first(query, "q") or "").split())
+        if len(search_query) < 2 or len(search_query) > 256:
+            return _http_error(400, "q must contain between 2 and 256 characters")
+        try:
+            limit = int(_query_first(query, "limit") or 20)
+        except ValueError:
+            return _http_error(400, "limit must be an integer")
+        if limit < 1 or limit > 50:
+            return _http_error(400, "limit must be between 1 and 50")
+        results = await asyncio.to_thread(
+            self._session_manager.search_sessions,
+            search_query,
+            limit=limit,
+        )
+        return _http_json_response({"results": results})
 
     def _webui_session_summaries(self) -> list[dict[str, Any]]:
         assert self._session_manager is not None
