@@ -91,6 +91,12 @@ def _is_kimi_thinking_model(model_name: str) -> bool:
     return False
 
 
+def _supports_qwen_preserve_thinking(model_name: str) -> bool:
+    """Return whether the model chat template supports historical thinking."""
+    normalized = model_name.lower().replace("_", ".").replace("-", ".")
+    return "qwen3.6" in normalized
+
+
 def _openai_compat_timeout_s() -> float:
     """Return the bounded request timeout used for OpenAI-compatible providers."""
     return _float_env("NANOBOT_OPENAI_COMPAT_TIMEOUT_S", _OPENAI_COMPAT_REQUEST_TIMEOUT_S)
@@ -660,6 +666,11 @@ class OpenAICompatProvider(LLMProvider):
                 "chat_template_kwargs", {}
             )
             chat_template_kwargs["enable_thinking"] = thinking_enabled
+            if _supports_qwen_preserve_thinking(model_name):
+                # Qwen3.6 was explicitly trained to consume reasoning_content
+                # from older assistant turns. Keep a configured False value as
+                # an operational escape hatch for canaries and regressions.
+                chat_template_kwargs.setdefault("preserve_thinking", True)
 
         return kwargs
 

@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from nanobot.agent.context import ContextBuilder
-from nanobot.agent.loop import AgentLoop
+from nanobot.agent.loop import _MAX_PERSISTED_REASONING_CHARS, AgentLoop
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.session.manager import Session
@@ -94,6 +94,24 @@ def test_save_turn_keeps_tool_results_under_16k() -> None:
     )
 
     assert session.messages[0]["content"] == content
+
+
+def test_save_turn_bounds_cross_turn_reasoning_history() -> None:
+    loop = _mk_loop()
+    session = Session(key="test:reasoning-cap")
+    reasoning = "start-marker" + ("x" * _MAX_PERSISTED_REASONING_CHARS) + "end-marker"
+
+    loop._save_turn(
+        session,
+        [{"role": "assistant", "content": "done", "reasoning_content": reasoning}],
+        skip=0,
+    )
+
+    persisted = session.messages[0]["reasoning_content"]
+    assert persisted.startswith("[Earlier reasoning omitted from persisted history.]\n")
+    assert "start-marker" not in persisted
+    assert persisted.endswith("end-marker")
+    assert len(persisted) <= _MAX_PERSISTED_REASONING_CHARS + 64
 
 
 def test_restore_runtime_checkpoint_rehydrates_completed_and_pending_tools() -> None:

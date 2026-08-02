@@ -211,7 +211,8 @@ class TestLocalQwenThinkingMode:
         )
 
         assert kwargs["extra_body"]["chat_template_kwargs"] == {
-            "enable_thinking": False
+            "enable_thinking": False,
+            "preserve_thinking": True,
         }
         assert kwargs["temperature"] == 0.7
         assert kwargs["top_p"] == 0.8
@@ -245,7 +246,8 @@ class TestLocalQwenThinkingMode:
         )
 
         assert kwargs["extra_body"]["chat_template_kwargs"] == {
-            "enable_thinking": True
+            "enable_thinking": True,
+            "preserve_thinking": True,
         }
         assert kwargs["temperature"] == 1.0
         assert kwargs["top_p"] == 0.95
@@ -276,7 +278,10 @@ class TestLocalQwenThinkingMode:
             "top_k": 20,
             "min_p": 0,
             "repetition_penalty": 1.0,
-            "chat_template_kwargs": {"enable_thinking": True},
+            "chat_template_kwargs": {
+                "enable_thinking": True,
+                "preserve_thinking": True,
+            },
         }
 
     def test_multimodal_qwen_request_remains_on_qwen(self) -> None:
@@ -306,7 +311,26 @@ class TestLocalQwenThinkingMode:
         assert kwargs["model"] == "qwen3.6-35b"
         assert kwargs["messages"][0]["content"][1] == messages[0]["content"][1]
         assert kwargs["extra_body"]["chat_template_kwargs"] == {
-            "enable_thinking": False
+            "enable_thinking": False,
+            "preserve_thinking": True,
+        }
+
+    def test_preserve_thinking_can_be_disabled_for_canary_rollback(self) -> None:
+        kwargs = _make_local_qwen(
+            {"chat_template_kwargs": {"preserve_thinking": False}}
+        )._build_kwargs(
+            messages=_simple_messages(),
+            tools=None,
+            model=None,
+            max_tokens=8192,
+            temperature=0.1,
+            reasoning_effort="high",
+            tool_choice=None,
+        )
+
+        assert kwargs["extra_body"]["chat_template_kwargs"] == {
+            "enable_thinking": True,
+            "preserve_thinking": False,
         }
 
 

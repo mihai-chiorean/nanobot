@@ -76,6 +76,7 @@ if TYPE_CHECKING:
 
 
 UNIFIED_SESSION_KEY = "unified:default"
+_MAX_PERSISTED_REASONING_CHARS = 128 * 1024
 
 # Only Mihai can modify system internals (architecture, skills, prompts, code)
 OWNER_USER_ID = "1476998117906845890"
@@ -1849,6 +1850,16 @@ class AgentLoop:
             role, content = entry.get("role"), entry.get("content")
             if role == "assistant" and not content and not entry.get("tool_calls"):
                 continue  # skip empty assistant messages — they poison session context
+            if role == "assistant":
+                reasoning = entry.get("reasoning_content")
+                if (
+                    isinstance(reasoning, str)
+                    and len(reasoning) > _MAX_PERSISTED_REASONING_CHARS
+                ):
+                    entry["reasoning_content"] = (
+                        "[Earlier reasoning omitted from persisted history.]\n"
+                        + reasoning[-_MAX_PERSISTED_REASONING_CHARS:]
+                    )
             if role == "tool":
                 if isinstance(content, str) and len(content) > self.max_tool_result_chars:
                     entry["content"] = truncate_text_fn(content, self.max_tool_result_chars)

@@ -55,6 +55,30 @@ class TestConsolidatorSummarize:
         entries = store.read_unprocessed_history(since_cursor=0)
         assert len(entries) == 1
 
+    async def test_summarize_uses_private_reasoning_for_working_state(
+        self, consolidator, mock_provider, store
+    ):
+        mock_provider.chat_with_retry.return_value = MagicMock(
+            content="- Retry with the corrected endpoint.",
+            finish_reason="stop",
+        )
+        await consolidator.archive([
+            {"role": "user", "content": "keep debugging"},
+            {
+                "role": "assistant",
+                "content": "I found the issue.",
+                "reasoning_content": "The old endpoint returned 404; use /v2 next.",
+            },
+        ])
+
+        request = mock_provider.chat_with_retry.call_args.kwargs["messages"]
+        assert "PRIVATE WORKING TRACE" in request[1]["content"]
+        assert "The old endpoint returned 404" in request[1]["content"]
+        assert "never copy the raw trace" in request[0]["content"]
+
+        entry = store.read_unprocessed_history(since_cursor=0)[0]
+        assert "The old endpoint returned 404" not in entry["content"]
+
     async def test_summarize_raw_dumps_on_llm_failure(self, consolidator, mock_provider, store):
         """On LLM failure, raw-dump messages to HISTORY.md."""
         mock_provider.chat_with_retry.side_effect = Exception("API error")
@@ -64,6 +88,22 @@ class TestConsolidatorSummarize:
         entries = store.read_unprocessed_history(since_cursor=0)
         assert len(entries) == 1
         assert "[RAW]" in entries[0]["content"]
+
+    async def test_raw_fallback_does_not_archive_private_reasoning(
+        self, consolidator, mock_provider, store
+    ):
+        mock_provider.chat_with_retry.side_effect = Exception("API error")
+        await consolidator.archive([
+            {
+                "role": "assistant",
+                "content": "Visible result",
+                "reasoning_content": "PRIVATE TRACE MUST NOT BE RAW ARCHIVED",
+            },
+        ])
+
+        entry = store.read_unprocessed_history(since_cursor=0)[0]
+        assert "Visible result" in entry["content"]
+        assert "PRIVATE TRACE MUST NOT BE RAW ARCHIVED" not in entry["content"]
 
     async def test_summarize_skips_empty_messages(self, consolidator):
         result = await consolidator.archive([])

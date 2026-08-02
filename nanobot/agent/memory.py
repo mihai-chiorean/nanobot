@@ -395,16 +395,35 @@ class MemoryStore:
 
     # -- message formatting utility ------------------------------------------
 
-    @staticmethod
-    def _format_messages(messages: list[dict]) -> str:
+    _REASONING_CHECKPOINT_MAX_CHARS = 32_000
+
+    @classmethod
+    def _format_messages(
+        cls,
+        messages: list[dict],
+        *,
+        include_reasoning: bool = False,
+    ) -> str:
         lines = []
         for message in messages:
-            if not message.get("content"):
-                continue
+            timestamp = str(message.get("timestamp", "?"))[:16]
+            role = str(message.get("role", "unknown")).upper()
             tools = f" [tools: {', '.join(message['tools_used'])}]" if message.get("tools_used") else ""
-            lines.append(
-                f"[{message.get('timestamp', '?')[:16]}] {message['role'].upper()}{tools}: {message['content']}"
-            )
+            content = message.get("content")
+            if content:
+                lines.append(f"[{timestamp}] {role}{tools}: {content}")
+            if include_reasoning and message.get("role") == "assistant":
+                reasoning = message.get("reasoning_content")
+                if isinstance(reasoning, str) and reasoning.strip():
+                    reasoning = reasoning.strip()
+                    if len(reasoning) > cls._REASONING_CHECKPOINT_MAX_CHARS:
+                        reasoning = (
+                            "[Earlier reasoning omitted.]\n"
+                            + reasoning[-cls._REASONING_CHECKPOINT_MAX_CHARS:]
+                        )
+                    lines.append(
+                        f"[{timestamp}] ASSISTANT PRIVATE WORKING TRACE:\n{reasoning}"
+                    )
         return "\n".join(lines)
 
     def raw_archive(self, messages: list[dict], *, max_chars: int | None = None) -> None:
@@ -554,7 +573,10 @@ class Consolidator:
         if not messages:
             return None
         try:
-            formatted = MemoryStore._format_messages(messages)
+            formatted = MemoryStore._format_messages(
+                messages,
+                include_reasoning=True,
+            )
             formatted = self._truncate_to_token_budget(formatted)
             response = await self.provider.chat_with_retry(
                 model=self.model,

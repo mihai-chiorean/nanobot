@@ -1,13 +1,13 @@
-Extract key facts from this conversation. Only output items matching these categories, skip everything else:
-- User facts: personal info, preferences, stated opinions, habits
-- Decisions: choices made, conclusions reached
-- Solutions: working approaches discovered through trial and error, especially non-obvious methods that succeeded after failed attempts
-- Events: plans, deadlines, notable occurrences
-- Preferences: communication style, tool preferences
+Create a compact, private checkpoint that lets the agent resume this conversation without repeating completed reasoning or tool work.
 
-Priority: user corrections and preferences > solutions > decisions > events > environment facts. The most valuable memory prevents the user from having to repeat themselves.
+Preserve only useful state:
+- Current objective, constraints, and unresolved questions
+- User facts, corrections, preferences, decisions, and commitments
+- Conclusions supported by evidence or tool results
+- Attempts that failed and the concrete reason they failed
+- Files, resources, identifiers, and next actions needed to continue
 
-Skip: code patterns derivable from source, git history, or anything already captured in existing memory.
+The input may contain PRIVATE WORKING TRACE sections. Use them to recover conclusions, hypotheses, and failed approaches, but never copy the raw trace or narrate hidden reasoning. Never include passwords, tokens, cookies, authorization headers, private keys, or transient secrets. Skip implementation details that are directly recoverable from source or git history unless they are necessary to explain an unresolved failure.
 
-Output as concise bullet points, one fact per line. No preamble, no commentary.
+Output concise bullets, one state item per line. No preamble or commentary.
 If nothing noteworthy happened, output: (nothing)
