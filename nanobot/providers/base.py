@@ -1,19 +1,24 @@
 """Base LLM provider interface."""
 
+from __future__ import annotations
+
 import asyncio
 import json
 import re
 from abc import ABC, abstractmethod
-from contextlib import suppress
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
 from nanobot.utils.helpers import image_placeholder_text
+
+if TYPE_CHECKING:
+    from nanobot.providers.structured_output import LLMRequestOptions
 
 
 @dataclass
@@ -94,6 +99,7 @@ class LLMProvider(ABC):
     """Base class for LLM providers."""
 
     supports_progress_deltas = False
+    supports_structured_output = False
 
     _CHAT_RETRY_DELAYS = (1, 2, 4)
     _PERSISTENT_MAX_DELAY = 60
@@ -268,6 +274,7 @@ class LLMProvider(ABC):
         temperature: float = 0.7,
         reasoning_effort: str | None = None,
         tool_choice: str | dict[str, Any] | None = None,
+        request_options: LLMRequestOptions | None = None,
     ) -> LLMResponse:
         """
         Send a chat completion request.
@@ -279,6 +286,7 @@ class LLMProvider(ABC):
             max_tokens: Maximum tokens in response.
             temperature: Sampling temperature.
             tool_choice: Tool selection strategy ("auto", "required", or specific tool dict).
+            request_options: Immutable options scoped to this request only.
 
         Returns:
             LLMResponse with content and/or tool calls.
@@ -494,6 +502,7 @@ class LLMProvider(ABC):
         reasoning_effort: str | None = None,
         tool_choice: str | dict[str, Any] | None = None,
         on_content_delta: Callable[[str], Awaitable[None]] | None = None,
+        request_options: LLMRequestOptions | None = None,
     ) -> LLMResponse:
         """Stream a chat completion, calling *on_content_delta* for each text chunk.
 
@@ -502,11 +511,18 @@ class LLMProvider(ABC):
         full content as a single delta.  Providers that support native
         streaming should override this method.
         """
-        response = await self.chat(
-            messages=messages, tools=tools, model=model,
-            max_tokens=max_tokens, temperature=temperature,
-            reasoning_effort=reasoning_effort, tool_choice=tool_choice,
-        )
+        kwargs: dict[str, Any] = {
+            "messages": messages,
+            "tools": tools,
+            "model": model,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "reasoning_effort": reasoning_effort,
+            "tool_choice": tool_choice,
+        }
+        if request_options is not None:
+            kwargs["request_options"] = request_options
+        response = await self.chat(**kwargs)
         if on_content_delta and response.content:
             await on_content_delta(response.content)
         return response
@@ -532,6 +548,7 @@ class LLMProvider(ABC):
         on_content_delta: Callable[[str], Awaitable[None]] | None = None,
         retry_mode: str = "standard",
         on_retry_wait: Callable[[str], Awaitable[None]] | None = None,
+        request_options: LLMRequestOptions | None = None,
     ) -> LLMResponse:
         """Call chat_stream() with retry on transient provider failures."""
         if max_tokens is self._SENTINEL or max_tokens is None:
@@ -547,6 +564,8 @@ class LLMProvider(ABC):
             reasoning_effort=reasoning_effort, tool_choice=tool_choice,
             on_content_delta=on_content_delta,
         )
+        if request_options is not None:
+            kw["request_options"] = request_options
         return await self._run_with_retry(
             self._safe_chat_stream,
             kw,
@@ -566,6 +585,7 @@ class LLMProvider(ABC):
         tool_choice: str | dict[str, Any] | None = None,
         retry_mode: str = "standard",
         on_retry_wait: Callable[[str], Awaitable[None]] | None = None,
+        request_options: LLMRequestOptions | None = None,
     ) -> LLMResponse:
         """Call chat() with retry on transient provider failures.
 
@@ -588,6 +608,8 @@ class LLMProvider(ABC):
             max_tokens=max_tokens, temperature=temperature,
             reasoning_effort=reasoning_effort, tool_choice=tool_choice,
         )
+        if request_options is not None:
+            kw["request_options"] = request_options
         return await self._run_with_retry(
             self._safe_chat,
             kw,

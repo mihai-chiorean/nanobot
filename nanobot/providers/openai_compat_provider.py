@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import importlib.util
 import json
@@ -38,6 +39,7 @@ from nanobot.providers.openai_responses import (
     convert_tools,
     parse_response_output,
 )
+from nanobot.providers.structured_output import LLMRequestOptions
 
 if TYPE_CHECKING:
     from nanobot.providers.registry import ProviderSpec
@@ -61,6 +63,15 @@ _KIMI_THINKING_MODELS: frozenset[str] = frozenset({
     "k2.6-code-preview",
 })
 _OPENAI_COMPAT_REQUEST_TIMEOUT_S = 120.0
+_STRUCTURED_OUTPUT_EXTRA_BODY_KEYS = frozenset({
+    "guided_choice",
+    "guided_grammar",
+    "guided_json",
+    "guided_regex",
+    "guided_whitespace_pattern",
+    "response_format",
+    "structured_outputs",
+})
 
 # Maps ProviderSpec.thinking_style → extra_body builder.
 # Each builder takes a bool (thinking_enabled) and returns the dict to
@@ -244,7 +255,7 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
     Nested dicts are merged key-by-key; all other types in *override*
     replace the corresponding key in *base*.
     """
-    merged = dict(base)
+    merged = copy.deepcopy(base)
     for key, value in override.items():
         if (
             key in merged
@@ -253,7 +264,7 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
         ):
             merged[key] = _deep_merge(merged[key], value)
         else:
-            merged[key] = value
+            merged[key] = copy.deepcopy(value)
     return merged
 
 
@@ -263,6 +274,8 @@ class OpenAICompatProvider(LLMProvider):
     Receives a resolved ``ProviderSpec`` from the caller — no internal
     registry lookups needed.
     """
+
+    supports_structured_output = True
 
     def __init__(
         self,
@@ -277,7 +290,7 @@ class OpenAICompatProvider(LLMProvider):
         self.default_model = default_model
         self.extra_headers = extra_headers or {}
         self._spec = spec
-        self._extra_body = extra_body or {}
+        self._extra_body = copy.deepcopy(extra_body) if extra_body else {}
 
         if api_key and spec and spec.env_key:
             self._setup_env(api_key, api_base)
@@ -536,6 +549,7 @@ class OpenAICompatProvider(LLMProvider):
         temperature: float,
         reasoning_effort: str | None,
         tool_choice: str | dict[str, Any] | None,
+        request_options: LLMRequestOptions | None = None,
     ) -> dict[str, Any]:
         model_name = model or self.default_model
         spec = self._spec
@@ -672,7 +686,37 @@ class OpenAICompatProvider(LLMProvider):
                 # an operational escape hatch for canaries and regressions.
                 chat_template_kwargs.setdefault("preserve_thinking", True)
 
+        self._apply_request_options(kwargs, request_options)
+
         return kwargs
+
+    @staticmethod
+    def _apply_request_options(
+        kwargs: dict[str, Any],
+        request_options: LLMRequestOptions | None,
+    ) -> None:
+        """Apply one-off options without retaining caller-owned dictionaries."""
+        if request_options is None or request_options.structured_output is None:
+            return
+
+        kwargs["response_format"] = (
+            request_options.structured_output.chat_completions_format()
+        )
+
+        # vLLM rejects requests that specify more than one structured-output
+        # mode. A per-request schema overrides configured legacy guided_json,
+        # while unrelated static extra_body settings remain available.
+        extra_body = kwargs.get("extra_body")
+        if isinstance(extra_body, dict):
+            filtered = {
+                key: copy.deepcopy(value)
+                for key, value in extra_body.items()
+                if key not in _STRUCTURED_OUTPUT_EXTRA_BODY_KEYS
+            }
+            if filtered:
+                kwargs["extra_body"] = filtered
+            else:
+                kwargs.pop("extra_body", None)
 
     def _should_use_responses_api(
         self,
@@ -759,6 +803,7 @@ class OpenAICompatProvider(LLMProvider):
         temperature: float,
         reasoning_effort: str | None,
         tool_choice: str | dict[str, Any] | None,
+        request_options: LLMRequestOptions | None = None,
     ) -> dict[str, Any]:
         """Build a Responses API body for direct OpenAI requests."""
         model_name = model or self.default_model
@@ -786,6 +831,11 @@ class OpenAICompatProvider(LLMProvider):
         if tools:
             body["tools"] = convert_tools(tools)
             body["tool_choice"] = tool_choice or "auto"
+
+        if request_options and request_options.structured_output:
+            body["text"] = {
+                "format": request_options.structured_output.responses_text_format(),
+            }
 
         return body
 
@@ -1213,13 +1263,14 @@ class OpenAICompatProvider(LLMProvider):
         temperature: float = 0.7,
         reasoning_effort: str | None = None,
         tool_choice: str | dict[str, Any] | None = None,
+        request_options: LLMRequestOptions | None = None,
     ) -> LLMResponse:
         try:
             if self._should_use_responses_api(model, reasoning_effort):
                 try:
                     body = self._build_responses_body(
                         messages, tools, model, max_tokens, temperature,
-                        reasoning_effort, tool_choice,
+                        reasoning_effort, tool_choice, request_options,
                     )
                     result = parse_response_output(await self._client.responses.create(**body))
                     self._record_responses_success(model, reasoning_effort)
@@ -1236,7 +1287,7 @@ class OpenAICompatProvider(LLMProvider):
 
             kwargs = self._build_kwargs(
                 messages, tools, model, max_tokens, temperature,
-                reasoning_effort, tool_choice,
+                reasoning_effort, tool_choice, request_options,
             )
             return self._parse(await self._client.chat.completions.create(**kwargs))
         except Exception as e:
@@ -1252,6 +1303,7 @@ class OpenAICompatProvider(LLMProvider):
         reasoning_effort: str | None = None,
         tool_choice: str | dict[str, Any] | None = None,
         on_content_delta: Callable[[str], Awaitable[None]] | None = None,
+        request_options: LLMRequestOptions | None = None,
     ) -> LLMResponse:
         idle_timeout_s = int(os.environ.get("NANOBOT_STREAM_IDLE_TIMEOUT_S", "90"))
         try:
@@ -1259,7 +1311,7 @@ class OpenAICompatProvider(LLMProvider):
                 try:
                     body = self._build_responses_body(
                         messages, tools, model, max_tokens, temperature,
-                        reasoning_effort, tool_choice,
+                        reasoning_effort, tool_choice, request_options,
                     )
                     body["stream"] = True
                     stream = await self._client.responses.create(**body)
@@ -1299,7 +1351,7 @@ class OpenAICompatProvider(LLMProvider):
 
             kwargs = self._build_kwargs(
                 messages, tools, model, max_tokens, temperature,
-                reasoning_effort, tool_choice,
+                reasoning_effort, tool_choice, request_options,
             )
             kwargs["stream"] = True
             kwargs["stream_options"] = {"include_usage": True}

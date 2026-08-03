@@ -12,6 +12,7 @@ from oauth_cli_kit.models import OAuthToken
 from oauth_cli_kit.storage import FileTokenStorage
 
 from nanobot.providers.openai_compat_provider import OpenAICompatProvider
+from nanobot.providers.structured_output import LLMRequestOptions
 
 DEFAULT_GITHUB_DEVICE_CODE_URL = "https://github.com/login/device/code"
 DEFAULT_GITHUB_ACCESS_TOKEN_URL = "https://github.com/login/oauth/access_token"
@@ -220,6 +221,7 @@ class GitHubCopilotProvider(OpenAICompatProvider):
         temperature: float = 0.7,
         reasoning_effort: str | None = None,
         tool_choice: str | dict[str, object] | None = None,
+        request_options: LLMRequestOptions | None = None,
     ):
         await self._refresh_client_api_key()
         return await super().chat(
@@ -230,6 +232,7 @@ class GitHubCopilotProvider(OpenAICompatProvider):
             temperature=temperature,
             reasoning_effort=reasoning_effort,
             tool_choice=tool_choice,
+            request_options=request_options,
         )
 
     async def chat_stream(
@@ -242,6 +245,7 @@ class GitHubCopilotProvider(OpenAICompatProvider):
         reasoning_effort: str | None = None,
         tool_choice: str | dict[str, object] | None = None,
         on_content_delta: Callable[[str], None] | None = None,
+        request_options: LLMRequestOptions | None = None,
     ):
         await self._refresh_client_api_key()
         return await super().chat_stream(
@@ -253,4 +257,5 @@ class GitHubCopilotProvider(OpenAICompatProvider):
             reasoning_effort=reasoning_effort,
             tool_choice=tool_choice,
             on_content_delta=on_content_delta,
+            request_options=request_options,
         )
