@@ -1252,6 +1252,7 @@ class AgentLoop:
                         on_stream_end=delivery.on_stream_end,
                         pending_queue=pending,
                         delivery=delivery,
+                        runtime=msg.runtime,
                     )
                     continuing = turn_continuation.internal_continuation_pending(msg.metadata)
                     await delivery.complete(

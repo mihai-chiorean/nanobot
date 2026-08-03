@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from loguru import logger
 
@@ -16,6 +16,9 @@ from nanobot.pairing import (
     generate_code,
     is_approved,
 )
+
+if TYPE_CHECKING:
+    from nanobot.utils.llm_runtime import LLMRuntime
 
 
 class BaseChannel(ABC):
@@ -277,6 +280,27 @@ class BaseChannel(ABC):
                 )
             return
 
+        await self._publish_inbound_message(
+            sender_id=sender_id,
+            chat_id=chat_id,
+            content=content,
+            media=media,
+            metadata=metadata,
+            session_key=session_key,
+        )
+
+    async def _publish_inbound_message(
+        self,
+        sender_id: str,
+        chat_id: str,
+        content: str,
+        media: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+        session_key: str | None = None,
+        *,
+        runtime: LLMRuntime | None = None,
+    ) -> None:
+        """Publish an authorized message with an optional trusted turn runtime."""
         meta = metadata or {}
         if self.supports_streaming:
             meta = {**meta, "_wants_stream": True}
@@ -289,6 +313,7 @@ class BaseChannel(ABC):
             media=media or [],
             metadata=meta,
             session_key_override=session_key,
+            runtime=runtime,
         )
 
         await self.bus.publish_inbound(msg)

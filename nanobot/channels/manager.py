@@ -44,6 +44,7 @@ if TYPE_CHECKING:
     from nanobot.cron.service import CronService
     from nanobot.session.manager import SessionManager
     from nanobot.triggers.local_store import LocalTriggerStore
+    from nanobot.utils.llm_runtime import LLMRuntime
 
 
 def _default_webui_dist() -> Path | None:
@@ -95,6 +96,7 @@ class ChannelManager:
         cron_service: CronService | None = None,
         local_trigger_store: LocalTriggerStore | None = None,
         webui_runtime_model_name: Callable[[], str | None] | None = None,
+        websocket_model_preset_resolver: Callable[[str], LLMRuntime] | None = None,
         webui_cron_pending_job_ids: Callable[[str], set[str]] | None = None,
         webui_local_trigger_pending_ids: Callable[[str], set[str]] | None = None,
         webui_static_dist: bool = True,
@@ -108,6 +110,7 @@ class ChannelManager:
         self._cron_service = cron_service
         self._local_trigger_store = local_trigger_store
         self._webui_runtime_model_name = webui_runtime_model_name
+        self._websocket_model_preset_resolver = websocket_model_preset_resolver
         self._webui_cron_pending_job_ids = webui_cron_pending_job_ids
         self._webui_local_trigger_pending_ids = webui_local_trigger_pending_ids
         self._webui_static_dist = webui_static_dist
@@ -184,6 +187,7 @@ class ChannelManager:
                 logger=logger,
             )
             kwargs["gateway"] = gateway
+            kwargs["model_preset_resolver"] = self._websocket_model_preset_resolver
         channel = cls(section, self.bus, **kwargs)
         if runtime_name and runtime_name != channel.name:
             channel.name = runtime_name

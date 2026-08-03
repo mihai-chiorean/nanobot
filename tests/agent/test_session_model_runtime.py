@@ -3,6 +3,7 @@ import asyncio
 import pytest
 
 from nanobot.agent.loop import AgentLoop
+from nanobot.bus.events import InboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.config.schema import ModelPresetConfig
 from nanobot.nanobot import Nanobot
@@ -104,6 +105,66 @@ async def test_sessions_run_concurrently_with_isolated_model_presets(tmp_path) -
     assert override.calls == ["override-model"]
     assert fast.calls == ["fast-model"]
     assert load_counts == {"fast": 1, "deep": 1}
+
+
+@pytest.mark.asyncio
+async def test_bus_turn_runtime_override_does_not_mutate_session_preset(tmp_path) -> None:
+    base = RecordingProvider("base-model")
+    fast = RecordingProvider("fast-model")
+    one_turn = RecordingProvider("one-turn-model")
+    providers = {"fast": fast, "one-turn": one_turn}
+    presets = {
+        "fast": ModelPresetConfig(model="fast-model", context_window_tokens=16_000),
+        "one-turn": ModelPresetConfig(
+            model="one-turn-model",
+            context_window_tokens=24_000,
+        ),
+    }
+
+    def load_preset(name: str) -> ProviderSnapshot:
+        preset = presets[name]
+        return ProviderSnapshot(
+            provider=providers[name],
+            model=preset.model,
+            context_window_tokens=preset.context_window_tokens,
+            signature=(name, preset.model),
+        )
+
+    loop = AgentLoop(
+        bus=MessageBus(),
+        provider=base,
+        workspace=tmp_path,
+        model="base-model",
+        context_window_tokens=8_000,
+        model_presets=presets,
+        preset_snapshot_loader=load_preset,
+    )
+    loop.schedule_background = lambda coro: coro.close()  # type: ignore[method-assign]
+    session_key = "websocket:one-turn"
+    loop.set_session_model_preset(session_key, "fast")
+    original_default = loop.runtime_resolver.runtime
+    override = loop.runtime_resolver.resolve_override(
+        model=None,
+        model_preset="one-turn",
+    )
+    assert override is not None
+
+    await loop._dispatch(
+        InboundMessage(
+            channel="websocket",
+            sender_id="trusted-client",
+            chat_id="one-turn",
+            content="hello",
+            runtime=override,
+        )
+    )
+
+    assert one_turn.calls == ["one-turn-model"]
+    assert fast.calls == []
+    assert loop.runtime_resolver.runtime is original_default
+    loop.sessions.invalidate(session_key)
+    restored = loop.sessions.get_or_create(session_key)
+    assert model_preset_from_metadata(restored.metadata) == "fast"
 
 
 @pytest.mark.asyncio

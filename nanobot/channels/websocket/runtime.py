@@ -11,7 +11,7 @@ import uuid
 from collections.abc import Callable
 from contextlib import suppress
 from pathlib import Path
-from typing import Any, Self, TypeGuard, cast
+from typing import TYPE_CHECKING, Any, Self, TypeGuard, cast
 
 from pydantic import Field, field_validator, model_validator
 from websockets.asyncio.server import ServerConnection, serve, unix_serve
@@ -73,6 +73,9 @@ from nanobot.webui.metadata import (
 from nanobot.webui.transcript import WEBUI_TRANSCRIPT_INCOMPLETE_KEY
 from nanobot.webui.transcription_ws import webui_transcription_event
 from nanobot.webui.websocket_logging import websockets_server_logger
+
+if TYPE_CHECKING:
+    from nanobot.utils.llm_runtime import LLMRuntime
 
 # Plain HTTP WebUI routes also run through websockets.process_request.
 _WEBUI_HTTP_OPEN_TIMEOUT_S = 360.0
@@ -261,6 +264,7 @@ class WebSocketChannel(BaseChannel):
         bus: MessageBus,
         *,
         gateway: GatewayServices,
+        model_preset_resolver: Callable[[str], LLMRuntime] | None = None,
     ):
         if isinstance(config, dict):
             config = WebSocketConfig.model_validate(config)
@@ -278,6 +282,7 @@ class WebSocketChannel(BaseChannel):
         self._server_task: asyncio.Task[None] | None = None
 
         self.gateway = gateway
+        self._model_preset_resolver = model_preset_resolver
         self._http_router = gateway.http
         self._tokens = gateway.tokens
         self._media = gateway.media
@@ -729,6 +734,52 @@ class WebSocketChannel(BaseChannel):
                 )
                 return
 
+            runtime = None
+            if "model_preset" in envelope:
+                model_preset = envelope.get("model_preset")
+                if (
+                    not isinstance(model_preset, str)
+                    or not model_preset.strip()
+                    or len(model_preset) > 128
+                ):
+                    await self._send_event(
+                        connection,
+                        "error",
+                        detail="model_preset_rejected",
+                        reason="invalid",
+                        **rejection_fields,
+                    )
+                    return
+                if self._model_preset_resolver is None:
+                    await self._send_event(
+                        connection,
+                        "error",
+                        detail="model_preset_rejected",
+                        reason="unsupported",
+                        **rejection_fields,
+                    )
+                    return
+                try:
+                    runtime = self._model_preset_resolver(model_preset.strip())
+                except KeyError:
+                    await self._send_event(
+                        connection,
+                        "error",
+                        detail="model_preset_rejected",
+                        reason="unknown",
+                        **rejection_fields,
+                    )
+                    return
+                except ValueError:
+                    await self._send_event(
+                        connection,
+                        "error",
+                        detail="model_preset_rejected",
+                        reason="invalid",
+                        **rejection_fields,
+                    )
+                    return
+
             raw_media = envelope.get("media")
             media_paths: list[str] = []
             if raw_media is not None:
@@ -827,14 +878,24 @@ class WebSocketChannel(BaseChannel):
                     })
                     if quote is not None:
                         metadata[RUNTIME_CONTEXT_INPUT_META] = [quote]
-                await self._handle_message(
-                    sender_id=client_id,
-                    chat_id=cid,
-                    content=content,
-                    media=media_paths or None,
-                    metadata=metadata,
-                    is_dm=False,
-                )
+                if runtime is None:
+                    await self._handle_message(
+                        sender_id=client_id,
+                        chat_id=cid,
+                        content=content,
+                        media=media_paths or None,
+                        metadata=metadata,
+                        is_dm=False,
+                    )
+                else:
+                    await self._publish_inbound_message(
+                        sender_id=client_id,
+                        chat_id=cid,
+                        content=content,
+                        media=media_paths or None,
+                        metadata=metadata,
+                        runtime=runtime,
+                    )
                 accepted = True
             finally:
                 if not accepted and queued_owner is not None:

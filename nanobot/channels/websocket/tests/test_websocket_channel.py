@@ -69,7 +69,12 @@ from .ws_test_client import http_get as _http_get
 _PORT = 29876
 
 
-def _ch(bus: Any, **kw: Any) -> WebSocketChannel:
+def _ch(
+    bus: Any,
+    *,
+    model_preset_resolver: Any = None,
+    **kw: Any,
+) -> WebSocketChannel:
     cfg: dict[str, Any] = {
         "enabled": True,
         "allowFrom": ["*"],
@@ -91,7 +96,12 @@ def _ch(bus: Any, **kw: Any) -> WebSocketChannel:
         runtime_surface="browser",
         runtime_capabilities_overrides=None,
     )
-    return WebSocketChannel(cfg, bus, gateway=gateway)
+    return WebSocketChannel(
+        cfg,
+        bus,
+        gateway=gateway,
+        model_preset_resolver=model_preset_resolver,
+    )
 
 
 def _basic_handler(bus: Any, **kw: Any) -> GatewayServices:
@@ -432,6 +442,114 @@ async def test_webui_message_envelope_marks_inbound_metadata(bus: MagicMock) -> 
         "turn_seq": 1,
     }
     assert isinstance(lines[0].get("created_at_ms"), int)
+
+
+@pytest.mark.asyncio
+async def test_message_envelope_resolves_model_preset_for_one_turn(bus: MagicMock) -> None:
+    runtime = MagicMock()
+    resolver = MagicMock(return_value=runtime)
+    channel = _ch(bus, model_preset_resolver=resolver)
+    conn = AsyncMock()
+    conn.remote_address = ("127.0.0.1", 50123)
+
+    await channel._dispatch_envelope(
+        conn,
+        "trusted-client",
+        {
+            "type": "message",
+            "chat_id": "chat-preset",
+            "content": "hello",
+            "model_preset": "fast",
+        },
+    )
+
+    resolver.assert_called_once_with("fast")
+    inbound = bus.publish_inbound.await_args.args[0]
+    assert inbound.runtime is runtime
+
+
+@pytest.mark.asyncio
+async def test_message_envelope_without_model_preset_preserves_default_path(
+    bus: MagicMock,
+) -> None:
+    resolver = MagicMock()
+    channel = _ch(bus, model_preset_resolver=resolver)
+    conn = AsyncMock()
+    conn.remote_address = ("127.0.0.1", 50123)
+
+    await channel._dispatch_envelope(
+        conn,
+        "trusted-client",
+        {"type": "message", "chat_id": "chat-default", "content": "hello"},
+    )
+
+    resolver.assert_not_called()
+    inbound = bus.publish_inbound.await_args.args[0]
+    assert inbound.runtime is None
+
+
+@pytest.mark.asyncio
+async def test_message_envelope_rejects_oversized_model_preset_with_bounded_error(
+    bus: MagicMock,
+) -> None:
+    supplied_name = "unknown-" + "x" * 10_000
+    resolver = MagicMock()
+    channel = _ch(bus, model_preset_resolver=resolver)
+    conn = AsyncMock()
+    conn.remote_address = ("127.0.0.1", 50123)
+
+    await channel._dispatch_envelope(
+        conn,
+        "trusted-client",
+        {
+            "type": "message",
+            "chat_id": "chat-unknown",
+            "content": "hello",
+            "model_preset": supplied_name,
+            "turn_id": "turn-unknown",
+        },
+    )
+
+    payload = json.loads(conn.send.await_args.args[0])
+    assert payload == {
+        "event": "error",
+        "detail": "model_preset_rejected",
+        "reason": "invalid",
+        "chat_id": "chat-unknown",
+        "turn_id": "turn-unknown",
+    }
+    assert len(conn.send.await_args.args[0]) < 200
+    assert supplied_name not in conn.send.await_args.args[0]
+    resolver.assert_not_called()
+    bus.publish_inbound.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_message_envelope_rejects_unknown_model_preset(bus: MagicMock) -> None:
+    resolver = MagicMock(side_effect=KeyError("missing"))
+    channel = _ch(bus, model_preset_resolver=resolver)
+    conn = AsyncMock()
+    conn.remote_address = ("127.0.0.1", 50123)
+
+    await channel._dispatch_envelope(
+        conn,
+        "trusted-client",
+        {
+            "type": "message",
+            "chat_id": "chat-unknown",
+            "content": "hello",
+            "model_preset": "missing",
+        },
+    )
+
+    assert json.loads(conn.send.await_args.args[0]) == {
+        "event": "error",
+        "detail": "model_preset_rejected",
+        "reason": "unknown",
+        "chat_id": "chat-unknown",
+    }
+    resolver.assert_called_once_with("missing")
+    bus.publish_inbound.assert_not_awaited()
 
 
 @pytest.mark.asyncio
