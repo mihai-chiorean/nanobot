@@ -11,6 +11,12 @@ import pytest
 
 from nanobot.providers.base import LLMProvider, LLMResponse
 from nanobot.providers.openai_compat_provider import OpenAICompatProvider
+from nanobot.providers.registry import find_by_name
+from nanobot.providers.request_context import (
+    current_scheduling_class,
+    reset_scheduling_class,
+    set_scheduling_class,
+)
 from nanobot.providers.structured_output import (
     JSONSchemaOutput,
     LLMRequestOptions,
@@ -78,6 +84,77 @@ def test_schema_propagates_using_standard_response_format() -> None:
             "strict": True,
         },
     }
+
+
+def test_scheduling_class_is_scoped_to_one_request_header() -> None:
+    provider = _provider()
+
+    foreground = _request_kwargs(
+        provider,
+        LLMRequestOptions(scheduling_class="foreground"),
+    )
+    background = _request_kwargs(
+        provider,
+        LLMRequestOptions(scheduling_class="background"),
+    )
+    ordinary = _request_kwargs(provider)
+
+    assert foreground["extra_headers"] == {
+        "X-Ziggy-Scheduling-Class": "foreground"
+    }
+    assert background["extra_headers"] == {
+        "X-Ziggy-Scheduling-Class": "background"
+    }
+    assert "extra_headers" not in ordinary
+
+
+def test_local_qwen_inherits_background_scheduling_context() -> None:
+    provider = OpenAICompatProvider(
+        api_key="test-key",
+        api_base="http://127.0.0.1:8001/v1",
+        default_model="qwen3.6-35b",
+        spec=find_by_name("custom"),
+    )
+    token = set_scheduling_class("background")
+    try:
+        kwargs = _request_kwargs(provider)
+    finally:
+        reset_scheduling_class(token)
+
+    assert kwargs["extra_headers"] == {
+        "X-Ziggy-Scheduling-Class": "background"
+    }
+
+
+def test_local_qwen_defaults_to_foreground_without_request_context() -> None:
+    provider = OpenAICompatProvider(
+        api_key="test-key",
+        api_base="http://127.0.0.1:8001/v1",
+        default_model="qwen3.6-35b",
+        spec=find_by_name("custom"),
+    )
+
+    kwargs = _request_kwargs(provider)
+
+    assert kwargs["extra_headers"] == {
+        "X-Ziggy-Scheduling-Class": "foreground"
+    }
+
+
+@pytest.mark.asyncio
+async def test_scheduling_context_is_inherited_by_child_tasks() -> None:
+    async def read_context() -> str:
+        await asyncio.sleep(0)
+        return current_scheduling_class()
+
+    token = set_scheduling_class("background")
+    try:
+        child = asyncio.create_task(read_context())
+    finally:
+        reset_scheduling_class(token)
+
+    assert current_scheduling_class() == "foreground"
+    assert await child == "background"
 
 
 def test_responses_api_receives_equivalent_text_format() -> None:
@@ -275,7 +352,7 @@ async def test_request_options_survive_retry_attempts(monkeypatch: pytest.Monkey
     async def no_sleep(_: float) -> None:
         return None
 
-    monkeypatch.setattr("nanobot.providers.base.asyncio.sleep", no_sleep)
+    monkeypatch.setattr(asyncio, "sleep", no_sleep)
 
     result = await generate_structured(
         provider,

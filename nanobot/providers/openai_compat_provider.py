@@ -39,6 +39,7 @@ from nanobot.providers.openai_responses import (
     convert_tools,
     parse_response_output,
 )
+from nanobot.providers.request_context import current_scheduling_class
 from nanobot.providers.structured_output import LLMRequestOptions
 
 if TYPE_CHECKING:
@@ -686,6 +687,15 @@ class OpenAICompatProvider(LLMProvider):
                 # an operational escape hatch for canaries and regressions.
                 chat_template_kwargs.setdefault("preserve_thinking", True)
 
+        if local_qwen and (
+            request_options is None or request_options.scheduling_class is None
+        ):
+            request_options = LLMRequestOptions(
+                structured_output=(
+                    request_options.structured_output if request_options else None
+                ),
+                scheduling_class=current_scheduling_class(),
+            )
         self._apply_request_options(kwargs, request_options)
 
         return kwargs
@@ -696,7 +706,17 @@ class OpenAICompatProvider(LLMProvider):
         request_options: LLMRequestOptions | None,
     ) -> None:
         """Apply one-off options without retaining caller-owned dictionaries."""
-        if request_options is None or request_options.structured_output is None:
+        if request_options is None:
+            return
+
+        if request_options.scheduling_class is not None:
+            extra_headers = copy.deepcopy(kwargs.get("extra_headers", {}))
+            extra_headers["X-Ziggy-Scheduling-Class"] = (
+                request_options.scheduling_class
+            )
+            kwargs["extra_headers"] = extra_headers
+
+        if request_options.structured_output is None:
             return
 
         kwargs["response_format"] = (

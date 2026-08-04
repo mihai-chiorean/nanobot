@@ -1,11 +1,13 @@
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from nanobot.agent.loop import AgentLoop
 import nanobot.agent.memory as memory_module
+from nanobot.agent.loop import AgentLoop
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMResponse
+from nanobot.providers.request_context import current_scheduling_class
 
 
 def _make_loop(tmp_path, *, estimated_tokens: int, context_window_tokens: int) -> AgentLoop:
@@ -28,6 +30,42 @@ def _make_loop(tmp_path, *, estimated_tokens: int, context_window_tokens: int) -
     loop.tools.get_definitions = MagicMock(return_value=[])
     loop.consolidator._SAFETY_BUFFER = 0
     return loop
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("metadata", "expected"),
+    [
+        (None, "foreground"),
+        ({"work_mode": "background"}, "background"),
+        ({"work_mode": "scheduled"}, "background"),
+    ],
+)
+async def test_agent_run_binds_and_restores_scheduling_class(
+    tmp_path,
+    metadata,
+    expected,
+) -> None:
+    loop = _make_loop(tmp_path, estimated_tokens=0, context_window_tokens=200)
+    observed: list[str] = []
+
+    async def fake_run(_spec):
+        observed.append(current_scheduling_class())
+        return SimpleNamespace(
+            stop_reason="completed",
+            final_content="done",
+            messages=[],
+            tools_used=[],
+            usage={},
+            had_injections=False,
+        )
+
+    loop.runner.run = AsyncMock(side_effect=fake_run)
+
+    await loop._run_agent_loop([], metadata=metadata)
+
+    assert observed == [expected]
+    assert current_scheduling_class() == "foreground"
 
 
 @pytest.mark.asyncio

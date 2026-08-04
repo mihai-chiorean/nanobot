@@ -11,7 +11,7 @@ import json
 import re
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 from jsonschema import FormatChecker, ValidationError, validators
 from jsonschema.exceptions import SchemaError
@@ -139,6 +139,7 @@ class LLMRequestOptions:
     """Optional behavior that applies to exactly one provider request."""
 
     structured_output: JSONSchemaOutput | None = None
+    scheduling_class: Literal["foreground", "background"] | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -56,6 +56,10 @@ from nanobot.config.schema import AgentDefaults
 from nanobot.observability import observe_turn
 from nanobot.providers.base import LLMProvider
 from nanobot.providers.factory import ProviderSnapshot
+from nanobot.providers.request_context import (
+    reset_scheduling_class,
+    set_scheduling_class,
+)
 from nanobot.session.manager import Session, SessionManager
 from nanobot.utils.document import extract_documents
 from nanobot.utils.helpers import image_placeholder_text
@@ -986,8 +990,13 @@ class AgentLoop:
         run_max_tokens = None
         run_temperature = None
         run_reasoning_profile = None
+        run_scheduling_class = "foreground"
+        background_work = False
         allow_reasoning_escalation = False
         if isinstance(metadata, dict):
+            background_work = metadata.get("work_mode") in {"background", "scheduled"}
+            if background_work:
+                run_scheduling_class = "background"
             requested_profile = parse_reasoning_profile(metadata.get("reasoning_profile"))
             uses_raw_generation_controls = (
                 "reasoning_effort" in metadata or "max_tokens" in metadata
@@ -996,7 +1005,7 @@ class AgentLoop:
                 decision = resolve_reasoning_profile(
                     requested_profile,
                     initial_messages,
-                    background_work=metadata.get("work_mode") == "background",
+                    background_work=background_work,
                 )
                 run_reasoning_profile = decision.generation.name.value
                 run_reasoning_effort = decision.generation.reasoning_effort
@@ -1020,6 +1029,7 @@ class AgentLoop:
                 ):
                     run_max_tokens = candidate_max_tokens
         file_state_token = bind_file_states(self._file_state_store.for_session(active_session_key))
+        scheduling_token = set_scheduling_class(run_scheduling_class)
         work_tokens = set_work_context(
             store=self.work_store if task_id else None,
             task_id=task_id,
@@ -1052,6 +1062,7 @@ class AgentLoop:
             ))
         finally:
             reset_work_context(work_tokens)
+            reset_scheduling_class(scheduling_token)
             reset_file_states(file_state_token)
         self._last_usage = result.usage
         if result.stop_reason == "max_iterations":
