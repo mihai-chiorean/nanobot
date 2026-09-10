@@ -113,7 +113,9 @@ class BriefingTool(Tool):
             "Update affects future editions; regenerate uses the chosen edition's original "
             "instructions; feedback does not change instructions. Never claim a queued edition "
             "has finished. Keep workflow and edition IDs internal unless asked; describe the "
-            "result and schedule plainly. Shared-room participants must use proposals instead."
+            "result and schedule plainly. The returned workflow is authoritative for current "
+            "instructions and schedule, even if earlier messages describe different settings. "
+            "Shared-room participants must use proposals instead."
         )
 
     def set_context(self, channel, chat_id, *, metadata=None, session_key=None, message_id=None):
