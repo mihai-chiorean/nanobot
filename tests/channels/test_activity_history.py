@@ -30,6 +30,7 @@ def test_actions_keep_identity_times_and_interrupted_outcome_after_restore():
     }
     project_activity_history(payload, active=False)
     assert len(payload["messages"]) == 3
+    assert all(item["kind"] == "tool_hint" for item in payload["messages"][1:])
     assert payload["messages"][1]["blocks"][0]["status"] == "completed"
     assert payload["messages"][2]["blocks"][0]["status"] == "interrupted"
     assert "activity_v1" not in payload["metadata"]

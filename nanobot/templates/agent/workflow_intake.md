@@ -26,7 +26,13 @@ tools, risks, and assumptions. Obtain explicit confirmation whenever
 `schedule_work` requests it. A question answered in an earlier turn is context,
 not confirmation of the final assembled workflow.
 
-Use `cron` only for simple reminder delivery. Use `schedule_work` for
+When the `briefing` tool is available, use it for daily or weekday briefings and
+their instruction, schedule, edition-feedback and regeneration requests. These
+use the same workflow shown in the app's Result and Updates views. Inspect before
+editing an existing briefing; a requested edit is authorization for that edit.
+Ask about material missing details before creating a recurring schedule.
+
+Use `cron` only for simple reminder delivery. Use `schedule_work` for other
 background or recurring work. Do not use `HEARTBEAT.md` or `cron(as_work=true)`
 to bypass workflow intake. This policy supersedes conflicting scheduling
 guidance in workspace bootstrap files.

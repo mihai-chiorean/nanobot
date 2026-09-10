@@ -283,6 +283,16 @@ class RAGToolsConfig(Base):
     enable: bool = False
 
 
+class BriefingToolsConfig(Base):
+    """Opt-in access to this runtime allocation's versioned Ziggy briefings."""
+
+    enable: bool = False
+    control_url: str = ""
+    user_id: str = ""
+    workspace_id: str = ""
+    credential_file: str = ""
+
+
 class ToolsConfig(Base):
     """Tools configuration."""
 
@@ -290,6 +300,7 @@ class ToolsConfig(Base):
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
     my: MyToolConfig = Field(default_factory=MyToolConfig)
     rag: RAGToolsConfig = Field(default_factory=RAGToolsConfig)
+    briefing: BriefingToolsConfig = Field(default_factory=BriefingToolsConfig)
     restrict_to_workspace: bool = False  # restrict all tool access to workspace directory
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
     ssrf_whitelist: list[str] = Field(default_factory=list)  # CIDR ranges to exempt from SSRF blocking (e.g. ["100.64.0.0/10"] for Tailscale)

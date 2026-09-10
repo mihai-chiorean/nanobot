@@ -71,6 +71,7 @@ def project_activity_history(payload, *, active: bool):
             "id": "tool-" + record.get("call_id", ""),
             "chat_id": payload.get("key", "").removeprefix("websocket:"),
             "role": "assistant",
+            "kind": "tool_hint",
             "content": record.get("summary", "Tool activity"),
             "created_at": record.get("started_at"),
             "blocks": [block],

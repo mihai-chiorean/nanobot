@@ -34,6 +34,14 @@ def format_tool_hints(tool_calls: list) -> str:
 
     formatted = []
     for tc in tool_calls:
+        if tc.name == "briefing":
+            formatted.append({
+                "inspect": "Checking your briefing", "create": "Creating your briefing",
+                "update": "Updating future editions", "pause": "Pausing your briefing",
+                "resume": "Resuming your briefing", "regenerate": "Requesting a new edition",
+                "feedback": "Saving edition feedback",
+            }.get(_get_args(tc).get("action"), "Checking your briefing"))
+            continue
         fmt = _TOOL_FORMATS.get(tc.name)
         if fmt:
             formatted.append(_fmt_known(tc, fmt))

@@ -434,12 +434,13 @@ class AgentLoop:
             workspace,
             timezone=timezone,
             disabled_skills=disabled_skills,
-            workflow_scheduling=cron_service is not None,
+            workflow_scheduling=cron_service is not None or _tc.briefing.enable,
         )
         self.sessions = session_manager or SessionManager(workspace)
         self.chat_inbox = ChatInboxStore(workspace)
         self.work_store = WorkStore(workspace)
         self.tools = ToolRegistry()
+        self._briefing_config = _tc.briefing
         self._audit_logger = AuditLogger(self.workspace / "audit.jsonl")
         self.tools.set_audit_logger(self._audit_logger)
         # One file-read/write tracker per logical session. The tool registry is
@@ -591,6 +592,10 @@ class AgentLoop:
         self.tools.register(ReportProgressTool())
         self.tools.register(PublishArtifactTool())
         self.tools.register(PublishFileTool(workspace=self.workspace))
+        if self._briefing_config.enable:
+            from nanobot.agent.tools.briefing import BriefingTool
+
+            self.tools.register(BriefingTool(self._briefing_config, self.sessions))
         if self.cron_service:
             self.tools.register(
                 CronTool(self.cron_service, default_timezone=self.context.timezone or "UTC")
@@ -647,13 +652,15 @@ class AgentLoop:
             effective_key = UNIFIED_SESSION_KEY
         else:
             effective_key = f"{channel}:{chat_id}"
-        for name in ("message", "spawn", "cron", "schedule_work", "my"):
+        for name in ("message", "spawn", "cron", "schedule_work", "briefing", "my"):
             if tool := self.tools.get(name):
                 if hasattr(tool, "set_context"):
                     if name == "spawn":
                         tool.set_context(channel, chat_id, effective_key=effective_key)
                         if hasattr(tool, "set_origin_message_id"):
                             tool.set_origin_message_id(message_id)
+                    elif name == "briefing":
+                        tool.set_context(channel, chat_id, metadata=metadata, session_key=session_key, message_id=message_id)
                     elif name in {"cron", "schedule_work"}:
                         tool.set_context(channel, chat_id, metadata=metadata, session_key=session_key)
                     elif name == "message":
