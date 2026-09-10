@@ -880,6 +880,13 @@ def _run_gateway(
         active_session_keys=getattr(agent, "active_session_keys", None),
     )
 
+    websocket_channel = channels.channels.get("websocket")
+    if websocket_channel is not None and getattr(websocket_channel.config, "shared_room_collaboration_enabled", False):
+        from nanobot.channels.room_work import connected_read_executor
+        connector_server = websocket_channel.config.shared_room_connector_server
+        if connector_server in agent._mcp_servers:
+            websocket_channel.connected_room_executor = connected_read_executor(agent, connector_server)
+
     def _pick_heartbeat_target() -> tuple[str, str]:
         """Pick a routable channel/chat target for heartbeat-triggered messages."""
         enabled = set(channels.enabled_channels)

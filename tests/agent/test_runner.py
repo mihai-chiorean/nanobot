@@ -1303,6 +1303,46 @@ async def test_runner_passes_cached_tokens_to_hook_context():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stub", ["Let me check the current state of things.", "Here are the two questions:"])
+async def test_incomplete_final_retries_without_user_nudge(stub):
+    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+    provider = MagicMock()
+    provider.chat_with_retry = AsyncMock(side_effect=[
+        LLMResponse(content=stub, finish_reason="stop"),
+        LLMResponse(content="What is your budget? What is your deadline?", finish_reason="stop"),
+    ])
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    result = await AgentRunner(provider).run(AgentRunSpec(
+        initial_messages=[{"role": "user", "content": "Help plan this."}],
+        tools=tools, model="test-model", max_iterations=5, max_tool_result_chars=16000,
+    ))
+    assert result.stop_reason == "completed"
+    assert result.final_content == "What is your budget? What is your deadline?"
+    assert provider.chat_with_retry.await_count == 2
+    assert not any(m.get("role") == "assistant" and m.get("content") == stub for m in result.messages)
+
+
+@pytest.mark.asyncio
+async def test_incomplete_final_retries_are_bounded_and_not_successful():
+    from nanobot.agent.runner import AgentRunSpec, AgentRunner, _incomplete_final
+    assert not _incomplete_final("The build passed. You can open the app.")
+    assert not _incomplete_final("Should I build it?")
+    assert not _incomplete_final("I can't proceed without your approval.")
+    provider = MagicMock()
+    provider.chat_with_retry = AsyncMock(return_value=LLMResponse(content="Let me check that.", finish_reason="stop"))
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    result = await AgentRunner(provider).run(AgentRunSpec(
+        initial_messages=[{"role": "user", "content": "Check it."}],
+        tools=tools, model="test-model", max_iterations=10, max_tool_result_chars=16000,
+    ))
+    assert result.stop_reason == "incomplete_response"
+    assert provider.chat_with_retry.await_count == 3
+    assert "not confirmed complete" in result.final_content
+
+
+@pytest.mark.asyncio
 async def test_length_recovery_continues_from_truncated_output():
     """When finish_reason is 'length', runner should insert a continuation
     prompt and retry, stitching partial outputs into the final result."""

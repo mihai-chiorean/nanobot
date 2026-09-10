@@ -25,6 +25,9 @@ class TransportRequest:
     path: str
     headers: Any
     body: bytes = b""
+    # aiohttp's ``path_qs`` decodes percent escapes. Keep the original
+    # request target for routes whose authorization contract is canonical.
+    raw_path: str | None = None
 
 
 @dataclass(slots=True)
@@ -130,8 +133,9 @@ async def run_channel_server(
     async def handle(request: web.Request) -> web.StreamResponse:
         transport_request = TransportRequest(
             method=request.method,
-            path=request.path_qs,
+            path=request.raw_path,
             headers=request.headers,
+            raw_path=request.raw_path,
         )
         connection = AiohttpConnection(request, transport_request)
         if request.can_read_body and request.method in {"POST", "PUT", "PATCH"}:

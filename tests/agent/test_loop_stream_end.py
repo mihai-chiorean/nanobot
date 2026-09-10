@@ -24,7 +24,34 @@ def _make_loop(tmp_path: Path) -> AgentLoop:
 
 
 @pytest.mark.asyncio
-async def test_on_stream_end_fires_on_successful_turn(tmp_path: Path) -> None:
+@pytest.mark.parametrize("stop_reason,status", [
+    ("completed", "succeeded"), ("tool_error", "failed"),
+    ("max_iterations", "failed"), ("empty_final_response", "failed"),
+    ("incomplete_response", "failed"), ("ask_user", "waiting"),
+])
+async def test_websocket_final_is_delivered_and_work_result_is_complete(tmp_path, stop_reason, status):
+    loop = _make_loop(tmp_path)
+    loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=False)
+    loop._record_work_status = AsyncMock()
+    answer = "Complete result. " * 100
+    loop._run_agent_loop = AsyncMock(return_value=(answer, [], [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": answer},
+    ], stop_reason, False))
+    result = await loop._process_message(
+        InboundMessage(channel="websocket", sender_id="u1", chat_id="c1", content="hi", metadata={"explicit_final_message": True}),
+        on_stream=AsyncMock(), on_stream_end=AsyncMock(),
+    )
+    assert result is not None
+    assert not result.metadata.get("_streamed")
+    assert loop._record_work_status.await_args.args[1] == status
+    assert loop._record_work_status.await_args.kwargs["result_summary"] == answer
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("channel", ["discord", "websocket"])
+async def test_on_stream_end_fires_on_successful_turn(tmp_path: Path, channel: str) -> None:
     """on_stream_end(resuming=False) must be awaited once at the end of a normal turn."""
     loop = _make_loop(tmp_path)
     loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=False)
@@ -43,13 +70,14 @@ async def test_on_stream_end_fires_on_successful_turn(tmp_path: Path) -> None:
 
     on_stream_end = AsyncMock()
 
-    await loop._process_message(
-        InboundMessage(channel="discord", sender_id="u1", chat_id="c1", content="hi"),
+    result = await loop._process_message(
+        InboundMessage(channel=channel, sender_id="u1", chat_id="c1", content="hi"),
         on_stream=AsyncMock(),
         on_stream_end=on_stream_end,
     )
 
     on_stream_end.assert_awaited_once_with(resuming=False)
+    assert result.metadata.get("_streamed") is True
 
 
 @pytest.mark.asyncio

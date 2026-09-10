@@ -39,6 +39,12 @@ from nanobot.agent.tools.file_state import FileStateStore, bind_file_states, res
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.notebook import NotebookEditTool
+from nanobot.agent.tools.publish_file import (
+    PublishFileTool,
+    PublishFileTurn,
+    bind_publish_file_turn,
+    reset_publish_file_turn,
+)
 from nanobot.agent.tools.recall import IngestTool, RecallTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.schedule_work import ScheduleWorkTool
@@ -584,6 +590,7 @@ class AgentLoop:
         self.tools.register(SpawnTool(manager=self.subagents))
         self.tools.register(ReportProgressTool())
         self.tools.register(PublishArtifactTool())
+        self.tools.register(PublishFileTool(workspace=self.workspace))
         if self.cron_service:
             self.tools.register(
                 CronTool(self.cron_service, default_timezone=self.context.timezone or "UTC")
@@ -873,6 +880,7 @@ class AgentLoop:
         metadata: dict[str, Any] | None = None,
         session_key: str | None = None,
         pending_queue: asyncio.Queue | None = None,
+        publish_file_turn: PublishFileTurn | None = None,
     ) -> tuple[str | None, list[str], list[dict], str, bool]:
         """Run the agent iteration loop.
 
@@ -1035,6 +1043,11 @@ class AgentLoop:
             task_id=task_id,
             workspace=self.workspace if task_id else None,
         )
+        publication_token = (
+            bind_publish_file_turn(publish_file_turn)
+            if publish_file_turn is not None
+            else None
+        )
         try:
             result = await self.runner.run(AgentRunSpec(
                 initial_messages=initial_messages,
@@ -1061,6 +1074,8 @@ class AgentLoop:
                 injection_callback=_drain_pending,
             ))
         finally:
+            if publication_token is not None:
+                reset_publish_file_turn(publication_token)
             reset_work_context(work_tokens)
             reset_scheduling_class(scheduling_token)
             reset_file_states(file_state_token)
@@ -1664,6 +1679,9 @@ class AgentLoop:
             meta["_progress"] = True
             meta["_tool_hint"] = tool_hint
             if tool_events:
+                from nanobot.utils.activity_history import record_tool_activity
+                record_tool_activity(session, tool_events)
+                self.sessions.save(session, fsync=True)
                 meta["_tool_events"] = tool_events
             await self.bus.publish_outbound(
                 OutboundMessage(
@@ -1712,6 +1730,25 @@ class AgentLoop:
             self.sessions.save(session)
             user_persisted_early = True
 
+        publish_file_turn = PublishFileTurn(
+            self.sessions,
+            key,
+            # Publish links are a WebSocket-client capability. Background
+            # Work may explicitly opt in so reports tied to its own session
+            # can be handed back through the same authenticated route.
+            enabled=(
+                not shared_room
+                and (
+                    msg.channel == "websocket"
+                    or msg.metadata.get("work_mode") in {"background", "scheduled"}
+                )
+            ),
+        )
+        persisted_before = len(session.messages)
+        # ContextBuilder may merge the current user message into a preceding
+        # discussion message. Capture the actual boundary before the loop can
+        # append to it; assuming history + user would skip the first reply.
+        initial_message_count = len(initial_messages)
         final_content, _, all_msgs, stop_reason, had_injections = await self._run_agent_loop(
             initial_messages,
             on_progress=on_progress or _bus_progress,
@@ -1726,14 +1763,20 @@ class AgentLoop:
             metadata=msg.metadata,
             session_key=key,
             pending_queue=pending_queue,
+            publish_file_turn=publish_file_turn,
         )
 
         if final_content is None or not final_content.strip():
             final_content = EMPTY_FINAL_RESPONSE_MESSAGE
 
         # Skip the already-persisted user message when saving the turn
-        save_skip = 1 + len(history) + (1 if user_persisted_early else 0)
+        save_skip = initial_message_count - (0 if user_persisted_early else 1)
         self._save_turn(session, all_msgs, save_skip)
+        self.sessions.grant_published_files(
+            session,
+            publish_file_turn.publications,
+            message_start=persisted_before,
+        )
         session.enforce_file_cap(
             on_archive=None if shared_room else self.context.memory.raw_archive
         )
@@ -1762,7 +1805,9 @@ class AgentLoop:
             msg.channel,
         )
         if on_stream is not None and stop_reason not in {"ask_user", "error"}:
-            meta["_streamed"] = True
+            # WebSocket consumers need an explicit final payload after the
+            # stream boundary (which may also precede ask_user or a retry).
+            meta["_streamed"] = not (msg.channel == "websocket" and msg.metadata.get("explicit_final_message") is True)
             # max_iterations already fires on_stream_end; emit it for the
             # normal "completed" path so Discord's _finalize_stream runs and
             # typing stops.
@@ -1770,7 +1815,7 @@ class AgentLoop:
                 await on_stream_end(resuming=False)
         if stop_reason == "ask_user":
             await self._record_work_status(msg, "waiting", result_summary=final_content)
-        elif stop_reason == "error":
+        elif stop_reason in {"error", "tool_error", "max_iterations", "empty_final_response", "incomplete_response"}:
             await self._record_work_status(
                 msg,
                 "failed",
@@ -1781,7 +1826,7 @@ class AgentLoop:
             await self._record_work_status(
                 msg,
                 "succeeded",
-                result_summary=final_content[:500],
+                result_summary=final_content,
             )
             artifact_refs = self._work_artifact_refs(msg)
             if artifact_refs:

@@ -29,4 +29,5 @@ Output is rendered in a terminal. Avoid markdown headings and tables. Use plain 
 {% include 'agent/_snippets/untrusted_content.md' %}
 
 Reply directly with text for conversations. Only use the 'message' tool to send to a specific chat channel.
+When you refer a reader to a generated Markdown report or file in the workspace, call `publish_file` and include its returned Markdown download link unchanged. Do not give a raw filesystem path as a download link.
 IMPORTANT: To send files (images, video, audio, documents) to the user, you MUST call the 'message' tool with the 'media' parameter. Do NOT use read_file to "send" a file — reading a file only shows its content to you, it does NOT deliver the file to the user. Examples: message(content="Here is the image", media=["/path/to/file.png"]) or message(content="Here is the video", media=["/path/to/video.mp4"])

@@ -1,14 +1,19 @@
 """Session management for conversation history."""
 
+import hashlib
 import json
 import os
+import re
+import secrets
 import shutil
+import stat
 from contextlib import suppress
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from loguru import logger
 
@@ -28,6 +33,10 @@ SESSION_PREVIEW_MAX_CHARS = 160
 SESSION_SEARCH_MAX_RESULTS = 50
 SESSION_SEARCH_MATCHES_PER_SESSION = 5
 SESSION_SEARCH_SNIPPET_CHARS = 240
+_PUBLISHED_FILE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+_PUBLISHED_GRANTS_KEY = "published_file_grants"
+_PUBLISHED_PROVENANCE_KEY = "published_file_provenance"
+_PUBLISHED_MESSAGE_ID_KEY = "_published_message_id"
 
 
 @dataclass
@@ -261,10 +270,190 @@ class SessionManager:
     def __init__(self, workspace: Path):
         self.workspace = workspace
         self.sessions_dir = ensure_dir(self.workspace / "sessions")
+        # Snapshots deliberately do not live below the agent workspace.  The
+        # workspace is where an agent writes reports; this runtime-owned,
+        # stable location holds immutable bytes that have already been
+        # published.  Its deterministic name lets a new process serve grants
+        # persisted in JSONL after restart.
+        store_key = hashlib.sha256(str(self.workspace.resolve()).encode("utf-8")).hexdigest()
+        self.published_files_dir = ensure_dir(
+            self.workspace.parent / ".nanobot-published-files" / store_key
+        )
+        with suppress(OSError):
+            os.chmod(self.published_files_dir, 0o700)
         self.legacy_sessions_dir = (
             get_legacy_sessions_dir() if is_default_workspace(self.workspace) else None
         )
         self._cache: dict[str, Session] = {}
+
+    @staticmethod
+    def published_file_url(session_key: str, file_id: str) -> str:
+        """Return the one canonical relative route emitted by ``publish_file``."""
+        if _PUBLISHED_FILE_ID_RE.fullmatch(file_id) is None:
+            raise ValueError("invalid published file id")
+        return f"/api/sessions/{quote(session_key, safe='')}/files/{file_id}"
+
+    @staticmethod
+    def _has_published_markdown_link(content: str, url: str) -> bool:
+        """Recognize the exact Markdown-link URL shape emitted by the tool."""
+        return f"]({url})" in content
+
+    def store_published_snapshot(self, filename: str, payload: bytes) -> str:
+        """Atomically persist immutable publication bytes in the server store."""
+        if not isinstance(payload, bytes) or len(payload) > 2 * 1024 * 1024:
+            raise ValueError("invalid published file payload")
+        if not isinstance(filename, str) or not filename.endswith(".md"):
+            raise ValueError("invalid published filename")
+        directory_fd = os.open(
+            self.published_files_dir,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
+        try:
+            for _ in range(8):
+                file_id = secrets.token_hex(16)
+                temp_name = f".{file_id}.tmp"
+                try:
+                    fd = os.open(
+                        temp_name,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+                        0o600,
+                        dir_fd=directory_fd,
+                    )
+                except FileExistsError:
+                    continue
+                try:
+                    with os.fdopen(fd, "wb") as handle:
+                        handle.write(payload)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    # link(2), unlike replace, never overwrites an existing
+                    # id. Both names are resolved from the trusted directory
+                    # descriptor, so a path race cannot redirect storage.
+                    try:
+                        os.link(
+                            temp_name,
+                            file_id,
+                            src_dir_fd=directory_fd,
+                            dst_dir_fd=directory_fd,
+                            follow_symlinks=False,
+                        )
+                    except FileExistsError:
+                        continue
+                    os.unlink(temp_name, dir_fd=directory_fd)
+                    os.fsync(directory_fd)
+                    return file_id
+                finally:
+                    with suppress(FileNotFoundError):
+                        os.unlink(temp_name, dir_fd=directory_fd)
+        finally:
+            os.close(directory_fd)
+        raise OSError("could not allocate a publication id")
+
+    def _snapshot_bytes(self, file_id: str) -> bytes | None:
+        if _PUBLISHED_FILE_ID_RE.fullmatch(file_id) is None:
+            return None
+        directory_fd = -1
+        try:
+            directory_fd = os.open(
+                self.published_files_dir,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+            fd = os.open(
+                file_id,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+                dir_fd=directory_fd,
+            )
+            try:
+                info = os.fstat(fd)
+                if not stat.S_ISREG(info.st_mode) or info.st_size > 2 * 1024 * 1024:
+                    return None
+                chunks: list[bytes] = []
+                remaining = 2 * 1024 * 1024 + 1
+                while remaining:
+                    chunk = os.read(fd, min(64 * 1024, remaining))
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    remaining -= len(chunk)
+                data = b"".join(chunks)
+                return data if len(data) <= 2 * 1024 * 1024 else None
+            finally:
+                os.close(fd)
+        except OSError:
+            return None
+        finally:
+            if directory_fd >= 0:
+                os.close(directory_fd)
+
+    def read_published_file(self, session_key: str, file_id: str) -> tuple[str, bytes] | None:
+        """Return a granted snapshot only; ids are never global capabilities."""
+        if _PUBLISHED_FILE_ID_RE.fullmatch(file_id) is None:
+            return None
+        payload = self.read_session_file(session_key)
+        if not isinstance(payload, dict) or payload.get("key") != session_key:
+            return None
+        metadata = payload.get("metadata") if isinstance(payload, dict) else None
+        grants = metadata.get(_PUBLISHED_GRANTS_KEY) if isinstance(metadata, dict) else None
+        grant = grants.get(file_id) if isinstance(grants, dict) else None
+        filename = grant.get("filename") if isinstance(grant, dict) else None
+        if not isinstance(filename, str) or not filename.endswith(".md"):
+            return None
+        data = self._snapshot_bytes(file_id)
+        return (filename, data) if data is not None else None
+
+    def grant_published_files(
+        self,
+        session: Session,
+        publications: dict[str, str],
+        *,
+        message_start: int,
+    ) -> None:
+        """Grant only tool publications rendered in a final visible answer.
+
+        The full assistant-message digest is durable provenance.  Room cloning
+        later requires that digest as well as the exact canonical URL, so a
+        pasted or invented id cannot become a room grant.
+        """
+        if not publications:
+            return
+        grants = session.metadata.setdefault(_PUBLISHED_GRANTS_KEY, {})
+        provenance = session.metadata.setdefault(_PUBLISHED_PROVENANCE_KEY, {})
+        if not isinstance(grants, dict) or not isinstance(provenance, dict):
+            return
+        for message in session.messages[message_start:]:
+            if message.get("role") != "assistant" or message.get("tool_calls"):
+                continue
+            content = message.get("content")
+            if not isinstance(content, str):
+                continue
+            digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            timestamp = message.get("timestamp")
+            for file_id, filename in publications.items():
+                if (
+                    _PUBLISHED_FILE_ID_RE.fullmatch(file_id) is None
+                    or not isinstance(filename, str)
+                    or not filename.endswith(".md")
+                    or not self._has_published_markdown_link(
+                        content, self.published_file_url(session.key, file_id)
+                    )
+                    or self._snapshot_bytes(file_id) is None
+                ):
+                    continue
+                message_id = message.get(_PUBLISHED_MESSAGE_ID_KEY)
+                if not isinstance(message_id, str) or _PUBLISHED_FILE_ID_RE.fullmatch(message_id) is None:
+                    message_id = secrets.token_hex(16)
+                    message[_PUBLISHED_MESSAGE_ID_KEY] = message_id
+                grants[file_id] = {"filename": filename}
+                records = provenance.setdefault(file_id, [])
+                if not isinstance(records, list):
+                    continue
+                record = {
+                    "message_sha256": digest,
+                    "timestamp": timestamp,
+                    "message_id": message_id,
+                }
+                if record not in records:
+                    records.append(record)
 
     @staticmethod
     def safe_key(key: str) -> str:
@@ -528,6 +717,8 @@ class SessionManager:
         *,
         metadata: dict[str, Any] | None = None,
         shared_room_owner: str | None = None,
+        snapshot_message_count: int | None = None,
+        snapshot_sha256: str | None = None,
     ) -> Session:
         """Create a durable conversation branch without sharing future source turns."""
         if self._get_session_path(destination_key).exists():
@@ -537,24 +728,53 @@ class SessionManager:
             raise FileNotFoundError(source_key)
         now = datetime.now()
         messages = deepcopy(source.messages)
+        if snapshot_message_count is not None:
+            if type(snapshot_message_count) is not int or not 0 <= snapshot_message_count <= len(messages):
+                raise ValueError("Invalid snapshot boundary")
+            messages = messages[:snapshot_message_count]
+            digest = hashlib.sha256(json.dumps(messages, sort_keys=True, default=str).encode()).hexdigest()
+            if not isinstance(snapshot_sha256, str) or digest != snapshot_sha256:
+                raise ValueError("The preview changed; review it again")
+        clone_metadata = {**deepcopy(source.metadata), **(metadata or {})}
         if shared_room_owner is not None:
-            messages = self._shareable_messages(messages, shared_room_owner)
+            # Private summaries, cached tool context, and instruction metadata
+            # are never part of a guest-visible snapshot.
+            clone_metadata = deepcopy(metadata or {})
+            messages, file_grants, file_provenance = self._shareable_messages(
+                messages,
+                shared_room_owner,
+                source_key=source.key,
+                source_metadata=source.metadata,
+                destination_key=destination_key,
+            )
+            # Never copy private grants wholesale.  Only the exact links that
+            # survived transcript sanitization and match server provenance are
+            # made available to the room session.
+            clone_metadata.pop(_PUBLISHED_GRANTS_KEY, None)
+            clone_metadata.pop(_PUBLISHED_PROVENANCE_KEY, None)
+            if file_grants:
+                clone_metadata[_PUBLISHED_GRANTS_KEY] = file_grants
+                clone_metadata[_PUBLISHED_PROVENANCE_KEY] = file_provenance
         clone = Session(
             key=destination_key,
             messages=messages,
             created_at=now,
             updated_at=now,
-            metadata={**deepcopy(source.metadata), **(metadata or {})},
+            metadata=clone_metadata,
             last_consolidated=0 if shared_room_owner is not None else source.last_consolidated,
         )
         self.save(clone, fsync=True)
         return clone
 
-    @staticmethod
     def _shareable_messages(
+        self,
         messages: list[dict[str, Any]],
         owner_display_name: str,
-    ) -> list[dict[str, Any]]:
+        *,
+        source_key: str,
+        source_metadata: dict[str, Any],
+        destination_key: str,
+    ) -> tuple[list[dict[str, Any]], dict[str, dict[str, str]], dict[str, list[dict[str, Any]]]]:
         """Copy only the transcript users could see before a room was shared."""
         allowed = {
             "role",
@@ -566,6 +786,8 @@ class SessionManager:
             "participant_display_name",
         }
         shareable: list[dict[str, Any]] = []
+        copied_grants: dict[str, dict[str, str]] = {}
+        copied_provenance: dict[str, list[dict[str, Any]]] = {}
         owner = owner_display_name.strip()[:64] or "Owner"
         for message in messages:
             if message.get("role") not in {"user", "assistant"}:
@@ -578,11 +800,59 @@ class SessionManager:
             content = visible.get("content")
             if not isinstance(content, str) or not content.strip():
                 continue
+            if visible.get("role") == "assistant":
+                copied: list[tuple[str, str]] = []
+                grants = source_metadata.get(_PUBLISHED_GRANTS_KEY)
+                provenance = source_metadata.get(_PUBLISHED_PROVENANCE_KEY)
+                digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+                if isinstance(grants, dict) and isinstance(provenance, dict):
+                    for file_id, grant in grants.items():
+                        records = provenance.get(file_id)
+                        filename = grant.get("filename") if isinstance(grant, dict) else None
+                        if (
+                            not isinstance(file_id, str)
+                            or _PUBLISHED_FILE_ID_RE.fullmatch(file_id) is None
+                            or not isinstance(filename, str)
+                            or not isinstance(records, list)
+                            or not any(
+                                isinstance(record, dict)
+                                and record.get("message_sha256") == digest
+                                and record.get("timestamp") == message.get("timestamp")
+                                and record.get("message_id")
+                                == message.get(_PUBLISHED_MESSAGE_ID_KEY)
+                                for record in records
+                            )
+                        ):
+                            continue
+                        source_url = self.published_file_url(source_key, file_id)
+                        if self._has_published_markdown_link(content, source_url):
+                            copied.append((file_id, filename))
+                            content = content.replace(
+                                source_url,
+                                self.published_file_url(destination_key, file_id),
+                            )
+                if copied:
+                    visible["content"] = content
+                    destination_message_id = secrets.token_hex(16)
+                    # Persisted internally so a room copied again has stable
+                    # server-recorded identity even after history compaction.
+                    # The WebSocket JSON handler removes this field on output.
+                    visible[_PUBLISHED_MESSAGE_ID_KEY] = destination_message_id
+                    rewritten_digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+                    for file_id, filename in copied:
+                        copied_grants[file_id] = {"filename": filename}
+                        copied_provenance.setdefault(file_id, []).append(
+                            {
+                                "message_sha256": rewritten_digest,
+                                "timestamp": visible.get("timestamp"),
+                                "message_id": destination_message_id,
+                            }
+                        )
             if visible.get("role") == "user":
                 visible.setdefault("participant_id", "owner")
                 visible.setdefault("participant_display_name", owner)
             shareable.append(visible)
-        return shareable
+        return shareable, copied_grants, copied_provenance
 
     def read_session_file(self, key: str) -> dict[str, Any] | None:
         """Load a session from disk without caching; intended for read-only HTTP endpoints.
@@ -626,6 +896,46 @@ class SessionManager:
                 logger.info("Recovered read-only session view {} from corrupt file", key)
                 return self._session_payload(repaired)
             return None
+
+    def set_session_title(
+        self,
+        key: str,
+        title: str,
+        *,
+        room_id: str | None = None,
+        title_revision: int | None = None,
+    ) -> str:
+        """Durably mutate the cached session metadata without replacing its turns.
+
+        The metadata line is part of the session JSONL snapshot, so this uses the
+        normal cache/save path rather than appending a competing metadata record.
+        ``missing`` also covers filename aliases whose persisted canonical key
+        does not exactly match the API key.
+        """
+        persisted = self.read_session_file(key)
+        if persisted is None or persisted.get("key") != key:
+            return "missing"
+        session = self.get_or_create(key)
+        metadata = session.metadata if isinstance(session.metadata, dict) else {}
+        if room_id is None and metadata.get("shared_room") is True:
+            return "shared"
+        if room_id is not None and (
+            metadata.get("shared_room") is not True or metadata.get("room_id") != room_id
+        ):
+            return "missing"
+        if title_revision is not None:
+            current = metadata.get("shared_room_title_revision", 0)
+            current = current if isinstance(current, int) and not isinstance(current, bool) else 0
+            if title_revision < current:
+                return "older"
+            metadata["shared_room_title_revision"] = title_revision
+        metadata["title"] = title
+        # Explicit names such as "Chat" are meaningful; clients must not
+        # substitute a message preview for them.
+        metadata["title_user_defined"] = True
+        session.metadata = metadata
+        self.save(session, fsync=True)
+        return "updated"
 
     def read_session_preview(self, key: str) -> str:
         """Read a bounded first-user-message preview without loading session history."""

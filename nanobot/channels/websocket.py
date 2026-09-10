@@ -18,6 +18,7 @@ import shutil
 import ssl
 import stat
 import time
+import unicodedata
 import uuid
 import zipfile
 from collections.abc import Callable
@@ -25,7 +26,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from loguru import logger
 from pydantic import Field, field_validator, model_validator
@@ -39,6 +40,7 @@ from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.channels.chat_inbox import ChatInboxStore
+from nanobot.channels.collaborative_rooms import CollaborativeRooms
 from nanobot.config.paths import get_media_dir, get_workspace_path
 from nanobot.config.schema import Base
 from nanobot.security.clerk import (
@@ -92,6 +94,9 @@ def _append_buttons_as_text(text: str, buttons: list[list[str]]) -> str:
 
 
 class WebSocketConfig(Base):
+    shared_room_collaboration_enabled: bool = False
+    shared_room_connector_server: str = "ziggy-connectors"
+
     """WebSocket server channel configuration.
 
     Clients connect with URLs like ``ws://{host}:{port}{path}?client_id=...&token=...``.
@@ -418,6 +423,7 @@ _CLIENT_MESSAGE_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[
 _MAX_ACCEPTED_CLIENT_MESSAGES = 4_096
 _COMMAND_ID_RE = re.compile(r"^cmd_[0-9a-f]{32}$")
 _ARTIFACT_ID_RE = re.compile(r"^artifact_[0-9a-f]{32}$")
+_PUBLISHED_FILE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _REASONING_EFFORTS = frozenset(
     {"none", "minimal", "minimum", "low", "medium", "high", "max", "adaptive"}
 )
@@ -442,6 +448,15 @@ def _decode_api_key(raw_key: str) -> str | None:
     if _API_KEY_RE.match(key) is None:
         return None
     return key
+
+
+def _valid_session_title(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    value = value.strip()
+    if not 1 <= len(value) <= 120:
+        return False
+    return not any(unicodedata.category(character) == "Cc" for character in value)
 
 
 def _decode_id(raw_value: str, pattern: re.Pattern[str]) -> str | None:
@@ -559,7 +574,7 @@ def _issue_route_secret_matches(headers: Any, configured_secret: str) -> bool:
     return hmac.compare_digest(header_token.strip(), configured_secret)
 
 
-class WebSocketChannel(BaseChannel):
+class WebSocketChannel(CollaborativeRooms, BaseChannel):
     """Run a local WebSocket server; forward text/JSON messages to the message bus."""
 
     name = "websocket"
@@ -611,6 +626,7 @@ class WebSocketChannel(BaseChannel):
         )
         self._stop_event: asyncio.Event | None = None
         self._server_task: asyncio.Task[None] | None = None
+        self.connected_room_executor = None
         self._session_manager = session_manager
         self._active_session_keys = active_session_keys
         self._work_store = (
@@ -670,6 +686,8 @@ class WebSocketChannel(BaseChannel):
 
     async def _broadcast_event(self, chat_id: str, event: str, **fields: Any) -> None:
         """Fan a room event out to a stable snapshot of current subscribers."""
+        if not self._room_is_active(chat_id):
+            return
         subscribers = list(self._subs.get(chat_id, set()))
         if not subscribers:
             return
@@ -797,6 +815,8 @@ class WebSocketChannel(BaseChannel):
         credential = self._room_ws_tokens.pop(token_value, None)
         if credential is None or time.monotonic() > credential.expires_at:
             return False
+        if not self._room_is_active(credential.chat_id):
+            return False
         self._conn_room[connection] = credential
         return True
 
@@ -808,6 +828,8 @@ class WebSocketChannel(BaseChannel):
         credential = self._room_api_tokens.get(token)
         if credential is None or time.monotonic() > credential.expires_at:
             self._room_api_tokens.pop(token, None)
+            return None
+        if not self._room_is_active(credential.chat_id):
             return None
         return credential
 
@@ -906,6 +928,11 @@ class WebSocketChannel(BaseChannel):
                 return _http_error(405, "Method Not Allowed")
             return await self._handle_auth_bootstrap(request)
 
+        if got.startswith("/auth/shared-rooms/") and got.rsplit("/", 1)[-1] in {"preview", "upgrade", "state", "prepare", "approve", "publish", "decline"}:
+            if method != "POST":
+                return _http_error(405, "Method Not Allowed")
+            return await self._handle_room_editorial(request, got.rsplit("/", 1)[-1])
+
         if got == "/auth/shared-rooms":
             if method != "POST":
                 return _http_error(405, "Method Not Allowed")
@@ -920,6 +947,11 @@ class WebSocketChannel(BaseChannel):
             if method != "POST":
                 return _http_error(405, "Method Not Allowed")
             return await self._handle_shared_room_revoke(request)
+
+        if got == "/auth/shared-rooms/title":
+            if method != "POST":
+                return _http_error(405, "Method Not Allowed")
+            return await self._handle_shared_room_title(request)
 
         # 2. WebUI bootstrap: localhost-only, mints tokens for the embedded UI.
         if got == "/webui/bootstrap":
@@ -1005,6 +1037,22 @@ class WebSocketChannel(BaseChannel):
             if method != "GET":
                 return _http_error(405, "Method Not Allowed")
             return self._handle_session_messages(request, m.group(1))
+
+        m = re.match(r"^/api/sessions/([^/]+)/title$", got)
+        if m:
+            if method != "POST":
+                return _http_error(405, "Method Not Allowed")
+            return await self._handle_session_title(request, m.group(1))
+
+        m = re.match(r"^/api/sessions/([^/]+)/files/([^/]+)$", got)
+        if m:
+            if method != "GET":
+                return _http_error(405, "Method Not Allowed")
+            # Publication URLs are exact capabilities scoped by session grants;
+            # no query/fragment-shaped override surface is accepted.
+            if query or "#" in request.path:
+                return _http_error(404, "Not Found")
+            return await self._handle_published_file(request, m.group(1), m.group(2))
 
         # NOTE: websockets' HTTP parser only accepts GET, so we cannot expose a
         # true ``DELETE`` verb. The action is folded into the path instead.
@@ -1115,8 +1163,14 @@ class WebSocketChannel(BaseChannel):
             return _http_error(400, "invalid room_id")
         title = str(body.get("title") or "Shared conversation").strip()
         owner_display_name = str(body.get("owner_display_name") or "Owner").strip()
-        if not 1 <= len(title) <= 120 or not 1 <= len(owner_display_name) <= 64:
+        if not _valid_session_title(title) or not 1 <= len(owner_display_name) <= 64:
             return _http_error(400, "invalid room metadata")
+        mode = body.get("mode", "legacy")
+        if mode not in {"legacy", "collaborative-v1"} or (mode == "collaborative-v1" and not self.config.shared_room_collaboration_enabled):
+            return _http_error(409, "Room mode unavailable")
+        selected_results = body.get("selected_results", [])
+        if not isinstance(selected_results, list) or len(selected_results) > 10 or any(not isinstance(item, dict) or not isinstance(item.get("content"), str) or len(item["content"].encode()) > 16000 for item in selected_results):
+            return _http_error(400, "Invalid selected results")
         destination_key = f"websocket:{chat_id}"
         try:
             await asyncio.to_thread(
@@ -1125,12 +1179,20 @@ class WebSocketChannel(BaseChannel):
                 destination_key,
                 metadata={
                     "shared_room": True,
+                    "room_mode": mode,
+                    "shared_room_expires_at": body.get("expires_at"),
                     "room_id": room_id,
                     "title": title,
+                    "title_user_defined": True,
+                    "shared_room_title_revision": 0,
                     "owner_display_name": owner_display_name,
                 },
                 shared_room_owner=owner_display_name,
+                snapshot_message_count=body.get("snapshot_message_count"),
+                snapshot_sha256=body.get("snapshot_sha256"),
             )
+        except ValueError:
+            return _http_error(409, "Preview changed. Review it again.")
         except FileNotFoundError:
             return _http_error(404, "source session not found")
         except FileExistsError:
@@ -1138,6 +1200,11 @@ class WebSocketChannel(BaseChannel):
         except Exception:
             logger.exception("failed to create shared room session {}", room_id)
             return _http_error(500, "failed to create room")
+        if selected_results:
+            destination = self._session_manager.get_or_create(destination_key)
+            for item in selected_results:
+                destination.add_message("assistant", item["content"], room_publication=True)
+            self._session_manager.save(destination, fsync=True)
         return _http_json_response(
             {
                 "room_id": room_id,
@@ -1147,6 +1214,35 @@ class WebSocketChannel(BaseChannel):
             },
             status=201,
         )
+
+    async def _handle_shared_room_title(self, request: WsRequest) -> Response:
+        if not _issue_route_secret_matches(request.headers, self.config.token_issue_secret.strip()):
+            return _http_error(401, "Unauthorized")
+        if not self.config.token_issue_secret.strip() or self._session_manager is None:
+            return _http_error(503, "room title sync is unavailable")
+        body = _request_json(request)
+        if body is None:
+            return _http_error(400, "invalid JSON body")
+        room_id, chat_id, title, revision = (
+            body.get("room_id"), body.get("chat_id"), body.get("title"), body.get("title_revision")
+        )
+        if not isinstance(room_id, str) or _ROOM_ID_RE.fullmatch(room_id) is None:
+            return _http_error(400, "invalid room_id")
+        if not _is_valid_chat_id(chat_id) or not _valid_session_title(title):
+            return _http_error(400, "invalid room title")
+        if not isinstance(revision, int) or isinstance(revision, bool) or revision < 0:
+            return _http_error(400, "invalid title_revision")
+        # Keep revision comparison and durable save on the runtime event loop.
+        # There is no await between them, so a delayed old mirror cannot win
+        # over a newer title and cannot race the active session cache.
+        result = self._session_manager.set_session_title(
+            f"websocket:{chat_id}", title.strip(), room_id=room_id, title_revision=revision,
+        )
+        if result == "missing":
+            return _http_error(404, "room not found")
+        if result == "older":
+            return _http_error(409, "older room title revision")
+        return _http_json_response({"room_id": room_id, "chat_id": chat_id, "title": title.strip(), "title_revision": revision})
 
     def _handle_shared_room_token(self, request: WsRequest) -> Response:
         if not _issue_route_secret_matches(
@@ -1185,13 +1281,19 @@ class WebSocketChannel(BaseChannel):
             or metadata.get("room_id") != room_id
         ):
             return _http_error(404, "room not found")
-        return self._mint_room_transport_token(
+        if not self._room_is_active(chat_id):
+            return _http_error(410, "Room expired or revoked")
+        response = self._mint_room_transport_token(
             room_id=room_id,
             chat_id=chat_id,
             participant_id=participant_id,
             display_name=display_name,
             role=role,
         )
+        payload = json.loads(response.body)
+        payload["mode"] = metadata.get("room_mode", "legacy")
+        payload["capabilities"] = ["discussion", "ask_ziggy", "connected_read_proposals"] if payload["mode"] == "collaborative-v1" else []
+        return _http_json_response(payload)
 
     async def _handle_shared_room_revoke(self, request: WsRequest) -> Response:
         if not _issue_route_secret_matches(
@@ -1220,6 +1322,10 @@ class WebSocketChannel(BaseChannel):
             or metadata.get("room_id") != room_id
         ):
             return _http_error(404, "room not found")
+
+        session = self._session_manager.get_or_create(f"websocket:{chat_id}")
+        session.metadata["shared_room_revoked"] = True
+        self._session_manager.save(session, fsync=True)
 
         invalidated_tokens = 0
         for pool in (self._room_ws_tokens, self._room_api_tokens):
@@ -1874,12 +1980,131 @@ class WebSocketChannel(BaseChannel):
         data = self._session_manager.read_session_file(decoded_key)
         if data is None:
             return _http_error(404, "session not found")
+        from nanobot.utils.activity_history import project_activity_history
+        active_keys = self._active_session_keys() if self._active_session_keys else set()
+        project_activity_history(data, active=decoded_key in active_keys)
+        self._strip_private_message_metadata(data)
         # Decorate persisted user messages with signed media URLs so the
         # client can render previews. The raw on-disk ``media`` paths are
         # stripped on the way out — they leak server filesystem layout and
         # the client never needs them once it has the signed fetch URL.
         self._augment_media_urls(data)
         return _http_json_response(data)
+
+    async def _handle_session_title(self, request: WsRequest, raw_key: str) -> Response:
+        """Rename a canonical websocket session for an owner API transport token."""
+        if not self._check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        if self._session_manager is None:
+            return _http_error(503, "session manager unavailable")
+        decoded_key = _decode_api_key(raw_key)
+        # Do not let URL normalization turn a filesystem alias into a valid
+        # session identifier. The control proxy preserves the encoded segment.
+        target = getattr(request, "raw_path", None) or request.path
+        if (
+            decoded_key is None
+            or _API_KEY_RE.fullmatch(decoded_key) is None
+            or quote(decoded_key, safe="") != raw_key
+            or target != f"/api/sessions/{raw_key}/title"
+            or not self._is_webui_session_key(decoded_key)
+        ):
+            return _http_error(404, "session not found")
+        body = _request_json(request)
+        if body is None or not _valid_session_title(body.get("title")):
+            return _http_error(400, "invalid title")
+        title = str(body["title"]).strip()
+        persisted = self._session_manager.read_session_file(decoded_key)
+        metadata = persisted.get("metadata") if isinstance(persisted, dict) else None
+        if isinstance(metadata, dict) and metadata.get("shared_room") is True:
+            # Shared-room titles are controlled by the DB/revision protocol;
+            # accepting this owner route would create a split-brain title.
+            return _http_error(409, "use shared room title endpoint")
+        result = self._session_manager.set_session_title(decoded_key, title)
+        if result == "missing":
+            return _http_error(404, "session not found")
+        if result == "shared":
+            return _http_error(409, "use shared room title endpoint")
+        return _http_json_response({"session_key": decoded_key, "title": title})
+
+    @staticmethod
+    def _strip_private_message_metadata(payload: dict[str, Any]) -> None:
+        """Remove server-only publication provenance from session JSON."""
+        metadata = payload.get("metadata")
+        if isinstance(metadata, dict):
+            metadata.pop("published_file_provenance", None)
+        messages = payload.get("messages")
+        if not isinstance(messages, list):
+            return
+        for message in messages:
+            if isinstance(message, dict):
+                message.pop("_published_message_id", None)
+
+    async def _handle_published_file(
+        self,
+        request: WsRequest,
+        raw_key: str,
+        raw_file_id: str,
+    ) -> Response:
+        """Serve one granted private publication, or reveal nothing (404).
+
+        API transport tokens are owner credentials. Room credentials are
+        accepted only for their exact room session. Deliberately use the same
+        response for malformed ids, absent grants, wrong sessions, revoked or
+        expired room tokens, and unauthenticated probes.
+        """
+        def missing() -> Response:
+            return _http_error(404, "Not Found")
+        if self._session_manager is None:
+            return _http_error(503, "session manager unavailable")
+        key = _decode_api_key(raw_key)
+        # The tool emits one canonical URI: a percent-encoded session key and
+        # an already-lowercase hexadecimal id. Reject alternate spellings
+        # rather than silently treating encoding as another route parameter.
+        file_id = raw_file_id if _PUBLISHED_FILE_ID_RE.fullmatch(raw_file_id) else None
+        if key is None or quote(key, safe="") != raw_key or file_id is None:
+            return missing()
+        canonical_path = f"/api/sessions/{raw_key}/files/{raw_file_id}"
+        # ``_parse_request_path`` normalizes a trailing slash and query
+        # parsing drops blank parameters. The original request must be the
+        # canonical path too, so that normalization never broadens a grant.
+        request_target = getattr(request, "raw_path", None) or request.path
+        if request_target != canonical_path:
+            return missing()
+        room_credential = self._room_api_credential(request)
+        owner_authorized = self._check_api_token(request)
+        if not owner_authorized and (
+            room_credential is None
+            or key != f"websocket:{room_credential.chat_id}"
+        ):
+            return missing()
+        published = await asyncio.to_thread(
+            self._session_manager.read_published_file,
+            key,
+            file_id,
+        )
+        if published is None:
+            return missing()
+        filename, payload = published
+        # RFC 6266-compatible fallback and UTF-8 filename. Never reflect
+        # control bytes into a response header, even if a host filesystem
+        # permits them in a filename.
+        clean_name = "".join(ch for ch in filename if ord(ch) >= 32 and ch != "\x7f")
+        ascii_name = "".join(ch if ord(ch) < 127 and ch not in {'"', '\\'} else "_" for ch in clean_name)
+        if not ascii_name or not ascii_name.endswith(".md"):
+            ascii_name = "download.md"
+        utf8_name = quote(clean_name or "download.md", safe="")
+        return _http_response(
+            payload,
+            content_type="text/markdown; charset=utf-8",
+            extra_headers=[
+                ("Cache-Control", "private, no-store"),
+                ("X-Content-Type-Options", "nosniff"),
+                (
+                    "Content-Disposition",
+                    f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{utf8_name}",
+                ),
+            ],
+        )
 
     def _augment_media_urls(self, payload: dict[str, Any]) -> None:
         """Mutate *payload* in place: each message's ``media`` path list is
@@ -2283,7 +2508,10 @@ class WebSocketChannel(BaseChannel):
         except Exception as e:
             logger.debug("websocket connection ended: {}", e)
         finally:
+            rooms = tuple(self._conn_chats.get(connection, ()))
             self._cleanup_connection(connection)
+            for chat_id in rooms:
+                await self._broadcast_room_presence(chat_id)
 
     @staticmethod
     def _save_envelope_media(
@@ -2407,6 +2635,11 @@ class WebSocketChannel(BaseChannel):
                 return
             self._attach(connection, cid)
             await self._send_event(connection, "attached", chat_id=cid)
+            if self._room_collaborative(cid):
+                owner_room = scoped_room or self._shared_room_owner_credential(cid)
+                if owner_room and self._room_is_active(cid):
+                    await self._send_event(connection, "room.state", chat_id=cid, mode="collaborative-v1", proposals=self._room_work_store().list(owner_room.room_id))
+                    await self._broadcast_room_presence(cid)
             return
         if t == "message":
             cid = envelope.get("chat_id")
@@ -2465,6 +2698,8 @@ class WebSocketChannel(BaseChannel):
             metadata: dict[str, Any] = {
                 "remote": getattr(connection, "remote_address", None)
             }
+            if envelope.get("explicit_final_message") is True:
+                metadata["explicit_final_message"] = True
             room = scoped_room or self._shared_room_owner_credential(cid)
             sender_id = client_id
             if room is not None:
@@ -2546,6 +2781,10 @@ class WebSocketChannel(BaseChannel):
 
             # Auto-attach on first use so clients can one-shot without a separate attach.
             self._attach(connection, cid)
+            if room is not None and await self._handle_room_intent(connection, room, envelope):
+                return
+            if room is not None and self._room_collaborative(cid):
+                metadata["room_intent"] = "ask_ziggy"
             if client_message_id is None:
                 await self._handle_message(
                     sender_id=sender_id,

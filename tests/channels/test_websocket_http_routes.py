@@ -136,6 +136,59 @@ async def test_sessions_routes_require_bearer_token(bus: MagicMock, tmp_path: Pa
 
 
 @pytest.mark.asyncio
+async def test_private_published_file_route_is_grant_scoped_and_no_store(
+    bus: MagicMock, tmp_path: Path
+) -> None:
+    manager = SessionManager(tmp_path)
+    session = Session(key="websocket:download")
+    file_id = manager.store_published_snapshot("report.md", b"# Snapshot\n")
+    url = manager.published_file_url(session.key, file_id)
+    session.add_message("assistant", f"Here: [report.md]({url})")
+    manager.grant_published_files(session, {file_id: "report.md"}, message_start=0)
+    manager.save(session)
+    channel = _ch(bus, session_manager=manager, port=29930)
+    server_task = asyncio.create_task(channel.start())
+    await asyncio.sleep(0.3)
+    try:
+        unauthenticated = await _http_get(f"http://127.0.0.1:29930{url}")
+        assert unauthenticated.status_code == 404
+        boot = await _http_get("http://127.0.0.1:29930/webui/bootstrap")
+        auth = {"Authorization": f"Bearer {boot.json()['token']}"}
+        downloaded = await _http_get(f"http://127.0.0.1:29930{url}", headers=auth)
+        assert downloaded.status_code == 200
+        assert downloaded.content == b"# Snapshot\n"
+        assert downloaded.headers["content-type"] == "text/markdown; charset=utf-8"
+        assert downloaded.headers["cache-control"] == "private, no-store"
+        assert downloaded.headers["x-content-type-options"] == "nosniff"
+        assert "attachment" in downloaded.headers["content-disposition"]
+        assert "report.md" in downloaded.headers["content-disposition"]
+        history = await _http_get(
+            "http://127.0.0.1:29930/api/sessions/websocket%3Adownload/messages",
+            headers=auth,
+        )
+        assert history.status_code == 200
+        assert "published_file_provenance" not in history.json()["metadata"]
+        assert all("_published_message_id" not in message for message in history.json()["messages"])
+
+        # URL decoding, arbitrary query params, invalid ids, and a valid id
+        # under a different session all fail with the same opaque response.
+        for path in (
+            url.replace("%3A", ":"),
+            f"{url}/",
+            f"{url}?x",
+            f"{url}?x=",
+            f"{url}?path=/etc/passwd",
+            url[:-1] + "A",
+            manager.published_file_url("websocket:other", file_id),
+        ):
+            denied = await _http_get(f"http://127.0.0.1:29930{path}", headers=auth)
+            assert denied.status_code == 404, path
+    finally:
+        await channel.stop()
+        await server_task
+
+
+@pytest.mark.asyncio
 async def test_sessions_list_only_returns_websocket_sessions_by_default(
     bus: MagicMock, tmp_path: Path
 ) -> None:

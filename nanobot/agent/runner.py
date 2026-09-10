@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import os
+import re
 import time
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
@@ -42,6 +43,18 @@ _DEFAULT_ERROR_MESSAGE = "Sorry, I encountered an error calling the AI model."
 _PERSISTED_MODEL_ERROR_PLACEHOLDER = "[Assistant reply unavailable due to model error.]"
 _MAX_EMPTY_RETRIES = 2
 _MAX_LENGTH_RECOVERIES = 3
+_MAX_INCOMPLETE_RECOVERIES = 2
+
+
+def _incomplete_final(text: str | None) -> bool:
+    """Conservative guard for dangling introductions, not a success judge."""
+    text = (text or "").strip()
+    if text.endswith(":") and not text.endswith("```"):
+        return True
+    return len(text) < 400 and bool(re.fullmatch(
+        r"(?:Let me|I'll|I’ll|I will) (?:check|look|search|build|implement|create|start|inspect|test|verify) [^\n!?]+[.!]?",
+        text, flags=re.IGNORECASE,
+    ))
 _MAX_INJECTIONS_PER_TURN = 3
 _MAX_INJECTION_CYCLES = 5
 _SNIP_SAFETY_BUFFER = 1024
@@ -271,6 +284,7 @@ class AgentRunner:
         external_lookup_counts: dict[str, int] = {}
         empty_content_retries = 0
         length_recovery_count = 0
+        incomplete_recovery_count = 0
         had_injections = False
         injection_cycles = 0
 
@@ -531,6 +545,25 @@ class AgentRunner:
                         messages.append(build_length_recovery_message())
                         await hook.after_iteration(context)
                         continue
+
+                if response.finish_reason == "stop" and _incomplete_final(clean):
+                    incomplete_recovery_count += 1
+                    if incomplete_recovery_count <= _MAX_INCOMPLETE_RECOVERIES:
+                        logger.warning("Incomplete final response; retrying ({}/{})", incomplete_recovery_count, _MAX_INCOMPLETE_RECOVERIES)
+                        # Do not save the stub as a completed assistant reply.
+                        messages.append({"role": "system", "content": (
+                            "Your last response ended with an unfinished introduction or only a promise to act. "
+                            "Complete the answer now, including any questions you intended to ask. "
+                            "If authorized work is needed, use the available tools and verify the result. "
+                            "Do not bypass approvals or safety controls. If blocked, explain the blocker. "
+                            "Do not claim completion without evidence."
+                        )})
+                        if hook.wants_streaming():
+                            await hook.on_stream_end(context, resuming=True)
+                        await hook.after_iteration(context)
+                        continue
+                    clean = "I couldn't finish this response after two automatic retries. The task is not confirmed complete. Please retry; any required approvals still apply."
+                    stop_reason = "incomplete_response"
 
                 assistant_message: dict[str, Any] | None = None
                 if response.finish_reason != "error" and not is_blank_text(clean):

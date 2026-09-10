@@ -49,6 +49,14 @@ async def test_room_token_is_scoped_and_messages_fan_out(tmp_path: Path) -> None
         media=["/home/mihai/private.pdf"],
     )
     source.add_message("assistant", "Existing answer", reasoning_content="PRIVATE REASONING")
+    published_id = sessions.store_published_snapshot("shared-report.md", b"# Shared report\n")
+    published_url = sessions.published_file_url(source.key, published_id)
+    source.add_message("assistant", f"Visible report: [shared-report.md]({published_url})")
+    sessions.grant_published_files(
+        source,
+        {published_id: "shared-report.md"},
+        message_start=len(source.messages) - 1,
+    )
     sessions.save(source)
     channel = WebSocketChannel(
         {
@@ -86,6 +94,37 @@ async def test_room_token_is_scoped_and_messages_fan_out(tmp_path: Path) -> None
             },
         )
         assert created.status_code == 201
+
+        # A delayed mirror response must never roll a later room rename back.
+        newest = await _request(
+            "POST",
+            "http://127.0.0.1:29924/auth/shared-rooms/title",
+            headers=authorization,
+            json={
+                "room_id": room_id,
+                "chat_id": chat_id,
+                "title": "Newest room title",
+                "title_revision": 2,
+            },
+        )
+        assert newest.status_code == 200
+        delayed = await _request(
+            "POST",
+            "http://127.0.0.1:29924/auth/shared-rooms/title",
+            headers=authorization,
+            json={
+                "room_id": room_id,
+                "chat_id": chat_id,
+                "title": "Old room title",
+                "title_revision": 1,
+            },
+        )
+        assert delayed.status_code == 409
+        room_payload = sessions.read_session_file(f"websocket:{chat_id}")
+        assert room_payload is not None
+        assert room_payload["metadata"]["title"] == "Newest room title"
+        assert room_payload["metadata"]["title_user_defined"] is True
+        assert room_payload["metadata"]["shared_room_title_revision"] == 2
 
         issued = await _request(
             "POST",
@@ -134,6 +173,22 @@ async def test_room_token_is_scoped_and_messages_fan_out(tmp_path: Path) -> None
         )
         assert existing_user["participant_id"] == "owner"
         assert existing_user["participant_display_name"] == "Owner"
+        room_file_url = sessions.published_file_url(
+            f"websocket:{chat_id}", published_id
+        )
+        room_file = await _request(
+            "GET",
+            f"http://127.0.0.1:29924{room_file_url}",
+            headers=room_auth,
+        )
+        assert room_file.status_code == 200
+        assert room_file.content == b"# Shared report\n"
+        source_file = await _request(
+            "GET",
+            f"http://127.0.0.1:29924{published_url}",
+            headers=room_auth,
+        )
+        assert source_file.status_code == 404
 
         async with websockets.connect(
             f"ws://127.0.0.1:29924/?token={token}"
@@ -182,6 +237,12 @@ async def test_room_token_is_scoped_and_messages_fan_out(tmp_path: Path) -> None
             )
             assert revoked.status_code == 200
             assert revoked.json()["closed_connections"] == 1
+            denied_file = await _request(
+                "GET",
+                f"http://127.0.0.1:29924{room_file_url}",
+                headers=room_auth,
+            )
+            assert denied_file.status_code == 404
             with pytest.raises(websockets.exceptions.ConnectionClosed):
                 await socket.recv()
 

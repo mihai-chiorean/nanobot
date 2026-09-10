@@ -25,6 +25,43 @@ def _make_full_loop(tmp_path: Path) -> AgentLoop:
     return AgentLoop(bus=MessageBus(), provider=provider, workspace=tmp_path, model="test-model")
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shared_room", [False, True])
+async def test_reply_after_consecutive_user_messages_survives_history_reload(
+    tmp_path: Path, shared_room: bool,
+) -> None:
+    loop = _make_full_loop(tmp_path)
+    loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=False)
+    session = loop.sessions.get_or_create("websocket:discussion")
+    session.add_message("user", "Let's discuss font safety.")
+    loop.sessions.save(session)
+
+    async def answer(initial_messages, **kwargs):
+        # Use the real context builder: adjacent user messages are merged for
+        # providers that reject consecutive messages with the same role.
+        return (
+            "Swift can make font parsing safer.", [],
+            [*initial_messages, {"role": "assistant", "content": "Swift can make font parsing safer."}],
+            "completed", False,
+        )
+
+    loop._run_agent_loop = answer
+    await loop._process_message(InboundMessage(
+        channel="websocket", sender_id="guest", chat_id="discussion",
+        content="Explain why.", metadata={
+            "shared_room": shared_room, "participant_display_name": "Guest",
+            "client_message_id": "ask-after-discussion",
+        },
+    ))
+
+    persisted = loop.sessions.read_session_file("websocket:discussion")
+    assert [(message["role"], message["content"]) for message in persisted["messages"]] == [
+        ("user", "Let's discuss font safety."),
+        ("user", "Explain why."),
+        ("assistant", "Swift can make font parsing safer."),
+    ]
+
+
 def test_agent_loop_scopes_audit_log_to_workspace(tmp_path: Path) -> None:
     loop = _make_full_loop(tmp_path)
 
