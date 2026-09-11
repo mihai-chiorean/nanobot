@@ -75,7 +75,7 @@ class MyTool(Tool):
         )
 
     RESTRICTED: dict[str, dict[str, Any]] = {
-        "max_iterations":        {"type": int, "min": 1,   "max": 100},
+        "max_iterations":        {"type": int, "min": 1,   "max": 1000},
         "context_window_tokens": {"type": int, "min": 4096, "max": 1_000_000},
         "model":                 {"type": str, "min_len": 1},
     }
@@ -118,6 +118,8 @@ class MyTool(Tool):
             "Scratchpad keys persist across turns but not restarts.\n"
             "Key values: _current_iteration (current progress), "
             "max_iterations - _current_iteration = remaining iterations.\n"
+            "The iteration budget applies to one run, not the conversation's lifetime. "
+            "Each new request or scheduled run starts a fresh budget.\n"
             "Note: web_config and exec_config are readable but read-only.\n"
             "\n"
             "When to use:\n"

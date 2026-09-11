@@ -22,8 +22,8 @@ async def test_my_tool_max_iterations_syncs_subagent_limit() -> None:
 
     tool = MyTool(loop=loop)
 
-    result = await tool.execute(action="set", key="max_iterations", value=80)
+    result = await tool.execute(action="set", key="max_iterations", value=1000)
 
-    assert "Set max_iterations = 80" in result
-    assert loop.max_iterations == 80
-    assert loop.subagents.max_iterations == 80
+    assert "Set max_iterations = 1000" in result
+    assert loop.max_iterations == 1000
+    assert loop.subagents.max_iterations == 1000

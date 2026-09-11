@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
+import json
 import os
 import re
 import time
@@ -44,6 +46,26 @@ _PERSISTED_MODEL_ERROR_PLACEHOLDER = "[Assistant reply unavailable due to model 
 _MAX_EMPTY_RETRIES = 2
 _MAX_LENGTH_RECOVERIES = 3
 _MAX_INCOMPLETE_RECOVERIES = 2
+
+
+@dataclass
+class _ExecProgress:
+    """Track consecutive identical successful exec responses within one run."""
+
+    fingerprint: str | None = None
+    count: int = 0
+
+    def observe(self, calls, results, events) -> int:
+        if (len(calls) != 1 or calls[0].name != "exec" or len(results) != 1
+                or len(events) != 1 or events[0].get("status") != "ok"
+                or not isinstance(results[0], str)):
+            self.fingerprint, self.count = None, 0
+            return 0
+        payload = json.dumps([calls[0].arguments, results[0]], sort_keys=True, default=str)
+        fingerprint = hashlib.sha256(payload.encode()).hexdigest()
+        self.count = self.count + 1 if fingerprint == self.fingerprint else 1
+        self.fingerprint = fingerprint
+        return self.count
 
 
 def _incomplete_final(text: str | None) -> bool:
@@ -287,6 +309,7 @@ class AgentRunner:
         incomplete_recovery_count = 0
         had_injections = False
         injection_cycles = 0
+        exec_progress = _ExecProgress()
 
         for iteration in range(spec.max_iterations):
             # MIT-202: open an llm-iteration span that encompasses the
@@ -373,6 +396,17 @@ class AgentRunner:
                         tool_calls,
                         external_lookup_counts,
                     )
+                    repeated_exec = exec_progress.observe(tool_calls, results, new_events)
+                    if repeated_exec >= 3:
+                        results[0] += (
+                            "\n\n[The same shell command has returned identical output "
+                            f"{repeated_exec} times consecutively. Reassess before calling "
+                            "it again: check whether the proposed change changes anything, "
+                            "inspect the saved result with another tool, then proceed to "
+                            "validation/publication if it is already correct. If waiting "
+                            "for external work, use its status/poll tool instead. "
+                            "Do not repeat this command unchanged.]"
+                        )
                     tool_events.extend(new_events)
                     context.tool_results = list(results)
                     context.tool_events = list(new_events)
@@ -432,6 +466,22 @@ class AgentRunner:
                     )
                     empty_content_retries = 0
                     length_recovery_count = 0
+                    if repeated_exec >= 6:
+                        # Three recovery opportunities precede this stop. Preserve
+                        # checkpoints and never report unfinished work as successful.
+                        final_content = (
+                            "This run stopped after the same shell command returned "
+                            "identical output six times, despite recovery prompts. "
+                            "Review the saved work and continue with a different approach. "
+                            "This is a repeated-command failure, not a lifetime tool quota."
+                        )
+                        error = final_content
+                        stop_reason = "incomplete_response"
+                        self._append_final_message(messages, final_content)
+                        context.final_content, context.error = final_content, error
+                        context.stop_reason = stop_reason
+                        await hook.after_iteration(context)
+                        break
                     # Checkpoint 1: drain injections after tools, before next LLM call
                     _drained, injection_cycles = await self._try_drain_injections(
                         spec, messages, None, injection_cycles,

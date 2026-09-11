@@ -105,7 +105,7 @@ These parameters have type and range validation — invalid values are rejected:
 
 | Parameter | Type | Range | Purpose |
 |-----------|------|-------|---------|
-| `max_iterations` | int | 1–100 | Max tool calls per conversation turn |
+| `max_iterations` | int | 1–1000 | Max tool iterations per run; resets for each request or scheduled run |
 | `context_window_tokens` | int | 4,096–1,000,000 | Context window size |
 | `model` | str | non-empty | LLM model to use |
 

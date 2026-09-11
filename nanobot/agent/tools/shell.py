@@ -355,9 +355,16 @@ class ExecTool(Tool):
             if "..\\" in cmd or "../" in cmd:
                 return "Error: Command blocked by safety guard (path traversal detected)"
 
-            cwd_path = Path(cwd).resolve()
+            # The workspace boundary does not shrink when working in a subdirectory.
+            cwd_path = Path(self.working_dir or cwd).expanduser().resolve()
+            # Exempt only ordinary redirection syntax. Commands that manipulate
+            # /dev/null itself (rm/chmod/mv/etc.) still hit the path boundary.
+            path_command = re.sub(
+                r'''(?<![<>])\d*(?:>>?|<)\s*(?:/dev/null|"/dev/null"|'/dev/null')(?=$|[\s;&|])''',
+                "", cmd,
+            ) if not _IS_WINDOWS else cmd
 
-            for raw in self._extract_absolute_paths(cmd):
+            for raw in self._extract_absolute_paths(path_command):
                 try:
                     expanded = os.path.expandvars(raw.strip())
                     p = Path(expanded).expanduser().resolve()

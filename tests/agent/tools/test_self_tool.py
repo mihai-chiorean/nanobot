@@ -213,7 +213,7 @@ class TestModifyRestricted:
     @pytest.mark.asyncio
     async def test_modify_restricted_max_exceeded(self):
         tool = _make_tool()
-        result = await tool.execute(action="set", key="max_iterations", value=999)
+        result = await tool.execute(action="set", key="max_iterations", value=1001)
         assert "Error" in result
 
     @pytest.mark.asyncio
