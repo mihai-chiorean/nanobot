@@ -196,6 +196,36 @@ values, so there is no known leak).
 
 ---
 
+## 5c. One thing that will make the *next* merge noisy
+
+`nanobot/agent/runner.py` diffs **649 lines** against upstream, but with
+`git diff -w` it is **15 lines**. The rest is pure reindentation: the MIT-202
+Langfuse span wraps the whole agent-iteration body, so ~350 lines of upstream
+code shifted right by four spaces.
+
+```
+$ git diff --stat    upstream/main HEAD -- nanobot/agent/runner.py   # 649 changed
+$ git diff --stat -w upstream/main HEAD -- nanobot/agent/runner.py   #  15 added
+```
+
+That is a real cost — `runner.py` is one of upstream's most-churned files, and a
+whitespace-shifted block conflicts on almost every hunk. It was kept anyway
+because the alternatives are worse:
+
+- Entering the span on an `ExitStack` and closing it at the top of the next
+  iteration would keep the original indentation, but `ExitStack.close()` does
+  not pass `exc_info` into the context manager, which breaks MIT-210 (exceptions
+  must propagate through the span so failed turns are not recorded as
+  successful).
+- Extracting the loop body into a helper is a larger refactor of upstream code,
+  which makes future merges harder, not easier.
+
+**For the next merge:** take `runner.py` from upstream wholesale, then re-apply
+the 15 lines. `git diff -w upstream/main HEAD -- nanobot/agent/runner.py` prints
+exactly what to re-apply. Do not try to merge it hunk by hunk.
+
+---
+
 ## 6. Known failures (pre-existing, not caused by this merge)
 
 Both reproduce on a pristine `upstream/main` checkout:
