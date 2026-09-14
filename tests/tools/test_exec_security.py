@@ -118,7 +118,24 @@ def test_exec_full_workspace_scope_still_blocks_metadata(tmp_path):
         "echo http://169.254.169.254/latest/meta-data/",
     ],
 )
-async def test_exec_full_access_skips_command_guard(tmp_path, command):
+async def test_exec_unrestricted_config_still_applies_the_command_guard(tmp_path, command):
+    """Ziggy-local (fork) divergence from upstream — deliberate.
+
+    Upstream skips the entire command guard whenever ``restrict_to_workspace``
+    is false, on the reasoning that full access is an explicit trust decision.
+    But ``restrict_to_workspace`` defaults to False in the schema, so a config
+    that simply never set it gets the same treatment as a deliberate grant —
+    and loses the deny-pattern filter, the SSRF/internal-URL check and the
+    MIT-123 secret-dump prescreen along with the workspace boundary. None of
+    those three are workspace-confinement policy.
+
+    The Ziggy Discord gateway runs in exactly that shape, so the fork narrows
+    the skip to an *explicitly bound* unrestricted workspace scope (covered by
+    ``test_exec_full_workspace_scope_skips_command_guard``, which still passes
+    unchanged). Config-default unrestricted still gets the guard.
+
+    Expect this to conflict on the next upstream merge. Keep the divergence.
+    """
     tool = ExecTool(
         working_dir=str(tmp_path),
         restrict_to_workspace=False,
@@ -126,8 +143,36 @@ async def test_exec_full_access_skips_command_guard(tmp_path, command):
     )
     result = await tool.execute(command=command)
 
+    assert "Command blocked by safety guard" in result or "deny pattern" in result
+
+
+async def test_exec_unrestricted_config_still_allows_benign_commands(tmp_path):
+    """The fork divergence above must not turn into a blanket block."""
+    tool = ExecTool(
+        working_dir=str(tmp_path),
+        restrict_to_workspace=False,
+        deny_patterns=[r"echo\s+blocked"],
+    )
+    result = await tool.execute(command="echo fine")
+
     assert "Exit code: 0" in result
     assert "Command blocked" not in result
+
+
+async def test_exec_unrestricted_config_does_not_confine_paths(tmp_path):
+    """Only the *security* half of the guard is unconditional — the workspace
+    path-confinement block stays gated on restrict_to_workspace."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "notes.txt").write_text("hello", encoding="utf-8")
+
+    tool = ExecTool(working_dir=str(workspace), restrict_to_workspace=False, timeout=5)
+    result = await tool.execute(command=f"cat {outside / 'notes.txt'}")
+
+    assert "hello" in result
+    assert "path outside working dir" not in result
 
 
 async def test_exec_full_workspace_scope_skips_command_guard(tmp_path):

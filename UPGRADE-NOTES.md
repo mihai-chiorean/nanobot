@@ -110,14 +110,40 @@ are dropped in favour of upstream — see "Local patches dropped".
 
 ## 5. Behaviour changes worth knowing before deploying
 
-1. **The exec safety guard now only runs when the workspace is restricted.**
+1. **Deliberate fork divergence: the exec safety guard stays unconditional.**
    Upstream's `_prepare_command` calls `_guard_command` only under
-   `if access.restrict_to_workspace:` — full access is an explicit trust
-   decision. This means the SSRF / internal-URL check, the deny-pattern filter
-   and the MIT-123 secret prescreen are all **skipped** for an unrestricted
-   `ExecTool`. **Verify every tenant config sets `restrict_to_workspace: true`
-   before rolling out.** Two fork tests were updated to construct
-   `ExecTool(restrict_to_workspace=True)` to reflect this.
+   `if access.restrict_to_workspace:` — "full access is an explicit trust
+   decision". But `restrict_to_workspace` **defaults to `False` in the schema**,
+   so a config that simply never set it is treated identically to a deliberate
+   grant, and loses the deny-pattern filter, the SSRF / internal-URL check and
+   the MIT-123 secret-dump prescreen along with the workspace boundary. None of
+   those three are workspace-confinement policy, and all three ran
+   unconditionally in the fork before this merge.
+
+   The Spark's Discord gateway (`~/.nanobot/config.json`) runs in exactly that
+   shape — `restrict_to_workspace` unset, `exec.enable` unset (defaults `True`),
+   `allow_loopback: true` — so taking upstream verbatim would have silently
+   removed the fork's entire shell-safety layer on deploy. Verified read-only on
+   `spark-094a`.
+
+   The fork therefore narrows the skip to an **explicitly bound** unrestricted
+   workspace scope (the WebUI Full Access grant, where `access.scope is not
+   None`). Upstream's `test_exec_full_workspace_scope_skips_command_guard`
+   still passes unchanged. Upstream's
+   `test_exec_full_access_skips_command_guard` — which asserts the
+   *config-default* case also skips — is forked into
+   `test_exec_unrestricted_config_still_applies_the_command_guard`, plus two
+   tests pinning that this does **not** become a blanket block and does **not**
+   start confining paths. See `nanobot/agent/tools/shell.py` in
+   `_prepare_command`. **Expect this to conflict on the next upstream merge;
+   keep the divergence.**
+
+   The three `nanobot-tenant@ws_*` runtimes on the Spark all have
+   `exec.enable: false`, so they were never exposed either way.
+
+   Two fork tests in `tests/security/test_allow_loopback.py` were still updated
+   to construct `ExecTool(restrict_to_workspace=True)`, because they assert on
+   the *workspace-gated* portion of the guard.
 2. **Loopback allowance narrowed.** Upstream permits loopback only when the
    *host itself* is a literal loopback name/IP and every resolved address is
    loopback — a public DNS name that resolves to `127.0.0.1` stays blocked
@@ -230,14 +256,25 @@ Two `pip check` complaints (`dulwich`, `pypdf`) are **pre-existing** on this
 venv and predate the merge; do not read a clean `pip check` as the success
 signal.
 
-### Step 4 — verify config before restarting anything
+### Step 4 — confirm the exec-guard posture
+
+No config change is required: §5.1 keeps the command guard unconditional for
+config-default-unrestricted runtimes, which is what the gateway is. Confirm
+the shape has not drifted since this was written:
 
 ```bash
-grep -rn "restrict_to_workspace" /home/mihai/.nanobot/*/config.json 2>/dev/null
+python3 -c '
+import json
+d = json.load(open("/home/mihai/.nanobot/config.json"))
+t = d.get("tools", {})
+print("restrict_to_workspace:", t.get("restrict_to_workspace"))
+print("exec:", t.get("exec"))
+'
 ```
 
-Every tenant must have `restrict_to_workspace: true` — see §5.1. If any tenant
-is unrestricted, fix it **before** step 5.
+Expected at the time of writing: `restrict_to_workspace` unset (schema default
+`False`), `exec.allow_loopback: true`. If someone has since set
+`restrict_to_workspace: true`, that is fine and strictly stricter.
 
 ### Step 5 — restart, one tenant first
 

@@ -459,14 +459,29 @@ class ExecTool(Tool):
                     + _WORKSPACE_BOUNDARY_NOTE
                 )
 
-        # Full access is an explicit trust decision. Keep the application-level
-        # command guard aligned with the selected access mode instead of
-        # continuing to block commands after workspace restriction is disabled.
-        if access.restrict_to_workspace:
+        # Full access is an explicit trust decision: when a caller has bound a
+        # workspace scope (the WebUI Full Access grant) and that scope lifts the
+        # workspace restriction, upstream skips the command guard entirely.
+        #
+        # Ziggy-local (fork): upstream keys that skip on `restrict_to_workspace`
+        # alone, which also fires for a config that merely left the flag at its
+        # schema default of False — no trust decision was made at all. That path
+        # would silently drop the deny-pattern filter, the SSRF/internal-URL
+        # check and the MIT-123 secret-dump prescreen, none of which are
+        # workspace-confinement policy; they are destructive-command and
+        # exfiltration policy, and they ran unconditionally in the fork before
+        # the 2026-09 upstream merge. The Ziggy Discord gateway runs exactly
+        # that way (`restrict_to_workspace` unset, exec enabled), so we narrow
+        # the skip to an *explicitly bound* unrestricted scope and otherwise run
+        # the guard, letting it gate only its own path-confinement block.
+        explicit_full_access_scope = (
+            access.scope is not None and not access.restrict_to_workspace
+        )
+        if not explicit_full_access_scope:
             guard_error = self._guard_command(
                 command,
                 cwd,
-                restrict_to_workspace=True,
+                restrict_to_workspace=access.restrict_to_workspace,
                 workspace_root=workspace_root,
             )
             if guard_error:
