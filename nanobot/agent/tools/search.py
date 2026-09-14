@@ -720,7 +720,7 @@ class GrepTool(_SearchTool):
             if target.is_file() and (
                 is_sensitive_path(path) or is_sensitive_path(target)
             ):
-                return (
+                return ToolResult.error(
                     f"Error: Path is protected by security policy: {path}. "
                     "Grepping sensitive files (SSH keys, credentials, "
                     ".env, PEM, etc.) is not permitted."

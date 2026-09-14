@@ -97,17 +97,9 @@ def _normalize_addr(
     return addr
 
 
-def _is_private(
-    addr: ipaddress.IPv4Address | ipaddress.IPv6Address,
-    *,
-    allow_loopback: bool = False,
-) -> bool:
+def _is_private(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     normalized = _normalize_addr(addr)
     if _allowed_networks and any(normalized in net for net in _allowed_networks):
-        return False
-    # Ziggy-local (fork, MIT-203): loopback-only scope reduction. Cloud metadata,
-    # RFC1918, CGNAT and IPv6 ULAs stay blocked.
-    if allow_loopback and any(normalized in net for net in _LOOPBACK_NETWORKS):
         return False
     return any(normalized in net for net in _BLOCKED_NETWORKS)
 
@@ -340,7 +332,14 @@ def validate_resolved_url(url: str, *, allow_loopback: bool | None = None) -> tu
 
     try:
         addr = ipaddress.ip_address(hostname)
-        if _is_private(addr, allow_loopback=effective_loopback):
+        # Ziggy-local (fork): use the same narrow gate as resolve_url_target --
+        # a literal loopback host whose every address is loopback. Passing the
+        # flag straight into _is_private would accept a public URL that 302s to
+        # 127.0.0.1, which is precisely the rebinding case upstream hardened
+        # against on the forward path.
+        if effective_loopback and _is_allowed_loopback_target(hostname, [addr]):
+            return True, ""
+        if _is_private(addr):
             return False, f"Redirect target is a private address: {addr}"
     except ValueError:
         # hostname is a domain name, resolve it
@@ -348,12 +347,16 @@ def validate_resolved_url(url: str, *, allow_loopback: bool | None = None) -> tu
             infos = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
         except socket.gaierror:
             return True, ""
+        resolved: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = []
         for info in infos:
             try:
-                addr = ipaddress.ip_address(info[4][0])
+                resolved.append(ipaddress.ip_address(info[4][0]))
             except ValueError:
                 continue
-            if _is_private(addr, allow_loopback=effective_loopback):
+        if effective_loopback and _is_allowed_loopback_target(hostname, resolved):
+            return True, ""
+        for addr in resolved:
+            if _is_private(addr):
                 return False, f"Redirect target {hostname} resolves to private address {addr}"
 
     return True, ""

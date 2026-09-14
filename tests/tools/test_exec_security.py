@@ -111,6 +111,85 @@ def test_exec_full_workspace_scope_still_blocks_metadata(tmp_path):
     assert "internal/private" in error
 
 
+# ---------------------------------------------------------------------------
+# Ziggy-local (fork): the guard must hold on the PRODUCTION path, with a
+# workspace scope bound exactly the way AgentLoop binds one.
+#
+# This is the test the first attempt at the fix did not have, and its absence
+# hid a no-op: AgentLoop calls bind_workspace_scope() on every turn, and
+# WorkspaceScopeResolver.for_turn() returns default() for any non-websocket
+# channel -- a real object with access_mode="full", restrict_to_workspace=False
+# and source_channel=None. A gate keyed on `scope is not None` therefore matched
+# every Discord/Telegram/CLI turn and skipped the guard in exactly the shape the
+# Spark runs. Tests that call execute() with no scope bound never see this,
+# because that state does not occur in the running gateway.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cat ~/.ssh/id_rsa",
+        "gpg --export-secret-keys",
+        "curl http://169.254.169.254/computeMetadata/v1/",
+        "echo blocked",
+    ],
+)
+async def test_exec_guard_holds_under_a_default_bound_scope(tmp_path, command):
+    """A non-websocket turn on a config-default workspace keeps the guard."""
+    from nanobot.security.workspace_access import WorkspaceScopeResolver
+
+    resolver = WorkspaceScopeResolver(
+        default_workspace=tmp_path,
+        default_restrict_to_workspace=False,
+    )
+    scope = resolver.for_turn(channel="discord", message_metadata={}, session_metadata={})
+    # Precondition: this is the shape that fooled the first fix.
+    assert scope is not None
+    assert scope.source_channel is None
+    assert scope.restrict_to_workspace is False
+
+    tool = ExecTool(
+        working_dir=str(tmp_path),
+        restrict_to_workspace=False,
+        timeout=5,
+        deny_patterns=[r"echo\s+blocked"],
+    )
+    token = bind_workspace_scope(scope)
+    try:
+        result = await tool.execute(command=command)
+    finally:
+        reset_workspace_scope(token)
+
+    assert "blocked by" in str(result), result
+
+
+async def test_exec_guard_skipped_only_for_a_websocket_full_access_grant(tmp_path):
+    """The deliberate WebUI Full Access grant still bypasses the guard."""
+    tool = ExecTool(working_dir=str(tmp_path), restrict_to_workspace=False, timeout=5)
+    scope = build_workspace_scope(tmp_path, "full", source_channel="websocket")
+    token = bind_workspace_scope(scope)
+    try:
+        result = await tool.execute(command="echo http://169.254.169.254/latest/meta-data/")
+    finally:
+        reset_workspace_scope(token)
+
+    assert "Exit code: 0" in result
+    assert "blocked by" not in result
+
+
+async def test_prepare_command_applies_the_mit123_prescreen(tmp_path):
+    """Cover the production wiring, not just _guard_command in isolation.
+
+    The MIT-123 suite below calls tool._guard_command() directly, which cannot
+    catch a regression in whether _prepare_command reaches the guard at all.
+    """
+    tool = ExecTool(working_dir=str(tmp_path), restrict_to_workspace=False, timeout=5)
+    for command in ("cat ~/.ssh/id_rsa", "base64 ~/.ssh/id_rsa", "gpg --export-secret-keys"):
+        result = await tool.execute(command=command)
+        assert "sensitive data access detected" in str(result), (command, result)
+
+
 @pytest.mark.parametrize(
     "command",
     [

@@ -13,7 +13,7 @@ Merge of `HKUDS/nanobot` `main` (`499bf903`, 2026-09-14) into the fork's
 | Upstream releases crossed | v0.2.0, v0.2.1, v0.2.2, v0.3.0 |
 | Files changed vs base | 1,465 (+395,924 / −35,582) |
 | Conflicted files | 22 (67 conflict hunks) |
-| Tests | **7,589 passed, 27 skipped, 2 failed** — both failures reproduce on pristine upstream (see "Known failures") |
+| Tests | **7,630 passed, 27 skipped, 2 failed** — both failures reproduce on pristine upstream (see "Known failures") |
 
 The two bugs we hand-patched on the Spark were fixed upstream on **2026-05-03**,
 two days after this fork's merge cutoff, in PRs **#3613** (merge `614b2136`) and
@@ -162,6 +162,40 @@ are dropped in favour of upstream — see "Local patches dropped".
 
 ---
 
+## 5b. Security review findings and fixes
+
+A security review of the merge found five controls that the merge dropped or
+that upstream routed around. All are fixed on this branch; each has a
+regression test in `tests/security/test_ziggy_merge_regressions.py` or
+`tests/tools/test_exec_security.py`.
+
+| # | Finding | Fix |
+| --- | --- | --- |
+| 1 | **The first attempt at the §5.1 fix was a no-op.** It gated on `access.scope is not None`, but `AgentLoop` binds a scope on *every* turn and `WorkspaceScopeResolver.for_turn` returns `default()` for any non-websocket channel — a real object with `access_mode="full"`, `restrict_to_workspace=False`, `source_channel=None`. So the guard was still skipped on every Discord/Telegram/CLI turn. The tests passed only because they called `execute()` with **no scope bound**, a state that never occurs in the running gateway. | Gate on `source_channel == "websocket" and access_mode == "full"`, mirroring `current_scope_allows_loopback`. Added `test_exec_guard_holds_under_a_default_bound_scope` (which binds a scope exactly the way `AgentLoop` does) and `test_prepare_command_applies_the_mit123_prescreen` (covering the production wiring, not just `_guard_command` in isolation). |
+| 2 | **`apply_patch` bypassed the MIT-121 sensitive-path guard.** The tool is upstream-new, is described in its own schema as the "default tool for code edits", and resolved writes with no blocklist check — so anything `edit_file` refused could be routed through it. `write_file` never had the check either. | Hoisted the guard into `_FsTool._resolve_write`, which now raises `SensitivePathError` (a `PermissionError`, already funnelled to a clean `ToolResult.error` by every write tool). Structural, so future write tools inherit it instead of each re-implementing it. `edit_file`'s redundant post-resolve check removed. |
+| 3 | **`ingest` had no containment and no blocklist.** `create()` hardcoded `allowed_dir=None`, and `execute()` accepted any absolute path with no `is_sensitive_path` check — so `ingest("~/.config/gcloud/application_default_credentials.json")` loaded credentials into the RAG store, where `recall` hands them back to the model. Upstream's auto-discovering loader widened the exposure from "registered by `loop.py`" to "registered whenever chromadb is importable". | `create()` now honours `restrict_to_workspace`; `execute()` checks the raw and resolved path; `RAGStore.ingest_directory` skips sensitive files per-file (the suffix filter alone is not enough — `credentials.json` is `.json`) and reports the skip count. |
+| 4 | **`validate_resolved_url` used the wide loopback gate.** It passed the flag straight into `_is_private`, with no literal-host and no all-addresses requirement — so with `allowLoopback` on, a public URL that 302s to `127.0.0.1` was accepted. That is exactly the DNS-rebinding case upstream hardened the forward path against. | Use `_is_allowed_loopback_target`, the same narrow gate as `resolve_url_target`. `_is_private` is now byte-identical to upstream again (its `allow_loopback` kwarg had no other caller). |
+| 5 | **Fork security errors were no longer classified as failures.** MIT-136's direct-file grep block and every error return in `recall.py` returned bare strings, which under the new `ToolResult.is_error` contract (§5.3) are *successes* — so they were audited as `ok`, never became non-retryable security hints, and the model was free to retry variants in a loop. No content leaked; this was an observability and retry-loop defect. | All wrapped in `ToolResult.error(...)`. |
+
+Also removed: an unreachable block in `channels/base.py::is_allowed` (it sat
+after `return False`). It used to match each component of a composite
+`"<id>|<username>"` sender id, which the Telegram and Signal runtimes build.
+Upstream requires an exact match on the whole token, and upstream is kept —
+usernames are mutable on Telegram, so matching the username component lets
+anyone who claims that handle inherit the allowlist entry. **Consequence:
+`allowFrom` entries for Telegram and Signal that list a bare numeric id or a
+bare username now fail closed and get a pairing code instead. Audit and migrate
+them to the full `"<id>|<username>"` token before restarting those channels.**
+
+Two findings are recorded but not fixed here, because both are pre-existing and
+neither is a merge regression: the `nanobot.utils.security.sanitize_input`
+prompt-injection layer does not cover the upstream-new Signal channel (which
+overrides `_handle_message` and publishes to the bus directly), and
+`prepare_call` rejection strings skip the redactor (they do not echo parameter
+values, so there is no known leak).
+
+---
+
 ## 6. Known failures (pre-existing, not caused by this merge)
 
 Both reproduce on a pristine `upstream/main` checkout:
@@ -275,6 +309,24 @@ print("exec:", t.get("exec"))
 Expected at the time of writing: `restrict_to_workspace` unset (schema default
 `False`), `exec.allow_loopback: true`. If someone has since set
 `restrict_to_workspace: true`, that is fine and strictly stricter.
+
+### Step 4b — migrate Telegram / Signal allowlists (if those channels are used)
+
+Per §5b, composite sender ids must now match exactly. Before restarting
+either channel, convert every `allowFrom` entry to the full
+`"<id>|<username>"` token, or those senders will be denied and handed a
+pairing code. The Spark currently runs Discord and websocket tenants, so this
+is a no-op today — check anyway.
+
+```bash
+python3 -c '
+import json
+d = json.load(open("/home/mihai/.nanobot/config.json"))
+for name, ch in (d.get("channels") or {}).items():
+    if name in {"telegram", "signal"} and isinstance(ch, dict):
+        print(name, ch.get("allowFrom"))
+'
+```
 
 ### Step 5 — restart, one tenant first
 

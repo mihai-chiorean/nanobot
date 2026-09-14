@@ -474,8 +474,19 @@ class ExecTool(Tool):
         # that way (`restrict_to_workspace` unset, exec enabled), so we narrow
         # the skip to an *explicitly bound* unrestricted scope and otherwise run
         # the guard, letting it gate only its own path-confinement block.
+        # NB: a scope is bound on *every* turn — WorkspaceScopeResolver.for_turn
+        # returns default() for any non-websocket channel, and that default is a
+        # real object with access_mode="full", restrict_to_workspace=False and
+        # source_channel=None. Testing `scope is not None` therefore matches every
+        # Discord/Telegram/CLI turn and skips the guard exactly where we need it.
+        # Key on source_channel instead, mirroring current_scope_allows_loopback,
+        # which is the only marker of a deliberate WebUI Full Access grant.
+        scope = access.scope
         explicit_full_access_scope = (
-            access.scope is not None and not access.restrict_to_workspace
+            scope is not None
+            and scope.source_channel == "websocket"
+            and scope.access_mode == "full"
+            and not access.restrict_to_workspace
         )
         if not explicit_full_access_scope:
             guard_error = self._guard_command(

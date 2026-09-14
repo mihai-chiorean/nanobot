@@ -252,15 +252,15 @@ class BaseChannel(ABC):
             return True
         if is_approved(self.name, str(sender_id)):
             return True
-        return False
-
-        sender_str = str(sender_id)
-        if sender_str in allow_list:
-            return True
-        if "|" in sender_str:
-            for part in sender_str.split("|"):
-                if part and part in allow_list:
-                    return True
+        # NOTE (fork, post-2026-09 merge): the fork used to also match each
+        # component of a composite sender id here ("<id>|<username>", built by
+        # the Telegram and Signal runtimes). Upstream requires an exact match on
+        # the whole token. Upstream is kept: usernames are mutable on Telegram,
+        # so matching the username component lets anyone who claims that handle
+        # inherit the allowlist entry. Consequence: allowFrom entries listing a
+        # bare numeric id or a bare username for those two channels now fail
+        # closed and get a pairing code instead -- migrate them to the full
+        # "<id>|<username>" token. See UPGRADE-NOTES.md.
         return False
     
     async def _handle_message(

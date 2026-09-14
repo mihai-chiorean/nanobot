@@ -14,6 +14,8 @@ from typing import Any
 
 from loguru import logger
 
+# Ziggy-local (fork, MIT-121): credential/key blocklist shared with the tools.
+from nanobot.utils.sensitive import is_sensitive_path
 from nanobot.utils.helpers import ensure_dir
 
 # ---------------------------------------------------------------------------
@@ -371,8 +373,17 @@ class RAGStore:
             return 0
 
         count = 0
+        skipped_sensitive = 0
         for file_path in sorted(dir_path.glob(glob)):
             if file_path.suffix not in _SUPPORTED_SUFFIXES:
+                continue
+            # Ziggy-local (fork, MIT-121): a bulk ingest must not sweep
+            # credential material into the store, where recall would hand it
+            # back to the model. The suffix filter alone is not enough --
+            # e.g. credentials.json and service_account_key.json are ".json".
+            if is_sensitive_path(file_path):
+                logger.warning("RAG: skipping sensitive path {}", file_path)
+                skipped_sensitive += 1
                 continue
             try:
                 content = _extract_text(file_path)
@@ -388,7 +399,10 @@ class RAGStore:
             except Exception:
                 logger.exception("RAG: failed to ingest file {}", file_path)
 
-        logger.info("RAG: ingest_directory ingested {} file(s) from {}", count, dir_path)
+        logger.info(
+            "RAG: ingest_directory ingested {} file(s) from {} (skipped {} sensitive)",
+            count, dir_path, skipped_sensitive,
+        )
         return count
 
     # ------------------------------------------------------------------

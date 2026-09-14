@@ -8,7 +8,8 @@ from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
-from nanobot.agent.tools.base import Tool
+from nanobot.agent.tools.base import Tool, ToolResult
+from nanobot.utils.sensitive import is_sensitive_path
 
 if TYPE_CHECKING:
     from nanobot.agent.tools.context import ToolContext
@@ -103,11 +104,11 @@ class RecallTool(Tool):
         try:
             rag = self._get_rag()
         except RuntimeError as exc:
-            return f"Error: {exc}"
+            return ToolResult.error(f"Error: {exc}")
 
         valid_scopes = {"all", "conversations", "documents", "knowledge"}
         if scope not in valid_scopes:
-            return f"Error: invalid scope '{scope}'. Must be one of: {', '.join(sorted(valid_scopes))}"
+            return ToolResult.error(f"Error: invalid scope '{scope}'. Must be one of: {', '.join(sorted(valid_scopes))}")
 
         collection = None if scope == "all" else scope
         n = min(max(n_results, 1), 20)
@@ -116,7 +117,7 @@ class RecallTool(Tool):
             results = rag.search(query=query, n_results=n, collection=collection)
         except Exception as exc:
             logger.exception("recall tool: search failed")
-            return f"Error performing semantic search: {exc}"
+            return ToolResult.error(f"Error performing semantic search: {exc}")
 
         if not results:
             return f"No results found for: {query!r} (scope={scope})"
@@ -162,7 +163,14 @@ class IngestTool(Tool):
 
     @classmethod
     def create(cls, ctx: "ToolContext") -> Tool:
-        return cls(workspace=Path(ctx.workspace), allowed_dir=None)
+        # Ziggy-local (fork): honour restrict_to_workspace. The pre-merge
+        # registration hardcoded allowed_dir=None, which disabled the only
+        # containment check in the tool; upstream's auto-discovering loader
+        # then widened that from "registered by loop.py" to "registered
+        # whenever chromadb is importable", so it needs the real bound.
+        workspace = Path(ctx.workspace)
+        restrict = bool(getattr(ctx.config, "restrict_to_workspace", False))
+        return cls(workspace=workspace, allowed_dir=workspace if restrict else None)
 
     def __init__(self, workspace: Path, allowed_dir: Path | None = None) -> None:
         self._workspace = workspace
@@ -212,7 +220,7 @@ class IngestTool(Tool):
         try:
             rag = self._get_rag()
         except RuntimeError as exc:
-            return f"Error: {exc}"
+            return ToolResult.error(f"Error: {exc}")
 
         target = Path(path).expanduser()
         if not target.is_absolute():
@@ -224,10 +232,19 @@ class IngestTool(Tool):
             try:
                 target.relative_to(allowed)
             except ValueError:
-                return f"Error: path {path} is outside the allowed directory ({allowed})"
+                return ToolResult.error(f"Error: path {path} is outside the allowed directory ({allowed})")
+
+        # Ziggy-local (fork, MIT-121): ingest reads file contents into the RAG
+        # store, where `recall` can hand them straight back to the model, so
+        # it needs the same credential/key blocklist as read_file. Checked on
+        # the raw input and the resolved path.
+        if is_sensitive_path(path) or is_sensitive_path(target):
+            return ToolResult.error(
+                f"Error: Ingesting {path} is blocked (sensitive path — credentials or key material)."
+            )
 
         if not target.exists():
-            return f"Error: path does not exist: {path}"
+            return ToolResult.error(f"Error: path does not exist: {path}")
 
         try:
             if target.is_dir():
@@ -239,7 +256,7 @@ class IngestTool(Tool):
 
             # Single file.
             if target.suffix not in _SUPPORTED_SUFFIXES:
-                return (
+                return ToolResult.error(
                     f"Error: unsupported file type '{target.suffix}'. "
                     f"Supported: {', '.join(sorted(_SUPPORTED_SUFFIXES))}"
                 )
@@ -251,7 +268,7 @@ class IngestTool(Tool):
                 try:
                     import pdfplumber
                 except ImportError:
-                    return (
+                    return ToolResult.error(
                         "Error: pdfplumber is not installed. "
                         "Run: pip install pdfplumber"
                     )
@@ -267,7 +284,7 @@ class IngestTool(Tool):
                 try:
                     import docx as python_docx
                 except ImportError:
-                    return (
+                    return ToolResult.error(
                         "Error: python-docx is not installed. "
                         "Run: pip install python-docx"
                     )
@@ -299,4 +316,4 @@ class IngestTool(Tool):
             )
         except Exception as exc:
             logger.exception("ingest tool: failed for {}", path)
-            return f"Error ingesting {path}: {exc}"
+            return ToolResult.error(f"Error ingesting {path}: {exc}")

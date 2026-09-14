@@ -39,6 +39,21 @@ from nanobot.utils.sensitive import is_sensitive_path
 _current_sender_id: str = ""
 
 
+class SensitivePathError(PermissionError):
+    """Ziggy-local (fork, MIT-121): a resolved path is credential/key material.
+
+    Raised from ``_resolve_write`` so the guard is structural rather than
+    re-implemented per tool. Upstream added ``apply_patch`` -- described in its
+    own schema as the "default tool for code edits" -- with no sensitive-path
+    check, which routed straight around ``edit_file``'s guard. Enforcing at the
+    single resolver both fixes that and covers ``write_file`` (which never had
+    the check) and any tool added later.
+
+    Subclasses PermissionError because every write tool already funnels that to
+    a clean ToolResult.error.
+    """
+
+
 class FileToolsConfig(Base):
     """Filesystem tools configuration."""
 
@@ -194,12 +209,20 @@ class _FsTool(Tool):
         )
 
     def _resolve_write(self, path: str) -> Path:
-        return self._resolve_with_extra(
+        resolved = self._resolve_with_extra(
             path,
             self._extra_write_allowed_dirs,
             self._extra_write_allowed_files,
             include_media_dir=False,
         )
+        # Ziggy-local (fork, MIT-121): check the raw input AND the resolved path,
+        # so a symlink under an innocent name or a ".." traversal that lands on
+        # credential material is caught too.
+        if is_sensitive_path(path) or is_sensitive_path(resolved):
+            raise SensitivePathError(
+                f"Writing {path} is blocked (sensitive path — credentials or key material)."
+            )
+        return resolved
 
     def _resolve(self, path: str) -> Path:
         return self._resolve_read(path)
@@ -335,11 +358,14 @@ class ReadFileTool(_FsTool):
                 return ToolResult.error(f"Error: Reading {path} is blocked (sensitive path — credentials or key material).")
 
             fp = self._resolve_read(path)
-            # Post-resolve pass: defence in depth against symlink / traversal escapes.
-            if is_sensitive_path(fp):
-                return ToolResult.error(f"Error: Reading {path} is blocked (sensitive path — credentials or key material).")
             if not fp.exists():
                 fp = _builtin_skill_read_path(path) or fp
+            # Post-resolve pass: defence in depth against symlink / traversal
+            # escapes. Runs *after* the builtin-skill fallback, which can
+            # reassign fp -- checking before it would leave the final value
+            # unvalidated.
+            if is_sensitive_path(fp):
+                return ToolResult.error(f"Error: Reading {path} is blocked (sensitive path — credentials or key material).")
             if _is_blocked_device(fp):
                 return ToolResult.error(f"Error: Reading {fp} is blocked (device path that could hang or produce infinite output).")
             if not fp.exists():
@@ -966,9 +992,9 @@ class EditFileTool(_FsTool):
             if is_sensitive_path(path):
                 return ToolResult.error(f"Error: Editing {path} is blocked (sensitive path — credentials or key material).")
 
+            # The post-resolve pass now lives in _resolve_write, which raises
+            # SensitivePathError (a PermissionError) caught below.
             fp = self._resolve_write(path)
-            if is_sensitive_path(fp):
-                return ToolResult.error(f"Error: Editing {path} is blocked (sensitive path — credentials or key material).")
             file_exists = fp.exists()
             if file_exists and old_text == new_text:
                 return ToolResult.error("Error: new_text must be different from old_text.")
