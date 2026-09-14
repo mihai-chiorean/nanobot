@@ -2639,10 +2639,13 @@ def test_optional_dependency_metadata_for_enable():
         "slackify-markdown",
     ):
         assert not any(dep.startswith(dep_name) for dep in required)
+    # NOTE (fork): pypdf's cap is raised from upstream's <6.0.0 so the Spark's
+    # editable install stops downgrading it out of the 6.16.x range that fixes
+    # six resource-exhaustion advisories. See pyproject.toml.
     for dependency in (
         "tzdata>=2025.2",
         "defusedxml>=0.7.1,<1.0.0",
-        "pypdf>=5.0.0,<6.0.0",
+        "pypdf>=5.0.0,<7.0.0",
         "python-docx>=1.1.0,<2.0.0",
         "openpyxl>=3.1.0,<4.0.0",
         "python-pptx>=1.0.0,<2.0.0",
@@ -2650,12 +2653,12 @@ def test_optional_dependency_metadata_for_enable():
         assert dependency in required
     assert deps["documents"] == [
         "defusedxml>=0.7.1,<1.0.0",
-        "pypdf>=5.0.0,<6.0.0",
+        "pypdf>=5.0.0,<7.0.0",
         "python-docx>=1.1.0,<2.0.0",
         "openpyxl>=3.1.0,<4.0.0",
         "python-pptx>=1.0.0,<2.0.0",
     ]
-    assert deps["pdf"] == ["pypdf>=5.0.0,<6.0.0"]
+    assert deps["pdf"] == ["pypdf>=5.0.0,<7.0.0"]
     assert deps["langfuse"] == ["langfuse>=3.0.0,<4.0.0"]
     assert deps["olostep"] == ["olostep>=0.1.0; python_version < '3.14'"]
     expected_olostep_args = [] if sys.version_info >= (3, 14) else ["olostep>=0.1.0"]

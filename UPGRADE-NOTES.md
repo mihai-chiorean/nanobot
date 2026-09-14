@@ -286,9 +286,23 @@ print('RAG tools discovered OK')
 "
 ```
 
-Two `pip check` complaints (`dulwich`, `pypdf`) are **pre-existing** on this
-venv and predate the merge; do not read a clean `pip check` as the success
-signal.
+`pip check` should now come back **clean**. The two long-standing complaints on
+this venv —
+
+```
+nanobot-ai has requirement dulwich<1.0.0,>=0.22.0, but you have dulwich 1.2.12
+nanobot-ai has requirement pypdf<6.0.0,>=5.0.0,  but you have pypdf 6.14.2
+```
+
+— are fixed on this branch by raising both caps in `pyproject.toml`
+(`dulwich<2.0.0`, `pypdf<7.0.0`). That matters beyond tidiness: with upstream's
+caps, `pip install -e` would have **downgraded pypdf back out of the range that
+fixes six resource-exhaustion advisories** on attacker-supplied PDFs. The full
+suite is verified green on dulwich 1.2.12 + pypdf 6.16.1.
+
+Note `chromadb>=0.6.0,<1.0.0` in the `ziggy` extra: the audit's Tier 3 item 27
+(chromadb → 1.x, for the code-injection and tenant-blind RBAC advisories) is now
+a change to this `pyproject.toml`, not a venv-side bump.
 
 ### Step 4 — confirm the exec-guard posture
 
