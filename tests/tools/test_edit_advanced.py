@@ -9,12 +9,11 @@
 """
 
 import os
-import time
 
 import pytest
 
-from nanobot.agent.tools.filesystem import EditFileTool, ReadFileTool, _find_match
 from nanobot.agent.tools import file_state
+from nanobot.agent.tools.filesystem import EditFileTool, ReadFileTool
 
 
 @pytest.fixture(autouse=True)
@@ -67,41 +66,6 @@ class TestDeleteLineCleanup:
 # ---------------------------------------------------------------------------
 # Smart quote normalization
 # ---------------------------------------------------------------------------
-
-
-class TestSmartQuoteNormalization:
-    """_find_match should handle curly ↔ straight quote fallback."""
-
-    def test_curly_double_quotes_match_straight(self):
-        content = 'She said \u201chello\u201d to him'
-        old_text = 'She said "hello" to him'
-        match, count = _find_match(content, old_text)
-        assert match is not None
-        assert count == 1
-        # Returned match should be the ORIGINAL content with curly quotes
-        assert "\u201c" in match
-
-    def test_curly_single_quotes_match_straight(self):
-        content = "it\u2019s a test"
-        old_text = "it's a test"
-        match, count = _find_match(content, old_text)
-        assert match is not None
-        assert count == 1
-        assert "\u2019" in match
-
-    def test_straight_matches_curly_in_old_text(self):
-        content = 'x = "hello"'
-        old_text = 'x = \u201chello\u201d'
-        match, count = _find_match(content, old_text)
-        assert match is not None
-        assert count == 1
-
-    def test_exact_match_still_preferred_over_quote_normalization(self):
-        content = 'x = "hello"'
-        old_text = 'x = "hello"'
-        match, count = _find_match(content, old_text)
-        assert match == old_text
-        assert count == 1
 
 
 class TestQuoteStylePreservation:
@@ -263,59 +227,6 @@ class TestAdvancedReplaceAll:
 
 
 # ---------------------------------------------------------------------------
-# Advanced fallback replacement behavior
-# ---------------------------------------------------------------------------
-
-
-class TestAdvancedReplaceAll:
-    """replace_all should work correctly for fallback-based matches too."""
-
-    @pytest.fixture()
-    def tool(self, tmp_path):
-        return EditFileTool(workspace=tmp_path)
-
-    @pytest.mark.asyncio
-    async def test_replace_all_preserves_each_match_indentation(self, tool, tmp_path):
-        f = tmp_path / "indent_multi.py"
-        f.write_text(
-            "if a:\n"
-            "    def foo():\n"
-            "        pass\n"
-            "if b:\n"
-            "        def foo():\n"
-            "            pass\n",
-            encoding="utf-8",
-        )
-        result = await tool.execute(
-            path=str(f),
-            old_text="def foo():\n    pass",
-            new_text="def bar():\n    return 1",
-            replace_all=True,
-        )
-        assert "Successfully" in result
-        assert f.read_text(encoding="utf-8") == (
-            "if a:\n"
-            "    def bar():\n"
-            "        return 1\n"
-            "if b:\n"
-            "        def bar():\n"
-            "            return 1\n"
-        )
-
-    @pytest.mark.asyncio
-    async def test_trim_and_quote_fallback_match_succeeds(self, tool, tmp_path):
-        f = tmp_path / "quote_indent.py"
-        f.write_text("    message = “hello”\n", encoding="utf-8")
-        result = await tool.execute(
-            path=str(f),
-            old_text='message = "hello"',
-            new_text='message = "goodbye"',
-        )
-        assert "Successfully" in result
-        assert f.read_text(encoding="utf-8") == "    message = “goodbye”\n"
-
-
-# ---------------------------------------------------------------------------
 # Trailing whitespace stripping on new_text
 # ---------------------------------------------------------------------------
 
@@ -369,8 +280,6 @@ class TestFileSizeProtection:
     async def test_rejects_file_over_size_limit(self, tool, tmp_path):
         f = tmp_path / "huge.txt"
         f.write_text("x", encoding="utf-8")
-        # Monkey-patch the file size check by creating a stat mock
-        original_stat = f.stat
 
         class FakeStat:
             def __init__(self, real_stat):
@@ -412,10 +321,9 @@ class TestStaleDetectionContentFallback:
         f.write_text("hello world", encoding="utf-8")
         await read_tool.execute(path=str(f))
 
-        # Touch the file to bump mtime without changing content
-        time.sleep(0.05)
-        original_content = f.read_text()
-        f.write_text(original_content, encoding="utf-8")
+        # Bump mtime without changing content.
+        stat = f.stat()
+        os.utime(f, (stat.st_atime, stat.st_mtime + 10))
 
         result = await edit_tool.execute(path=str(f), old_text="world", new_text="earth")
         assert "Successfully" in result

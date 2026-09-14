@@ -1,3 +1,4 @@
+# pyright: reportMissingTypeStubs=false
 """AWS Bedrock Converse provider."""
 
 from __future__ import annotations
@@ -8,23 +9,33 @@ import json
 import os
 import re
 from collections.abc import Awaitable, Callable, Iterator
-from typing import Any
+from typing import Any, cast
 
-import json_repair
-
-from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from nanobot.providers.base import (
+    LLMProvider,
+    LLMResponse,
+    LLMUsage,
+    ToolCallRequest,
+    parse_tool_arguments,
+    resolve_stream_idle_timeout_s,
+    tool_arguments_object_for_replay,
+)
 
 _IMAGE_DATA_URL = re.compile(r"^data:image/([a-zA-Z0-9.+-]+);base64,(.*)$", re.DOTALL)
 _TEXT_BLOCK_TYPES = {"text", "input_text", "output_text"}
 _TEMPERATURE_UNSUPPORTED_MODEL_TOKENS = ("claude-opus-4-7",)
 _ADAPTIVE_THINKING_ONLY_MODEL_TOKENS = ("claude-opus-4-7",)
+_NOOP_TOOL_NAME = "nanobot_noop"
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
     merged = dict(base)
     for key, value in override.items():
         if key in merged and isinstance(merged[key], dict) and isinstance(value, dict):
-            merged[key] = _deep_merge(merged[key], value)
+            merged[key] = _deep_merge(
+                cast(dict[str, Any], merged[key]),
+                cast(dict[str, Any], value),
+            )
         else:
             merged[key] = value
     return merged
@@ -50,8 +61,9 @@ class BedrockProvider(LLMProvider):
         profile: str | None = None,
         extra_body: dict[str, Any] | None = None,
         client: Any | None = None,
+        provider_name: str = "bedrock",
     ):
-        super().__init__(api_key, api_base)
+        super().__init__(api_key, api_base, provider_name=provider_name)
         self.default_model = default_model
         self.region = region or os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
         self.profile = profile
@@ -63,17 +75,22 @@ class BedrockProvider(LLMProvider):
             os.environ["AWS_BEARER_TOKEN_BEDROCK"] = self.api_key
         try:
             import boto3
+            from botocore.config import Config
         except ImportError as exc:  # pragma: no cover - exercised only without boto3 installed
             raise RuntimeError(
-                "AWS Bedrock provider requires boto3. Install it with `pip install boto3`."
+                "AWS Bedrock provider requires boto3. Run `nanobot plugins enable bedrock`."
             ) from exc
 
         session_kwargs: dict[str, Any] = {}
         if self.profile:
             session_kwargs["profile_name"] = self.profile
-        session = boto3.Session(**session_kwargs)
+        boto3_module = cast(Any, boto3)
+        session = boto3_module.Session(**session_kwargs)
 
-        client_kwargs: dict[str, Any] = {}
+        idle_timeout_s = resolve_stream_idle_timeout_s()
+        client_kwargs: dict[str, Any] = {
+            "config": Config(connect_timeout=idle_timeout_s, read_timeout=idle_timeout_s),
+        }
         if self.region:
             client_kwargs["region_name"] = self.region
         if self.api_base:
@@ -101,7 +118,8 @@ class BedrockProvider(LLMProvider):
 
     @staticmethod
     def _image_url_block(block: dict[str, Any]) -> dict[str, Any] | None:
-        url = (block.get("image_url") or {}).get("url", "")
+        image_url = cast(dict[str, Any], block.get("image_url") or {})
+        url = image_url.get("url", "")
         if not isinstance(url, str) or not url:
             return None
         match = _IMAGE_DATA_URL.match(url)
@@ -126,10 +144,11 @@ class BedrockProvider(LLMProvider):
             return [{"text": str(content)}]
 
         blocks: list[dict[str, Any]] = []
-        for item in content:
-            if not isinstance(item, dict):
-                blocks.append({"text": str(item)})
+        for raw_item in cast(list[object], content):
+            if not isinstance(raw_item, dict):
+                blocks.append({"text": str(raw_item)})
                 continue
+            item = cast(dict[str, Any], raw_item)
 
             item_type = item.get("type")
             if item_type in _TEXT_BLOCK_TYPES or "text" in item:
@@ -175,14 +194,8 @@ class BedrockProvider(LLMProvider):
         function = tool_call.get("function")
         if not isinstance(function, dict):
             return None
-        args = function.get("arguments", {})
-        if isinstance(args, str):
-            try:
-                args = json_repair.loads(args) if args.strip() else {}
-            except Exception:
-                args = {}
-        if not isinstance(args, dict):
-            args = {}
+        function = cast(dict[str, Any], function)
+        args = tool_arguments_object_for_replay(function.get("arguments", {}))
         return {
             "toolUse": {
                 "toolUseId": str(tool_call.get("id") or ""),
@@ -217,8 +230,10 @@ class BedrockProvider(LLMProvider):
     def _assistant_blocks(cls, msg: dict[str, Any]) -> list[dict[str, Any]]:
         blocks: list[dict[str, Any]] = []
 
-        for thinking in msg.get("thinking_blocks") or []:
-            if isinstance(thinking, dict):
+        thinking_values = cast(list[object], msg.get("thinking_blocks") or [])
+        for thinking_value in thinking_values:
+            if isinstance(thinking_value, dict):
+                thinking = cast(dict[str, Any], thinking_value)
                 reasoning = cls._reasoning_block(thinking)
                 if reasoning:
                     blocks.append(reasoning)
@@ -229,8 +244,10 @@ class BedrockProvider(LLMProvider):
         elif isinstance(content, list):
             blocks.extend(block for block in cls._content_blocks(content) if "text" in block)
 
-        for tool_call in msg.get("tool_calls") or []:
-            if isinstance(tool_call, dict):
+        tool_call_values = cast(list[object], msg.get("tool_calls") or [])
+        for tool_call_value in tool_call_values:
+            if isinstance(tool_call_value, dict):
+                tool_call = cast(dict[str, Any], tool_call_value)
                 block = cls._tool_use_block(tool_call)
                 if block:
                     blocks.append(block)
@@ -241,7 +258,8 @@ class BedrockProvider(LLMProvider):
     def _has_tool_use(msg: dict[str, Any]) -> bool:
         content = msg.get("content")
         return isinstance(content, list) and any(
-            isinstance(block, dict) and "toolUse" in block for block in content
+            isinstance(block, dict) and "toolUse" in block
+            for block in cast(list[object], content)
         )
 
     @staticmethod
@@ -250,12 +268,14 @@ class BedrockProvider(LLMProvider):
         for msg in messages:
             if merged and merged[-1].get("role") == msg.get("role"):
                 prev = merged[-1].setdefault("content", [])
-                cur = msg.get("content") or []
+                cur: Any = msg.get("content") or []
                 if not isinstance(prev, list):
                     prev = [{"text": str(prev)}]
                     merged[-1]["content"] = prev
+                else:
+                    prev = cast(list[Any], prev)
                 if isinstance(cur, list):
-                    prev.extend(cur)
+                    prev.extend(cast(list[Any], cur))
                 else:
                     prev.append({"text": str(cur)})
             else:
@@ -304,9 +324,12 @@ class BedrockProvider(LLMProvider):
             return None
         result: list[dict[str, Any]] = []
         for tool in tools:
-            func = tool.get("function") if isinstance(tool.get("function"), dict) else tool
-            if not isinstance(func, dict):
-                continue
+            function_value = tool.get("function")
+            func = (
+                cast(dict[str, Any], function_value)
+                if isinstance(function_value, dict)
+                else tool
+            )
             name = str(func.get("name") or "")
             if not name:
                 continue
@@ -326,6 +349,29 @@ class BedrockProvider(LLMProvider):
         return result or None
 
     @staticmethod
+    def _contains_tool_blocks(messages: list[dict[str, Any]]) -> bool:
+        for msg in messages:
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+            for block_value in cast(list[object], content):
+                if isinstance(block_value, dict):
+                    block = cast(dict[str, Any], block_value)
+                    if "toolUse" in block or "toolResult" in block:
+                        return True
+        return False
+
+    @staticmethod
+    def _noop_tool() -> dict[str, Any]:
+        return {
+            "toolSpec": {
+                "name": _NOOP_TOOL_NAME,
+                "description": "Internal placeholder for Bedrock tool history validation.",
+                "inputSchema": {"json": {"type": "object", "properties": {}}},
+            }
+        }
+
+    @staticmethod
     def _convert_tool_choice(
         tool_choice: str | dict[str, Any] | None,
     ) -> dict[str, Any] | None:
@@ -336,7 +382,8 @@ class BedrockProvider(LLMProvider):
         if tool_choice == "none":
             return None
         if isinstance(tool_choice, dict):
-            name = tool_choice.get("function", {}).get("name")
+            function = cast(dict[str, Any], tool_choice.get("function", {}))
+            name = function.get("name")
             if name:
                 return {"tool": {"name": str(name)}}
         return {"auto": {}}
@@ -389,11 +436,16 @@ class BedrockProvider(LLMProvider):
             kwargs["additionalModelRequestFields"] = additional
 
         bedrock_tools = self._convert_tools(tools)
+        tool_config: dict[str, Any] | None = None
         if bedrock_tools:
-            tool_config: dict[str, Any] = {"tools": bedrock_tools}
+            tool_config = {"tools": bedrock_tools}
             choice = self._convert_tool_choice(tool_choice)
             if choice:
                 tool_config["toolChoice"] = choice
+        elif self._contains_tool_blocks(bedrock_messages):
+            tool_config = {"tools": [self._noop_tool()]}
+
+        if tool_config:
             kwargs["toolConfig"] = tool_config
 
         return kwargs
@@ -407,33 +459,35 @@ class BedrockProvider(LLMProvider):
         }.get(stop_reason or "", stop_reason or "stop")
 
     @staticmethod
-    def _usage(usage: dict[str, Any] | None) -> dict[str, int]:
+    def _usage(usage: dict[str, Any] | None) -> LLMUsage | None:
         if not usage:
-            return {}
-        prompt = int(usage.get("inputTokens") or 0)
-        completion = int(usage.get("outputTokens") or 0)
-        total = int(usage.get("totalTokens") or prompt + completion)
-        result = {
-            "prompt_tokens": prompt,
-            "completion_tokens": completion,
-            "total_tokens": total,
-        }
-        cache_read = int(usage.get("cacheReadInputTokens") or 0)
-        cache_write = int(usage.get("cacheWriteInputTokens") or 0)
-        if cache_read:
-            result["cached_tokens"] = cache_read
-            result["cache_read_input_tokens"] = cache_read
-        if cache_write:
-            result["cache_creation_input_tokens"] = cache_write
-        return result
+            return None
+
+        def _optional_count(key: str) -> int | None:
+            raw = usage.get(key)
+            return int(raw) if raw is not None else None
+
+        cache_read = _optional_count("cacheReadInputTokens")
+        cache_write = _optional_count("cacheWriteInputTokens")
+        logical_input = int(usage.get("inputTokens") or 0) + (cache_read or 0) + (
+            cache_write or 0
+        )
+        return LLMUsage.reported(
+            input_tokens=logical_input,
+            output_tokens=int(usage.get("outputTokens") or 0),
+            cache_read_tokens=cache_read,
+            cache_write_tokens=cache_write,
+        )
 
     @staticmethod
     def _parse_reasoning(block: dict[str, Any]) -> tuple[str | None, dict[str, Any] | None]:
         reasoning = block.get("reasoningContent")
         if not isinstance(reasoning, dict):
             return None, None
+        reasoning = cast(dict[str, Any], reasoning)
         text_obj = reasoning.get("reasoningText")
         if isinstance(text_obj, dict):
+            text_obj = cast(dict[str, Any], text_obj)
             text = text_obj.get("text")
             if isinstance(text, str):
                 return text, {
@@ -455,16 +509,20 @@ class BedrockProvider(LLMProvider):
         reasoning_parts: list[str] = []
         tool_calls: list[ToolCallRequest] = []
         thinking_blocks: list[dict[str, Any]] = []
-        message = (response.get("output") or {}).get("message") or {}
+        output = cast(dict[str, Any], response.get("output") or {})
+        message = cast(dict[str, Any], output.get("message") or {})
 
-        for block in message.get("content") or []:
-            if not isinstance(block, dict):
+        content_blocks = cast(list[object], message.get("content") or [])
+        for block_value in content_blocks:
+            if not isinstance(block_value, dict):
                 continue
+            block = cast(dict[str, Any], block_value)
             if isinstance(block.get("text"), str):
-                content_parts.append(block["text"])
+                content_parts.append(cast(str, block["text"]))
             tool_use = block.get("toolUse")
             if isinstance(tool_use, dict):
-                arguments = tool_use.get("input") if isinstance(tool_use.get("input"), dict) else {}
+                tool_use = cast(dict[str, Any], tool_use)
+                arguments = tool_use.get("input", {})
                 tool_calls.append(ToolCallRequest(
                     id=str(tool_use.get("toolUseId") or ""),
                     name=str(tool_use.get("name") or ""),
@@ -479,8 +537,8 @@ class BedrockProvider(LLMProvider):
         return LLMResponse(
             content="".join(content_parts) or None,
             tool_calls=tool_calls,
-            finish_reason=cls._finish_reason(response.get("stopReason")),
-            usage=cls._usage(response.get("usage")),
+            finish_reason=cls._finish_reason(cast(str | None, response.get("stopReason"))),
+            usage=cls._usage(cast(dict[str, Any] | None, response.get("usage"))),
             reasoning_content="".join(reasoning_parts) or None,
             thinking_blocks=thinking_blocks or None,
         )
@@ -497,11 +555,12 @@ class BedrockProvider(LLMProvider):
         state: dict[str, Any],
     ) -> str | None:
         if "contentBlockStart" in event:
-            data = event["contentBlockStart"]
+            data = cast(dict[str, Any], event["contentBlockStart"])
             idx = int(data.get("contentBlockIndex") or 0)
-            start = data.get("start") or {}
+            start = cast(dict[str, Any], data.get("start") or {})
             tool_use = start.get("toolUse")
             if isinstance(tool_use, dict):
+                tool_use = cast(dict[str, Any], tool_use)
                 tool_buffers[idx] = {
                     "id": str(tool_use.get("toolUseId") or ""),
                     "name": str(tool_use.get("name") or ""),
@@ -510,21 +569,27 @@ class BedrockProvider(LLMProvider):
             return None
 
         if "contentBlockDelta" in event:
-            data = event["contentBlockDelta"]
+            data = cast(dict[str, Any], event["contentBlockDelta"])
             idx = int(data.get("contentBlockIndex") or 0)
-            delta = data.get("delta") or {}
+            delta = cast(dict[str, Any], data.get("delta") or {})
             text = delta.get("text")
             if isinstance(text, str):
                 content_parts.append(text)
                 return text
             tool_delta = delta.get("toolUse")
             if isinstance(tool_delta, dict):
+                tool_delta = cast(dict[str, Any], tool_delta)
                 buf = tool_buffers.setdefault(idx, {"id": "", "name": "", "input": ""})
                 if isinstance(tool_delta.get("input"), str):
                     buf["input"] += tool_delta["input"]
             reasoning = delta.get("reasoningContent")
             if isinstance(reasoning, dict):
-                buf = state.setdefault("reasoning_buffers", {}).setdefault(
+                reasoning = cast(dict[str, Any], reasoning)
+                reasoning_buffers = cast(
+                    dict[int, dict[str, Any]],
+                    state.setdefault("reasoning_buffers", {}),
+                )
+                buf = reasoning_buffers.setdefault(
                     idx, {"text": "", "signature": "", "redactedContent": None}
                 )
                 if isinstance(reasoning.get("text"), str):
@@ -537,8 +602,13 @@ class BedrockProvider(LLMProvider):
             return None
 
         if "contentBlockStop" in event:
-            idx = int((event["contentBlockStop"] or {}).get("contentBlockIndex") or 0)
-            reasoning_buf = state.setdefault("reasoning_buffers", {}).pop(idx, None)
+            stop = cast(dict[str, Any], event["contentBlockStop"] or {})
+            idx = int(stop.get("contentBlockIndex") or 0)
+            reasoning_buffers = cast(
+                dict[int, dict[str, Any]],
+                state.setdefault("reasoning_buffers", {}),
+            )
+            reasoning_buf = reasoning_buffers.pop(idx, None)
             if reasoning_buf:
                 if reasoning_buf.get("text"):
                     thinking_blocks.append({
@@ -564,11 +634,12 @@ class BedrockProvider(LLMProvider):
             return None
 
         if "messageStop" in event:
-            state["stop_reason"] = (event["messageStop"] or {}).get("stopReason")
+            message_stop = cast(dict[str, Any], event["messageStop"] or {})
+            state["stop_reason"] = message_stop.get("stopReason")
             return None
 
         if "metadata" in event:
-            metadata = event["metadata"] or {}
+            metadata = cast(dict[str, Any], event["metadata"] or {})
             if isinstance(metadata.get("usage"), dict):
                 state["usage"] = metadata["usage"]
             return None
@@ -589,14 +660,11 @@ class BedrockProvider(LLMProvider):
         for buf in tool_buffers.values():
             args: Any = {}
             if buf.get("input"):
-                try:
-                    args = json_repair.loads(buf["input"])
-                except Exception:
-                    args = {}
+                args = parse_tool_arguments(buf["input"])
             tool_calls.append(ToolCallRequest(
                 id=buf.get("id") or "",
                 name=buf.get("name") or "",
-                arguments=args if isinstance(args, dict) else {},
+                arguments=args,
             ))
         return LLMResponse(
             content="".join(content_parts) or None,
@@ -609,14 +677,29 @@ class BedrockProvider(LLMProvider):
 
     @classmethod
     def _handle_error(cls, e: Exception) -> LLMResponse:
-        response = getattr(e, "response", None)
-        metadata = response.get("ResponseMetadata", {}) if isinstance(response, dict) else {}
-        headers = metadata.get("HTTPHeaders") if isinstance(metadata, dict) else None
-        error_obj = response.get("Error", {}) if isinstance(response, dict) else {}
-        message = error_obj.get("Message") if isinstance(error_obj, dict) else None
-        code = error_obj.get("Code") if isinstance(error_obj, dict) else None
-        status_code = metadata.get("HTTPStatusCode") if isinstance(metadata, dict) else None
-        body = message or str(e)
+        response_value = getattr(e, "response", None)
+        response = (
+            cast(dict[str, Any], response_value)
+            if isinstance(response_value, dict)
+            else {}
+        )
+        metadata_value = response.get("ResponseMetadata", {})
+        metadata = (
+            cast(dict[str, Any], metadata_value)
+            if isinstance(metadata_value, dict)
+            else {}
+        )
+        headers = metadata.get("HTTPHeaders")
+        error_value = response.get("Error", {})
+        error_obj = (
+            cast(dict[str, Any], error_value)
+            if isinstance(error_value, dict)
+            else {}
+        )
+        message = error_obj.get("Message")
+        code = error_obj.get("Code")
+        status_code = metadata.get("HTTPStatusCode")
+        body = cast(str, message or str(e))
         retry_after = cls._extract_retry_after_from_headers(headers)
         if retry_after is None:
             retry_after = cls._extract_retry_after(body)
@@ -661,7 +744,10 @@ class BedrockProvider(LLMProvider):
             kwargs = self._build_kwargs(
                 messages, tools, model, max_tokens, temperature, reasoning_effort, tool_choice
             )
-            response = await asyncio.to_thread(self._client.converse, **kwargs)
+            response = cast(
+                dict[str, Any],
+                await asyncio.to_thread(self._client.converse, **kwargs),
+            )
             return self._parse_response(response)
         except Exception as e:
             return self._handle_error(e)
@@ -676,8 +762,11 @@ class BedrockProvider(LLMProvider):
         reasoning_effort: str | None = None,
         tool_choice: str | dict[str, Any] | None = None,
         on_content_delta: Callable[[str], Awaitable[None]] | None = None,
+        on_thinking_delta: Callable[[str], Awaitable[None]] | None = None,
+        on_tool_call_delta: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     ) -> LLMResponse:
-        idle_timeout_s = int(os.environ.get("NANOBOT_STREAM_IDLE_TIMEOUT_S", "90"))
+        _ = on_thinking_delta, on_tool_call_delta
+        idle_timeout_s = resolve_stream_idle_timeout_s()
         content_parts: list[str] = []
         reasoning_parts: list[str] = []
         thinking_blocks: list[dict[str, Any]] = []
@@ -688,8 +777,14 @@ class BedrockProvider(LLMProvider):
             kwargs = self._build_kwargs(
                 messages, tools, model, max_tokens, temperature, reasoning_effort, tool_choice
             )
-            response = await asyncio.to_thread(self._client.converse_stream, **kwargs)
-            stream = iter(response.get("stream") or [])
+            response = cast(
+                dict[str, Any],
+                await asyncio.wait_for(
+                    asyncio.to_thread(self._client.converse_stream, **kwargs),
+                    timeout=idle_timeout_s,
+                ),
+            )
+            stream = cast(Iterator[dict[str, Any]], iter(response.get("stream") or []))
             while True:
                 event = await asyncio.wait_for(
                     asyncio.to_thread(_next_or_none, stream),
@@ -707,6 +802,8 @@ class BedrockProvider(LLMProvider):
                 )
                 if delta and on_content_delta:
                     await on_content_delta(delta)
+            if not state.get("stop_reason"):
+                raise ConnectionError("Model stream ended before a stop reason was received")
             return self._stream_result(
                 content_parts=content_parts,
                 reasoning_parts=reasoning_parts,
@@ -718,7 +815,7 @@ class BedrockProvider(LLMProvider):
             return LLMResponse(
                 content=(
                     f"Error calling LLM: stream stalled for more than "
-                    f"{idle_timeout_s} seconds"
+                    f"{idle_timeout_s:g} seconds"
                 ),
                 finish_reason="error",
                 error_kind="timeout",

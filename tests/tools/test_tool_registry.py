@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
-from nanobot.agent.tools.base import Tool
+from nanobot.agent.tools.base import Tool, ToolResult
+from nanobot.agent.tools.filesystem import ReadFileTool
 from nanobot.agent.tools.registry import ToolRegistry
 
 
 class _FakeTool(Tool):
-    def __init__(self, name: str):
+    def __init__(self, name: str, schema: dict[str, Any] | None = None):
         self._name = name
+        self._schema = schema
 
     @property
     def name(self) -> str:
@@ -22,11 +25,10 @@ class _FakeTool(Tool):
 
     @property
     def parameters(self) -> dict[str, Any]:
-        return {"type": "object", "properties": {}}
+        return self._schema or {"type": "object", "properties": {}}
 
     async def execute(self, **kwargs: Any) -> Any:
         return kwargs
-
 
 def _tool_names(definitions: list[dict[str, Any]]) -> list[str]:
     names: list[str] = []
@@ -34,6 +36,13 @@ def _tool_names(definitions: list[dict[str, Any]]) -> list[str]:
         fn = definition.get("function", {})
         names.append(fn.get("name", ""))
     return names
+
+
+def _registry_with_names(names: list[str]) -> ToolRegistry:
+    registry = ToolRegistry()
+    for name in names:
+        registry.register(_FakeTool(name))
+    return registry
 
 
 def test_get_definitions_orders_builtins_then_mcp_tools() -> None:
@@ -51,56 +60,245 @@ def test_get_definitions_orders_builtins_then_mcp_tools() -> None:
     ]
 
 
-# ---------------------------------------------------------------------------
-# Parameter-type validation for read_file / write_file — originally covered
-# by `registry.prepare_call(...)` (removed in commit 1d18d24 when the
-# timing/audit wrapper in `execute()` absorbed `prepare_call`).  The
-# semantic contract still holds through `execute()`, so the tests are
-# re-targeted there to keep the coverage.
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_execute_read_file_rejects_non_object_params_with_actionable_hint() -> None:
+def test_prepare_call_rejects_near_miss_tool_name_with_suggestion() -> None:
     registry = ToolRegistry()
     registry.register(_FakeTool("read_file"))
 
-    result = await registry.execute("read_file", ["foo.txt"])
+    tool, params, error = registry.prepare_call("readFile", {"path": "foo.txt"})
 
-    assert "must be a JSON object" in result
-    assert "Use named parameters" in result
+    assert tool is None
+    assert params == {"path": "foo.txt"}
+    assert error is not None
+    assert "Tool 'readFile' not found" in error
+    assert "Did you mean 'read_file'?" in error
+    assert "must match exactly" in error
 
 
-@pytest.mark.asyncio
-async def test_execute_other_tools_keep_generic_object_validation() -> None:
-    """Non read_file/write_file tools still flow through the generic
-    `validate_params` path and get the generic error message."""
+def test_suggest_name_handles_canonical_tool_name_variants() -> None:
+    registry = _registry_with_names(["read_file"])
+    expected = {
+        "readFile": "read_file",
+        "read-file": "read_file",
+        "READ_FILE": "read_file",
+        "read file": "read_file",
+        "readfile": "read_file",
+    }
+
+    assert {name: registry._suggest_name(name) for name in expected} == expected
+
+
+def test_suggest_name_suppresses_low_confidence_and_non_unique_matches() -> None:
+    registry = _registry_with_names(["read_file", "write_file"])
+
+    for name in ["", "foo", "read", "file", "readfil", "read_file_tool"]:
+        assert registry._suggest_name(name) is None
+
+    ambiguous = _registry_with_names(["read_file", "readFile"])
+    assert ambiguous._suggest_name("readfile") is None
+
+
+def test_suggest_name_updates_after_register_and_unregister() -> None:
+    registry = _registry_with_names(["read_file"])
+
+    assert registry._suggest_name("readFile") == "read_file"
+
+    registry.register(_FakeTool("readFile"))
+    assert registry._suggest_name("read-file") is None
+
+    registry.unregister("read_file")
+    assert registry._suggest_name("read-file") == "readFile"
+
+
+def test_prepare_call_read_file_rejects_non_object_params_with_actionable_hint() -> None:
+    registry = ToolRegistry()
+    registry.register(_FakeTool("read_file"))
+
+    tool, params, error = registry.prepare_call("read_file", ["foo.txt"])
+
+    assert tool is not None
+    assert params == ["foo.txt"]
+    assert error is not None
+    assert "must be a JSON object" in error
+    assert 'tool_name(param1="value1", param2="value2")' in error
+    assert "matching the tool schema" in error
+
+
+def test_prepare_call_parses_json_string_arguments() -> None:
+    registry = ToolRegistry()
+    registry.register(_FakeTool("read_file"))
+
+    tool, params, error = registry.prepare_call("read_file", '{"path":"foo.txt"}')
+
+    assert tool is not None
+    assert params == {"path": "foo.txt"}
+    assert error is None
+
+
+def test_prepare_call_rejects_malformed_json_string_arguments() -> None:
+    registry = ToolRegistry()
+    registry.register(_FakeTool("read_file"))
+
+    tool, params, error = registry.prepare_call("read_file", '{path:"foo.txt"}')
+
+    assert tool is not None
+    assert params == '{path:"foo.txt"}'
+    assert error is not None
+    assert "parameters must be a JSON object" in error
+
+
+def test_prepare_call_rejects_scalar_for_single_required_parameter() -> None:
+    registry = ToolRegistry()
+    registry.register(_FakeTool(
+        "web_fetch",
+        {
+            "type": "object",
+            "properties": {"url": {"type": "string"}},
+            "required": ["url"],
+        },
+    ))
+
+    tool, params, error = registry.prepare_call("web_fetch", "https://example.com")
+
+    assert tool is not None
+    assert params == "https://example.com"
+    assert error is not None
+    assert "parameters must be a JSON object" in error
+
+
+def test_prepare_call_rejects_unquoted_scalar_strings_before_schema_cast() -> None:
+    registry = ToolRegistry()
+    registry.register(_FakeTool(
+        "message",
+        {
+            "type": "object",
+            "properties": {"content": {"type": "string"}},
+            "required": ["content"],
+        },
+    ))
+
+    tool, params, error = registry.prepare_call("message", "true")
+
+    assert tool is not None
+    assert params == "true"
+    assert error is not None
+    assert "parameters must be a JSON object" in error
+
+
+def test_prepare_call_unwraps_arguments_payload() -> None:
+    registry = ToolRegistry()
+    registry.register(_FakeTool(
+        "read_file",
+        {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        },
+    ))
+
+    tool, params, error = registry.prepare_call(
+        "read_file",
+        {"arguments": '{"path":"foo.txt"}'},
+    )
+
+    assert tool is not None
+    assert params == {"path": "foo.txt"}
+    assert error is None
+
+
+def test_prepare_call_treats_none_arguments_as_empty_object() -> None:
+    registry = ToolRegistry()
+    registry.register(_FakeTool("list_exec_sessions"))
+
+    tool, params, error = registry.prepare_call("list_exec_sessions", None)
+
+    assert tool is not None
+    assert params == {}
+    assert error is None
+
+    tool, params, error = registry.prepare_call("list_exec_sessions", "null")
+
+    assert tool is not None
+    assert params == "null"
+    assert error is not None
+    assert "parameters must be a JSON object" in error
+
+
+def test_prepare_call_other_tools_keep_generic_object_validation() -> None:
     registry = ToolRegistry()
     registry.register(_FakeTool("grep"))
 
-    result = await registry.execute("grep", ["TODO"])
+    tool, params, error = registry.prepare_call("grep", ["TODO"])
 
-    # The specific 'JSON object' hint is reserved for read_file/write_file.
-    assert "must be a JSON object" not in result
-    # And the generic validator's error surfaces instead.
-    assert "Invalid parameters for tool 'grep'" in result
-
-
-# ---------------------------------------------------------------------------
-# Cache behaviour for get_definitions().  The internal attribute was
-# renamed `_cached_definitions` -> `_definitions_cache` in commit 1d18d24,
-# so the old test that poked at the attribute by its old name is removed.
-# The observable contract — same list instance across calls, fresh list
-# after mutation — is kept via the two invalidation tests below.
-# ---------------------------------------------------------------------------
+    assert tool is not None
+    assert params == ["TODO"]
+    assert error == (
+        "Error: Tool 'grep' parameters must be a JSON object, got list. "
+        'Use named parameters like tool_name(param1="value1", param2="value2") '
+        "matching the tool schema."
+    )
 
 
-def test_get_definitions_is_cached_between_calls() -> None:
-    """Back-to-back calls return the same list instance (stable ordering
-    cache, no resorting)."""
+async def test_registry_rejects_unknown_builtin_tool_parameters(tmp_path) -> None:
+    (tmp_path / "sample.txt").write_text("one\ntwo\nthree\n", encoding="utf-8")
+    registry = ToolRegistry()
+    registry.register(
+        ReadFileTool(
+            workspace=tmp_path,
+            allowed_dir=tmp_path,
+            restrict_to_workspace=True,
+        )
+    )
+
+    result = await registry.execute(
+        "read_file",
+        {"path": "sample.txt", "line_limit": 1},
+    )
+
+    assert "Invalid parameters" in result
+    assert "unexpected parameter line_limit" in result
+    assert "one" not in result
+
+
+async def test_registry_preserves_successful_exec_output_that_starts_with_error() -> None:
+    registry = ToolRegistry()
+    output = "Error: generated report successfully\n\nExit code: 0"
+    tool = _FakeTool("exec")
+    tool.execute = AsyncMock(return_value=output)
+    registry.register(tool)
+
+    result = await registry.execute("exec", {})
+
+    assert result == output
+
+
+async def test_registry_uses_structured_tool_result_for_errors() -> None:
+    registry = ToolRegistry()
+    output = "Error: plain tool output, not a structured failure"
+    raw_tool = _FakeTool("raw_output")
+    raw_tool.execute = AsyncMock(return_value=output)
+    registry.register(raw_tool)
+
+    raw_result = await registry.execute("raw_output", {})
+
+    assert raw_result == output
+
+    failing_tool = _FakeTool("failing_tool")
+    failing_tool.execute = AsyncMock(return_value=ToolResult.error("Error: real failure"))
+    registry.register(failing_tool)
+
+    error_result = await registry.execute("failing_tool", {})
+
+    assert isinstance(error_result, ToolResult)
+    assert error_result.is_error
+    assert error_result.startswith("Error: real failure")
+    assert "[Analyze the error above" in error_result
+
+
+def test_get_definitions_returns_cached_result() -> None:
     registry = ToolRegistry()
     registry.register(_FakeTool("read_file"))
     first = registry.get_definitions()
+    assert registry._cached_definitions is not None
     second = registry.get_definitions()
     assert first is second
 
@@ -306,12 +504,25 @@ async def test_execute_does_not_touch_list_results() -> None:
 # ---------------------------------------------------------------------------
 
 
+class _ErrorReturningTool(_StringReturningTool):
+    """Fake tool whose output is a *structured* failure (ToolResult.error).
+
+    Post-upstream-merge: a bare string that merely starts with "Error" is no
+    longer a failure — upstream made failure detection structural via
+    ``ToolResult.is_error``. Tests that exercise the error branch must produce
+    a real ToolResult failure.
+    """
+
+    async def execute(self, **kwargs: Any) -> Any:
+        return ToolResult.error(await super().execute(**kwargs))
+
+
 @pytest.mark.asyncio
 async def test_execute_redacts_aws_key_in_error_output() -> None:
     """MIT-147: AKIA-style secrets embedded in Error: strings must be scrubbed."""
     payload = "Error: invalid AWS credentials: AKIAABCDEFGHIJKLMNOP is not valid"
     registry = ToolRegistry()
-    registry.register(_StringReturningTool("boom", payload))
+    registry.register(_ErrorReturningTool("boom", payload))
 
     result = await registry.execute("boom", {})
 
@@ -319,8 +530,8 @@ async def test_execute_redacts_aws_key_in_error_output() -> None:
     assert "REDACTED" in result
     # The error-path hint still attaches so the model knows to try again.
     assert "Analyze the error above" in result
-    # Downstream-contract: failure detection via startswith("Error")
-    assert result.startswith("Error")
+    # Downstream-contract: failure detection is structural post-merge.
+    assert result.is_error
 
 
 @pytest.mark.asyncio
@@ -333,7 +544,7 @@ async def test_execute_redacts_pem_material_in_error_output() -> None:
         "-----END RSA PRIVATE KEY-----\n"
     )
     registry = ToolRegistry()
-    registry.register(_StringReturningTool("parser", payload))
+    registry.register(_ErrorReturningTool("parser", payload))
 
     result = await registry.execute("parser", {})
 
@@ -341,7 +552,7 @@ async def test_execute_redacts_pem_material_in_error_output() -> None:
     assert "MIIEowIBAAKCAQEAy3SECRETSECRETSECRET" not in result
     assert "REDACTED" in result
     assert "Analyze the error above" in result
-    assert result.startswith("Error")
+    assert result.is_error
 
 
 @pytest.mark.asyncio
@@ -352,14 +563,14 @@ async def test_execute_redacts_github_token_in_error_output() -> None:
         "ghp_0123456789abcdef0123456789abcdef0123 (403 Forbidden)"
     )
     registry = ToolRegistry()
-    registry.register(_StringReturningTool("gh", payload))
+    registry.register(_ErrorReturningTool("gh", payload))
 
     result = await registry.execute("gh", {})
 
     assert "ghp_0123456789abcdef0123456789abcdef0123" not in result
     assert "REDACTED" in result
     assert "Analyze the error above" in result
-    assert result.startswith("Error")
+    assert result.is_error
 
 
 @pytest.mark.asyncio
@@ -371,7 +582,7 @@ async def test_execute_clean_error_passes_through_with_hint() -> None:
     that secret-bearing error bodies now get scrubbed.
     """
     registry = ToolRegistry()
-    registry.register(_StringReturningTool("boom", "Error: something bad happened"))
+    registry.register(_ErrorReturningTool("boom", "Error: something bad happened"))
 
     result = await registry.execute("boom", {})
 
@@ -400,7 +611,7 @@ async def test_execute_redacts_secret_in_exception_message() -> None:
     assert "BEGIN OPENSSH PRIVATE KEY" not in result
     assert "REDACTED" in result
     assert "Analyze the error above" in result
-    assert result.startswith("Error")
+    assert result.is_error
 
 
 @pytest.mark.asyncio
@@ -416,7 +627,7 @@ async def test_execute_redacts_akia_in_exception_message() -> None:
     assert "AKIAABCDEFGHIJKLMNOP" not in result
     assert "REDACTED" in result
     assert "Analyze the error above" in result
-    assert result.startswith("Error")
+    assert result.is_error
 
 
 @pytest.mark.asyncio
@@ -431,7 +642,7 @@ async def test_execute_clean_exception_passes_through_with_hint() -> None:
     assert "disk full" in result
     assert "Analyze the error above" in result
     assert "REDACTED" not in result
-    assert result.startswith("Error")
+    assert result.is_error
 
 
 @pytest.mark.asyncio
@@ -454,7 +665,7 @@ async def test_execute_preserves_error_prefix_when_whole_body_is_redacted() -> N
     # registry classifies status=error), but the payload after that is just
     # the secret — redaction swallows everything downstream of the first match.
     registry.register(
-        _StringReturningTool("pure_error", f"Error: {secret_only}")
+        _ErrorReturningTool("pure_error", f"Error: {secret_only}")
     )
 
     result = await registry.execute("pure_error", {})
@@ -463,9 +674,9 @@ async def test_execute_preserves_error_prefix_when_whole_body_is_redacted() -> N
     assert secret_only not in result
     # Redaction notice must be present.
     assert "REDACTED" in result
-    # CRITICAL: the runner uses startswith("Error") to detect failures.
+    # CRITICAL: the runner keys off ToolResult.is_error to detect failures.
     # If this regresses, `fail_on_tool_error` paths stop firing.
-    assert result.startswith("Error")
+    assert result.is_error
     # Hint is still appended.
     assert "Analyze the error above" in result
 
@@ -481,7 +692,7 @@ async def test_execute_preserves_error_prefix_when_exception_body_is_redacted() 
 
     assert "AKIAABCDEFGHIJKLMNOP" not in result
     assert "REDACTED" in result
-    assert result.startswith("Error")  # downstream failure detection contract
+    assert result.is_error  # downstream failure detection contract
     assert "Analyze the error above" in result
 
 

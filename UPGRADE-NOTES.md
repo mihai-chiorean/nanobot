@@ -1,0 +1,297 @@
+# Upstream merge — `ziggy-main-upgrade-2026-09`
+
+Merge of `HKUDS/nanobot` `main` (`499bf903`, 2026-09-14) into the fork's
+`ziggy-main` (`71d5923d`, 2026-05-01).
+
+| | |
+| --- | --- |
+| Base | `71d5923d` (fork `ziggy-main`) |
+| Merged | `upstream/main` @ `499bf903` |
+| Merge base | `861fbb0d` |
+| Upstream commits merged | **2,146** |
+| Fork-local commits preserved | 88 |
+| Upstream releases crossed | v0.2.0, v0.2.1, v0.2.2, v0.3.0 |
+| Files changed vs base | 1,465 (+395,924 / −35,582) |
+| Conflicted files | 22 (67 conflict hunks) |
+| Tests | **7,589 passed, 27 skipped, 2 failed** — both failures reproduce on pristine upstream (see "Known failures") |
+
+The two bugs we hand-patched on the Spark were fixed upstream on **2026-05-03**,
+two days after this fork's merge cutoff, in PRs **#3613** (merge `614b2136`) and
+**#3614** (merge `2a7433b7`). Both verified present in this merge. Our patches
+are dropped in favour of upstream — see "Local patches dropped".
+
+---
+
+## 1. Conflicts and how each was resolved
+
+### Source files
+
+| File | Hunks | Resolution |
+| --- | --- | --- |
+| `nanobot/agent/loop.py` | 13 | Upstream turn pipeline taken wholesale (typed events, `TurnDelivery`, `TurnContext`, hook factories). Four Ziggy features re-applied on top — see §3. |
+| `nanobot/agent/tools/shell.py` | 9 | Upstream (`ExecSessionManager`, `_prepare_command`, device-path allowlist, `current_scope_allows_loopback`). Kept MIT-123 prescreen and the MIT-203 `allow_loopback` override; dropped MIT-162 (superseded). |
+| `nanobot/agent/runner.py` | 7 | **Reset to upstream verbatim**, then re-applied the Langfuse iteration span and `latency_ms` as two explicit edits. The fork's version of this file no longer exists in any recognisable form upstream. |
+| `nanobot/agent/subagent.py` | 6 | Upstream (`workspace_scope`, `LLMRuntime`, `_run_admitted_subagent`, request-context binding). Re-threaded `trace_context` and re-wrapped `runner.run` in `observe_subagent`. |
+| `nanobot/agent/tools/registry.py` | 5 | Upstream (`prepare_call`, `_coerce_params`, `ToolResult`). Ziggy audit + Prometheus + redaction layer rebuilt on top of `ToolResult`. `_definitions_cache` renamed to upstream's `_cached_definitions`. |
+| `nanobot/channels/base.py` | 4 | Upstream (pairing store, `authorization_id`). Kept the `sanitize_input` prompt-injection layer. Upstream's `is_allowed` is still fail-closed, so the fork's hardening is subsumed. |
+| `nanobot/agent/tools/search.py` | 4 | Both sides kept: upstream's document-line sources plus MIT-136's sensitive-path skipping and its `(skipped N sensitive-path files)` note. |
+| `nanobot/agent/tools/filesystem.py` | 3 | Upstream (`_resolve_read` / `_resolve_write`). MIT-121 guards re-applied against the new resolvers and converted to `ToolResult.error(...)`. Kept the module-level `_current_sender_id` (MIT-138) that `registry.set_context` and its tests depend on. |
+| `nanobot/security/network.py` | 3 | Upstream (`resolve_url_target`, `_normalize_addr`, `_is_allowed_loopback_target`). `configure_loopback_exception` kept; `allow_loopback` widened to `bool \| None` on `resolve_url_target` / `validate_url_target` / `contains_internal_url` so `None` still falls back to the Ziggy module default. `_is_private` regained its optional `allow_loopback` kwarg for `validate_resolved_url`. |
+| `nanobot/providers/openai_compat_provider.py` | 2 | Upstream entirely — **file is now byte-identical to upstream**. |
+| `nanobot/templates/AGENTS.md` | 2 | Upstream (built-in `cron` tool, protected heartbeat job). |
+| `nanobot/channels/manager.py` | 1 | Upstream event dispatch, with the Ziggy `_status_delta` heartbeat branch handled *before* it (it is not an upstream event type). |
+| `nanobot/agent/hook.py` | 1 | Upstream `usage: LLMUsage \| None`, plus the fork's `latency_ms` field. |
+| `nanobot/config/schema.py` | 1 | Upstream — `ExecToolConfig` / `WebToolsConfig` moved into their tool modules. MIT-203's `timeout=180` and `allow_loopback` re-applied to `shell.ExecToolConfig`. |
+| `nanobot/providers/base.py` | 1 | Upstream. The fork's `ttft_ms` field was dropped: **upstream already has `LLMResponse.ttft_ms`.** |
+| `nanobot/utils/__init__.py` | 1 | Upstream lazy module aliases, with `get_data_path` / `get_workspace_path` re-exported for fork call sites. |
+| `nanobot/utils/helpers.py` | 1 | Both: upstream's `load_bundled_template` plus the Discord heartbeat helpers. |
+| `pyproject.toml` | 1 | Both `bedrock` (upstream) and `ziggy` (fork) extras. Note upstream ships its own `langfuse` extra pinned to 3.x; Ziggy needs 4.x, so the two stay separate and the `ziggy` extra is the one to install. |
+
+### Test files
+
+| File | Resolution |
+| --- | --- |
+| `tests/tools/test_tool_registry.py` | Upstream's `prepare_call` tests restored (upstream reinstated the method the fork had removed). MIT-122/147 redaction tests kept but retargeted at `ToolResult`. |
+| `tests/tools/test_exec_security.py` | Both: upstream's #3599 device-path suite and the fork's MIT-123 prescreen suite. |
+| `tests/tools/test_filesystem_tools.py` | Both. |
+| `tests/providers/test_providers_init.py` | Upstream, with `CustomProvider` added back to the expected `__all__`. |
+| `tests/security/test_allow_loopback.py` | Kept, adjusted to upstream semantics (see §5). |
+| `tests/tools/test_registry_classification.py` | Kept, adjusted to the `ToolResult` contract. |
+
+---
+
+## 2. Local patches dropped because upstream fixed it
+
+| Fork patch | Upstream replacement | Why |
+| --- | --- | --- |
+| **ExecTool `/dev/null` guard false positive** (hand-patched on the Spark, uncommitted; also fork commit `e9daa2a0` on `feat/shared-rooms`) | PR **#3613** + **#3614** | Upstream allow-lists `/dev/null`, `/dev/zero`, `/dev/full`, `/dev/random`, `/dev/urandom`, `/dev/std{in,out,err}`, `/dev/tty` and `/dev/fd/N` before the workspace-path check, and stopped treating `\|~` as a home-dir prefix. Strictly broader than our patch. **Delete the Spark's `nanobot/agent/tools/shell.py.bak-20260913T213019`.** |
+| **stderr / streamed-reply drop** (`deploy/runtime/reliability-20260906.patch`, never committed, never deployed) | PR **#3613**, third fix | `loop.py` now reads `if streamed_content and stop_reason not in {"error", "tool_error"}`. The `tool_error` stop no longer marks the reply as already-streamed, so the channel manager stops dropping it. **This bug was live in production until this merge.** |
+| **MIT-162 process-group teardown** (`os.killpg` in a `finally`) | `ExecTool._kill_process_tree` | Upstream spawns with `start_new_session=True`, kills the whole group, reaps with `_reap_pid`, and adds Windows Job Object support. Superset of ours. |
+| **MIT-144 / MIT-185 TTFT capture in `OpenAICompatProvider`** | `LLMResponse.ttft_ms` + provider-base streaming instrumentation | Upstream measures TTFT for *every* provider, not just the OpenAI-compatible one. `openai_compat_provider.py` is now identical to upstream. `tests/providers/test_openai_compat_ttft.py` deleted. |
+| **MIT-203 "classify by explicit marker, not `startswith('Error')`"** (the *detection* half) | `ToolResult.is_error` | Upstream made failure detection structural. `_looks_like_error` now just defers to it, and the fork's string-marker scan is gone. The *classification* half (prescreen / timeout / nonzero_exit / exception / misclassified, for the audit log) is kept. **Behaviour change: a tool returning a bare string that merely starts with `"Error"` is no longer treated as a failure.** That was the original MIT-203 goal. |
+| **`.ipynb` edit guard in `EditFileTool`** | Upstream supports editing `.ipynb` as JSON | Dropped; upstream has tests asserting the new behaviour. |
+| **Verbose `ExecTool.description`** | Upstream's concise one | Upstream has `test_exec_tool_descriptions_are_concise` enforcing brevity; the guidance moved into the prompt templates. |
+| **Fork's removal of `ToolRegistry.prepare_call`** (commit `1d18d24`, worked around in `execute()`) | Upstream reinstated and extended `prepare_call` | Fork's re-targeted tests reverted to upstream's. |
+| **`get_workspace_path` in `nanobot/utils/helpers.py`** | `nanobot/config/paths.py` | Upstream's is canonical; ours stays only as a re-export shim. |
+
+---
+
+## 3. Local features re-applied on upstream's new architecture
+
+| Feature | Where it lives now | Note |
+| --- | --- | --- |
+| **Langfuse turn span (MIT-202)** | `loop.py` — `_process_message` is now a thin `observe_turn` wrapper around `_process_message_impl` | Unchanged shape; `**kwargs` passthrough so upstream can keep adding parameters. |
+| **Langfuse iteration span (MIT-202/210)** | `runner.py` — `with observe_llm_iteration(...)` wraps the entire agent-iteration body | Model name now comes from `spec.runtime.model` (upstream moved it onto `LLMRuntime`). |
+| **Langfuse tool span + input redaction (MIT-202/211)** | `nanobot/agent/tools/execution.py` | Upstream moved tool dispatch out of `runner.py` into this module, so the span moved with it. |
+| **Langfuse subagent span (MIT-186)** | `subagent.py` — `trace_context` threaded through `_run_subagent` → `_run_admitted_subagent`, span wraps `runner.run` | |
+| **LLM latency (`AgentHookContext.latency_ms`)** | `runner.py`, using `time.monotonic()` | Deliberately **not** `perf_counter`: upstream's provider-timing tests patch `perf_counter` with an exact `side_effect` budget, and an extra call broke them. |
+| **Discord progress heartbeat + LLM telemetry** | `loop.py` — new `_ZiggyTurnHook(AgentHook)`, registered through `self._hook_factories` | The old `_LoopHook` was wired into the removed positional-callback pipeline. Rebuilt against upstream's `AgentTurnHookContext` (which carries channel / chat_id / metadata) and publishes `_status_delta` straight onto the bus, which decouples it from the callback plumbing entirely. |
+| **`_status_delta` channel dispatch** | `channels/manager.py::_send_once`, checked before upstream's event dispatch | |
+| **ChromaDB RAG (`recall` / `ingest`)** | `nanobot/agent/tools/recall.py` — now exposes `enabled(ctx)` / `create(ctx)` | Upstream replaced manual registration with an auto-discovering `ToolLoader`. `enabled()` gates on `importlib.util.find_spec("chromadb")`, so an install without the `ziggy` extra stays clean. Verified: both tools are discovered and registered when chromadb is present, and skipped when it is not. |
+| **Audit log + Prometheus (MIT-203)** | `tools/registry.py` — `_audit` / `_prom_observe` | Rebuilt on `ToolResult`. Invalid-parameter rejections (now returned by upstream's `prepare_call`) are audited as `prescreen`. |
+| **Secret redaction (MIT-122/147)** | `tools/registry.py::execute` | Both success and error branches still run `redact_if_sensitive`. The old "re-prefix the scrubbed body with `Error:`" hack is **gone** — the error flag now rides on the rewrapped `ToolResult`, which is a strictly better version of the same guarantee. |
+| **Sensitive-path blocking (MIT-121/136/139/140)** | `tools/filesystem.py`, `tools/search.py`, `utils/sensitive.py` | Re-applied against upstream's new resolvers; `utils/sensitive.py` merged without conflict. |
+| **Shell prescreen (MIT-123)** | `tools/shell.py::_guard_command`, now the **last** check | Moved to the end so an out-of-workspace path keeps upstream's more specific `path outside working dir` message. |
+| **Exec hardening (MIT-203)** | `shell.ExecToolConfig.timeout = 180`, `allow_loopback` | `allow_loopback` now ORs with upstream's `current_scope_allows_loopback`: an explicit per-instance `True` wins, `None`/`False` defers to upstream's WebUI-scoped check. |
+| **Prompt-injection sanitising** | `channels/base.py` | Unchanged. |
+| **Owner-only system-modification guard** | `loop.py::_dispatch` | Unchanged; the fork's duplicate pending-queue setup next to it was dropped (upstream does that inside the session lock). |
+| **`CustomProvider` (MiniMax M2.5 sampling)** | `providers/custom_provider.py` | Merged cleanly; re-added to the expected `__all__` in `tests/providers/test_providers_init.py`. |
+| **Dashboard / Prometheus server** | `nanobot/dashboard/` | Merged cleanly, no conflicts. |
+
+---
+
+## 4. Not in this merge
+
+- **Shared rooms.** The Mac lock (`.ziggy/nanobot.lock.json`) names fork commit `e9daa2a0`, which lives only on the fork's `feat/shared-rooms` branch and was never merged to `ziggy-main`. It is therefore **not** in this merge. It must be rebased onto `ziggy-main-upgrade-2026-09` separately — and note that upstream restructured `nanobot/channels/websocket.py` into a `nanobot/channels/websocket/` package (`runtime.py`, `manifest.py`, `validation.py`, `webui/`), so that rebase is non-trivial.
+- **The Spark's other uncommitted work.** `cron.py`, `cron/service.py`, `cron/types.py`, `cli/commands.py`, `nanobot/work/`, `agent/tools/work.py`, `agent/tools/schedule_work.py`, `utils/vision.py`, and the `webui/` changes are all uncommitted on the Spark and exist in no repository. They are **not** in this merge and **will be lost** by the rollout below unless they are committed first. See step 0 of the rollout.
+- The fork's other ~27 topic branches were not reviewed.
+
+---
+
+## 5. Behaviour changes worth knowing before deploying
+
+1. **The exec safety guard now only runs when the workspace is restricted.**
+   Upstream's `_prepare_command` calls `_guard_command` only under
+   `if access.restrict_to_workspace:` — full access is an explicit trust
+   decision. This means the SSRF / internal-URL check, the deny-pattern filter
+   and the MIT-123 secret prescreen are all **skipped** for an unrestricted
+   `ExecTool`. **Verify every tenant config sets `restrict_to_workspace: true`
+   before rolling out.** Two fork tests were updated to construct
+   `ExecTool(restrict_to_workspace=True)` to reflect this.
+2. **Loopback allowance narrowed.** Upstream permits loopback only when the
+   *host itself* is a literal loopback name/IP and every resolved address is
+   loopback — a public DNS name that resolves to `127.0.0.1` stays blocked
+   (DNS-rebinding defence). Ziggy's `configure_loopback_exception` module
+   default still works, but through this narrower gate.
+3. **Tool failure detection is structural.** Any Ziggy or MCP tool that signals
+   failure by returning a bare `"Error: ..."` string is now treated as a
+   *success*. Tools must return `ToolResult.error(...)`. Upstream wraps
+   entry-point plugins in `_LegacyErrorPrefixTool` for compatibility, but
+   in-tree tools get no such wrapper.
+4. **`nanobot-ai` version.** This branch is upstream ≥ v0.3.0, which supersedes
+   the dependency audit's "bump `nanobot-ai` to ≥ 0.2.1 for the web-tool SSRF
+   (GHSA-434r-7c99-hwf3)" item. **Do not `pip install nanobot-ai`** on the
+   Spark — it is an editable install pointing at this checkout, and a PyPI
+   install would silently replace the fork with an upstream wheel.
+
+---
+
+## 6. Known failures (pre-existing, not caused by this merge)
+
+Both reproduce on a pristine `upstream/main` checkout:
+
+| Test | Cause |
+| --- | --- |
+| `tests/channels/test_channel_setup.py::test_every_runtime_channel_field_has_a_webui_contract` | Optional channel deps missing (`nh3`, `matrix-nio`). Install the matrix plugin extras or accept the skip. |
+| `tests/session/test_recovery.py::test_bus_remains_quiet_after_recovered_state` | Upstream test leaks a `SessionUpdatedEvent` onto the bus. Upstream bug. |
+
+`ruff check nanobot/` is clean for `F` and `E9`. The remaining ~80 style
+findings (`W293`, `I001`, `N802`) are all in fork-only files and pre-date this
+merge; upstream's own tree is ruff-clean.
+
+---
+
+## 7. Spark rollout — DO NOT RUN FROM THIS BRANCH WITHOUT READING STEP 0
+
+Target: `/home/mihai/workspace/ziggy/vendor/nanobot` on `spark-094a`, currently
+at `71d5923d` on `ziggy-main` with a **dirty tree**. The runtime is an editable
+install into `/home/mihai/workspace/ziggy/.venv`. The units are **user** units
+(`systemctl --user`), not system units.
+
+### Step 0 — preserve the Spark's uncommitted work (MANDATORY)
+
+The Spark carries roughly 12 modified and 10 untracked files that exist in no
+repository. A checkout will destroy them.
+
+```bash
+ssh mihai@spark-094a.local
+cd /home/mihai/workspace/ziggy/vendor/nanobot
+
+# Full snapshot of the working tree, tracked and untracked, outside the repo.
+tar czf ~/nanobot-spark-worktree-$(date +%Y%m%dT%H%M%S).tar.gz .
+
+# And a reviewable patch of just the tracked modifications.
+git diff > ~/nanobot-spark-tracked-$(date +%Y%m%dT%H%M%S).patch
+git status --porcelain > ~/nanobot-spark-status-$(date +%Y%m%dT%H%M%S).txt
+
+# Commit them on a rescue branch so they are recoverable by ref, not just by tarball.
+git checkout -b spark-rescue-$(date +%Y%m%d)
+git add -A
+git commit -m "chore(spark): snapshot uncommitted Spark working tree before upstream merge"
+git push origin HEAD
+```
+
+Files that are *deliberately* discarded and must **not** be carried forward:
+
+- `nanobot/agent/tools/shell.py.bak-20260913T213019` — the hand-written
+  `/dev/null` patch, superseded by upstream #3613/#3614.
+- `nanobot/channels/websocket.py.pre-clerk-*` (5 files) — stale backups of a
+  file upstream has since turned into a package.
+
+### Step 1 — record the rollback point
+
+```bash
+cd /home/mihai/workspace/ziggy/vendor/nanobot
+git rev-parse HEAD > ~/nanobot-rollback-commit.txt      # expect 71d5923d...
+/home/mihai/workspace/ziggy/.venv/bin/pip list --format=freeze \
+  > ~/nanobot-venv-rollback-$(date +%Y%m%dT%H%M%S).txt
+```
+
+### Step 2 — fetch and check out the upgrade branch
+
+```bash
+cd /home/mihai/workspace/ziggy/vendor/nanobot
+git fetch origin ziggy-main-upgrade-2026-09
+git checkout ziggy-main-upgrade-2026-09
+git status --short     # must be empty
+git log --oneline -1
+```
+
+### Step 3 — refresh the editable install
+
+The dependency set moved a long way across four upstream releases, so `-e .`
+alone is not enough; the extras must be named or `recall`/`ingest` and the
+Langfuse hooks silently disappear.
+
+```bash
+cd /home/mihai/workspace/ziggy
+./.venv/bin/pip install -e "vendor/nanobot[ziggy]"
+./.venv/bin/pip check
+./.venv/bin/python -c "import nanobot; print(nanobot.__version__, nanobot.__file__)"
+./.venv/bin/python -c "
+from nanobot.agent.tools.loader import ToolLoader
+names = sorted(c.__name__ for c in ToolLoader().discover())
+assert 'RecallTool' in names and 'IngestTool' in names, names
+print('RAG tools discovered OK')
+"
+```
+
+Two `pip check` complaints (`dulwich`, `pypdf`) are **pre-existing** on this
+venv and predate the merge; do not read a clean `pip check` as the success
+signal.
+
+### Step 4 — verify config before restarting anything
+
+```bash
+grep -rn "restrict_to_workspace" /home/mihai/.nanobot/*/config.json 2>/dev/null
+```
+
+Every tenant must have `restrict_to_workspace: true` — see §5.1. If any tenant
+is unrestricted, fix it **before** step 5.
+
+### Step 5 — restart, one tenant first
+
+```bash
+systemctl --user daemon-reload
+systemctl --user restart nanobot-tenant@ws_584aff5a-a0a5-4b78-8a4f-89baf3847ce7.service
+systemctl --user status  nanobot-tenant@ws_584aff5a-a0a5-4b78-8a4f-89baf3847ce7.service
+journalctl --user -u nanobot-tenant@ws_584aff5a-a0a5-4b78-8a4f-89baf3847ce7.service -n 200 --no-pager
+```
+
+Smoke-test that one tenant end to end — send a message, run a tool, confirm a
+reply arrives — then do the rest:
+
+```bash
+systemctl --user restart nanobot-tenant@ws_aa52c124-7112-49b1-9157-c3afb2300c37.service
+systemctl --user restart nanobot-tenant@ws_dee4fcfe-c759-4916-8a2c-55513b96dc7e.service
+systemctl --user restart nanobot-gateway.service
+systemctl --user restart nanobot-dashboard.service
+```
+
+`nanobot-analytics.service` and `nanobot-observability.service` are `exited`
+one-shots and do not need restarting.
+
+### Step 6 — post-deploy checks
+
+- `rm file.txt 2>/dev/null` from a tenant → must succeed (this is #3599).
+- Force a tool error → the reply must reach the channel (this is the
+  `tool_error` streamed-drop fix, live-broken until now).
+- Langfuse: one trace per turn, with `llm-iteration` → `tool:<name>` nested
+  underneath, and subagents as children.
+- Discord: the progress heartbeat still edits one message per turn.
+- `recall` / `ingest` present in the tool list.
+
+### Rollback
+
+```bash
+cd /home/mihai/workspace/ziggy/vendor/nanobot
+git checkout $(cat ~/nanobot-rollback-commit.txt)        # 71d5923d
+# restore the Spark's working tree from the rescue branch or the tarball
+git checkout spark-rescue-<date> -- .
+cd /home/mihai/workspace/ziggy
+./.venv/bin/pip install -e vendor/nanobot
+systemctl --user restart nanobot-gateway.service nanobot-dashboard.service
+systemctl --user restart 'nanobot-tenant@*.service'
+```
+
+Rollback returns to a runtime with **both** the `/dev/null` false positive and
+the streamed-reply drop unfixed, so treat it as a short-lived state.
+
+### Also update after a successful rollout
+
+`.ziggy/nanobot.lock.json` in the main repo currently disagrees with itself
+three ways (Mac lock `e9daa2a0`, Spark lock `2c45561c`, Spark actual
+`71d5923d`, installed package `0.1.5.post2` against a `post3` baseline). Once
+this branch is deployed, set **both** lock files to the same value:
+`upstream_baseline` → `HKUDS/nanobot` @ `499bf903` (v0.3.0 line),
+`effective_runtime.commit` → this branch's merge commit.

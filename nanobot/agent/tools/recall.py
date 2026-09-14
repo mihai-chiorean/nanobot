@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
 from nanobot.agent.tools.base import Tool
+
+if TYPE_CHECKING:
+    from nanobot.agent.tools.context import ToolContext
 
 _SUPPORTED_SUFFIXES = {
     ".md", ".txt", ".py", ".json",
@@ -20,6 +23,22 @@ _SUPPORTED_SUFFIXES = {
 
 class RecallTool(Tool):
     """Semantic search across RAG collections (conversations, documents, knowledge)."""
+
+    @classmethod
+    def enabled(cls, ctx: "ToolContext") -> bool:
+        """Only register when the optional ``ziggy`` extra (chromadb) is installed.
+
+        Ziggy-local (fork): RAG is behind ``pip install nanobot-ai[ziggy]``.
+        Upstream's ToolLoader auto-discovers every Tool subclass in this
+        package, so this gate is what keeps a chromadb-less install clean.
+        """
+        import importlib.util
+
+        return importlib.util.find_spec("chromadb") is not None
+
+    @classmethod
+    def create(cls, ctx: "ToolContext") -> Tool:
+        return cls(workspace=Path(ctx.workspace))
 
     def __init__(self, workspace: Path) -> None:
         self._workspace = workspace
@@ -128,6 +147,22 @@ class RecallTool(Tool):
 
 class IngestTool(Tool):
     """Ingest a file or directory into the RAG semantic store."""
+
+    @classmethod
+    def enabled(cls, ctx: "ToolContext") -> bool:
+        """Only register when the optional ``ziggy`` extra (chromadb) is installed.
+
+        Ziggy-local (fork): RAG is behind ``pip install nanobot-ai[ziggy]``.
+        Upstream's ToolLoader auto-discovers every Tool subclass in this
+        package, so this gate is what keeps a chromadb-less install clean.
+        """
+        import importlib.util
+
+        return importlib.util.find_spec("chromadb") is not None
+
+    @classmethod
+    def create(cls, ctx: "ToolContext") -> Tool:
+        return cls(workspace=Path(ctx.workspace), allowed_dir=None)
 
     def __init__(self, workspace: Path, allowed_dir: Path | None = None) -> None:
         self._workspace = workspace

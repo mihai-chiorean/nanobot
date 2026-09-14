@@ -48,11 +48,27 @@ def test_loopback_allowed_when_per_call_flag_set():
 
 
 def test_ipv6_loopback_allowed_when_flag_set():
+    """``::1`` passes when the *host* is itself a loopback name.
+
+    Post-upstream-merge: upstream narrowed the allowance deliberately — an
+    arbitrary public DNS name that merely resolves to loopback is still
+    blocked (DNS-rebinding defence). Only literal loopback hosts qualify,
+    so this test now uses ``localhost`` rather than ``myhost``.
+    """
+    def _resolver(hostname, port, family=0, type_=0):
+        return [(socket.AF_INET6, socket.SOCK_STREAM, 0, "", ("::1", 0, 0, 0))]
+    with patch("nanobot.security.network.socket.getaddrinfo", _resolver):
+        ok, _ = validate_url_target("http://localhost/", allow_loopback=True)
+    assert ok
+
+
+def test_public_host_resolving_to_loopback_stays_blocked():
+    """Upstream hardening: DNS rebinding to loopback is not a loopback host."""
     def _resolver(hostname, port, family=0, type_=0):
         return [(socket.AF_INET6, socket.SOCK_STREAM, 0, "", ("::1", 0, 0, 0))]
     with patch("nanobot.security.network.socket.getaddrinfo", _resolver):
         ok, _ = validate_url_target("http://myhost/", allow_loopback=True)
-    assert ok
+    assert not ok
 
 
 # ---------------------------------------------------------------------------
@@ -145,7 +161,9 @@ def test_per_call_overrides_module_default():
 
 @pytest.mark.asyncio
 async def test_exec_tool_blocks_localhost_by_default():
-    tool = ExecTool()
+    # Post-upstream-merge: _guard_command only runs when the workspace is
+    # restricted — upstream made full access an explicit trust decision.
+    tool = ExecTool(restrict_to_workspace=True)
     with patch("nanobot.security.network.socket.getaddrinfo", _fake_resolve("localhost", ["127.0.0.1"])):
         result = await tool.execute(command="curl http://localhost:3000/api/health")
     assert result.startswith("Error: Command blocked by safety guard")
@@ -159,7 +177,7 @@ async def test_exec_tool_allows_localhost_when_configured():
     layer since we don't have a local server — but the key assertion is
     that the prescreen is no longer the reason it fails.
     """
-    tool = ExecTool(allow_loopback=True)
+    tool = ExecTool(allow_loopback=True, restrict_to_workspace=True)
     with patch("nanobot.security.network.socket.getaddrinfo", _fake_resolve("localhost", ["127.0.0.1"])):
         result = await tool.execute(command="echo dry-run http://localhost:3000/")
     assert not result.startswith("Error: Command blocked by safety guard")
@@ -167,7 +185,7 @@ async def test_exec_tool_allows_localhost_when_configured():
 
 @pytest.mark.asyncio
 async def test_exec_tool_still_blocks_metadata_with_flag():
-    tool = ExecTool(allow_loopback=True)
+    tool = ExecTool(allow_loopback=True, restrict_to_workspace=True)
     with patch(
         "nanobot.security.network.socket.getaddrinfo",
         _fake_resolve("169.254.169.254", ["169.254.169.254"]),

@@ -1,14 +1,27 @@
 """Tool registry for dynamic tool management."""
 
+from __future__ import annotations
+
+import json
 import re
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 from loguru import logger
 
+from nanobot.agent.tools.base import Tool, ToolResult
+from nanobot.agent.tools.context import ContextAware, current_request_context
+# Ziggy-local (fork): audit + redaction layer.
 from nanobot.agent.tools.audit import ErrorType
-from nanobot.agent.tools.base import Tool
 from nanobot.utils.sensitive import redact_if_sensitive
+
+if TYPE_CHECKING:
+    from nanobot.runtime_context import RuntimeContextProvider
+
+
+def is_tool_error_result(result: Any) -> bool:
+    return isinstance(result, ToolResult) and result.is_error
+
 
 # MIT-203: explicit error-type classifier. Historically the registry used
 # ``result.startswith("Error")`` — brittle, and conflated a user command
@@ -80,13 +93,18 @@ def _classify_tool_error(result: str, tool_name: str) -> tuple[ErrorType, int | 
 
 
 def _looks_like_error(result: Any) -> bool:
-    """Preserve the historical ``startswith("Error")`` contract for now.
+    """Ziggy-local (fork): did this tool call fail?
 
-    Downstream code (``AgentRunner._run_tool``, redaction) keys off this
-    same shape. MIT-203 keeps detection unchanged and focuses on *what*
-    gets recorded once we've decided a result is an error.
+    MIT-203 replaced the brittle ``result.startswith("Error")`` heuristic with
+    an explicit marker. Upstream reached the same conclusion and made it
+    structural via ``ToolResult.is_error``, so this now simply defers to
+    upstream and the fork's string-marker scan is gone. A plain string that
+    merely *starts with* "Error" (e.g. a user command whose stdout does) is
+    no longer misreported as a framework failure.
     """
-    return isinstance(result, str) and result.startswith("Error")
+    return is_tool_error_result(result)
+
+
 
 
 class ToolRegistry:
@@ -98,7 +116,7 @@ class ToolRegistry:
 
     def __init__(self):
         self._tools: dict[str, Tool] = {}
-        self._definitions_cache: list[dict[str, Any]] | None = None
+        self._cached_definitions: list[dict[str, Any]] | None = None
         self._audit_logger = None
         self._session_id: str = ""
         self._channel: str = ""
@@ -107,12 +125,12 @@ class ToolRegistry:
     def register(self, tool: Tool) -> None:
         """Register a tool."""
         self._tools[tool.name] = tool
-        self._definitions_cache = None
+        self._cached_definitions = None
 
     def unregister(self, name: str) -> None:
         """Unregister a tool by name."""
         self._tools.pop(name, None)
-        self._definitions_cache = None
+        self._cached_definitions = None
 
     def set_audit_logger(self, audit_logger) -> None:
         """Attach an AuditLogger to record all tool executions."""
@@ -131,16 +149,43 @@ class ToolRegistry:
         """Get a tool by name."""
         return self._tools.get(name)
 
+    def get_runtime_context_providers(self) -> list[RuntimeContextProvider]:
+        """Return tool-owned providers in stable tool-name order."""
+        providers: list[RuntimeContextProvider] = []
+        for name in sorted(self._tools):
+            provider = self._tools[name].runtime_context_provider()
+            if provider is not None:
+                providers.append(provider)
+        return providers
+
+    @staticmethod
+    def _lookup_key(name: str) -> str:
+        """Normalize names for suggestions only; never for execution."""
+        return "".join(ch.lower() for ch in name if ch.isalnum())
+
+    def _suggest_name(self, name: str) -> str | None:
+        key = self._lookup_key(str(name or ""))
+        if not key:
+            return None
+        matches = [
+            registered
+            for registered in self._tools
+            if self._lookup_key(registered) == key
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        return None
+
     def has(self, name: str) -> bool:
         """Check if a tool is registered."""
-        return name in self._tools
+        return self.get(name) is not None
 
     @staticmethod
     def _schema_name(schema: dict[str, Any]) -> str:
         """Extract a normalized tool name from either OpenAI or flat schemas."""
         fn = schema.get("function")
         if isinstance(fn, dict):
-            name = fn.get("name")
+            name = cast(dict[str, Any], fn).get("name")
             if isinstance(name, str):
                 return name
         name = schema.get("name")
@@ -150,83 +195,146 @@ class ToolRegistry:
         """Get tool definitions with stable ordering for cache-friendly prompts.
 
         Built-in tools are sorted first as a stable prefix, then MCP tools are
-        sorted and appended.  The result is cached until the next
+        sorted and appended. The result is cached until the next
         register/unregister call.
         """
-        if self._definitions_cache is not None:
-            return self._definitions_cache
+        if self._cached_definitions is None:
+            definitions = [tool.to_schema() for tool in self._tools.values()]
+            builtins: list[dict[str, Any]] = []
+            mcp_tools: list[dict[str, Any]] = []
+            for schema in definitions:
+                name = self._schema_name(schema)
+                if name.startswith("mcp_"):
+                    mcp_tools.append(schema)
+                else:
+                    builtins.append(schema)
 
-        definitions = [tool.to_schema() for tool in self._tools.values()]
-        builtins: list[dict[str, Any]] = []
-        mcp_tools: list[dict[str, Any]] = []
-        for schema in definitions:
-            name = self._schema_name(schema)
-            if name.startswith("mcp_"):
-                mcp_tools.append(schema)
-            else:
-                builtins.append(schema)
+            builtins.sort(key=self._schema_name)
+            mcp_tools.sort(key=self._schema_name)
+            self._cached_definitions = builtins + mcp_tools
 
-        builtins.sort(key=self._schema_name)
-        mcp_tools.sort(key=self._schema_name)
-        self._definitions_cache = builtins + mcp_tools
-        return self._definitions_cache
+        return self._cached_definitions
+
+    def prepare_call(
+        self,
+        name: str,
+        params: Any,
+    ) -> tuple[Tool | None, Any, str | None]:
+        """Resolve, cast, and validate one tool call."""
+        tool = self.get(name)
+        if not tool:
+            suggestion = self._suggest_name(str(name))
+            hint = f" Did you mean '{suggestion}'? Tool names must match exactly." if suggestion else ""
+            return None, params, (
+                ToolResult.error(
+                    f"Error: Tool '{name}' not found.{hint} Available: {', '.join(self.tool_names)}"
+                )
+            )
+        # Compatibility for external tools that still implement the legacy
+        # setter protocol. Built-ins read the authoritative ContextVar
+        # directly and never copy routing state.
+        if isinstance(tool, ContextAware) and (ctx := current_request_context()) is not None:
+            tool.set_context(ctx)
+
+        params = self._coerce_params(tool, params)
+        if not isinstance(params, dict):
+            return tool, params, (
+                ToolResult.error(
+                    f"Error: Tool '{name}' parameters must be a JSON object, got "
+                    f"{type(params).__name__}. Use named parameters like "
+                    'tool_name(param1="value1", param2="value2") matching the tool schema.'
+                )
+            )
+
+        cast_params = tool.cast_params(cast(dict[str, Any], params))
+        errors = tool.validate_params(cast_params)
+        if errors:
+            return tool, cast_params, (
+                ToolResult.error(f"Error: Invalid parameters for tool '{name}': " + "; ".join(errors))
+            )
+        return tool, cast_params, None
+
+    @classmethod
+    def _coerce_argument_value(cls, value: Any) -> Any:
+        if value is None:
+            return {}
+        if not isinstance(value, str):
+            return value
+
+        stripped = value.strip()
+        if not stripped:
+            return {}
+
+        if not stripped.startswith(("{", "[")):
+            return value
+
+        try:
+            parsed = json.loads(stripped)
+        except Exception:
+            return value
+
+        return parsed
+
+    @classmethod
+    def _coerce_params(cls, tool: Tool, params: Any) -> Any:
+        params = cls._coerce_argument_value(params)
+        return cls._unwrap_arguments_payload(tool, params)
+
+    @classmethod
+    def _unwrap_arguments_payload(cls, tool: Tool, params: Any) -> Any:
+        if not isinstance(params, dict):
+            return params
+        arguments_payload = cast(dict[str, Any], params)
+        if set(arguments_payload) != {"arguments"}:
+            return arguments_payload
+        properties = (tool.parameters or {}).get("properties", {})
+        if isinstance(properties, dict) and "arguments" in properties:
+            return arguments_payload
+        return cls._coerce_argument_value(arguments_payload.get("arguments"))
 
     async def execute(
         self,
         name: str,
-        params: dict[str, Any],
+        params: Any,
         *,
         session_id: str | None = None,
         channel: str | None = None,
-    ) -> str:
+    ) -> Any:
         """Execute a tool by name with given parameters.
 
-        *session_id* and *channel* are per-call overrides for audit logging,
-        avoiding shared mutable state across concurrent workers.
+        Ziggy-local (fork): *session_id* and *channel* are per-call audit
+        overrides so concurrent workers do not share mutable registry state.
         """
-        _HINT = "\n\n[Analyze the error above and try a different approach.]"
-
-        # Guard against invalid parameter types (e.g., list instead of dict)
-        if not isinstance(params, dict) and name in ('write_file', 'read_file'):
-            return (
-                f"Error: Tool '{name}' parameters must be a JSON object, got {type(params).__name__}. "
-                "Use named parameters: tool_name(param1=\"value1\", param2=\"value2\")" + _HINT
-            )
-
-        tool = self._tools.get(name)
-        if not tool:
-            return f"Error: Tool '{name}' not found. Available: {', '.join(self.tool_names)}"
-
+        hint = "\n\n[Analyze the error above and try a different approach.]"
         sid = session_id or self._session_id
         ch = channel or self._channel
-
         t0 = time.monotonic()
+        tool, params, error = self.prepare_call(name, params)
+        if error:
+            # Ziggy-local (fork, MIT-203): a rejected call never ran — audit it
+            # as a prescreen-class failure (no exit code, no stderr).
+            self._audit(
+                "error", name, params if isinstance(params, dict) else {}, t0, sid, ch,
+                error=str(error)[:2048],
+                error_type="prescreen",
+            )
+            self._prom_observe(name, "error", (time.monotonic() - t0) * 1000)
+            return ToolResult.error(str(error) + hint)
+
         try:
-            # Schema-driven cast (e.g. stringly-typed ints from LLM JSON) before
-            # validation — regression restored from pre-1d18d24 prepare_call().
-            params = tool.cast_params(params)
-            errors = tool.validate_params(params)
-            if errors:
-                # Invalid-parameter rejection is a prescreen-class failure:
-                # the tool never ran, there's no exit code, and the message
-                # is the accumulated validator errors.
-                self._audit(
-                    "error", name, params, t0, sid, ch,
-                    error="; ".join(errors),
-                    error_type="prescreen",
-                )
-                return f"Error: Invalid parameters for tool '{name}': " + "; ".join(errors) + _HINT
+            assert tool is not None  # guarded by prepare_call()
             result = await tool.execute(**params)
             duration_ms = (time.monotonic() - t0) * 1000
+            # Ziggy-local (fork, MIT-203): audit + Prometheus + redaction layered
+            # on upstream's ToolResult contract. Upstream's ``is_tool_error_result``
+            # replaces the old startswith("Error") heuristic; the finer-grained
+            # classifier below still buckets *why* the call failed for the audit log.
             if _looks_like_error(result):
                 status = "error"
-                error_type, exit_code, stderr_tail = _classify_tool_error(result, name)
-                # ``error`` persists the full (un-redacted-here; scrubbed below
-                # by ``redact_if_sensitive``) message so operators can triage
-                # without replaying the session. Keep it bounded.
+                error_type, exit_code, stderr_tail = _classify_tool_error(str(result), name)
                 self._audit(
                     status, name, params, t0, sid, ch,
-                    error=result[:2048],
+                    error=str(result)[:2048],
                     error_type=error_type,
                     exit_code=exit_code,
                     stderr_tail=stderr_tail,
@@ -235,37 +343,20 @@ class ToolRegistry:
                 status = "ok"
                 self._audit(status, name, params, t0, sid, ch)
             self._prom_observe(name, status, duration_ms)
-            # Defence-in-depth: scrub embedded secrets from any string result,
-            # both success AND error paths (MIT-147).
-            #
-            # Tool authors can legitimately return error strings that embed the
-            # offending payload for the model to reason about — e.g. "Error:
-            # invalid AWS credentials: AKIA..." or "Error parsing PEM: -----BEGIN
-            # RSA PRIVATE KEY-----...". Before MIT-147, the error branch was a
-            # short-circuit that bypassed the redactor entirely, so anything a
-            # (possibly adversarial) tool stuffed into an `Error:` prefix would
-            # leak straight to the model.
-            #
-            # Error-prefix preservation: `AgentRunner._run_tool()` (and other
-            # downstream consumers) detect tool failures via
-            # `result.startswith("Error")`. The raw redaction notice does NOT
-            # start with "Error", so on the error branch we re-wrap the
-            # redacted result in an "Error: ..." shell to preserve the
-            # failure-detection contract. The `_HINT` suffix is appended after
-            # redaction so the model still gets the "try something else" nudge.
-            #
-            # Non-string results (e.g. ReadFileTool's image content blocks ->
-            # list[dict]) bypass the scrubber and pass through untouched.
+
+            # Ziggy-local (fork, MIT-122/MIT-147): scrub embedded secrets from any
+            # string result, on BOTH the success and error paths. Tool authors
+            # legitimately echo the offending payload into an error message, and
+            # before MIT-147 the error branch short-circuited the redactor. The
+            # error flag is carried on the rewrapped ToolResult, so upstream's
+            # structured failure detection survives redaction (this replaces the
+            # old "re-prefix with Error:" hack, which existed only because the
+            # contract used to be a bare string).
             if isinstance(result, str):
-                redacted = redact_if_sensitive(result)
+                redacted = redact_if_sensitive(str(result))
                 if status == "error":
-                    # Preserve the "Error:" prefix that downstream failure
-                    # detection relies on, even when the body was scrubbed.
-                    if not redacted.startswith("Error"):
-                        redacted = f"Error ({name}): {redacted}"
-                    result = redacted + _HINT
-                else:
-                    result = redacted
+                    return ToolResult.error(redacted + hint)
+                return ToolResult(redacted, is_error=False)
             return result
         except Exception as e:
             duration_ms = (time.monotonic() - t0) * 1000
@@ -275,18 +366,9 @@ class ToolRegistry:
                 error_type="exception",
             )
             self._prom_observe(name, "error", duration_ms)
-            # Exception strings can also carry secrets — e.g. a ValueError
-            # raised while parsing a file embeds the line that failed. Run
-            # the redactor on the exception path too (MIT-147).
-            #
-            # Preserve the "Error executing ..." prefix so downstream failure
-            # detection keeps working when the exception message contained
-            # a secret and got fully replaced by the redaction notice.
+            # Exception strings can also carry secrets (MIT-147).
             raw = f"Error executing {name}: {str(e)}"
-            redacted = redact_if_sensitive(raw)
-            if not redacted.startswith("Error"):
-                redacted = f"Error executing {name}: {redacted}"
-            return redacted + _HINT
+            return ToolResult.error(redact_if_sensitive(raw) + hint)
 
     def _audit(
         self,
@@ -338,6 +420,7 @@ class ToolRegistry:
         except Exception:
             pass
 
+
     @property
     def tool_names(self) -> list[str]:
         """Get list of registered tool names."""
@@ -347,4 +430,4 @@ class ToolRegistry:
         return len(self._tools)
 
     def __contains__(self, name: str) -> bool:
-        return name in self._tools
+        return self.has(name)

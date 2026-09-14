@@ -1,9 +1,14 @@
 """Tests for MIT-203 ToolRegistry error classification.
 
 Exercises the explicit-enum classifier that replaced
-``result.startswith("Error")`` as the sole failure detector. Each test
-drives a fake tool that returns (or raises) a specific shape, and asserts
-the correct ``error_type`` lands in the audit log.
+``result.startswith("Error")`` as the sole failure detector.
+
+Post-upstream-merge (2026-09): upstream reached the same conclusion and made
+failure detection structural via ``ToolResult.is_error``, so *whether* a call
+failed now comes from the ToolResult and the fork classifier only decides
+*why* (prescreen / timeout / nonzero_exit / exception / misclassified). These
+tests therefore wrap failing outputs in ``ToolResult.error(...)``; a bare
+string that merely starts with "Error" is, by design, no longer a failure.
 """
 
 from __future__ import annotations
@@ -13,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from nanobot.agent.tools.audit import AuditLogger
-from nanobot.agent.tools.base import Tool
+from nanobot.agent.tools.base import Tool, ToolResult
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.schema import StringSchema, tool_parameters_schema
 
@@ -59,7 +64,7 @@ async def _run_once(tmp_path: Path, tool: _FakeTool, params: dict[str, Any] | No
 
 
 async def test_classify_prescreen_shell_marker(tmp_path: Path) -> None:
-    tool = _FakeTool(return_value="Error: Command blocked by safety guard (dangerous pattern detected)")
+    tool = _FakeTool(return_value=ToolResult.error("Error: Command blocked by safety guard (dangerous pattern detected)"))
     entry = await _run_once(tmp_path, tool)
     assert entry["result_status"] == "error"
     assert entry["error_type"] == "prescreen"
@@ -75,7 +80,7 @@ async def test_classify_prescreen_invalid_params(tmp_path: Path) -> None:
 
 
 async def test_classify_timeout(tmp_path: Path) -> None:
-    tool = _FakeTool(return_value="Error: Command timed out after 180 seconds")
+    tool = _FakeTool(return_value=ToolResult.error("Error: Command timed out after 180 seconds"))
     entry = await _run_once(tmp_path, tool)
     assert entry["error_type"] == "timeout"
 
@@ -96,7 +101,7 @@ async def test_successful_result_starting_with_error_keyword(tmp_path: Path) -> 
 async def test_classify_exec_exception_with_stderr(tmp_path: Path) -> None:
     """A tool that wraps a subprocess error as 'Error executing command: ...'."""
     result = "Error executing command: cmd failed\nSTDERR:\nboom\n\nExit code: 2"
-    tool = _FakeTool(return_value=result)
+    tool = _FakeTool(return_value=ToolResult.error(result))
     entry = await _run_once(tmp_path, tool)
     assert entry["error_type"] == "exception"
     assert entry["exit_code"] == 2
@@ -113,14 +118,14 @@ async def test_classify_exception_raised(tmp_path: Path) -> None:
 
 async def test_classify_misclassified_legacy_error_string(tmp_path: Path) -> None:
     """Legacy tool returning 'Error: something weird' with no known shape."""
-    tool = _FakeTool(return_value="Error: something a human wrote a decade ago")
+    tool = _FakeTool(return_value=ToolResult.error("Error: something a human wrote a decade ago"))
     entry = await _run_once(tmp_path, tool)
     assert entry["error_type"] == "misclassified"
 
 
 async def test_prescreen_takes_precedence_over_exit_code(tmp_path: Path) -> None:
     """If a safety-guard marker and an exit-code footer both appear, prescreen wins."""
-    tool = _FakeTool(return_value="Error: Command blocked by safety guard (x)\n\nExit code: 0")
+    tool = _FakeTool(return_value=ToolResult.error("Error: Command blocked by safety guard (x)\n\nExit code: 0"))
     entry = await _run_once(tmp_path, tool)
     assert entry["error_type"] == "prescreen"
     # exit_code stays out of the entry for prescreen rows.
