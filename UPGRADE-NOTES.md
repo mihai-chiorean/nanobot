@@ -278,6 +278,39 @@ Files that are *deliberately* discarded and must **not** be carried forward:
 - `nanobot/channels/websocket.py.pre-clerk-*` (5 files) — stale backups of a
   file upstream has since turned into a package.
 
+### Step 0b — do not let the gateway watcher front-run the checkout
+
+`nanobot-gateway.service` is titled "hot-reload" and the unit body still has
+
+```
+ExecStart=…/.venv/bin/python3 …/scripts/watch-gateway.py
+```
+
+`watch-gateway.py` watches `vendor/nanobot/nanobot` for `*.py` changes and
+restarts the gateway through `watchfiles.run_process`. If that were the
+effective `ExecStart`, the Step 2 checkout — which rewrites hundreds of `.py`
+files at once — would **restart the owner gateway onto the new runtime
+instantly**, before any tenant has been validated, destroying the canary-first
+property this section depends on.
+
+It is currently inert only because a drop-in overrides it:
+
+```
+/home/mihai/.config/systemd/user/nanobot-gateway.service.d/99-release.conf
+```
+
+resets `ExecStart=` to a direct `python3 -m nanobot gateway`, and no
+`watch-gateway.py` process is running. **Verify this before Step 2**, and treat
+the answer as a gate, not a formality:
+
+```bash
+systemctl --user show -p ExecStart --value nanobot-gateway.service   # must NOT be watch-gateway.py
+pgrep -af watch-gateway                                              # must be empty
+```
+
+If the watcher is ever live again, stop it before checking out, or the rollout
+order stops being yours to choose.
+
 ### Step 1 — record the rollback point
 
 ```bash
@@ -428,3 +461,74 @@ three ways (Mac lock `e9daa2a0`, Spark lock `2c45561c`, Spark actual
 this branch is deployed, set **both** lock files to the same value:
 `upstream_baseline` → `HKUDS/nanobot` @ `499bf903` (v0.3.0 line),
 `effective_runtime.commit` → this branch's merge commit.
+
+### Step 7 — sessions move out of the workspace: FIX THE BACKUP FIRST
+
+Upstream `b34f1bd0` relocates session transcripts. `SessionManager.__init__`
+calls `_migrate_from_workspace()`, which durably copies
+`<workspace>/sessions/*.jsonl` into the new root **and then removes the
+source**. Migration is automatic and conflict-safe (older duplicates are
+archived, not overwritten), so no conversation is lost — but it *moves*, and
+everything that reads the old path must be updated.
+
+New location — **it is derived from the config file's directory**, not from
+`$HOME`. `get_data_dir()` returns `get_config_path().parent`, so the owner and
+the tenants land in completely different trees:
+
+| Runtime | `--config` | Sessions root |
+| --- | --- | --- |
+| owner gateway | `~/.nanobot/config.json` | `~/.nanobot/sessions/<workspace_id>/` |
+| each tenant | `~/.local/share/ziggy/tenants/<ws>/runtime/config.json` | `~/.local/share/ziggy/tenants/<ws>/runtime/sessions/<workspace_id>/` |
+
+Verified on the Spark 2026-09-14; the owner's root resolved to
+`~/.nanobot/sessions/2d049537b1d309399149fe68acda1611/`.
+
+`<workspace_id>` is **not** a hash of the workspace path. It is a random
+`secrets.token_hex(16)` generated once and persisted in a marker file inside
+the workspace (`_WORKSPACE_ID_FILE = "workspace-id"`), recovered via the
+`.workspace` marker if that file is deleted. So the directory name is opaque
+and differs per machine — never hard-code it; enumerate
+`~/.nanobot/sessions/*/` instead.
+
+Downgrade path: `nanobot sessions restore-workspace` copies sessions back into
+the workspace before reinstalling an older nanobot.
+
+**`ziggy-backup.service` does not cover the new path.** As of 2026-09-14 it
+binds only:
+
+```
+BindReadOnlyPaths=/home/mihai/.nanobot/workspace:/run/ziggy-backup-input/workspace
+BindReadOnlyPaths=/home/mihai/.local/share/ziggy/tenants:/run/ziggy-backup-input/tenants
+```
+
+Migration is **lazy** — it runs when `SessionManager` is first constructed, not
+at process start. A freshly restarted runtime can sit with the old layout
+untouched for hours, so "the files did not move yet" is not evidence that the
+upgrade is safe. It is evidence that nobody has talked to it yet.
+
+There were **two** gaps, both fixed on 2026-09-14:
+
+1. *Owner.* Nothing bound `~/.nanobot/sessions`. Fixed with
+   `/etc/systemd/system/ziggy-backup.service.d/10-sessions.conf`:
+
+   ```
+   Environment=ZIGGY_SESSION_ROOT=/run/ziggy-backup-input/sessions
+   BindReadOnlyPaths=-/home/mihai/.nanobot/sessions:/run/ziggy-backup-input/sessions
+   ```
+
+2. *Tenants — the worse one.* Their sessions land under
+   `<tenant>/runtime/sessions/`, and the tenant-workspace tar **explicitly
+   excludes** `tenants/*/runtime` and `tenants/*/runtime/**`. A bind alone does
+   nothing here; the exclusion silently drops every tenant transcript.
+
+`/usr/local/libexec/ziggy-backup` needed a code change for both (it archives
+named inputs, so a bind on its own is inert): a `ziggy-sessions.tgz` block for
+the owner root and a `find`-driven `ziggy-tenant-sessions.tgz` block for
+`*/runtime/sessions/*`. **That script is not in this repository** — it exists
+only on the Spark, with a rollback copy at
+`/usr/local/libexec/ziggy-backup.bak-2026-09-14`. Getting it under version
+control is a prerequisite for trusting any of this.
+
+Verify with one backup run that both archives appear and that
+`ziggy-sessions.tgz` is megabytes, not ~115 bytes (an empty `sessions/`
+directory entry tars to about that and looks like success).
