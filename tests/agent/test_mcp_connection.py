@@ -414,6 +414,56 @@ async def test_reload_is_a_direct_provider_operation_without_an_agent_loop(
     assert closed == ["browserbase"]
 
 
+def test_has_pending_config_changes_compares_loaded_servers_with_live_set():
+    live = MCPServerConfig(type="stdio", command="browserbase-mcp")
+    configured: dict[str, MCPServerConfig] = {"browserbase": live.model_copy()}
+    provider = MCPProvider({"browserbase": live}, ToolRegistry(), server_loader=lambda: configured)
+
+    assert provider.has_pending_config_changes() is False
+
+    configured["browserbase"] = live.model_copy(update={"enabled_tools": ["navigate"]})
+    assert provider.has_pending_config_changes() is True
+
+    configured["browserbase"] = live.model_copy()
+    configured["linkedin"] = MCPServerConfig(type="stdio", command="linkedin-mcp")
+    assert provider.has_pending_config_changes() is True
+
+    configured = {}
+    assert provider.has_pending_config_changes() is True
+
+
+def test_from_config_loader_pins_the_live_workspace_for_plugin_servers(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr("nanobot.config.loader._current_config_path", tmp_path / "config.json")
+    config = load_config()
+    config.agents.defaults.workspace = str(tmp_path / "override-workspace")
+    seen: list[Any] = []
+
+    def _fake_plugin_servers(workspace, configured=None):
+        seen.append(workspace)
+        return dict(configured or {})
+
+    monkeypatch.setattr("nanobot.agent.plugins.agent_plugin_mcp_servers", _fake_plugin_servers)
+    provider = MCPProvider.from_config(config, ToolRegistry())
+
+    assert provider.has_pending_config_changes() is False
+    # Both the initial set and every re-read scan the gateway's (in-memory,
+    # --workspace) workspace, not whatever the on-disk config would resolve.
+    assert seen == [config.workspace_path, config.workspace_path]
+
+
+def test_has_pending_config_changes_propagates_loader_errors():
+    def _broken_loader() -> dict[str, MCPServerConfig]:
+        raise ValueError("config.json: expecting value")
+
+    provider = MCPProvider({}, ToolRegistry(), server_loader=_broken_loader)
+
+    with pytest.raises(ValueError, match="expecting value"):
+        provider.has_pending_config_changes()
+
+
 @pytest.mark.asyncio
 async def test_reload_timeout_marks_attempted_server_failed_and_allows_retry(
     monkeypatch: pytest.MonkeyPatch,

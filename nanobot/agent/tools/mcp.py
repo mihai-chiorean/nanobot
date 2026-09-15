@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import json
 import os
@@ -11,6 +12,7 @@ import shutil
 import urllib.parse
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
 from contextlib import AsyncExitStack, suppress
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 
 import httpx
@@ -1337,10 +1339,20 @@ def _configured_servers(config: Config) -> dict[str, MCPServerConfig]:
     )
 
 
-def _load_current_servers() -> dict[str, MCPServerConfig]:
+def _load_current_servers(workspace: Path | None = None) -> dict[str, MCPServerConfig]:
+    """Re-read MCP servers from the config file plus enabled workspace plugins.
+
+    ``workspace`` pins the plugin directory to the one the running gateway was
+    built with (``--workspace`` is applied in memory and is not on disk).
+    """
+    from nanobot.agent.plugins import agent_plugin_mcp_servers
     from nanobot.config.loader import load_config, resolve_config_env_vars
 
-    return _configured_servers(resolve_config_env_vars(load_config()))
+    config = resolve_config_env_vars(load_config())
+    return agent_plugin_mcp_servers(
+        workspace if workspace is not None else config.workspace_path,
+        config.tools.mcp_servers,
+    )
 
 
 class MCPProvider:
@@ -1372,7 +1384,8 @@ class MCPProvider:
         return cls(
             _configured_servers(config),
             registry,
-            server_loader=server_loader,
+            server_loader=server_loader
+            or functools.partial(_load_current_servers, config.workspace_path),
         )
 
     @property
@@ -1382,6 +1395,23 @@ class MCPProvider:
     @property
     def connected_server_names(self) -> set[str]:
         return set(self._connections)
+
+    def has_pending_config_changes(self) -> bool:
+        """Return whether the configured MCP servers differ from the live set.
+
+        Reads the current configuration through the provider's server loader
+        and compares it with the servers ``reload()`` last applied, using the
+        same per-server signature ``reload()`` uses to detect changed servers
+        (so an ``enabledTools`` edit counts as a change).  Raises whatever the
+        loader raises when the configuration cannot be read.
+
+        Runs without ``_lock``: ``reload()`` rebinds ``_servers`` wholesale
+        rather than mutating it, so this only ever sees a complete server set,
+        and a stale answer is harmless because ``reload()`` re-reads and diffs
+        under the lock itself.
+        """
+        next_servers = dict(self._server_loader())
+        return _servers_signature(next_servers) != _servers_signature(self._servers)
 
     def runtime_status(self) -> dict[str, MCPRuntimeStatus]:
         """Return the latest connection-attempt result for configured servers."""
@@ -1685,6 +1715,10 @@ def _server_signature(cfg: Any) -> Any:
     if hasattr(cfg, "model_dump"):
         return cfg.model_dump(mode="json")
     return cfg
+
+
+def _servers_signature(servers: Mapping[str, Any]) -> dict[str, Any]:
+    return {name: _server_signature(cfg) for name, cfg in servers.items()}
 
 
 def _tool_prefix(server_name: str) -> str:

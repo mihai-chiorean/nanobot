@@ -2030,7 +2030,11 @@ the config automatically on first click.
 
 nanobot opens the server's authorization page and handles the callback through
 the gateway. The tools become available immediately when hot reload succeeds;
-otherwise the WebUI asks for a restart. OAuth tokens and dynamic client
+otherwise the WebUI asks for a restart. The gateway also watches `config.json`
+itself: an `mcpServers` edit saved by hand or by tooling (a server added,
+removed, or changed, including `enabledTools`) is reconciled the same way
+before the next turn, while edits that only touch model settings never
+reconnect an MCP server. OAuth tokens and dynamic client
 registration data are stored in the nanobot data directory under
 `auth/mcp.json`; they are not written to `config.json`. Removing the MCP server
 from Apps also removes its saved OAuth credentials. Normal gateway startup never
