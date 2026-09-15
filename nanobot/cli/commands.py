@@ -694,6 +694,9 @@ def _run_gateway(
     # Set cron callback (needs agent)
     async def on_cron_job(job: CronJob) -> str | None:
         """Execute a cron job through the agent."""
+        async def _silent(*_args, **_kwargs):
+            pass
+
         # Dream is an internal job — run directly, not through the agent loop.
         if job.name == "dream":
             try:
@@ -702,6 +705,74 @@ def _run_gateway(
             except Exception:
                 logger.exception("Dream cron job failed")
             return None
+
+        if job.payload.kind == "work_task":
+            meta = dict(job.payload.channel_meta or {})
+            scope = str(meta.get("work_scope") or meta.get("_scope") or "owner")
+            chat_id = str(meta.get("work_chat_id") or job.payload.to or f"scheduled:{job.id}")
+            channel = job.payload.channel or "websocket"
+            session_key = job.payload.session_key or f"cron:{job.id}"
+            title = str(meta.get("work_title") or job.name or "Scheduled work")
+            plan_task_id = meta.get("work_plan_task_id")
+            task = agent.work_store.create_task(
+                scope=scope,
+                session_key=session_key,
+                chat_id=chat_id,
+                content=job.payload.message,
+                mode="scheduled",
+                title=title,
+                model=agent.model,
+            )
+            task_id = str(task["task_id"])
+            logger.info(
+                "Cron: created scheduled Work task {} for job '{}' ({})",
+                task_id,
+                job.name,
+                job.id,
+            )
+            if isinstance(plan_task_id, str) and plan_task_id.startswith("work_"):
+                agent.work_store.append_event(
+                    plan_task_id,
+                    "scheduled_run.created",
+                    {
+                        "cron_job_id": job.id,
+                        "run_task_id": task_id,
+                        "title": title,
+                    },
+                    actor="scheduler",
+                )
+            resp = await agent.process_direct(
+                job.payload.message,
+                session_key=session_key,
+                channel=channel,
+                chat_id=chat_id,
+                metadata={
+                    "work_task_id": task_id,
+                    "work_mode": "scheduled",
+                    "cron_job_id": job.id,
+                    "_scope": scope,
+                },
+                on_progress=_silent,
+            )
+            if resp is not None and channel == "websocket":
+                await bus.publish_outbound(resp)
+            if isinstance(plan_task_id, str) and plan_task_id.startswith("work_"):
+                agent.work_store.append_event(
+                    plan_task_id,
+                    "scheduled_run.completed",
+                    {
+                        "cron_job_id": job.id,
+                        "run_task_id": task_id,
+                    },
+                    actor="scheduler",
+                )
+                if job.delete_after_run:
+                    agent.work_store.update_status(
+                        plan_task_id,
+                        "succeeded",
+                        result_summary=f"One-time scheduled work ran as {task_id}.",
+                    )
+            return resp.content if resp else None
 
         from nanobot.utils.evaluator import evaluate_response
 
@@ -717,9 +788,6 @@ def _run_gateway(
         cron_token = None
         if isinstance(cron_tool, CronTool):
             cron_token = cron_tool.set_cron_context(True)
-
-        async def _silent(*_args, **_kwargs):
-            pass
 
         message_record_token = None
         if isinstance(message_tool, MessageTool):

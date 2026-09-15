@@ -18,8 +18,6 @@ import shutil
 import ssl
 import subprocess
 import time
-import urllib.error
-import urllib.request
 import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Self
@@ -108,8 +106,7 @@ class WebSocketConfig(Base):
     # (base64 overhead) + envelope framing stays under 36 MB; the 40 MB ceiling
     # leaves a small margin for sender slop without opening a DoS avenue.
     max_message_bytes: int = Field(default=37_748_736, ge=1024, le=41_943_040)
-    # Set to null when a client-owned heartbeat is responsible for liveness.
-    ping_interval_s: float | None = Field(default=20.0, ge=5.0, le=300.0)
+    ping_interval_s: float = Field(default=20.0, ge=5.0, le=300.0)
     ping_timeout_s: float = Field(default=20.0, ge=5.0, le=300.0)
     ssl_certfile: str = ""
     ssl_keyfile: str = ""
@@ -486,48 +483,6 @@ def _build_jwt_identity_verifier(config: WebSocketConfig) -> IdentityVerifier | 
         return await asyncio.to_thread(verify_sync, token)
 
     return verify
-
-
-async def _fetch_clerk_primary_email(subject: str) -> str | None:
-    """Resolve a signed-in Clerk user's verified primary email server-side."""
-    secret_key = os.environ.get("CLERK_SECRET_KEY", "").strip()
-    if not secret_key:
-        return None
-
-    def fetch() -> str | None:
-        request = urllib.request.Request(
-            f"https://api.clerk.com/v1/users/{subject}",
-            headers={
-                "Accept": "application/json",
-                "Authorization": f"Bearer {secret_key}",
-                "User-Agent": "Ziggy/1.0 ClerkBackend",
-            },
-        )
-        with urllib.request.urlopen(request, timeout=5.0) as response:
-            payload = json.load(response)
-        if not isinstance(payload, dict):
-            return None
-        primary_id = payload.get("primary_email_address_id")
-        addresses = payload.get("email_addresses")
-        if not isinstance(primary_id, str) or not isinstance(addresses, list):
-            return None
-        for address in addresses:
-            if not isinstance(address, dict) or address.get("id") != primary_id:
-                continue
-            verification = address.get("verification")
-            if not isinstance(verification, dict) or verification.get("status") != "verified":
-                return None
-            value = address.get("email_address")
-            return value if isinstance(value, str) and value.strip() else None
-        return None
-
-    try:
-        return await asyncio.to_thread(fetch)
-    except urllib.error.HTTPError as e:
-        logger.warning("websocket: Clerk user lookup failed with HTTP {}", e.code)
-    except (urllib.error.URLError, TimeoutError, ValueError, OSError) as e:
-        logger.warning("websocket: Clerk user lookup failed: {}", type(e).__name__)
-    return None
 
 
 def _has_cloudflare_headers(headers: Any) -> bool:
@@ -1094,8 +1049,6 @@ class WebSocketChannel(BaseChannel):
         authorized_party = claims.get("azp")
         if not isinstance(subject, str) or not subject:
             return _http_error(401, "Unauthorized")
-        if not isinstance(email, str) or not email:
-            email = await _fetch_clerk_primary_email(subject)
         if not isinstance(email, str) or not email:
             return _http_error(403, "identity token is missing the primary email claim")
 
@@ -2351,27 +2304,17 @@ class WebSocketChannel(BaseChannel):
             payload["media_urls"] = [*(payload.get("media_urls") or []), *artifact_urls]
         if msg.reply_to:
             payload["reply_to"] = msg.reply_to
-        tool_events = msg.metadata.get("_tool_events")
-        if isinstance(tool_events, list) and tool_events:
-            payload["tool_events"] = tool_events
         # Mark intermediate agent breadcrumbs (tool-call hints, generic
         # progress strings) so WS clients can render them as subordinate
         # trace rows rather than conversational replies.
         if msg.metadata.get("_tool_hint"):
             payload["kind"] = "tool_hint"
-            payload["activity_type"] = "tool"
         elif (
             msg.metadata.get("_progress")
             or msg.metadata.get("_status_delta")
             or msg.metadata.get("_retry_wait")
         ):
             payload["kind"] = "progress"
-            if tool_events:
-                payload["activity_type"] = "tool"
-            elif msg.metadata.get("_status_delta") or msg.metadata.get("_retry_wait"):
-                payload["activity_type"] = "progress"
-            else:
-                payload["activity_type"] = "reasoning"
         raw = json.dumps(payload, ensure_ascii=False)
         for connection in conns:
             await self._safe_send_to(connection, raw, label=" ")

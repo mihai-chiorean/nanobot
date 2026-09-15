@@ -364,23 +364,6 @@ class ExecTool(Tool):
                 except Exception:
                     continue
 
-                # Device pseudo-files are not filesystem escapes. `2>/dev/null`
-                # is the most common shell idiom there is, and because the path
-                # extractor treats `>` as a delimiter it pulled `/dev/null` out
-                # as an absolute path that is never under the working directory,
-                # so every command using it was rejected.
-                if str(p) in (
-                    "/dev/null",
-                    "/dev/zero",
-                    "/dev/stdin",
-                    "/dev/stdout",
-                    "/dev/stderr",
-                    "/dev/tty",
-                    "/dev/random",
-                    "/dev/urandom",
-                ):
-                    continue
-
                 media_path = get_media_dir().resolve()
                 if (p.is_absolute()
                     and cwd_path not in p.parents

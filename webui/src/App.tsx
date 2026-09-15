@@ -1,4 +1,13 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  Component,
+  type ErrorInfo,
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useTranslation } from "react-i18next";
 import { DeleteConfirm } from "@/components/DeleteConfirm";
 import { Sidebar } from "@/components/Sidebar";
@@ -27,6 +36,56 @@ type BootState =
 const SIDEBAR_STORAGE_KEY = "nanobot-webui.sidebar";
 const SIDEBAR_WIDTH = 279;
 type ShellView = "chat" | "settings";
+
+interface ErrorBoundaryState {
+  error: Error | null;
+}
+
+class ErrorBoundary extends Component<
+  { children: ReactNode },
+  ErrorBoundaryState
+> {
+  state: ErrorBoundaryState = { error: null };
+
+  static getDerivedStateFromError(error: Error): ErrorBoundaryState {
+    return { error };
+  }
+
+  componentDidCatch(error: Error, info: ErrorInfo) {
+    console.error("Nanobot WebUI render error", error, info);
+  }
+
+  render() {
+    if (this.state.error) {
+      return (
+        <div className="flex h-full w-full items-center justify-center px-4 text-center">
+          <div className="flex max-w-md flex-col items-center gap-3">
+            <img
+              src="/brand/nanobot_icon.png"
+              alt=""
+              className="h-10 w-10 opacity-60 grayscale select-none"
+              aria-hidden
+              draggable={false}
+            />
+            <p className="text-lg font-semibold">Something went wrong</p>
+            <p className="text-sm text-muted-foreground">
+              {this.state.error.message}
+            </p>
+            <button
+              type="button"
+              className="rounded-md border border-border px-3 py-1.5 text-sm hover:bg-muted"
+              onClick={() => this.setState({ error: null })}
+            >
+              Try again
+            </button>
+          </div>
+        </div>
+      );
+    }
+
+    return this.props.children;
+  }
+}
 
 function readSidebarOpen(): boolean {
   if (typeof window === "undefined") return true;
@@ -150,7 +209,9 @@ export default function App() {
       token={state.token}
       modelName={state.modelName}
     >
-      <Shell onModelNameChange={handleModelNameChange} />
+      <ErrorBoundary>
+        <Shell onModelNameChange={handleModelNameChange} />
+      </ErrorBoundary>
     </ClientProvider>
   );
 }

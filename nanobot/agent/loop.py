@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
-import re
 import dataclasses
 import json
 import os
+import re
+import tempfile
 import time
 from contextlib import AsyncExitStack, nullcontext, suppress
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
@@ -29,18 +31,20 @@ from nanobot.agent.tools.ask import (
     pending_ask_user_id,
 )
 from nanobot.agent.tools.audit import AuditLogger
-from nanobot.agent.tools.recall import IngestTool, RecallTool
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.file_state import FileStateStore, bind_file_states, reset_file_states
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.notebook import NotebookEditTool
+from nanobot.agent.tools.recall import IngestTool, RecallTool
 from nanobot.agent.tools.registry import ToolRegistry
+from nanobot.agent.tools.schedule_work import ScheduleWorkTool
 from nanobot.agent.tools.search import GlobTool, GrepTool
 from nanobot.agent.tools.self import MyTool
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
+from nanobot.agent.tools.work import PublishArtifactTool, ReportProgressTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
@@ -59,6 +63,9 @@ from nanobot.utils.progress_events import (
     on_progress_accepts_tool_events,
 )
 from nanobot.utils.runtime import EMPTY_FINAL_RESPONSE_MESSAGE
+from nanobot.utils.vision import describe_images
+from nanobot.work.context import reset_work_context, set_work_context
+from nanobot.work.store import WorkEvent, WorkStore
 
 if TYPE_CHECKING:
     from nanobot.config.schema import ChannelsConfig, ExecToolConfig, ToolsConfig, WebToolsConfig
@@ -255,6 +262,65 @@ class _LoopHook(AgentHook):
         return self._loop._strip_think(content)
 
 
+class _WorkHook(AgentHook):
+    """Persist tool/progress breadcrumbs for one Work task."""
+
+    def __init__(
+        self,
+        agent_loop: AgentLoop,
+        *,
+        task_id: str,
+        channel: str,
+        chat_id: str,
+    ) -> None:
+        super().__init__()
+        self._loop = agent_loop
+        self._task_id = task_id
+        self._channel = channel
+        self._chat_id = chat_id
+
+    async def _publish(self, event: WorkEvent | None) -> None:
+        if event is None:
+            return
+        await self._loop._publish_work_event(self._channel, self._chat_id, event)
+
+    async def before_iteration(self, context: AgentHookContext) -> None:
+        if context.iteration == 0:
+            await self._publish(
+                self._loop.work_store.update_status(self._task_id, "running")
+            )
+
+    async def before_execute_tools(self, context: AgentHookContext) -> None:
+        for tc in context.tool_calls:
+            await self._publish(
+                self._loop.work_store.append_event(
+                    self._task_id,
+                    "tool.started",
+                    {"name": tc.name, "arguments": tc.arguments or {}},
+                    actor="main_agent",
+                )
+            )
+
+    async def after_iteration(self, context: AgentHookContext) -> None:
+        for event in context.tool_events or []:
+            await self._publish(
+                self._loop.work_store.append_event(
+                    self._task_id,
+                    "tool.finished",
+                    dict(event),
+                    actor="main_agent",
+                )
+            )
+        if context.stop_reason == "ask_user":
+            await self._publish(
+                self._loop.work_store.update_status(
+                    self._task_id,
+                    "waiting",
+                    result_summary=context.final_content,
+                )
+            )
+
+
 class AgentLoop:
     """
     The agent loop is the core processing engine.
@@ -335,6 +401,11 @@ class AgentLoop:
 
         self.context = ContextBuilder(workspace, timezone=timezone, disabled_skills=disabled_skills)
         self.sessions = session_manager or SessionManager(workspace)
+        work_workspace = (
+            workspace if isinstance(workspace, Path)
+            else Path(tempfile.mkdtemp(prefix="nanobot-work-"))
+        )
+        self.work_store = WorkStore(work_workspace)
         self.tools = ToolRegistry()
         self._audit_logger = AuditLogger()
         self.tools.set_audit_logger(self._audit_logger)
@@ -424,6 +495,19 @@ class AgentLoop:
         self._provider_signature = snapshot.signature
         logger.info("Runtime model switched for next turn: {} -> {}", old_model, model)
 
+    @staticmethod
+    def _display_model_name(model: str | None) -> str:
+        """Return a compact model label for user-visible progress text."""
+        raw = str(model or "").strip()
+        if not raw:
+            return "Ziggy"
+        lower = raw.lower()
+        if "qwen" in lower:
+            return "Qwen"
+        if "minimax" in lower:
+            return "MiniMax"
+        return raw.rsplit("/", 1)[-1]
+
     def _refresh_provider_snapshot(self) -> None:
         if self._provider_snapshot_loader is None:
             return
@@ -484,9 +568,19 @@ class AgentLoop:
             )
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound, workspace=self.workspace))
         self.tools.register(SpawnTool(manager=self.subagents))
+        self.tools.register(ReportProgressTool())
+        self.tools.register(PublishArtifactTool())
         if self.cron_service:
             self.tools.register(
                 CronTool(self.cron_service, default_timezone=self.context.timezone or "UTC")
+            )
+            self.tools.register(
+                ScheduleWorkTool(
+                    self.cron_service,
+                    self.work_store,
+                    default_timezone=self.context.timezone or "UTC",
+                    model_name=self.model,
+                )
             )
         # Ziggy: recall/ingest tools for ChromaDB vector memory
         try:
@@ -533,14 +627,14 @@ class AgentLoop:
             effective_key = UNIFIED_SESSION_KEY
         else:
             effective_key = f"{channel}:{chat_id}"
-        for name in ("message", "spawn", "cron", "my"):
+        for name in ("message", "spawn", "cron", "schedule_work", "my"):
             if tool := self.tools.get(name):
                 if hasattr(tool, "set_context"):
                     if name == "spawn":
                         tool.set_context(channel, chat_id, effective_key=effective_key)
                         if hasattr(tool, "set_origin_message_id"):
                             tool.set_origin_message_id(message_id)
-                    elif name == "cron":
+                    elif name in {"cron", "schedule_work"}:
                         tool.set_context(channel, chat_id, metadata=metadata, session_key=session_key)
                     elif name == "message":
                         tool.set_context(channel, chat_id, message_id, metadata=metadata)
@@ -602,6 +696,98 @@ class AgentLoop:
             return UNIFIED_SESSION_KEY
         return msg.session_key
 
+    @staticmethod
+    def _work_task_id(metadata: dict[str, Any] | None) -> str | None:
+        if not isinstance(metadata, dict):
+            return None
+        value = metadata.get("work_task_id")
+        return value if isinstance(value, str) and value.startswith("work_") else None
+
+    async def _publish_work_event(
+        self,
+        channel: str,
+        chat_id: str,
+        event: WorkEvent,
+    ) -> None:
+        await self.bus.publish_outbound(
+            OutboundMessage(
+                channel=channel,
+                chat_id=chat_id,
+                content="",
+                metadata={"_work_event": event.to_api()},
+            )
+        )
+
+    async def _record_work_status(
+        self,
+        msg: InboundMessage,
+        status: str,
+        *,
+        error: str | None = None,
+        result_summary: str | None = None,
+    ) -> None:
+        task_id = self._work_task_id(msg.metadata)
+        if task_id is None:
+            return
+        event = self.work_store.update_status(
+            task_id,
+            status,
+            error=error,
+            result_summary=result_summary,
+        )
+        if event is not None:
+            await self._publish_work_event(msg.channel, msg.chat_id, event)
+
+    def _work_artifact_refs(self, msg: InboundMessage) -> list[dict[str, Any]]:
+        task_id = self._work_task_id(msg.metadata)
+        if task_id is None:
+            return []
+        refs: list[dict[str, Any]] = []
+        for artifact in self.work_store.list_artifacts(task_id):
+            artifact_id = artifact.get("artifact_id")
+            if not isinstance(artifact_id, str):
+                continue
+            refs.append(
+                {
+                    "artifact_id": artifact_id,
+                    "name": artifact.get("name"),
+                    "kind": artifact.get("kind"),
+                    "mime": artifact.get("mime"),
+                }
+            )
+        return refs
+
+    def _attach_work_artifacts_to_last_assistant(
+        self,
+        session: Session,
+        artifact_refs: list[dict[str, Any]],
+    ) -> None:
+        if not artifact_refs:
+            return
+        for entry in reversed(session.messages):
+            if not isinstance(entry, dict) or entry.get("role") != "assistant":
+                continue
+            existing = entry.get("work_artifacts")
+            if isinstance(existing, list):
+                known = {
+                    item.get("artifact_id")
+                    for item in existing
+                    if isinstance(item, dict)
+                }
+                entry["work_artifacts"] = [
+                    *existing,
+                    *[
+                        item
+                        for item in artifact_refs
+                        if item.get("artifact_id") not in known
+                    ],
+                ]
+            else:
+                entry["work_artifacts"] = list(artifact_refs)
+            session.updated_at = datetime.now()
+            self.sessions.save(session)
+            return
+
     def _replay_token_budget(self) -> int:
         """Derive a token budget for session history replay from the context window."""
         if self.context_window_tokens <= 0:
@@ -654,9 +840,19 @@ class AgentLoop:
             metadata=metadata,
             session_key=session_key,
         )
-        hook: AgentHook = (
-            CompositeHook([loop_hook] + self._extra_hooks) if self._extra_hooks else loop_hook
-        )
+        task_id = self._work_task_id(metadata)
+        hooks: list[AgentHook] = [loop_hook]
+        if task_id:
+            hooks.append(
+                _WorkHook(
+                    self,
+                    task_id=task_id,
+                    channel=channel,
+                    chat_id=chat_id,
+                )
+            )
+        hooks.extend(self._extra_hooks)
+        hook: AgentHook = CompositeHook(hooks) if len(hooks) > 1 else loop_hook
 
         async def _checkpoint(payload: dict[str, Any]) -> None:
             if session is None:
@@ -675,12 +871,12 @@ class AgentLoop:
             if pending_queue is None:
                 return []
 
-            def _to_user_message(pending_msg: InboundMessage) -> dict[str, Any]:
+            async def _to_user_message(pending_msg: InboundMessage) -> dict[str, Any]:
                 content = pending_msg.content
                 media = pending_msg.media if pending_msg.media else None
                 if media:
                     content, media = extract_documents(content, media)
-                    media = media or None
+                    content, media = await self._preprocess_vision(content, media)
                 user_content = self.context._build_user_content(content, media)
                 runtime_ctx = self.context._build_runtime_context(
                     pending_msg.channel,
@@ -696,7 +892,7 @@ class AgentLoop:
             items: list[dict[str, Any]] = []
             while len(items) < limit:
                 try:
-                    items.append(_to_user_message(pending_queue.get_nowait()))
+                    items.append(await _to_user_message(pending_queue.get_nowait()))
                 except asyncio.QueueEmpty:
                     break
 
@@ -725,6 +921,11 @@ class AgentLoop:
 
         active_session_key = session.key if session else session_key
         file_state_token = bind_file_states(self._file_state_store.for_session(active_session_key))
+        work_tokens = set_work_context(
+            store=self.work_store if task_id else None,
+            task_id=task_id,
+            workspace=self.workspace if task_id else None,
+        )
         try:
             result = await self.runner.run(AgentRunSpec(
                 initial_messages=initial_messages,
@@ -746,6 +947,7 @@ class AgentLoop:
                 injection_callback=_drain_pending,
             ))
         finally:
+            reset_work_context(work_tokens)
             reset_file_states(file_state_token)
         self._last_usage = result.usage
         if result.stop_reason == "max_iterations":
@@ -941,9 +1143,15 @@ class AgentLoop:
                             session_key,
                             exc_info=True,
                         )
+                    await self._record_work_status(msg, "cancelled")
                     raise
                 except Exception:
                     logger.exception("Error processing message for session {}", session_key)
+                    await self._record_work_status(
+                        msg,
+                        "failed",
+                        error="Sorry, I encountered an error.",
+                    )
                     await self.bus.publish_outbound(OutboundMessage(
                         channel=msg.channel, chat_id=msg.chat_id,
                         content="Sorry, I encountered an error.",
@@ -1138,8 +1346,10 @@ class AgentLoop:
 
         # Extract document text from media at the processing boundary so all
         # channels benefit without format-specific logic in ContextBuilder.
+        prompt_media = msg.media if msg.media else None
         if msg.media:
             new_content, image_only = extract_documents(msg.content, msg.media)
+            new_content, prompt_media = await self._preprocess_vision(new_content, image_only)
             msg = dataclasses.replace(msg, content=new_content, media=image_only)
 
         preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
@@ -1193,7 +1403,7 @@ class AgentLoop:
                 history=history,
                 current_message=msg.content,
                 session_summary=pending,
-                media=msg.media if msg.media else None,
+                media=prompt_media,
                 channel=msg.channel,
                 chat_id=self._runtime_chat_id(msg),
                 sender_id=msg.sender_id,
@@ -1245,6 +1455,10 @@ class AgentLoop:
             self._mark_pending_user_turn(session)
             self.sessions.save(session)
             user_persisted_early = True
+
+        if on_stream is not None:
+            model_label = self._display_model_name(self.model)
+            await _bus_progress(f"{model_label} is processing your request on Spark.")
 
         final_content, _, all_msgs, stop_reason, had_injections = await self._run_agent_loop(
             initial_messages,
@@ -1300,6 +1514,30 @@ class AgentLoop:
             # typing stops.
             if on_stream_end is not None and stop_reason != "max_iterations":
                 await on_stream_end(resuming=False)
+        if stop_reason == "ask_user":
+            await self._record_work_status(
+                msg,
+                "waiting",
+                result_summary=final_content,
+            )
+        elif stop_reason == "error":
+            await self._record_work_status(
+                msg,
+                "failed",
+                error=final_content,
+                result_summary=final_content,
+            )
+            artifact_refs = []
+        else:
+            await self._record_work_status(
+                msg,
+                "succeeded",
+                result_summary=final_content[:500],
+            )
+            artifact_refs = self._work_artifact_refs(msg)
+            if artifact_refs:
+                meta["_work_artifacts"] = artifact_refs
+                self._attach_work_artifacts_to_last_assistant(session, artifact_refs)
         return OutboundMessage(
             channel=msg.channel,
             chat_id=msg.chat_id,
@@ -1518,6 +1756,27 @@ class AgentLoop:
         self._clear_pending_user_turn(session)
         return True
 
+    async def _preprocess_vision(
+        self,
+        content: str,
+        image_paths: list[str] | None,
+    ) -> tuple[str, list[str] | None]:
+        """Describe attached images with the vision sidecar before MiniMax.
+
+        Documents are handled earlier by :func:`extract_documents`. When the
+        sidecar succeeds, MiniMax receives text-only vision context and the
+        original media stays available for persistence/replay. When it fails,
+        return image paths so the older direct multimodal provider path remains
+        available as a fallback.
+        """
+        if not image_paths:
+            return content, None
+        description = await describe_images(image_paths)
+        if not description:
+            return content, image_paths
+        joined = f"{content}\n\n{description}" if content.strip() else description
+        return joined, None
+
     async def process_direct(
         self,
         content: str,
@@ -1525,6 +1784,7 @@ class AgentLoop:
         channel: str = "cli",
         chat_id: str = "direct",
         media: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
         on_progress: Callable[..., Awaitable[None]] | None = None,
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
@@ -1533,7 +1793,7 @@ class AgentLoop:
         await self._connect_mcp()
         msg = InboundMessage(
             channel=channel, sender_id="user", chat_id=chat_id,
-            content=content, media=media or [],
+            content=content, media=media or [], metadata=metadata or {},
         )
         return await self._process_message(
             msg,
