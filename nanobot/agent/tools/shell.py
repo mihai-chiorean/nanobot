@@ -956,8 +956,14 @@ class ExecTool(Tool):
                 if not allowed and sandbox_bind_roots:
                     allowed = any(is_path_within(p, root) for root in sandbox_bind_roots)
                 if p.is_absolute() and not allowed:
+                    # Name the path *after* the parenthesised code. A bare
+                    # "outside working dir" gives the model nothing to act on,
+                    # so it retries the same command instead of dropping the one
+                    # offending argument. Keeping the code intact means callers
+                    # (and tests) that match on it are unaffected.
                     return ToolResult.error(
                         "Error: Command blocked by safety guard (path outside working dir)"
+                        f": {p}"
                         + _WORKSPACE_BOUNDARY_NOTE
                     )
 
