@@ -106,6 +106,11 @@ class _GatewayAgentContractStub:
     def preserve_inflight_turns_on_shutdown(self) -> None:
         return None
 
+    async def reconcile_work_store(self) -> int:
+        # Ziggy-local (MIT-1010): gateway startup sweeps Work tasks left
+        # running by the previous process, before any channel accepts input.
+        return 0
+
 
 class _EmptyGatewaySessionManager:
     """Minimal session-manager contract for gateway assembly tests."""

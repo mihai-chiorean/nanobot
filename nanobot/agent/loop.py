@@ -632,7 +632,13 @@ class AgentLoop:
         self.sessions = session_manager or SessionManager(workspace)
         # Ziggy-local (MIT-1010): durable Work store for report_progress /
         # publish_artifact / schedule_work and the ``work_task`` cron kind.
-        self.work_store = WorkStore(workspace)
+        # The restart sweep is *not* run on open. The schema comes up lazily
+        # (so an unwritable workspace does not fail construction), which means
+        # an on-open sweep would fire at first agent use -- by which time the
+        # gateway has already accepted work.create and inserted a task, and the
+        # sweep would mark that live task interrupted. Startup calls
+        # ``reconcile_work_store`` explicitly, before any channel accepts input.
+        self.work_store = WorkStore(workspace, reconcile_on_open=False)
         self.tools = ToolRegistry()
         self._audit_logger = AuditLogger()
         self.tools.set_audit_logger(self._audit_logger)
@@ -905,6 +911,15 @@ class AgentLoop:
         logger.info("Registered {} tools: {}", len(registered), registered)
 
     # -- Work event stream (Ziggy-local, MIT-1010) --------------------------
+
+    async def reconcile_work_store(self) -> int:
+        """Fail Work tasks left mid-flight by a previous process.
+
+        Must be awaited during startup *before* any channel accepts input: it
+        sweeps every task still ``queued``/``running``, and it cannot tell one
+        left over from the last process from one this process just accepted.
+        """
+        return await self.work_store.run_io(self.work_store.reconcile_interrupted)
 
     def _work_turn_hook(self, turn: AgentTurnHookContext) -> AgentHook | None:
         """Build the Work hook for a Work turn; ``None`` for every other turn."""
@@ -1852,6 +1867,16 @@ class AgentLoop:
                             "Only my owner can authorize that. Let me know if there's something "
                             "else I can help you with!",
                 ))
+                # Ziggy-local (MIT-1010): a Work subscriber is waiting on a
+                # terminal status.changed. A Work turn's sender is the creating
+                # client, never the owner, so a task whose prompt trips this
+                # guard would otherwise hang until the executor's read deadline.
+                with suppress(Exception):
+                    await self.record_work_status(
+                        msg,
+                        "failed",
+                        error="Work tasks cannot request changes to the agent's own system.",
+                    )
                 return
 
         try:
@@ -2167,6 +2192,12 @@ class AgentLoop:
         await self._run_turn_stage(ctx, "restore", self._restore_turn)
         await self._run_turn_stage(ctx, "compact", self._compact_session)
         if await self._run_turn_stage(ctx, "command", self._dispatch_command):
+            # Ziggy-local (MIT-1010): a command short-circuits every later
+            # stage, including the one that closes the Work task out. Cancel
+            # is the expected case -- work.cancel publishes "/stop", and
+            # cancel_task has already written the terminal row, so this is a
+            # no-op there and a real close-out for anything else.
+            await self._run_turn_stage(ctx, "work", self._record_work_outcome)
             return ctx.outbound
         await self._run_turn_stage(ctx, "build", self._build_turn)
         await self._run_turn_stage(ctx, "run", self._run_turn)

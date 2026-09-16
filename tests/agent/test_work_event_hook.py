@@ -372,3 +372,27 @@ async def test_a_work_task_refused_by_the_owner_guard_still_ends_terminal(
     assert collector.types()[-1] == "status.changed"
     assert collector.events[-1]["payload"]["status"] == "failed"
     assert loop.work_store.get_task(task_id)["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_a_work_task_whose_prompt_is_a_command_still_ends_terminal(
+    tmp_path: Path,
+    bus: MessageBus,
+    collector: _Collector,
+) -> None:
+    """The command stage short-circuits every later stage, including the one
+    that closes the Work task out. Before, such a task stayed queued and the
+    executor blocked until its read deadline."""
+    loop = _make_loop(tmp_path, bus)
+    task = loop.work_store.create_task(chat_id=CHAT_ID, content="/help")
+    task_id = str(task["task_id"])
+    collector.drain()
+    collector.events.clear()
+
+    response = await _run(loop, task_id, content="/help")
+    assert response is not None, "the command did not dispatch; pick another one"
+    await asyncio.sleep(0)
+    collector.drain()
+
+    assert loop.work_store.get_task(task_id)["status"] == "succeeded"
+    assert collector.types()[-1] == "status.changed"
