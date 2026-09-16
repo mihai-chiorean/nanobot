@@ -768,3 +768,48 @@ async def test_the_channels_store_does_not_sweep_a_live_task(
     # First touch of the channel's handle: this is what brings its schema up.
     assert channel.work.store.get_task(task_id) is not None
     assert writer.get_task(task_id)["status"] == "running"
+
+
+@pytest.mark.asyncio
+async def test_the_work_routes_answer_through_the_real_gateway_dispatch(
+    channel: WebSocketChannel,
+) -> None:
+    """The seam, not just the router.
+
+    ``GatewayHTTPHandler.dispatch`` stamps trusted-proxy state onto the request
+    before any route sees it and runs the shared-room router first, so the
+    router passing in isolation does not prove ``/api/work`` is reachable --
+    or that a room bearer is refused once the real token store is in play.
+    """
+
+    class _Peer:
+        remote_address = ("8.8.8.8", 5000)
+
+        def respond(self, status: int, text: str) -> Any:
+            return (status, text)
+
+    def _get(token: str) -> TransportRequest:
+        return TransportRequest(
+            method="GET",
+            path="/api/work",
+            headers=_Headers({"Authorization": f"Bearer {token}"}),
+            body=b"",
+            raw_path="/api/work",
+        )
+
+    denied = await channel.gateway.http.dispatch(_Peer(), _get("nbrt_deadbeef"))
+    assert denied is not None
+    assert denied.status_code == 401
+
+    api_token = channel.gateway.tokens.issue_api_token(300)
+    if isinstance(api_token, tuple):
+        api_token = api_token[0]
+    allowed = await channel.gateway.http.dispatch(_Peer(), _get(str(api_token)))
+    assert allowed is not None
+    assert allowed.status_code == 200
+    assert _body(allowed) == {
+        "tasks": [],
+        "has_more": False,
+        "next_offset": 0,
+        "next_task_id": None,
+    }
