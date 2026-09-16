@@ -285,7 +285,7 @@ from `origin_metadata` after migration.
 | `…:560` | `POST /auth/shared-room-revoke` | unchanged |
 | `…:58` | `/api/shared-rooms/*` proxy prefix | unchanged (ziggy-control's own surface) |
 | `…:607` | `GET /api/sessions/websocket:<chat>/messages` | **reinstated, room-scoped only** — see below |
-| `…:615` | `GET /api/sessions/websocket:<chat>/files/<id>` | unchanged |
+| `…:615` | `GET /api/sessions/websocket:<chat>/files/<id>` | **404 at cutover** — the whole published-file feature (`agent/tools/publish_file.py`, `published_file_grants`, `read_published_file`) exists only in the snapshot. Not a shared-rooms regression; a separate carry-forward, tracked with C8 |
 | `deploy/releases/editorial/configure.py:75` | `websocket.sharedRoomConnectorServer` | unchanged |
 | `services/ziggy-worker/.../client.go:291` | `GET /api/sessions/websocket:<chat>/messages` | **owner-token caller — must migrate** (C5) |
 | `ios/Ziggy/Networking/ZiggyRESTClient.swift:239` | same route | **owner-token caller — must migrate** (C5) |
@@ -309,5 +309,7 @@ which is C5 and out of scope here.
 - [ ] Decide whether the aiohttp transport is acceptable for the owner runtime
       or whether shared rooms should move to a dedicated tenant (§3d tradeoff)
 - [ ] C8 briefing/editorial carry-forward (`agent/tools/briefing.py`)
+- [ ] Published files carry-forward (`agent/tools/publish_file.py` + the grant
+      re-attachment `shareable_messages` had); until then room file downloads 404
 - [ ] Canary one tenant with `sharedRoomCollaborationEnabled` before repointing
       `current-nanobot`
