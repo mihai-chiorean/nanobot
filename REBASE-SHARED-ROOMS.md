@@ -340,11 +340,12 @@ which is C5 and out of scope here.
 - [x] C6 per-entry `jobs.json` quarantine
 - [ ] **P0** migrate `client.go:291` and `ZiggyRESTClient.swift:238` off
       `/messages` to `/webui-thread` — same release train as the cutover
-- [ ] **Product call:** the rich Work event stream (`_WorkHook`,
-      `work.created` / `work.subscribed` / `work.event`) was not ported. The
-      runner now delivers the digest to chat, so the four owner jobs are
-      visible again, but the Work UI stays dark until the stream lands.
-      `e971284f` explicitly targets the Work app (`curated_digest_in_work_app`)
+- [x] The rich Work event stream (`_WorkHook`, `work.created` /
+      `work.subscribed` / `work.event`) — **ported** on
+      `ziggy/work-app-0.3.0`; see `REBASE-WORK-APP.md` for the
+      adopt/port/bridge comparison and the reason it was not a product call:
+      `services/ziggy-work`'s executor *runs* a task over these frames, so
+      without them the durable Work service cannot execute at all
 - [ ] Decide whether the aiohttp transport is acceptable for the owner runtime
       or whether shared rooms should move to a dedicated tenant (§3d tradeoff)
 - [ ] C8 briefing/editorial carry-forward (`agent/tools/briefing.py`)
