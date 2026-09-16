@@ -304,7 +304,15 @@ class WorkStreamHub:
             await self._error(connection, "failed to enqueue work", task_id=task_id)
             return
         if request_id is not None:
-            await self._store.run_io(self._store.mark_dispatched, task_id, request_id)
+            # Bookkeeping only, and it runs *after* the enqueue succeeded: the
+            # task is already running, so failing the task here would be a lie.
+            # Letting it raise would instead kill the socket over a UPDATE, so
+            # it is logged. The cost of losing it is that an idempotent retry
+            # re-enqueues rather than replaying.
+            try:
+                await self._store.run_io(self._store.mark_dispatched, task_id, request_id)
+            except Exception:
+                logger.exception("failed to mark Work task {} dispatched", task_id)
 
     async def handle_subscribe(self, connection: Any, envelope: dict[str, Any]) -> None:
         task_id = envelope.get("task_id")
