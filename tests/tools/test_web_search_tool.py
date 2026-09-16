@@ -252,7 +252,7 @@ async def test_serper_fallback_to_duckduckgo_when_no_key(monkeypatch):
         def __init__(self, **kw):
             pass
 
-        def text(self, query, max_results=5):
+        def text(self, query, max_results=5, **kwargs):
             return [{"title": "Fallback", "href": "https://ddg.example", "body": "DuckDuckGo fallback"}]
 
     monkeypatch.setattr("ddgs.DDGS", MockDDGS)
@@ -425,7 +425,7 @@ async def test_bocha_missing_key_falls_back_to_duckduckgo(monkeypatch):
         def __init__(self, **kw):
             pass
 
-        def text(self, query, max_results=5):
+        def text(self, query, max_results=5, **kwargs):
             return [{"title": "Fallback", "href": "https://ddg.example", "body": "DuckDuckGo fallback"}]
 
     monkeypatch.setattr("ddgs.DDGS", MockDDGS)
@@ -493,7 +493,7 @@ async def test_volcengine_missing_key_falls_back_to_duckduckgo(monkeypatch):
         def __init__(self, **kw):
             pass
 
-        def text(self, query, max_results=5):
+        def text(self, query, max_results=5, **kwargs):
             return [{"title": "Fallback", "href": "https://ddg.example", "body": "DuckDuckGo fallback"}]
 
     monkeypatch.setattr("ddgs.DDGS", MockDDGS)
@@ -535,7 +535,7 @@ async def test_duckduckgo_search(monkeypatch):
         def __init__(self, **kw):
             pass
 
-        def text(self, query, max_results=5):
+        def text(self, query, max_results=5, **kwargs):
             return [{"title": "DDG Result", "href": "https://ddg.example", "body": "From DuckDuckGo"}]
 
     monkeypatch.setattr("nanobot.agent.tools.web.DDGS", MockDDGS, raising=False)
@@ -559,7 +559,7 @@ async def test_duckduckgo_search_passes_proxy(monkeypatch):
         def __init__(self, **kw):
             captured.update(kw)
 
-        def text(self, query, max_results=5):
+        def text(self, query, max_results=5, **kwargs):
             return [{"title": "Result", "href": "https://example.com", "body": "OK"}]
 
     monkeypatch.setattr("ddgs.DDGS", ProxyCaptorDDGS)
@@ -580,7 +580,7 @@ async def test_brave_fallback_to_duckduckgo_when_no_key(monkeypatch):
         def __init__(self, **kw):
             pass
 
-        def text(self, query, max_results=5):
+        def text(self, query, max_results=5, **kwargs):
             return [{"title": "Fallback", "href": "https://ddg.example", "body": "DuckDuckGo fallback"}]
 
     monkeypatch.setattr("ddgs.DDGS", MockDDGS)
@@ -725,7 +725,7 @@ async def test_searxng_no_base_url_falls_back(monkeypatch):
         def __init__(self, **kw):
             pass
 
-        def text(self, query, max_results=5):
+        def text(self, query, max_results=5, **kwargs):
             return [{"title": "Fallback", "href": "https://ddg.example", "body": "fallback"}]
 
     monkeypatch.setattr("ddgs.DDGS", MockDDGS)
@@ -749,7 +749,7 @@ async def test_jina_422_falls_back_to_duckduckgo(monkeypatch):
         def __init__(self, **kw):
             pass
 
-        def text(self, query, max_results=5):
+        def text(self, query, max_results=5, **kwargs):
             return [{"title": "Fallback", "href": "https://ddg.example", "body": "DuckDuckGo fallback"}]
 
     async def mock_get(self, url, **kw):
@@ -774,7 +774,7 @@ async def test_kagi_fallback_to_duckduckgo_when_no_key(monkeypatch):
         def __init__(self, **kw):
             pass
 
-        def text(self, query, max_results=5):
+        def text(self, query, max_results=5, **kwargs):
             return [{"title": "Fallback", "href": "https://ddg.example", "body": "DuckDuckGo fallback"}]
 
     monkeypatch.setattr("ddgs.DDGS", MockDDGS)
@@ -791,7 +791,7 @@ async def test_exa_fallback_to_duckduckgo_when_no_key(monkeypatch):
         def __init__(self, **kw):
             pass
 
-        def text(self, query, max_results=5):
+        def text(self, query, max_results=5, **kwargs):
             return [{"title": "Fallback", "href": "https://ddg.example", "body": "DuckDuckGo fallback"}]
 
     monkeypatch.setattr("ddgs.DDGS", MockDDGS)
@@ -830,7 +830,7 @@ async def test_duckduckgo_timeout_returns_error(monkeypatch):
         def __init__(self, **kw):
             pass
 
-        def text(self, query, max_results=5):
+        def text(self, query, max_results=5, **kwargs):
             gate.wait(timeout=10)
             return []
 
@@ -894,7 +894,7 @@ async def test_olostep_missing_key_falls_back_to_duckduckgo(monkeypatch):
         def __init__(self, **kw):
             pass
 
-        def text(self, query, max_results=5):
+        def text(self, query, max_results=5, **kwargs):
             return [{"title": "Fallback", "href": "https://ddg.example", "body": "fallback"}]
 
     fake_mod = types.ModuleType("olostep")
@@ -921,3 +921,86 @@ async def test_olostep_package_missing_returns_install_hint(monkeypatch):
     assert result == (
         "Error: Olostep support is not installed. Run `nanobot plugins enable olostep`."
     )
+
+
+# ---------------------------------------------------------------------------
+# MIT-1017 — the DuckDuckGo provider must stay on DuckDuckGo.
+#
+# `ddgs.text()` defaults to backend="auto", which fans one query out across
+# every engine ddgs knows — Grokipedia (xAI), Yandex, Yahoo, Mojeek, Wikipedia
+# — and for the text category deliberately queries Grokipedia and Wikipedia
+# *first*. Queries here are synthesised from private conversations, so the
+# fan-out discloses user intent to parties nobody configured.
+#
+# Asserting `provider == "duckduckgo"` is what let this through: the provider
+# was right the whole time. These assert the ddgs *call argument*.
+# ---------------------------------------------------------------------------
+
+
+def _recording_ddgs(monkeypatch):
+    """Install a ddgs.DDGS stand-in that records how text() was called."""
+    calls = []
+
+    class RecordingDDGS:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def text(self, query, **kwargs):
+            calls.append({"query": query, **kwargs})
+            return [{"title": "t", "href": "https://example.invalid/", "body": "b"}]
+
+    monkeypatch.setattr("ddgs.DDGS", RecordingDDGS)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_duckduckgo_search_pins_the_ddgs_backend(monkeypatch):
+    calls = _recording_ddgs(monkeypatch)
+
+    await _tool(provider="duckduckgo").execute("a private sounding query", count=3)
+
+    assert calls, "ddgs.text() was never called"
+    assert "backend" in calls[0], (
+        "ddgs.text() was called without a `backend` argument, so ddgs runs "
+        'backend="auto" and fans the query out across every engine it knows.'
+    )
+    assert calls[0]["backend"] == "duckduckgo"
+
+
+@pytest.mark.asyncio
+async def test_fallback_to_duckduckgo_also_pins_the_ddgs_backend(monkeypatch):
+    """Every other provider falls back here when its key is missing."""
+    calls = _recording_ddgs(monkeypatch)
+
+    await _tool(provider="brave", api_key="").execute("another private query", count=3)
+
+    assert calls, "ddgs.text() was never called"
+    assert calls[0].get("backend") == "duckduckgo"
+
+
+def test_pinned_backend_resolves_to_duckduckgo_only_inside_ddgs():
+    """The pinned value must be a real ddgs engine key, not a silent fallback.
+
+    `DDGS._get_engines` falls back to "auto" on an unknown key instead of
+    raising, so a typo would quietly restore the fan-out while every
+    mock-based test above kept passing. Assert against the installed registry.
+    """
+    ddgs_module = pytest.importorskip("ddgs")
+    from ddgs.engines import ENGINES
+
+    from nanobot.agent.tools.web import _DDGS_TEXT_BACKEND
+
+    text_engines = ENGINES["text"]
+    assert _DDGS_TEXT_BACKEND in text_engines, (
+        f"{_DDGS_TEXT_BACKEND!r} is not a text backend in this ddgs; "
+        f"available: {sorted(text_engines)}"
+    )
+
+    client = ddgs_module.DDGS()
+    pinned = client._get_engines("text", _DDGS_TEXT_BACKEND)
+    pinned_urls = {str(getattr(e, "search_url", "")) for e in pinned}
+    assert len(pinned) == 1, f"pinned backend resolved to {len(pinned)} engines: {pinned_urls}"
+    assert all("duckduckgo.com" in url for url in pinned_urls), pinned_urls
+
+    # Positive control: the default really is a fan-out, so the pin matters.
+    assert len(client._get_engines("text", "auto")) > 1
