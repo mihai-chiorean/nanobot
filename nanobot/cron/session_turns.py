@@ -62,11 +62,18 @@ def cron_run_id(metadata: Mapping[str, Any] | None) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+# Payload kinds that run as a user-owned turn and therefore must be bound to a
+# concrete session.  ``work_task`` (Ziggy, MIT-1010) is bound the same way as
+# ``agent_turn``: ``session_key`` names the originating session, even though the
+# run itself executes in a dedicated ``cron:<job_id>`` session.
+BINDABLE_PAYLOAD_KINDS = frozenset({"agent_turn", "work_task"})
+
+
 def is_bound_cron_job(job: CronJob) -> bool:
     """True for session-bound cron jobs with complete delivery context."""
     payload = job.payload
     if (
-        payload.kind != "agent_turn"
+        payload.kind not in BINDABLE_PAYLOAD_KINDS
         or not payload.session_key
         or not payload.origin_channel
         or not payload.origin_chat_id

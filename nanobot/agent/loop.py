@@ -117,6 +117,7 @@ from nanobot.utils.progress_events import output_events
 from nanobot.utils.runtime import (
     EMPTY_FINAL_RESPONSE_MESSAGE,
 )
+from nanobot.work.store import WorkStore
 
 if TYPE_CHECKING:
     from nanobot.config.schema import (
@@ -518,6 +519,9 @@ class AgentLoop:
 
         self.context = ContextBuilder(workspace, timezone=timezone, disabled_skills=disabled_skills)
         self.sessions = session_manager or SessionManager(workspace)
+        # Ziggy-local (MIT-1010): durable Work store for report_progress /
+        # publish_artifact / schedule_work and the ``work_task`` cron kind.
+        self.work_store = WorkStore(workspace)
         self.tools = ToolRegistry()
         self._audit_logger = AuditLogger()
         self.tools.set_audit_logger(self._audit_logger)
@@ -781,6 +785,8 @@ class AgentLoop:
             timezone=self.context.timezone or "UTC",
             workspace_sandbox=self.workspace_scopes.sandbox_status,
             runtime_control=AgentRuntimeControl(self),
+            work_store=self.work_store,
+            model_name=self.model,
         )
         loader = ToolLoader()
         registered = loader.load(ctx, self.tools)
@@ -2531,11 +2537,15 @@ class AgentLoop:
         runtime: LLMRuntime | None = None,
         on_runtime_admitted: Callable[[LLMRuntime], Awaitable[None]] | None = None,
         attributes: Mapping[str, Any] | None = None,
+        metadata: Mapping[str, Any] | None = None,
     ) -> OutboundMessage | None:
         """Process an external message directly and return the outbound payload."""
         if channel == "system":
             raise ValueError("channel 'system' is reserved for internal messages")
-        metadata: dict[str, Any] = {}
+        # Ziggy-local (MIT-1010): callers such as the ``work_task`` cron runner
+        # stamp turn metadata (``work_task_id`` and friends) so the audit layer
+        # and ziggy-control see the same shape they do on 0.2.x.
+        metadata: dict[str, Any] = dict(metadata or {})
         if not persist_user_message:
             metadata[turn_continuation.SKIP_USER_PERSIST_META] = True
         msg = InboundMessage(

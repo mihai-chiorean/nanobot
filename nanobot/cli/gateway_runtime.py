@@ -363,6 +363,7 @@ def _run_gateway(
     from nanobot.cron.service import CronJobSkippedError, CronService
     from nanobot.cron.session_turns import is_bound_cron_job
     from nanobot.cron.types import CronJob, CronRunResult
+    from nanobot.cron.work_runner import run_work_task_cron_job
     from nanobot.llm_usage import record_llm_call
     from nanobot.llm_usage.context import llm_usage_source
     from nanobot.providers.factory import (
@@ -684,6 +685,20 @@ def _run_gateway(
             else:
                 logger.info("Heartbeat: silenced by post-run evaluation")
             return response
+
+        # Ziggy-local (MIT-1010): scheduled Work runs in its own durable session.
+        if job.payload.kind == "work_task":
+            if not is_bound_cron_job(job):
+                reason = "unbound work_task cron job must be recreated from a chat session"
+                logger.warning(
+                    "Cron: skipped unbound work job '{}' ({}): {}",
+                    job.name,
+                    job.id,
+                    reason,
+                )
+                raise CronJobSkippedError(reason)
+            await mcp_provider.connect()
+            return await run_work_task_cron_job(job, agent=agent)
 
         if is_bound_cron_job(job):
             return await run_bound_cron_job(job, agent=agent, cron=cron)

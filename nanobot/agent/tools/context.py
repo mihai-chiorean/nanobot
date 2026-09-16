@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from nanobot.security.workspace_access import WorkspaceSandboxStatus
     from nanobot.session.manager import SessionManager
     from nanobot.utils.llm_runtime import LLMRuntime
+    from nanobot.work.store import WorkStore
 
 _CURRENT_REQUEST_CONTEXT: ContextVar["RequestContext | None"] = ContextVar(
     "nanobot_tool_request_context",
@@ -90,3 +91,6 @@ class ToolContext:
     timezone: str = "UTC"
     workspace_sandbox: WorkspaceSandboxStatus | None = None
     runtime_control: RuntimeControl | None = None
+    # Ziggy-local (MIT-1010): durable Work store backing the scheduled-work tools.
+    work_store: WorkStore | None = None
+    model_name: str = ""

@@ -49,8 +49,15 @@ class CronSchedule:
 
 @dataclass
 class CronPayload:
-    """What to do when the job runs."""
-    kind: Literal["system_event", "agent_turn"] = "agent_turn"
+    """What to do when the job runs.
+
+    ``work_task`` is a Ziggy-local kind (MIT-1010): the job creates a durable
+    Work task and runs its prompt in a dedicated ``cron:<job_id>`` session so a
+    long-running scheduled run cannot serialize against, or inject history
+    into, the chat it was created from.  ``session_key`` still binds the job to
+    its originating session for delivery and provenance.
+    """
+    kind: Literal["system_event", "agent_turn", "work_task"] = "agent_turn"
     message: str = ""
     # Legacy delivery fields used by pre-session-bound cron jobs.
     deliver: bool = False

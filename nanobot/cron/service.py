@@ -16,7 +16,7 @@ from typing import Any, Callable, Coroutine, Literal
 from filelock import FileLock
 from loguru import logger
 
-from nanobot.cron.session_turns import is_bound_cron_job
+from nanobot.cron.session_turns import BINDABLE_PAYLOAD_KINDS, is_bound_cron_job
 from nanobot.cron.types import (
     CronJob,
     CronJobState,
@@ -143,7 +143,7 @@ def _normalize_agent_turn_job(job: CronJob) -> bool:
     changed = origin_metadata != payload.origin_metadata
     payload.origin_metadata = origin_metadata
 
-    if payload.kind != "agent_turn" or not _has_legacy_delivery_context(payload):
+    if payload.kind not in BINDABLE_PAYLOAD_KINDS or not _has_legacy_delivery_context(payload):
         return changed
 
     if not payload.channel or not payload.to:
@@ -197,7 +197,7 @@ class CronService:
         return self._running or self._active_executions > 0
 
     def _is_unbound_agent_job(self, job: CronJob) -> bool:
-        return job.payload.kind == "agent_turn" and not is_bound_cron_job(job)
+        return job.payload.kind in BINDABLE_PAYLOAD_KINDS and not is_bound_cron_job(job)
 
     def _enforce_agent_binding(self, job: CronJob) -> bool:
         """Disable user cron jobs that cannot be routed to a concrete session."""
@@ -232,6 +232,38 @@ class CronService:
             changed = self._enforce_agent_binding(job) or changed
         return changed
 
+    def _quarantine_job_entries(self, entries: list[tuple[Any, str]]) -> None:
+        """Set malformed job records aside so the remaining jobs can start.
+
+        Each entry is appended to ``jobs.json.quarantine-<ts>.jsonl`` with the
+        parse error that rejected it.  Failing to write the quarantine file must
+        never block startup, so write errors are logged and swallowed -- the
+        records are already reported at ERROR level below.
+        """
+        path = self.store_path.with_suffix(
+            self.store_path.suffix + f".quarantine-{int(time.time())}.jsonl"
+        )
+        for raw, reason in entries:
+            logger.error(
+                "Cron: quarantined malformed job entry in {} ({}); preserved at {}",
+                self.store_path,
+                reason,
+                path,
+            )
+        try:
+            with open(path, "a", encoding="utf-8") as handle:
+                for raw, reason in entries:
+                    handle.write(
+                        json.dumps(
+                            {"reason": reason, "entry": raw},
+                            ensure_ascii=False,
+                            default=str,
+                        )
+                        + "\n"
+                    )
+        except OSError:
+            logger.exception("Cron: failed to write quarantine file {}", path)
+
     def _load_jobs(self) -> tuple[list[CronJob], int] | None:
         """Load jobs from disk.
 
@@ -250,12 +282,30 @@ class CronService:
         if self.store_path.exists():
             try:
                 data = json.loads(self.store_path.read_text(encoding="utf-8"))
+                if not isinstance(data, dict):
+                    raise ValueError("cron store root must be a JSON object")
+                raw_jobs = data.get("jobs", [])
+                if not isinstance(raw_jobs, list):
+                    raise ValueError("cron store 'jobs' must be a list")
                 jobs = []
                 version = data.get("version", 1)
-                for j in data.get("jobs", []):
-                    job = CronJob.from_store_dict(j)
-                    _normalize_agent_turn_job(job)
+                quarantined: list[tuple[Any, str]] = []
+                for j in raw_jobs:
+                    # MIT-1010: quarantine a single malformed entry instead of
+                    # failing the whole store.  Upstream's whole-file hard-fail
+                    # is deliberate and stays below for an unparseable file --
+                    # silently treating that as an empty list would let the next
+                    # save wipe every job.  But one bad record should not take
+                    # the gateway down; it is set aside and the rest load.
+                    try:
+                        job = CronJob.from_store_dict(j)
+                        _normalize_agent_turn_job(job)
+                    except Exception as exc:
+                        quarantined.append((j, f"{type(exc).__name__}: {exc}"))
+                        continue
                     jobs.append(job)
+                if quarantined:
+                    self._quarantine_job_entries(quarantined)
             except Exception:
                 # Preserve the corrupt file for forensic recovery instead of
                 # letting the next save overwrite it with an empty job list.
@@ -700,6 +750,8 @@ class CronService:
         origin_channel: str | None = None,
         origin_chat_id: str | None = None,
         origin_metadata: dict[str, Any] | None = None,
+        *,
+        payload_kind: Literal["agent_turn", "work_task"] = "agent_turn",
     ) -> CronJob:
         """Add a new job."""
         _validate_schedule_for_add(schedule)
@@ -711,7 +763,7 @@ class CronService:
             enabled=True,
             schedule=schedule,
             payload=CronPayload(
-                kind="agent_turn",
+                kind=payload_kind,
                 message=message,
                 deliver=deliver,
                 channel=channel,
