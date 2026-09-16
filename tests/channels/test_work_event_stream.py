@@ -746,3 +746,25 @@ async def test_the_owner_socket_still_reaches_the_work_stream(
         {"type": "work.create", "chat_id": CHAT_ID, "content": "summarize the inbox"},
     )
     assert [f["event"] for f in sent] == ["work.created"]
+
+
+@pytest.mark.asyncio
+async def test_the_channels_store_does_not_sweep_a_live_task(
+    channel: WebSocketChannel,
+    tmp_path: Path,
+) -> None:
+    """Regression: two WorkStores, one restart sweep.
+
+    The schema is brought up lazily, and ``reconcile_interrupted`` rides along
+    with it.  The channel opens a second handle on the same database, so if it
+    reconciled too, the first ``/api/work`` request after a task started would
+    mark that live task ``interrupted`` and the client would see the run die.
+    """
+    writer = WorkStore(tmp_path)
+    task_id = str(writer.create_task(chat_id=CHAT_ID, content="long job")["task_id"])
+    writer.update_status(task_id, "running")
+
+    assert channel.work is not None
+    # First touch of the channel's handle: this is what brings its schema up.
+    assert channel.work.store.get_task(task_id) is not None
+    assert writer.get_task(task_id)["status"] == "running"

@@ -465,7 +465,12 @@ class WebSocketChannel(BaseChannel):
 
             self.work = WorkStreamHub(
                 transport=self,
-                store=WorkStore(gateway.session_manager.workspace),
+                # The agent loop's store owns the restart sweep; this one is a
+                # reader of the same file and must not run it.
+                store=WorkStore(
+                    gateway.session_manager.workspace,
+                    reconcile_on_open=False,
+                ),
                 bus=bus,
             )
             gateway.http.work = WorkRouter(

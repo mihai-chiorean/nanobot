@@ -58,8 +58,14 @@ class WorkEvent:
 class WorkStore:
     """Synchronous workspace-local store for a single Nanobot tenant."""
 
-    def __init__(self, workspace: Path):
+    def __init__(self, workspace: Path, *, reconcile_on_open: bool = True):
         self.workspace = workspace
+        # Reconciliation is a *startup* responsibility and must have exactly
+        # one owner. A second reader that opened the same database mid-run
+        # would otherwise mark the live task 'interrupted' the first time it
+        # touched the file, because the schema is brought up lazily (below)
+        # and the sweep rides along with it.
+        self._reconcile_on_open = reconcile_on_open
         self.root = workspace / "work"
         self.artifacts_root = self.root / "artifacts"
         self.db_path = self.root / "work.sqlite3"
@@ -82,7 +88,8 @@ class WorkStore:
         # re-enters this guard.
         self._ready = True
         self._has_compat_scope = self._column_exists("work_tasks", "scope")
-        self.reconcile_interrupted()
+        if self._reconcile_on_open:
+            self.reconcile_interrupted()
 
     async def run_io(self, operation: Any, /, *args: Any, **kwargs: Any) -> Any:
         """Run one store operation off the event loop, preserving tenant-local order."""
