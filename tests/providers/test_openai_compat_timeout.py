@@ -64,6 +64,9 @@ async def test_openai_compat_provider_timeout_can_be_overridden_by_env(monkeypat
 
 async def test_missing_langfuse_warning_recommends_plugin_command(monkeypatch) -> None:
     monkeypatch.setenv("LANGFUSE_SECRET_KEY", "secret")
+    # A pinned destination isolates this to the "not installed" case; an unset
+    # LANGFUSE_HOST is its own (fail-closed) warning, covered separately.
+    monkeypatch.setenv("LANGFUSE_HOST", "http://langfuse.invalid:3000")
     monkeypatch.setattr(openai_compat_provider, "AsyncOpenAI", None)
 
     with (
@@ -79,3 +82,23 @@ async def test_missing_langfuse_warning_recommends_plugin_command(monkeypatch) -
         "run `nanobot plugins enable langfuse` to enable tracing"
     )
     mock_async_openai.assert_called_once()
+
+
+async def test_langfuse_openai_wrapper_is_skipped_when_host_is_unset(monkeypatch) -> None:
+    """The tracing wrapper ships prompts and completions, so it fails closed.
+
+    Without a pinned LANGFUSE_HOST the Langfuse SDK would send them to its
+    Cloud SaaS endpoint; the plain openai client must be used instead.
+    """
+    monkeypatch.setenv("LANGFUSE_SECRET_KEY", "secret")
+    monkeypatch.delenv("LANGFUSE_HOST", raising=False)
+    monkeypatch.setattr(openai_compat_provider, "AsyncOpenAI", None)
+
+    with (
+        patch("importlib.util.find_spec", return_value=object()),
+        patch("openai.AsyncOpenAI") as mock_plain_openai,
+    ):
+        provider = OpenAICompatProvider(api_key="test-key", api_base="https://example.com/v1")
+        await provider._ensure_client()
+
+    mock_plain_openai.assert_called_once()
