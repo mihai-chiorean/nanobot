@@ -41,9 +41,16 @@ from websockets.datastructures import Headers
 from websockets.http11 import Response
 
 
-@dataclass(slots=True)
+@dataclass
 class TransportRequest:
-    """The request shape ``GatewayHTTPHandler`` and the handshake path consume."""
+    """The request shape ``GatewayHTTPHandler`` and the handshake path consume.
+
+    Deliberately **not** ``slots=True``: ``GatewayHTTPHandler.dispatch`` stamps
+    ``_nanobot_trusted_proxy_authenticated`` (and the WebUI-mutation attributes)
+    onto the request object with ``setattr`` (``webui/ws_http.py:470``). A
+    slotted dataclass raises ``AttributeError`` there, which would turn every
+    HTTP request under this transport into a 500.
+    """
 
     method: str
     path: str
