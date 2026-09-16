@@ -960,7 +960,13 @@ class WebSocketChannel(BaseChannel):
             self.logger.warning("client_id too long ({} chars), truncating", len(client_id))
             client_id = client_id[:128]
 
-        default_chat_id = str(uuid.uuid4())
+        # Ziggy-local (MIT-1010): a guest socket opens straight into its room
+        # rather than a fresh chat, so the `ready` frame names the room and the
+        # client needs no separate attach.
+        guest_credential = self.room_credential(connection)
+        default_chat_id = (
+            guest_credential.chat_id if guest_credential is not None else str(uuid.uuid4())
+        )
 
         try:
             await connection.send(

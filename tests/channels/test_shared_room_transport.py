@@ -204,3 +204,49 @@ async def test_websocket_upgrade_path_falls_through_to_the_handshake(
 def test_check_api_token_shim_reaches_the_http_handler(channel: WebSocketChannel) -> None:
     """The transport's pre-body auth gate must resolve on the channel."""
     assert channel.check_api_token(_request("/api/x", method="POST")) is False
+
+
+# --------------------------------------------------------------------------
+# Handshake
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_room_token_binds_the_connection_at_handshake(
+    channel: WebSocketChannel,
+) -> None:
+    await channel._dispatch_http(
+        _Connection(),
+        _request(
+            "/auth/shared-rooms",
+            body={
+                "source_session_key": f"websocket:{OWNER_CHAT}",
+                "chat_id": ROOM_CHAT,
+                "room_id": ROOM_ID,
+                "title": "Shared conversation",
+                "owner_display_name": "Mihai",
+            },
+        ),
+    )
+    assert channel.rooms is not None
+    token, _ = channel.rooms.mint(
+        room_id=ROOM_ID,
+        chat_id=ROOM_CHAT,
+        participant_id="participant_" + "b" * 32,
+        display_name="Guest",
+        role="contributor",
+    )
+    connection = _Connection()
+    assert channel._authorize_websocket_handshake(connection, {"token": [token]}) is None
+    credential = channel.room_credential(connection)
+    assert credential is not None
+    assert credential.chat_id == ROOM_CHAT
+    # A guest socket opens straight into its room, not a fresh chat.
+    assert credential.chat_id != str(channel.config.port)
+
+
+@pytest.mark.asyncio
+async def test_a_bogus_room_token_does_not_bind(channel: WebSocketChannel) -> None:
+    connection = _Connection()
+    channel._authorize_websocket_handshake(connection, {"token": ["nbrt_nope"]})
+    assert channel.room_credential(connection) is None
