@@ -163,12 +163,20 @@ to upstream's `websockets`; the `WebSocketConfig` validator forces `aiohttp`
 whenever `sharedRoomsEnabled` or `sharedRoomCollaborationEnabled` is set. A
 tenant without shared rooms is on upstream's listener, unchanged.
 
-**Tradeoff, accepted deliberately:** upstream's slow-client fan-out isolation
-and degraded-listener recovery are `websockets`-specific and do **not** apply
-under the aiohttp transport. aiohttp's `max_msg_size` and heartbeat cover the
-message-size and liveness half; the 1013/1011 force-close behaviour (C23) does
-not exist there. This is the one place the port does not preserve a 0.3.0
-improvement, and it applies only to runtimes with shared rooms on.
+**Tradeoff, accepted deliberately**, for rooms-enabled runtimes only:
+
+- upstream's degraded-listener recovery loop does not run (it is built on
+  `websockets`' `Server` object);
+- slow-client fan-out isolation partly degrades: send timeouts still retire a
+  connection, but `_retire_connection`'s last-resort `connection.transport.abort()`
+  is a no-op because `AiohttpConnection` has no `.transport`, so a genuinely
+  wedged client is never force-aborted;
+- `TransportFileResponse` exists for streamed file responses but nothing in
+  0.3.0 produces one, so media is fully buffered where the snapshot streamed it.
+
+aiohttp's `max_msg_size` and heartbeat cover the message-size and liveness half,
+and `AiohttpConnection.send` translates aiohttp's `ConnectionResetError` into
+`ConnectionClosed` so routine disconnects are handled, not logged as crashes.
 
 ### 3e. Contract changes respected
 
@@ -212,6 +220,30 @@ improvement, and it applies only to runtimes with shared rooms on.
    slash-command dispatch, `pending_ask_user` resumption and memory archival,
    makes `context.py` attribute each line to its participant, and makes
    `autocompact.py` refuse to rewrite guest-visible history.
+
+### Where the model was wrong, and what review caught
+
+Two independent reviews (security, cross-component) found four ways the model
+above did not actually hold. All four are fixed and regression-tested; they are
+recorded here because each is a class of mistake this port invites.
+
+1. **The gate was enforced in one of three inbound paths.** `prepare_call` is a
+   real single funnel for *tool calls*, but a turn reaches it only if the room
+   scope was stamped. The untyped legacy frame path
+   (`runtime.py::_connection_loop`) and the non-`message` command types
+   (`new_chat`, `fork_chat`, `attach`) both bypassed the stamping entirely.
+   Fixed by refusing untyped frames on a room connection and allow-listing
+   guest commands.
+2. **Subagents got a fresh `RequestContext` with empty metadata**, so the scope
+   evaporated one level down while `_announce_result` relayed the result back
+   into the room. Fixed by inheriting the scope; `spawn`/`long_task` are also
+   denied outright.
+3. **The handshake hook was dead code.** The room-token check sat on the channel
+   method the listener does not call. Moved onto `WebUIGatewayEndpoint`.
+4. **A contextvar-based gate needs every fresh context to opt in.** That is the
+   general lesson: `Tool.available()` was checked by the framework, so it could
+   not be forgotten. A scope on `RequestContext.metadata` is only as good as
+   every place that constructs one.
 
 ### 0.3.0 model (what is implemented on this branch)
 
@@ -287,8 +319,9 @@ from `origin_metadata` after migration.
 | `…:607` | `GET /api/sessions/websocket:<chat>/messages` | **reinstated, room-scoped only** — see below |
 | `…:615` | `GET /api/sessions/websocket:<chat>/files/<id>` | **404 at cutover** — the whole published-file feature (`agent/tools/publish_file.py`, `published_file_grants`, `read_published_file`) exists only in the snapshot. Not a shared-rooms regression; a separate carry-forward, tracked with C8 |
 | `deploy/releases/editorial/configure.py:75` | `websocket.sharedRoomConnectorServer` | unchanged |
-| `services/ziggy-worker/.../client.go:291` | `GET /api/sessions/websocket:<chat>/messages` | **owner-token caller — must migrate** (C5) |
-| `ios/Ziggy/Networking/ZiggyRESTClient.swift:239` | same route | **owner-token caller — must migrate** (C5) |
+| `services/ziggy-worker/.../client.go:291` | `GET /api/sessions/websocket:<chat>/messages` | **P0 — must migrate in the same train.** The route now answers only room credentials, so the owner bearer gets 404. `client.go:311` maps 404 → `(…, false, nil)`, so this degrades *silently*. Repoint to `…/webui-thread` and re-map `sessionResponse.Messages`; `reconciledFinal` (`client.go:335`) needs `role` and `client_message_id(s)` preserved |
+| `ios/Ziggy/Networking/ZiggyRESTClient.swift:238` | same route | **P0 — must migrate in the same train.** `loadMessages(sessionKey:)` is the history load for *every* conversation (`ios/Ziggy/App/AppModel.swift:1140`), not a room-only path, so every conversation renders empty. Repoint `fetchMessages` to `["api","sessions",sessionKey,"webui-thread"]` and adapt `RESTListResponse<ZiggyMessage>` to the webui-thread envelope |
+| `services/ziggy-control/deploy/spark/provision_tenant.py:301` | `"pingIntervalS": None` | **fixed runtime-side.** 0.3.0 narrowed these to `float`, which rejected every generated config. `WebSocketConfig.ping_interval_s` / `ping_timeout_s` are `float \| None` again, so no provisioning change and no migration of the four on-disk configs is needed |
 
 `/api/sessions/<key>/messages` is restored as a room-credential-only route:
 an `nbrt_` bearer authorizes exactly its own `websocket:<chat_id>` and the
@@ -305,7 +338,13 @@ which is C5 and out of scope here.
 - [x] C3 authorization replacement (§4)
 - [x] C4 `work_task` cron + `work`/`schedule_work` tools
 - [x] C6 per-entry `jobs.json` quarantine
-- [ ] C5 migrate `client.go:291` and `ZiggyRESTClient.swift:239` off `/messages`
+- [ ] **P0** migrate `client.go:291` and `ZiggyRESTClient.swift:238` off
+      `/messages` to `/webui-thread` — same release train as the cutover
+- [ ] **Product call:** the rich Work event stream (`_WorkHook`,
+      `work.created` / `work.subscribed` / `work.event`) was not ported. The
+      runner now delivers the digest to chat, so the four owner jobs are
+      visible again, but the Work UI stays dark until the stream lands.
+      `e971284f` explicitly targets the Work app (`curated_digest_in_work_app`)
 - [ ] Decide whether the aiohttp transport is acceptable for the owner runtime
       or whether shared rooms should move to a dedicated tenant (§3d tradeoff)
 - [ ] C8 briefing/editorial carry-forward (`agent/tools/briefing.py`)
