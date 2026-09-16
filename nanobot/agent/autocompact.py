@@ -82,6 +82,13 @@ class AutoCompact:
             updated_at = info.get("updated_at")
             if self._is_expired(updated_at, now) and self._has_unarchived_messages(key):
                 session = self.sessions.get_or_create(key)
+                # Ziggy-local (MIT-1010): never rewrite a shared room's history.
+                # Compaction replaces turns with a summary, and every guest who
+                # can read the room would see their own messages disappear.
+                # Checked here (after the cheap filters) and again in _archive,
+                # because a room can be created between the two.
+                if session.metadata.get("shared_room") is True:
+                    continue
                 try:
                     runtime = resolve_runtime(session)
                 except (KeyError, ValueError):
@@ -92,6 +99,13 @@ class AutoCompact:
 
     async def _archive(self, key: str, *, runtime: LLMRuntime) -> None:
         if self._is_internal_session(key):
+            self._archiving.discard(key)
+            return
+        # Re-check under the archive path: a room can be created between the
+        # scan above and this coroutine running.
+        payload = self.sessions.read_session_metadata(key)
+        metadata = payload.get("metadata") if isinstance(payload, dict) else None
+        if isinstance(metadata, dict) and metadata.get("shared_room") is True:
             self._archiving.discard(key)
             return
         try:

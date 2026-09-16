@@ -11,6 +11,15 @@ from loguru import logger
 
 from nanobot.agent.tools.base import Tool, ToolResult
 from nanobot.agent.tools.context import ContextAware, current_request_context
+# Ziggy-local (MIT-1010): shared-room tool authorization.  Upstream 6e9ae5bd
+# removed Tool.available() and the request-scoped session grant; prepare_call is
+# the remaining single funnel for every tool call, so the gate lives here.
+from nanobot.agent.tools.room_policy import (
+    RoomPolicy,
+    room_denial_message,
+    room_policy_for,
+    room_scope,
+)
 # Ziggy-local (fork): audit + redaction layer.
 from nanobot.agent.tools.audit import ErrorType
 from nanobot.utils.sensitive import redact_if_sensitive
@@ -230,10 +239,19 @@ class ToolRegistry:
                     f"Error: Tool '{name}' not found.{hint} Available: {', '.join(self.tool_names)}"
                 )
             )
+        ctx = current_request_context()
+        # Shared-room gate. Denied before parameter coercion so a malformed call
+        # to a denied tool still reports the denial, not a schema complaint.
+        if (
+            ctx is not None
+            and room_scope(ctx.metadata) is not None
+            and room_policy_for(tool.name) is RoomPolicy.DENIED
+        ):
+            return tool, params, ToolResult.error(room_denial_message(tool.name))
         # Compatibility for external tools that still implement the legacy
         # setter protocol. Built-ins read the authoritative ContextVar
         # directly and never copy routing state.
-        if isinstance(tool, ContextAware) and (ctx := current_request_context()) is not None:
+        if isinstance(tool, ContextAware) and ctx is not None:
             tool.set_context(ctx)
 
         params = self._coerce_params(tool, params)

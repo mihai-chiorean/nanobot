@@ -16,6 +16,16 @@ OUTBOUND_META_AGENT_UI = "_agent_ui"
 # services. Never accept these keys verbatim from an untrusted client.
 INBOUND_META_RUNTIME_CONTROL = "_runtime_control"
 INBOUND_META_USER_SHELL = "_user_shell"
+# Ziggy-local (MIT-1010). Present only on turns that belong to a shared room:
+# guest frames arriving on a room-credentialled connection, and owner turns in a
+# session whose metadata says ``shared_room``. Value is
+# ``{"room_id", "chat_id", "participant_id", "role"}``.
+#
+# This is the replacement for the request-scoped session access grant upstream
+# removed in ``6e9ae5bd`` together with ``Tool.available()``. It is minted only
+# by the WebSocket runtime after it has validated a room credential, so it must
+# never be accepted verbatim from a client envelope.
+INBOUND_META_ROOM_SCOPE = "_room_scope"
 RUNTIME_CONTROL_ACK = "_ack"
 RUNTIME_CONTROL_IMAGE_GENERATION_RELOAD = "image_generation_reload"
 RUNTIME_CONTROL_SESSION_DISCARD = "session_discard"

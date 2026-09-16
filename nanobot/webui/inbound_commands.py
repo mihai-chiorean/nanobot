@@ -506,6 +506,30 @@ class WebUICommandRouter:
                 **rejection_fields,
             )
             return
+
+        # -- Shared rooms (Ziggy-local, MIT-1010) ---------------------------
+        # A guest socket may address exactly the room it was credentialled for.
+        # Checked before anything is stored, hydrated or dispatched.
+        room_credential = self._transport.room_credential(connection)
+        if room_credential is not None:
+            if room_credential.chat_id != chat_id:
+                await self._transport.webui_send_event(
+                    connection,
+                    "error",
+                    detail="access_denied",
+                    **rejection_fields,
+                )
+                return
+            from nanobot.channels.websocket.room_editorial import handle_room_intent
+
+            if await handle_room_intent(
+                self._transport,
+                connection,
+                room_credential,
+                envelope,
+            ):
+                return
+
         message_rejection = self._ingress.validate_text(content)
         if message_rejection is not None:
             await self._transport.webui_send_event(
@@ -640,6 +664,10 @@ class WebUICommandRouter:
             if session_mentions:
                 metadata["session_mentions"] = session_mentions
         metadata[WORKSPACE_SCOPE_METADATA_KEY] = scope.metadata()
+        # Room turns carry shared_room (read by the agent loop) plus the room
+        # scope that ToolRegistry.prepare_call gates cross-session tools on.
+        # Minted from a validated credential; never copied from the envelope.
+        metadata.update(self._transport.room_turn_metadata(connection, chat_id))
         is_webui = metadata.get("webui") is True
         queued_owner = None
         if is_webui and not is_user_shell and builtin_command_starts_agent_turn(content):

@@ -870,15 +870,33 @@ class AgentLoop:
             return True
         return False
 
+    @staticmethod
+    def _shared_room_turn(msg: InboundMessage) -> bool:
+        """Ziggy-local (MIT-1010): whether this turn belongs to a shared room.
+
+        The flag is minted by the WebSocket runtime from a validated room
+        credential (``WebSocketChannel.room_turn_metadata``), never copied from
+        a client envelope.
+        """
+        metadata = msg.metadata
+        return isinstance(metadata, dict) and metadata.get("shared_room") is True
+
     def _build_transcript_input(self, ctx: TurnContext) -> TranscriptInput:
         """Capture the persisted history and fresh input as separate transcript parts."""
         assert ctx.session is not None
+        metadata = ctx.msg.metadata or {}
+        shared_room = self._shared_room_turn(ctx.msg)
+        participant = metadata.get("participant_display_name")
         return TranscriptInput(
             history=ctx.history,
             current_message=ctx.msg.content,
             media=ctx.msg.media if ctx.kind is TurnKind.USER and ctx.msg.media else None,
             session_summary=ctx.pending_summary,
             runtime_context_blocks=ctx.runtime_context_blocks,
+            shared_room=shared_room,
+            participant_display_name=(
+                participant if shared_room and isinstance(participant, str) else None
+            ),
         )
 
     def _request_context_for_turn(self, ctx: TurnContext) -> RequestContext:
@@ -1447,7 +1465,14 @@ class AgentLoop:
                     continue
                 if msg.is_user_input:
                     await self.runtime_event_publisher.user_input_accepted(msg, effective_key)
-                if msg.channel != "system" and self.commands.is_priority(raw):
+                # Slash commands are owner capabilities. A guest turn in a
+                # shared room must never reach the command router.
+                room_turn = self._shared_room_turn(msg)
+                if (
+                    msg.channel != "system"
+                    and not room_turn
+                    and self.commands.is_priority(raw)
+                ):
                     await self._dispatch_command_inline(
                         msg, effective_key, raw,
                         self.commands.dispatch_priority,
@@ -1492,7 +1517,11 @@ class AgentLoop:
                 if effective_key in self._pending_queues:
                     # Non-priority commands must not be queued for injection;
                     # dispatch them directly (same pattern as priority commands).
-                    if msg.channel != "system" and self.commands.is_dispatchable_command(raw):
+                    if (
+                        msg.channel != "system"
+                        and not room_turn
+                        and self.commands.is_dispatchable_command(raw)
+                    ):
                         await self._dispatch_command_inline(
                             msg, effective_key, raw,
                             self.commands.dispatch,

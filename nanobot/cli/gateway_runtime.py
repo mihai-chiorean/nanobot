@@ -762,6 +762,24 @@ def _run_gateway(
             unified_session_metadata=unified_metadata,
         )
 
+    # Ziggy-local (MIT-1010): bind the shared-room connected-read executor to
+    # exactly one configured connector server. The executor is never reachable
+    # from the model -- the owner approves one exact operation in Room work and
+    # the app dispatches it out of band.
+    get_channel = getattr(channels, "get_channel", None)
+    websocket_channel = get_channel("websocket") if callable(get_channel) else None
+    if getattr(
+        getattr(websocket_channel, "config", None),
+        "shared_room_collaboration_enabled",
+        False,
+    ):
+        from nanobot.channels.websocket.room_work import connected_read_executor
+
+        websocket_channel.connected_room_executor = connected_read_executor(
+            agent,
+            websocket_channel.config.shared_room_connector_server,
+        )
+
     if channels.enabled_channels:
         console.print(f"[green]✓[/green] Channels enabled: {', '.join(channels.enabled_channels)}")
     else:
