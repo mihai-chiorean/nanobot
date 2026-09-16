@@ -510,16 +510,22 @@ class WebUICommandRouter:
         # -- Shared rooms (Ziggy-local, MIT-1010) ---------------------------
         # A guest socket may address exactly the room it was credentialled for.
         # Checked before anything is stored, hydrated or dispatched.
-        room_credential = self._transport.room_credential(connection)
+        guest_credential = self._transport.room_credential(connection)
+        if guest_credential is not None and guest_credential.chat_id != chat_id:
+            await self._transport.webui_send_event(
+                connection,
+                "error",
+                detail="access_denied",
+                **rejection_fields,
+            )
+            return
+        # Owners post into their own rooms through the same intent path as
+        # guests, so a discussion or proposal frame is recorded and broadcast
+        # the same way whoever sent it. ``effective_room_credential`` resolves
+        # the guest credential when there is one and the owner's implicit
+        # credential otherwise; it is ``None`` outside a room.
+        room_credential = self._transport.effective_room_credential(connection, chat_id)
         if room_credential is not None:
-            if room_credential.chat_id != chat_id:
-                await self._transport.webui_send_event(
-                    connection,
-                    "error",
-                    detail="access_denied",
-                    **rejection_fields,
-                )
-                return
             from nanobot.channels.websocket.room_editorial import handle_room_intent
 
             if await handle_room_intent(
@@ -667,7 +673,13 @@ class WebUICommandRouter:
         # Room turns carry shared_room (read by the agent loop) plus the room
         # scope that ToolRegistry.prepare_call gates cross-session tools on.
         # Minted from a validated credential; never copied from the envelope.
-        metadata.update(self._transport.room_turn_metadata(connection, chat_id))
+        room_metadata = self._transport.room_turn_metadata(connection, chat_id)
+        metadata.update(room_metadata)
+        if room_metadata and self._transport.rooms is not None:
+            if self._transport.rooms.is_collaborative(chat_id):
+                # Anything reaching the agent from a collaborative room is an
+                # explicit request for help; discussion never gets this far.
+                metadata["room_intent"] = "ask_ziggy"
         is_webui = metadata.get("webui") is True
         queued_owner = None
         if is_webui and not is_user_shell and builtin_command_starts_agent_turn(content):

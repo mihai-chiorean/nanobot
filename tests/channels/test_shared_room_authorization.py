@@ -506,3 +506,177 @@ def test_a_guest_credential_cannot_mint_scope_for_another_chat(
     channel = _FakeChannel(store)
     channel.room_credential = store.connection_credential
     assert channel.room_turn_metadata(conn, OWNER_CHAT) == {}
+
+
+# --------------------------------------------------------------------------
+# Room intents: owners use the same path as guests
+# --------------------------------------------------------------------------
+
+
+class _IntentChannel(_FakeChannel):
+    """Enough channel surface for ``handle_room_intent``."""
+
+    def __init__(self, store: SharedRoomStore, sessions: SessionManager) -> None:
+        super().__init__(store)
+        self.events: list[tuple[str, dict[str, Any]]] = []
+        self.broadcasts: list[tuple[str, str, dict[str, Any]]] = []
+
+        class _Gateway:
+            session_manager = sessions
+
+        self.gateway = _Gateway()
+
+    async def _send_event(self, connection: Any, event: str, **fields: Any) -> None:
+        self.events.append((event, fields))
+
+    async def broadcast_room_event(self, chat_id: str, event: str, **fields: Any) -> None:
+        self.broadcasts.append((chat_id, event, fields))
+
+    def webui_subscribers(self, chat_id: str):
+        return ()
+
+    def room_work_store(self):
+        raise AssertionError("not used by these tests")
+
+
+def _collaborative(sessions: SessionManager) -> None:
+    session = sessions.get_or_create(f"websocket:{ROOM_CHAT}")
+    session.metadata["room_mode"] = "collaborative-v1"
+    sessions.save(session, fsync=True)
+
+
+@pytest.mark.asyncio
+async def test_owner_discussion_is_recorded_and_broadcast(
+    sessions: SessionManager,
+    store: SharedRoomStore,
+) -> None:
+    """The snapshot routes owner frames through the intent path too."""
+    from nanobot.channels.websocket.room_editorial import handle_room_intent
+
+    _collaborative(sessions)
+    channel = _IntentChannel(store, sessions)
+    owner = store.owner_credential(ROOM_CHAT)
+    assert owner is not None
+
+    handled = await handle_room_intent(
+        channel,
+        object(),
+        owner,
+        {"room_intent": "discussion", "client_message_id": "c1", "content": "hi all"},
+    )
+    assert handled is True
+    assert [e for e, _ in channel.events] == ["message.ack"]
+    assert channel.events[0][1]["status"] == "accepted"
+    assert [name for _c, name, _f in channel.broadcasts] == ["participant.message"]
+
+    stored = sessions.get_or_create(f"websocket:{ROOM_CHAT}").messages[-1]
+    assert stored["content"] == "hi all"
+    assert stored["participant_id"] == "owner"
+    assert stored["room_intent"] == "discussion"
+
+
+@pytest.mark.asyncio
+async def test_ask_ziggy_falls_through_to_a_normal_turn(
+    sessions: SessionManager,
+    store: SharedRoomStore,
+) -> None:
+    from nanobot.channels.websocket.room_editorial import handle_room_intent
+
+    _collaborative(sessions)
+    channel = _IntentChannel(store, sessions)
+    handled = await handle_room_intent(
+        channel,
+        object(),
+        guest_credential(),
+        {"room_intent": "ask_ziggy", "client_message_id": "c2", "content": "what now?"},
+    )
+    assert handled is False
+    assert channel.events == []
+
+
+@pytest.mark.asyncio
+async def test_replayed_id_with_different_content_is_rejected(
+    sessions: SessionManager,
+    store: SharedRoomStore,
+) -> None:
+    from nanobot.channels.websocket.room_editorial import handle_room_intent
+
+    _collaborative(sessions)
+    channel = _IntentChannel(store, sessions)
+    credential = guest_credential()
+    envelope = {"room_intent": "discussion", "client_message_id": "c3", "content": "first"}
+    await handle_room_intent(channel, object(), credential, envelope)
+
+    channel.events.clear()
+    await handle_room_intent(channel, object(), credential, dict(envelope))
+    assert channel.events[0][1]["status"] == "duplicate"
+
+    channel.events.clear()
+    await handle_room_intent(
+        channel,
+        object(),
+        credential,
+        {**envelope, "content": "rewritten"},
+    )
+    assert channel.events[0][1]["status"] == "rejected"
+
+
+@pytest.mark.asyncio
+async def test_revoked_room_refuses_an_intent(
+    sessions: SessionManager,
+    store: SharedRoomStore,
+) -> None:
+    from nanobot.channels.websocket.room_editorial import handle_room_intent
+
+    _collaborative(sessions)
+    session = sessions.get_or_create(f"websocket:{ROOM_CHAT}")
+    session.metadata["shared_room_revoked"] = True
+    sessions.save(session, fsync=True)
+
+    channel = _IntentChannel(store, sessions)
+    handled = await handle_room_intent(
+        channel,
+        object(),
+        guest_credential(),
+        {"room_intent": "discussion", "client_message_id": "c4", "content": "hello"},
+    )
+    assert handled is True
+    assert channel.events[0][0] == "error"
+    assert channel.events[0][1]["detail"] == "Room expired or revoked"
+
+
+@pytest.mark.asyncio
+async def test_unsupported_intent_is_refused(
+    sessions: SessionManager,
+    store: SharedRoomStore,
+) -> None:
+    from nanobot.channels.websocket.room_editorial import handle_room_intent
+
+    _collaborative(sessions)
+    channel = _IntentChannel(store, sessions)
+    handled = await handle_room_intent(
+        channel,
+        object(),
+        guest_credential(),
+        {"room_intent": "delete_everything", "client_message_id": "c5", "content": "x"},
+    )
+    assert handled is True
+    assert channel.events[0][1]["detail"] == "Unsupported room intent"
+
+
+@pytest.mark.asyncio
+async def test_legacy_room_does_not_use_the_intent_path(
+    sessions: SessionManager,
+    store: SharedRoomStore,
+) -> None:
+    """A legacy (non-collaborative) room posts as a normal turn."""
+    from nanobot.channels.websocket.room_editorial import handle_room_intent
+
+    channel = _IntentChannel(store, sessions)
+    handled = await handle_room_intent(
+        channel,
+        object(),
+        guest_credential(),
+        {"room_intent": "discussion", "client_message_id": "c6", "content": "hi"},
+    )
+    assert handled is False
