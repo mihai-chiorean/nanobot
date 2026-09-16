@@ -92,6 +92,16 @@ _WORKSPACE_BOUNDARY_NOTE = (
     "restrict_to_workspace policy and ask how to proceed."
 )
 
+# Unlike the workspace and SSRF boundaries, an unresolvable hostname is a
+# recoverable mistake: the name simply does not exist. Say so plainly so the
+# model fixes the URL instead of concluding it has hit a security wall.
+_UNRESOLVABLE_HOST_NOTE = (
+    "\n\nNote: this hostname does not exist in DNS — it is not a blocked "
+    "internal address. Do not retry the same hostname. Check for a typo, use "
+    "a documented endpoint for the service, or tell the user you could not "
+    "reach it and ask for the correct URL."
+)
+
 
 class ExecToolConfig(Base):
     """Shell exec tool configuration."""
@@ -885,8 +895,8 @@ class ExecTool(Tool):
             if self.allow_patterns:
                 return ToolResult.error("Error: Command blocked by allowlist filter (not in allowlist)")
 
-        from nanobot.security.network import contains_internal_url
-        if contains_internal_url(
+        from nanobot.security.network import find_internal_url, is_unresolvable_reason
+        offending_url = find_internal_url(
             cmd,
             # Ziggy-local (fork, MIT-203): an explicit per-instance True wins over
             # upstream's WebUI-scoped check; None/False defers to upstream.
@@ -894,9 +904,27 @@ class ExecTool(Tool):
             or current_scope_allows_loopback(
                 enabled=self.webui_allow_local_service_access,
             ),
-        ):
+        )
+        if offending_url is not None:
+            url, reason = offending_url
+            # A name that does not resolve is refused too (the guard is
+            # fail-closed), but it is not a private-network target. Labelling it
+            # "internal/private" made the runner escalate a plain typo to the
+            # non-bypassable SSRF boundary, which dead-ended the turn instead of
+            # letting the model correct the URL. Report the two cases apart.
+            if is_unresolvable_reason(reason):
+                return ToolResult.error(
+                    "Error: Command blocked by safety guard (unresolvable hostname)"
+                    f": {url} — {reason}"
+                    + _UNRESOLVABLE_HOST_NOTE
+                )
             # The runner turns this marker into a non-retryable security hint.
-            return ToolResult.error("Error: Command blocked by safety guard (internal/private URL detected)")
+            # The URL and reason are appended *after* the parenthesised code so
+            # existing callers and tests that match on the code still work.
+            return ToolResult.error(
+                "Error: Command blocked by safety guard (internal/private URL detected)"
+                f": {url} — {reason}"
+            )
 
         should_restrict = self.restrict_to_workspace if restrict_to_workspace is None else restrict_to_workspace
         if should_restrict:

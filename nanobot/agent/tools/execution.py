@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import Callable
 from typing import Any, cast
 
@@ -34,6 +35,21 @@ _SSRF_BOUNDARY_NOTE = (
     "If the user explicitly trusts this private URL, ask them to whitelist "
     "the exact IP/CIDR via tools.ssrfWhitelist."
 )
+# A hostname that does not resolve is blocked by the same guard, but it is a
+# correctable mistake rather than a private-network target -- see
+# tests/security/test_internal_url_reporting.py.
+_UNRESOLVABLE_MARKER = "(unresolvable hostname)"
+_UNRESOLVABLE_HOST_RE = re.compile(r"cannot resolve hostname:\s*([^\s,;)]+)", re.IGNORECASE)
+_MAX_REPEAT_UNRESOLVABLE_HOSTS = 2
+# Aggregate budget across *distinct* dead hostnames in one turn. Without it the
+# per-host cap is near-useless: a model that guesses URLs guesses a new one each
+# time, so every attempt starts a fresh counter.
+_MAX_TOTAL_UNRESOLVABLE_HOSTS = 3
+_UNRESOLVABLE_TOTAL_KEY = "unresolvable:*"
+# Per-turn budget for SSRF blocks. The guard never yields, so this only bounds
+# how many times an (possibly injected) model may probe before being told to stop.
+_MAX_TOTAL_SSRF_BLOCKS = 3
+_SSRF_TOTAL_KEY = "ssrf:*"
 # Non-SSRF boundary markers returned to the model as recoverable tool errors.
 _WORKSPACE_VIOLATION_MARKERS: tuple[str, ...] = (
     "outside the configured workspace",
@@ -208,6 +224,25 @@ async def _execute_tool_call(
     return result, {"name": tool_call.name, "status": "ok", "detail": detail}
 
 
+def is_unresolvable_host(text: str) -> bool:
+    """Return whether a tool error describes a hostname that does not resolve.
+
+    Checked *before* the SSRF classification: an unreachable name is refused
+    by the same guard but is a correctable mistake, not an attempt to reach a
+    private network, and must not inherit the non-bypassable SSRF advice.
+    """
+    if not text:
+        return False
+    return _UNRESOLVABLE_MARKER in text.lower()
+
+
+def _unresolvable_host_key(text: str) -> str:
+    """Throttle key for a repeated unresolvable hostname."""
+    match = _UNRESOLVABLE_HOST_RE.search(text)
+    host = match.group(1).lower() if match else "unknown"
+    return f"unresolvable:{host}"
+
+
 def is_ssrf_violation(text: str) -> bool:
     """Return whether a tool error describes a blocked private-network request."""
     if not text:
@@ -234,13 +269,58 @@ def _classify_violation(
     tool_call: ToolCallRequest,
     workspace_violation_counts: dict[str, int],
 ) -> tuple[Any, dict[str, str]] | None:
+    if is_unresolvable_host(raw_text):
+        # Recoverable: the name does not exist, so the model should fix the URL.
+        # Capped two ways. A per-host counter catches a model retrying the same
+        # dead name; an aggregate counter catches the far more common case of a
+        # model *inventing a fresh* hostname each time, which a per-host key
+        # alone never trips -- every new guess would start again at one.
+        host = _unresolvable_host_key(raw_text)
+        count = workspace_violation_counts.get(host, 0) + 1
+        workspace_violation_counts[host] = count
+        total = workspace_violation_counts.get(_UNRESOLVABLE_TOTAL_KEY, 0) + 1
+        workspace_violation_counts[_UNRESOLVABLE_TOTAL_KEY] = total
+        event["detail"] = _event_detail("unresolvable_host: ", raw_text)
+        if count > _MAX_REPEAT_UNRESOLVABLE_HOSTS or total > _MAX_TOTAL_UNRESOLVABLE_HOSTS:
+            logger.warning(
+                "Tool {} retried an unresolvable hostname {} times; escalating",
+                tool_call.name,
+                count,
+            )
+            event["detail"] = _event_detail("unresolvable_host_escalated: ", raw_text)
+            return (
+                "Error: repeated lookups of hostnames that do not resolve.\n"
+                f"{raw_text.strip()}\n\n"
+                "Stop guessing URLs. Use a documented endpoint, a configured "
+                "search tool, or tell the user you could not reach the service "
+                "and ask them for the correct address."
+            ), event
+        return soft_payload, event
+
     if is_ssrf_violation(raw_text):
+        # The turn deliberately does not abort here (#3599/#3605), but the
+        # attempts must still be bounded: without a cap an injected model gets
+        # a fresh probe every iteration. The block itself never yields -- this
+        # only decides how many times we restate it before saying "stop".
+        total = workspace_violation_counts.get(_SSRF_TOTAL_KEY, 0) + 1
+        workspace_violation_counts[_SSRF_TOTAL_KEY] = total
         logger.warning(
-            "Tool {} blocked by SSRF guard; returning non-retryable tool error: {}",
+            "Tool {} blocked by SSRF guard ({} this turn); returning non-retryable tool error: {}",
             tool_call.name,
+            total,
             raw_text.replace("\n", " ").strip()[:200],
         )
         event["detail"] = _event_detail("ssrf_violation: ", raw_text)
+        if total > _MAX_TOTAL_SSRF_BLOCKS:
+            event["detail"] = _event_detail("ssrf_violation_escalated: ", raw_text)
+            return (
+                "Error: refusing repeated attempts to reach private/internal addresses.\n"
+                f"{raw_text.strip()}\n\n"
+                f"You have been blocked {total} times in this turn. Stop. Trying "
+                "another host, encoding, port, redirect, or tool will not change "
+                "the answer. Tell the user what you could not reach and ask how "
+                "they want to proceed."
+            ), event
         return _ssrf_soft_payload(raw_text), event
 
     if _is_workspace_violation(raw_text):
