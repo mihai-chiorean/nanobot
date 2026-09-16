@@ -291,3 +291,84 @@ async def test_a_failing_work_run_still_publishes_a_terminal_status(
     assert collector.types()[-1] == "status.changed"
     assert collector.events[-1]["payload"]["status"] == "failed"
     assert loop.work_store.get_task(task_id)["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_the_restart_sweep_cannot_interrupt_a_task_this_process_accepted(
+    tmp_path: Path,
+    bus: MessageBus,
+) -> None:
+    """Regression, in production order.
+
+    The gateway constructs the channel (which inserts tasks) and the agent loop
+    as peers, and the loop's store brings its schema up lazily. When the sweep
+    rode along with that first open it fired at first *agent* use -- after the
+    task existed -- and marked the live task interrupted. The executor sees a
+    terminal status.changed, returns, and the task is lost. Once per restart,
+    deterministically, on the first task submitted after a deploy.
+    """
+    # The channel's handle inserts a task before the agent loop has run anything.
+    from nanobot.work.store import WorkStore
+
+    reader = WorkStore(tmp_path, reconcile_on_open=False)
+    task_id = str(reader.create_task(chat_id=CHAT_ID, content="long job")["task_id"])
+
+    loop = _make_loop(tmp_path, bus)
+    # First touch of the loop's own handle.
+    assert loop.work_store.get_task(task_id)["status"] == "queued"
+
+    _scripted(loop, [LLMResponse(content="Done.", tool_calls=[])])
+    await _run(loop, task_id, content="long job")
+    assert loop.work_store.get_task(task_id)["status"] == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_the_sweep_still_runs_when_startup_asks_for_it(
+    tmp_path: Path,
+    bus: MessageBus,
+) -> None:
+    """Non-vacuity for the test above: the sweep is moved, not removed."""
+    loop = _make_loop(tmp_path, bus)
+    task_id = str(loop.work_store.create_task(chat_id=CHAT_ID, content="orphan")["task_id"])
+    loop.work_store.update_status(task_id, "running")
+
+    assert await loop.reconcile_work_store() == 1
+    assert loop.work_store.get_task(task_id)["status"] == "interrupted"
+
+
+@pytest.mark.asyncio
+async def test_a_work_task_refused_by_the_owner_guard_still_ends_terminal(
+    tmp_path: Path,
+    bus: MessageBus,
+    collector: _Collector,
+) -> None:
+    """A Work turn's sender is the creating client, never the owner, so the
+    system-modification guard always refuses it. Before, that exit published no
+    status at all and the executor blocked until its read deadline."""
+    loop = _make_loop(tmp_path, bus)
+    task = loop.work_store.create_task(chat_id=CHAT_ID, content="x")
+    task_id = str(task["task_id"])
+    collector.drain()
+    collector.events.clear()
+
+    from nanobot.agent.loop import is_system_modification
+
+    content = "modify your code"
+    assert is_system_modification(content), "guard no longer trips on this phrasing"
+
+    await loop._dispatch(  # pyright: ignore[reportPrivateUsage]
+        InboundMessage(
+            channel="websocket",
+            sender_id="ziggy-work",
+            chat_id=CHAT_ID,
+            content=content,
+            metadata={"work_task_id": task_id, "work_mode": "background"},
+            session_key_override=f"work:{task_id}",
+        )
+    )
+    await asyncio.sleep(0)
+    collector.drain()
+
+    assert collector.types()[-1] == "status.changed"
+    assert collector.events[-1]["payload"]["status"] == "failed"
+    assert loop.work_store.get_task(task_id)["status"] == "failed"

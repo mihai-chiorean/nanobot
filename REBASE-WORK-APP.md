@@ -126,10 +126,13 @@ and mirroring how shared rooms were ported:
 | --- | --- | --- |
 | `channels/websocket/work_stream.py` | **new** (subscriptions, envelope handlers, fan-out) | none |
 | `webui/work_http.py` | **new** (`/api/work*`) | none |
-| `channels/websocket/runtime.py` | construct the hub, detach on cleanup, one `if` in `send()`, one line in `stop()` | low |
+| `channels/websocket/runtime.py` | construct the hub, detach on cleanup, one line in `stop()` | low |
+| `webui/outbound_projection.py` | one `if` demultiplexing `_work_event` | low |
 | `webui/inbound_commands.py` | one `if` block delegating `work.*` types | low |
 | `webui/ws_http.py` | one attribute + one dispatch delegation next to `shared_rooms` | low |
-| `agent/loop.py` | `_WorkHook` + a hook factory + work-context binding | medium (loop.py is upstream's churniest file) |
+| `agent/loop.py` | `_WorkHook` + a hook factory + work-context binding + terminal status on each exit | medium (loop.py is upstream's churniest file) |
+| `agent/subagent.py` | clear the Work contextvars for a spawned subagent | low |
+| `cli/gateway_runtime.py`, `cli/agent.py` | one awaited `reconcile_work_store()` at startup | low |
 
 `loop.py` is the only real ongoing cost, and it is ~70 lines expressed through
 0.3.0's own `AgentTurnHookFactory` extension point rather than by editing the
@@ -175,11 +178,34 @@ not the decision boundary -- "ziggy-work cannot run a task" is.
    never an `nbrt_` room bearer. A room guest driving the agent cannot reach
    another session's Work rows.
 
-5. **`reasoning_profile`** is validated against the snapshot's enum values
-   (`auto`, `fast`, `think`, `think-code`) and stored, so the wire contract is
-   preserved, but it has no behavioural effect until `agent/reasoning_policy.py`
-   is carried forward. That module is a separate fork feature, not part of this
-   train.
+5. **Startup ordering.** The Work restart sweep (`reconcile_interrupted`) is
+   no longer run on store open. The schema comes up lazily -- so an unwritable
+   workspace cannot fail `AgentLoop.__init__` -- which meant the sweep fired at
+   *first agent use*, by which point the gateway had already accepted a
+   `work.create` and inserted a task. The sweep cannot tell a task left running
+   by the last process from one this process just accepted, so it marked the
+   live task `interrupted`, the executor saw a terminal `status.changed` and
+   returned, and the task was lost. Deterministically, once per restart, on the
+   first task submitted after a deploy. `AgentLoop.reconcile_work_store()` is
+   now awaited in startup next to `recovery.scan()`, which already carries the
+   same "must finish before channels accept input" requirement.
+
+6. **Every exit publishes a terminal status.** ziggy-work's executor returns on
+   a terminal or `waiting` `status.changed`; anything else blocks until its read
+   deadline. Covered: success, failure, cancellation, `max_iterations`, the
+   owner-only system-modification guard (a Work turn's sender is the creating
+   client, never the owner, so that guard always refuses it), and the
+   command-stage short circuit.
+
+### Wire preserved, behaviour deferred
+
+Two fields ride the contract unchanged so no client needs a release, but their
+behaviour depends on carry-forwards outside this train.
+
+| Field / state | Status |
+| --- | --- |
+| `reasoning_profile` | Validated against the snapshot's enum (`auto`, `fast`, `think`, `think-code`) and stored, so the column and the wire payload are right. It selects nothing until `agent/reasoning_policy.py` is carried forward. |
+| `waiting` / `ask_user` | `_WorkHook` transitions to `waiting` on `stop_reason == "ask_user"`, and the executor has an early return for it. **Nothing in 0.3.0 ever sets that stop reason** -- there is no `ask_user` tool in the tree -- so the snapshot's ask-a-question-and-pause lifecycle does not exist yet. Clients tolerate never seeing it. |
 
 ---
 
@@ -197,8 +223,16 @@ not the decision boundary -- "ziggy-work cannot run a task" is.
 
 ## 5. Ziggy-side changes required
 
-**None for the Work app.** The wire contract is byte-identical to the snapshot,
-so `services/ziggy-work`, `web/`, and the iOS Work views need no change.
+**None for the Work wire contract.** Every frame, field name, field type, HTTP
+envelope and route matches what `services/ziggy-work`, `web/` and the iOS Work
+views already send and decode, verified seam by seam against
+`executor.go:66-250`, `reconcile.go:27-122`, `nanobot-client.ts:242-353` and
+`WebSocketModels.swift:546-636`. No client release is required.
+
+Two notes that are server-side rather than client-side, recorded so they are
+not mistaken for contract gaps: the startup-ordering fix in §3.5 is invisible to
+clients but was fatal to the first task after every restart, and the `waiting`
+state above is unreachable until an `ask_user` stop reason exists.
 
 The two P0s already recorded in `REBASE-SHARED-ROOMS.md` §6 are unchanged and
 still required in this train:

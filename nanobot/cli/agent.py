@@ -300,6 +300,9 @@ def agent(
 
         async def run_interactive() -> None:
             await mcp_provider.connect()
+            # Ziggy-local (MIT-1010): the Work restart sweep is explicit, not
+            # on-open. Nothing accepts input before this point in the CLI.
+            await agent_loop.reconcile_work_store()
             bus_task = asyncio.create_task(agent_loop.run())
             turn_done = asyncio.Event()
             turn_done.set()

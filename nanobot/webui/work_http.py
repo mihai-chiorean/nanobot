@@ -46,6 +46,21 @@ DEFAULT_LIST_LIMIT = 50
 MAX_LIST_LIMIT = 200
 
 
+def _header_safe_filename(name: Any) -> str:
+    """A filename safe to interpolate into ``Content-Disposition``.
+
+    ``safe_filename`` strips path and quote characters but not control ones,
+    and an artifact name originates with the agent -- which routinely handles
+    untrusted text. Quoting alone is therefore not enough: a CR/LF would be a
+    response-splitting primitive if the transport ever stopped validating
+    header values for us.
+    """
+    if not isinstance(name, str):
+        return "artifact"
+    cleaned = "".join(ch for ch in name if ch.isprintable() and ch != '"')
+    return cleaned.strip() or "artifact"
+
+
 class WorkRouter:
     """Serve ``/api/work*`` against the gateway's :class:`WorkStreamHub`."""
 
@@ -303,7 +318,7 @@ class WorkRouter:
         if not isinstance(mime, str) or not mime:
             mime = "application/octet-stream"
         name = metadata.get("name")
-        filename = name if isinstance(name, str) and name else "artifact"
+        filename = _header_safe_filename(name)
         return TransportFileResponse(
             path=path,
             content_type=mime,

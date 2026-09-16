@@ -286,7 +286,12 @@ class WorkStreamHub:
             task=task,
         )
         if not was_created:
-            # Idempotent replay: the caller retried with a known key.
+            # Idempotent replay: the caller retried with a known key. Only a
+            # task confirmed dispatched is replayed -- an unconfirmed one is
+            # either still being enqueued by the first attempt or lost its
+            # mark_dispatched write, and re-enqueuing on a guess would run the
+            # turn twice. The client has the task row from work.created and can
+            # subscribe explicitly.
             if was_dispatched:
                 await self.replay(connection, task_id, after_seq=0)
             return
@@ -306,9 +311,10 @@ class WorkStreamHub:
         if request_id is not None:
             # Bookkeeping only, and it runs *after* the enqueue succeeded: the
             # task is already running, so failing the task here would be a lie.
-            # Letting it raise would instead kill the socket over a UPDATE, so
+            # Letting it raise would instead kill the socket over an UPDATE, so
             # it is logged. The cost of losing it is that an idempotent retry
-            # re-enqueues rather than replaying.
+            # re-sends work.created without replaying the backlog; the turn
+            # still runs exactly once, which is the property that matters.
             try:
                 await self._store.run_io(self._store.mark_dispatched, task_id, request_id)
             except Exception:
@@ -417,7 +423,14 @@ class WorkStreamHub:
             return
         await self.record_message(task_id, content)
         if command_id is not None:
-            await self._store.run_io(self._store.mark_command_dispatched, command_id)
+            # Same reasoning as mark_dispatched in handle_create: the message is
+            # already enqueued, and letting a bookkeeping write raise here tears
+            # down the whole connection (``_connection_loop`` has no per-frame
+            # handler), losing every chat and Work subscription on it.
+            try:
+                await self._store.run_io(self._store.mark_command_dispatched, command_id)
+            except Exception:
+                logger.exception("failed to mark Work command {} dispatched", command_id)
 
     # -- shared task operations --------------------------------------------
 
