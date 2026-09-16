@@ -389,3 +389,26 @@ async def test_control_plane_routes_reject_get(router: SharedRoomRouter) -> None
     ):
         response = await router.dispatch(_Request(path, method="GET"), path)
         assert response.status_code == 405, path
+
+
+@pytest.mark.asyncio
+async def test_bearer_secret_is_accepted(router: SharedRoomRouter) -> None:
+    """ziggy-control sends the secret as ``Authorization: Bearer`` (shared_rooms.go:725)."""
+    request = _Request(
+        "/auth/shared-rooms",
+        body={
+            "source_session_key": f"websocket:{OWNER_CHAT}",
+            "chat_id": ROOM_CHAT,
+            "room_id": ROOM_ID,
+            "mode": "legacy",
+            "snapshot_message_count": None,
+            "snapshot_sha256": "",
+            "selected_results": None,
+            "expires_at": None,
+            "title": "Shared conversation",
+            "owner_display_name": "Mihai",
+        },
+        headers={"Authorization": f"Bearer {SECRET}"},
+    )
+    response = await router.dispatch(request, "/auth/shared-rooms")
+    assert response.status_code == 201

@@ -199,7 +199,10 @@ class SharedRoomRouter:
         ):
             return http_error(409, "Room mode unavailable")
 
-        selected_results = body.get("selected_results", [])
+        # ziggy-control builds this payload as a Go map, so an empty
+        # []map[string]string marshals to JSON ``null`` rather than being
+        # omitted (shared_rooms.go:218). Treat null as "none supplied".
+        selected_results = body.get("selected_results") or []
         if (
             not isinstance(selected_results, list)
             or len(selected_results) > MAX_SELECTED_RESULTS

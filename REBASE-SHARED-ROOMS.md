@@ -34,7 +34,7 @@ themselves mention `shared_room`; they are listed under "Support modules".
 | --- | --- | --- |
 | `nanobot/channels/room_work.py` (233 L) | `RoomWorkStore` — flock'd JSON proposal store, `canonical_action`/`action_hash`, `propose`/`consume`/`finish`/`publish`, `connected_read_executor(agent, server_name)` bounded to `gmail_search` + `gmail_get_message` | `nanobot/channels/websocket/room_work.py` (verbatim; pure stdlib) |
 | `nanobot/channels/chat_inbox.py` (453 L) | `ChatInboxStore` — SQLite durable, ordered, exactly-once chat inbox backing room `ask_ziggy` and normal delivery | `nanobot/channels/websocket/chat_inbox.py` (verbatim) |
-| `nanobot/channels/websocket_server.py` (183 L) | aiohttp transport adapter for the websocket channel | **not ported.** 0.3.0's `runtime.py` serves via `websockets.asyncio.server` with its own HTTP dispatch; the aiohttp shim is fork-local dead weight after the repackage |
+| `nanobot/channels/websocket_server.py` (183 L) | aiohttp transport adapter for the websocket channel | `nanobot/channels/websocket/transport.py` — **load-bearing after all**, see §3d |
 
 ---
 
@@ -134,7 +134,43 @@ the agent's turn, so at cutover a guest could prompt the room agent into
   file that is not valid JSON, or whose top level is not an object with a
   `jobs` list, still takes the whole-file path unchanged.
 
-### 3d. Contract changes respected
+### 3d. Upstream's listener cannot read an HTTP request body
+
+Found while wiring the control plane, and the largest single surprise of the
+port. The gateway's listener is `websockets.asyncio.server`; its HTTP parser
+reads a request line and headers only. There is no body. That is *why* 0.3.0
+moved every WebUI mutation onto the authenticated `webui_request` frame
+(`GatewayHTTPHandler.dispatch_webui_mutation`) and returns 405 for a mutation
+arriving over HTTP.
+
+The deployed snapshot does not hit this because it does not run that listener:
+`WebSocketChannel.start()` there calls
+`nanobot/channels/websocket_server.run_channel_server`, an **aiohttp** adapter,
+which is what makes `request.body` available. So `websocket_server.py` is
+load-bearing for shared rooms, contrary to the first pass of this inventory.
+
+`ziggy-control` POSTs JSON bodies to all four `/auth/shared-room*` routes. Three
+options were considered:
+
+| Option | Keeps the Go contract? | Cost |
+| --- | --- | --- |
+| Move the room control plane onto the `webui_request` frame | **no** — four Go call sites rewritten, plus a WS client in ziggy-control | large, and ziggy-control is not a WebUI client |
+| A second, body-capable listener on its own port | no — new base URL in `render.go` | medium, and splits the auth surface |
+| **Carry the fork's aiohttp transport forward as an opt-in listener** | **yes, byte-identical** | one ~200-line module |
+
+**Chosen: the third.** `websocket.transport` selects the listener and defaults
+to upstream's `websockets`; the `WebSocketConfig` validator forces `aiohttp`
+whenever `sharedRoomsEnabled` or `sharedRoomCollaborationEnabled` is set. A
+tenant without shared rooms is on upstream's listener, unchanged.
+
+**Tradeoff, accepted deliberately:** upstream's slow-client fan-out isolation
+and degraded-listener recovery are `websockets`-specific and do **not** apply
+under the aiohttp transport. aiohttp's `max_msg_size` and heartbeat cover the
+message-size and liveness half; the 1013/1011 force-close behaviour (C23) does
+not exist there. This is the one place the port does not preserve a 0.3.0
+improvement, and it applies only to runtimes with shared rooms on.
+
+### 3e. Contract changes respected
 
 - `/api/sessions/<key>/messages` deleted in favour of `/webui-thread`. The
   **room-scoped** variant is reinstated (§6) because the guest read path and
@@ -270,6 +306,8 @@ which is C5 and out of scope here.
 - [x] C4 `work_task` cron + `work`/`schedule_work` tools
 - [x] C6 per-entry `jobs.json` quarantine
 - [ ] C5 migrate `client.go:291` and `ZiggyRESTClient.swift:239` off `/messages`
+- [ ] Decide whether the aiohttp transport is acceptable for the owner runtime
+      or whether shared rooms should move to a dedicated tenant (§3d tradeoff)
 - [ ] C8 briefing/editorial carry-forward (`agent/tools/briefing.py`)
 - [ ] Canary one tenant with `sharedRoomCollaborationEnabled` before repointing
       `current-nanobot`
