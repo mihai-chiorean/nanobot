@@ -698,7 +698,11 @@ def _run_gateway(
                 )
                 raise CronJobSkippedError(reason)
             await mcp_provider.connect()
-            return await run_work_task_cron_job(job, agent=agent)
+            return await run_work_task_cron_job(
+                job,
+                agent=agent,
+                deliver=lambda msg: _deliver_to_channel(msg, record=True),
+            )
 
         if is_bound_cron_job(job):
             return await run_bound_cron_job(job, agent=agent, cron=cron)
@@ -778,6 +782,7 @@ def _run_gateway(
         websocket_channel.connected_room_executor = connected_read_executor(
             agent,
             websocket_channel.config.shared_room_connector_server,
+            mcp_provider,
         )
 
     if channels.enabled_channels:

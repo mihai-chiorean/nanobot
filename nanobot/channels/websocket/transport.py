@@ -32,12 +32,14 @@ from __future__ import annotations
 import asyncio
 import email.utils
 import http
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator
 
 from aiohttp import WSMsgType, web
 from websockets.datastructures import Headers
+from websockets.exceptions import ConnectionClosedError
 from websockets.http11 import Response
 
 
@@ -102,10 +104,19 @@ class AiohttpConnection:
     async def send(self, data: str | bytes) -> None:
         if self._ws is None:
             raise RuntimeError("WebSocket is not prepared")
-        if isinstance(data, bytes):
-            await self._ws.send_bytes(data)
-        else:
-            await self._ws.send_str(data)
+        try:
+            if isinstance(data, bytes):
+                await self._ws.send_bytes(data)
+            else:
+                await self._ws.send_str(data)
+        except (ConnectionResetError, RuntimeError) as exc:
+            # The channel's outbound writer treats a normal disconnect as
+            # ``websockets.exceptions.ConnectionClosed`` and everything else as
+            # a bug worth a stack trace. aiohttp raises ConnectionResetError (or
+            # RuntimeError once the response is closed) instead, so translate --
+            # otherwise every routine client disconnect logs an exception and
+            # triggers a spurious 1011 retirement.
+            raise ConnectionClosedError(None, None) from exc
 
     async def close(self, *, code: int = 1000, reason: str = "") -> None:
         if self._ws is not None:
@@ -173,15 +184,23 @@ async def run_channel_server(
         )
         connection = AiohttpConnection(request, transport_request)
         if request.can_read_body and request.method in {"POST", "PUT", "PATCH"}:
-            # Every mutation in the embedded /api surface requires the
-            # short-lived REST bearer. Reject *before* buffering a body so an
-            # unauthenticated client cannot multiply max_message_bytes across
-            # all front-door slots. The /auth/* room routes carry their own
-            # tokenIssueSecret check inside the handler.
-            if request.path.startswith("/api/") and not channel.check_api_token(
-                transport_request
-            ):
-                return to_aiohttp_response(connection.respond(401, "Unauthorized"))
+            # Reject *before* buffering a body so an unauthenticated client
+            # cannot multiply max_message_bytes across all front-door slots.
+            # Two gates, because two credentials:
+            #   /api/*   -> the short-lived REST bearer
+            #   /auth/*  -> the tenant tokenIssueSecret (an HMAC compare, no
+            #               I/O, so it is safe to run this early; the handlers
+            #               still re-check it on their own)
+            # Anything else that carries a body is unrouted, so refuse it
+            # rather than buffering for a 404.
+            if request.path.startswith("/api/"):
+                if not channel.check_api_token(transport_request):
+                    return to_aiohttp_response(connection.respond(401, "Unauthorized"))
+            elif request.path.startswith("/auth/"):
+                if not channel.check_issue_route_secret(transport_request):
+                    return to_aiohttp_response(connection.respond(401, "Unauthorized"))
+            else:
+                return to_aiohttp_response(connection.respond(404, "Not Found"))
             try:
                 transport_request.body = await asyncio.wait_for(request.read(), timeout=10.0)
             except (TimeoutError, asyncio.TimeoutError):
@@ -212,11 +231,22 @@ async def run_channel_server(
     await runner.setup()
     site: web.BaseSite
     if unix_socket_path:
+        # Match what the websockets listener does for a unix socket: create the
+        # parent directory, clear a stale socket so a restart does not fail with
+        # EADDRINUSE, and chmod 0600 so the socket is not world-reachable at the
+        # process umask.
+        socket_file = Path(unix_socket_path)
+        socket_file.parent.mkdir(parents=True, exist_ok=True)
+        with suppress(FileNotFoundError):
+            socket_file.unlink()
         site = web.UnixSite(runner, unix_socket_path, ssl_context=ssl_context)
     else:
         site = web.TCPSite(runner, host, port, ssl_context=ssl_context)
     try:
         await site.start()
+        if unix_socket_path:
+            with suppress(OSError):
+                Path(unix_socket_path).chmod(0o600)
         await stop_event.wait()
     finally:
         await runner.cleanup()

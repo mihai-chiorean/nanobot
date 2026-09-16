@@ -179,8 +179,16 @@ class RoomWorkStore:
             raise ValueError("Proposal not found.")
 
 
-def connected_read_executor(agent: Any, server_name: str):
-    """Bind to one configured connector, never to model-selected tools or servers."""
+def connected_read_executor(agent: Any, server_name: str, mcp_provider: Any = None):
+    """Bind to one configured connector, never to model-selected tools or servers.
+
+    ``mcp_provider`` is required on 0.3.0: upstream moved MCP connection
+    management out of ``AgentLoop`` (there is no ``_connect_mcp`` or
+    ``_mcp_connecting`` any more) and behind ``MCPProvider.connect()``. Passing
+    ``None`` leaves the tools unconnected, which surfaces as "this exact
+    connected read is unavailable" rather than an AttributeError swallowed by
+    the caller's except clause.
+    """
 
     async def execute(action: dict[str, Any]) -> str:
         import asyncio
@@ -192,9 +200,8 @@ def connected_read_executor(agent: Any, server_name: str):
 
         action = canonical_action(**action)
         async with asyncio.timeout(40):
-            await agent._connect_mcp()
-            while agent._mcp_connecting:
-                await asyncio.sleep(0.05)
+            if mcp_provider is not None:
+                await mcp_provider.connect()
             tool = agent.tools.get(
                 _sanitize_mcp_tool_name(f"mcp_{server_name}_{action['operation']}")
             )

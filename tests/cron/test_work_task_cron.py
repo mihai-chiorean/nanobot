@@ -410,3 +410,110 @@ def test_cron_payload_kind_literal_includes_work_task() -> None:
     """Guard the Literal itself: a silent drop is how C4 happened."""
     payload = CronPayload.from_store_dict({"kind": "work_task", "message": "x"})
     assert payload.kind == "work_task"
+
+
+# --------------------------------------------------------------------------
+# Delivery (tech-lead review, P0-3)
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_work_task_publishes_its_response(tmp_path: Path) -> None:
+    """Without this the four owner digests run, cost tokens, and post nothing.
+
+    All four jobs are ``deliver: false`` at the cron layer and
+    ``process_direct`` does not publish, so the runner has to deliver.
+    """
+    job = CronJob.from_store_dict(OWNER_WORK_JOBS[0])
+    store = _FakeWorkStore()
+    agent = _FakeAgent(store, tmp_path)
+    delivered: list[Any] = []
+
+    async def _deliver(message: Any) -> None:
+        delivered.append(message)
+
+    await run_work_task_cron_job(job, agent=agent, deliver=_deliver)
+
+    assert len(delivered) == 1
+    assert delivered[0].content == "digest body"
+
+
+@pytest.mark.asyncio
+async def test_work_task_does_not_deliver_for_a_non_websocket_origin(
+    tmp_path: Path,
+) -> None:
+    raw = dict(OWNER_WORK_JOBS[0])
+    raw["payload"] = {**raw["payload"], "channel": "discord"}
+    job = CronJob.from_store_dict(raw)
+    store = _FakeWorkStore()
+    agent = _FakeAgent(store, tmp_path)
+    delivered: list[Any] = []
+
+    async def _deliver(message: Any) -> None:
+        delivered.append(message)
+
+    await run_work_task_cron_job(job, agent=agent, deliver=_deliver)
+    assert delivered == []
+
+
+@pytest.mark.asyncio
+async def test_a_failed_run_delivers_nothing(tmp_path: Path) -> None:
+    job = CronJob.from_store_dict(OWNER_WORK_JOBS[0])
+    store = _FakeWorkStore()
+    agent = _FakeAgent(store, tmp_path)
+    delivered: list[Any] = []
+
+    async def _deliver(message: Any) -> None:
+        delivered.append(message)
+
+    async def boom(_content: str, **_kwargs: Any):
+        raise RuntimeError("provider down")
+
+    agent.process_direct = boom  # type: ignore[assignment]
+    with pytest.raises(RuntimeError):
+        await run_work_task_cron_job(job, agent=agent, deliver=_deliver)
+    assert delivered == []
+
+
+# --------------------------------------------------------------------------
+# Quarantine hygiene (tech-lead review, P1-9)
+# --------------------------------------------------------------------------
+
+
+def test_a_repeated_load_does_not_re_quarantine_the_same_entry(tmp_path: Path) -> None:
+    """``_load_jobs`` runs on nearly every public call; one bad record must not
+    produce a file and an ERROR line per reload, forever."""
+    store_path = tmp_path / "cron" / "jobs.json"
+    bad = {"id": "broken", "schedule": {"kind": "every", "everyMs": 1000}}
+    _write_store(store_path, [OWNER_WORK_JOBS[0], bad])
+
+    service = CronService(store_path)
+    for _ in range(5):
+        loaded = service._load_jobs()
+        assert loaded is not None
+        assert [job.id for job in loaded[0]] == ["cbc6a67c"]
+
+    quarantine = list(store_path.parent.glob("jobs.json.quarantine-*.jsonl"))
+    assert len(quarantine) == 1
+    records = [line for line in quarantine[0].read_text().splitlines() if line.strip()]
+    assert len(records) == 1
+
+
+def test_two_different_bad_entries_are_both_quarantined(tmp_path: Path) -> None:
+    store_path = tmp_path / "cron" / "jobs.json"
+    _write_store(
+        store_path,
+        [
+            {"id": "broken-a", "schedule": {"kind": "every", "everyMs": 1000}},
+            {"id": "broken-b", "schedule": {"kind": "every", "everyMs": 2000}},
+        ],
+    )
+    service = CronService(store_path)
+    assert service._load_jobs() == ([], 1)
+    records = [
+        line
+        for path in store_path.parent.glob("jobs.json.quarantine-*.jsonl")
+        for line in path.read_text().splitlines()
+        if line.strip()
+    ]
+    assert len(records) == 2

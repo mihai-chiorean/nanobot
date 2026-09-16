@@ -24,6 +24,7 @@ from websockets.http11 import Request as WsRequest
 from nanobot.bus.events import OUTBOUND_META_AGENT_UI, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
+
 # Ziggy-local (MIT-1010): shared rooms.
 from nanobot.channels.websocket.rooms import (
     RoomCredential,
@@ -37,6 +38,9 @@ from nanobot.session.webui_turns import (
     websocket_turn_transcript_persistence_failed,
 )
 from nanobot.webui.gateway_services import GatewayServices
+from nanobot.webui.http_utils import (
+    issue_route_secret_matches as _issue_route_secret_matches,
+)
 from nanobot.webui.http_utils import (
     normalize_config_path as _normalize_config_path,
 )
@@ -215,8 +219,15 @@ class WebSocketConfig(Base):
     # (base64 overhead) + envelope framing stays under 36 MB; the 40 MB ceiling
     # leaves a small margin for sender slop without opening a DoS avenue.
     max_message_bytes: int = Field(default=37_748_736, ge=1024, le=41_943_040)
-    ping_interval_s: float = Field(default=20.0, ge=5.0, le=300.0)
-    ping_timeout_s: float = Field(default=20.0, ge=5.0, le=300.0)
+    # Ziggy-local (MIT-1010): nullable again. The fork these tenants run typed
+    # these as ``float | None`` and provision_tenant.py writes
+    # ``"pingIntervalS": null``; all four live config files on disk carry it.
+    # 0.3.0 narrowing them to ``float`` makes every tenant config fail
+    # validation at cutover. Both listeners accept None (``websockets``
+    # ping_interval= and aiohttp heartbeat=), so widening is the cheap fix and
+    # avoids a config migration.
+    ping_interval_s: float | None = Field(default=20.0, ge=5.0, le=300.0)
+    ping_timeout_s: float | None = Field(default=20.0, ge=5.0, le=300.0)
     ssl_certfile: str = ""
     ssl_keyfile: str = ""
     # Ziggy-local (MIT-1010): shared rooms. ``sharedRoomCollaborationEnabled``
@@ -454,6 +465,11 @@ class WebSocketChannel(BaseChannel):
                 store=self.rooms,
                 channel=self,
             )
+            # The listener calls the *endpoint's* handshake, not this class's,
+            # so the room-token check has to be injected there. Without this a
+            # guest presenting a valid nbrt_ token is simply 401'd and shared
+            # rooms never work at all.
+            gateway.endpoint.room_token_consumer = self.rooms.consume_ws_token
 
     # -- Subscription bookkeeping -------------------------------------------
 
@@ -565,11 +581,26 @@ class WebSocketChannel(BaseChannel):
         try:
             await self._commands.cleanup_connection(connection)
         finally:
-            for chat_id in tuple(self._conn_chats.get(connection, ())):
+            chats_before_detach = tuple(self._conn_chats.get(connection, ()))
+            for chat_id in chats_before_detach:
                 self._detach(connection, chat_id)
             self._conn_default.pop(connection, None)
             if self.rooms is not None:
+                room_chats = [
+                    chat_id
+                    for chat_id in chats_before_detach
+                    if self.rooms.is_collaborative(chat_id)
+                ]
                 self.rooms.forget_connection(connection)
+                if room_chats:
+                    from nanobot.channels.websocket.room_editorial import (
+                        broadcast_room_presence,
+                    )
+
+                    for chat_id in room_chats:
+                        # The roster must shrink when a participant leaves.
+                        with suppress(Exception):
+                            await broadcast_room_presence(self, chat_id)
             self.gateway.endpoint.discard_connection(connection)
             if self._connection_outbound.get(connection) is state:
                 self._connection_outbound.pop(connection, None)
@@ -624,14 +655,13 @@ class WebSocketChannel(BaseChannel):
         query: dict[str, list[str]],
         headers: Any = None,
     ) -> Any:
-        """Authorize a handshake, accepting a single-use room token first."""
-        # Ziggy-local (MIT-1010): an ``nbrt_`` room token binds this connection
-        # to exactly one room session before the generic token paths run, so a
-        # guest never reaches the tenant-wide credential checks at all.
-        if self.rooms is not None:
-            supplied = _query_first(query, "token")
-            if supplied and self.rooms.consume_ws_token(connection, supplied):
-                return None
+        """Compatibility proxy for handshake tests and integrations.
+
+        The room-token check lives on the endpoint
+        (``WebUIGatewayEndpoint.room_token_consumer``), because that is what the
+        listener actually calls; this proxy must not duplicate it or the two
+        could drift.
+        """
         return self.gateway.endpoint.authorize_websocket_handshake(
             connection,
             query,
@@ -642,6 +672,20 @@ class WebSocketChannel(BaseChannel):
         """Expose the HTTP handler's API-token check to the aiohttp transport."""
         return self.gateway.http.check_api_token(request)
 
+    def check_issue_route_secret(self, request: Any) -> bool:
+        """Pre-buffer gate for ``/auth/*`` bodies (Ziggy-local, MIT-1010).
+
+        The room control-plane handlers check this themselves, but only after
+        the body has been read. Running the same constant-time compare before
+        ``request.read()`` keeps an unauthenticated caller from making the
+        gateway buffer ``max_message_bytes`` per in-flight request. Fails
+        closed when no secret is configured, matching the handlers' own 503.
+        """
+        secret = self.config.token_issue_secret.strip()
+        if not secret:
+            return False
+        return _issue_route_secret_matches(getattr(request, "headers", {}), secret)
+
     # -- Shared rooms -------------------------------------------------------
 
     def room_credential(self, connection: Any) -> RoomCredential | None:
@@ -651,7 +695,20 @@ class WebSocketChannel(BaseChannel):
         return self.rooms.connection_credential(connection)
 
     def effective_room_credential(self, connection: Any, chat_id: str) -> RoomCredential | None:
-        """Guest credential if present, else the owner's implicit room credential."""
+        """Guest credential if present, else the owner's implicit room credential.
+
+        The owner fallback is deliberately *not* narrowed to trusted-WebUI
+        sockets. A nanobot runtime is single-tenant: any connection that
+        completed the handshake without a room credential holds a tenant
+        credential, and the tenant is the owner. Gating on
+        ``is_webui_connection`` would instead break the owner, because
+        ``/auth/token`` -- the route ziggy-control and the iOS app use -- issues
+        ``audience="client"`` and only ``/webui/bootstrap`` issues ``"webui"``
+        (``webui/ws_http.py``). The owner would silently lose their own room.
+
+        The fallback is safe because an owner credential only ever authorizes
+        the room named by ``chat_id``, which the caller already resolved.
+        """
         if self.rooms is None:
             return None
         return self.rooms.connection_credential(connection) or self.rooms.owner_credential(
@@ -1002,6 +1059,22 @@ class WebSocketChannel(BaseChannel):
 
                 content = _parse_inbound_payload(raw)
                 if content is None:
+                    continue
+                # Ziggy-local (MIT-1010). The legacy untyped-frame path below
+                # dispatches straight to BaseChannel._handle_message with a
+                # fresh chat_id and hand-built metadata -- it never consults the
+                # connection's room credential, so it carries no
+                # INBOUND_META_ROOM_SCOPE and every room-denied tool would be
+                # allowed. A guest could therefore drive a fully unrestricted
+                # turn simply by omitting "type" from its frame. Room
+                # connections speak envelopes only.
+                if guest_credential is not None:
+                    await self._send_event(
+                        connection,
+                        "error",
+                        chat_id=guest_credential.chat_id,
+                        detail="shared room connections must send typed envelopes",
+                    )
                     continue
                 # WebSocket already authenticates at handshake time (token),
                 # so pairing is not applicable. Treat as non-DM to avoid

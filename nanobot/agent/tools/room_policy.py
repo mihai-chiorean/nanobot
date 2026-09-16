@@ -57,6 +57,13 @@ ROOM_DENIED_TOOLS: dict[str, str] = {
     # 3. private memory
     "recall": "private memory is not readable from a shared room",
     "ingest": "shared-room content is not ingested into private memory",
+    # 4. fan-out. A subagent inherits the room scope (see
+    #    SubagentManager._inherited_room_scope), so this is not the gate that
+    #    keeps a subagent inside the room -- it is a resource bound and it keeps
+    #    the promise the room system prompt makes to participants ("you have no
+    #    access to ... tools ... in this conversation").
+    "spawn": "background agents cannot be started from a shared room",
+    "long_task": "long-running tasks cannot be started from a shared room",
 }
 
 

@@ -42,6 +42,9 @@ class _Headers(dict):
 class _Connection:
     remote_address = ("127.0.0.1", 41000)
 
+    def respond(self, status: int, text: str) -> Any:
+        return (status, text)
+
 
 def _config(**kw: Any) -> WebSocketConfig:
     payload: dict[str, Any] = {
@@ -250,3 +253,354 @@ async def test_a_bogus_room_token_does_not_bind(channel: WebSocketChannel) -> No
     connection = _Connection()
     channel._authorize_websocket_handshake(connection, {"token": ["nbrt_nope"]})
     assert channel.room_credential(connection) is None
+
+
+# --------------------------------------------------------------------------
+# Frame-shape bypass (security review, CRITICAL B)
+# --------------------------------------------------------------------------
+
+
+class _LoopConnection(_Connection):
+    """A connection that replays a fixed set of frames, then closes."""
+
+    def __init__(self, frames: list[str]) -> None:
+        self._frames = frames
+        self.sent: list[str] = []
+        self.request = None
+
+    def __aiter__(self):
+        async def gen():
+            for frame in self._frames:
+                yield frame
+
+        return gen()
+
+    async def send(self, data: str | bytes) -> None:
+        self.sent.append(data if isinstance(data, str) else data.decode())
+
+
+@pytest.mark.asyncio
+async def test_a_room_connection_cannot_use_the_legacy_untyped_frame_path(
+    channel: WebSocketChannel,
+) -> None:
+    """A guest must not escape room scoping by omitting ``type`` from its frame.
+
+    The legacy path dispatches straight to ``BaseChannel._handle_message`` with
+    a fresh chat_id and hand-built metadata, so it carries no room scope and
+    every room-denied tool would be allowed. Found by security review.
+    """
+    await channel._dispatch_http(
+        _Connection(),
+        _request(
+            "/auth/shared-rooms",
+            body={
+                "source_session_key": f"websocket:{OWNER_CHAT}",
+                "chat_id": ROOM_CHAT,
+                "room_id": ROOM_ID,
+                "title": "Shared conversation",
+                "owner_display_name": "Mihai",
+            },
+        ),
+    )
+    assert channel.rooms is not None
+    token, _ = channel.rooms.mint(
+        room_id=ROOM_ID,
+        chat_id=ROOM_CHAT,
+        participant_id="participant_" + "c" * 32,
+        display_name="Guest",
+        role="contributor",
+    )
+    connection = _LoopConnection(
+        [
+            "just plain text",
+            json.dumps({"content": "json without a type field"}),
+        ]
+    )
+    assert channel._authorize_websocket_handshake(connection, {"token": [token]}) is None
+
+    dispatched: list[dict[str, Any]] = []
+
+    async def _record(**kwargs: Any) -> None:
+        dispatched.append(kwargs)
+
+    channel._handle_message = _record  # type: ignore[assignment]
+    await channel._connection_loop(connection)
+
+    assert dispatched == [], "a room connection must not reach the legacy path"
+    errors = [json.loads(frame) for frame in connection.sent]
+    errors = [e for e in errors if e.get("event") == "error"]
+    assert len(errors) == 2
+    assert all("typed envelopes" in e["detail"] for e in errors)
+
+
+@pytest.mark.asyncio
+async def test_a_normal_connection_still_uses_the_legacy_frame_path(
+    channel: WebSocketChannel,
+) -> None:
+    """The bypass fix must not break ordinary non-room clients."""
+    connection = _LoopConnection(["hello from a plain client"])
+    dispatched: list[dict[str, Any]] = []
+
+    async def _record(**kwargs: Any) -> None:
+        dispatched.append(kwargs)
+
+    channel._handle_message = _record  # type: ignore[assignment]
+    await channel._connection_loop(connection)
+
+    assert len(dispatched) == 1
+    assert dispatched[0]["content"] == "hello from a plain client"
+
+
+# --------------------------------------------------------------------------
+# Pre-buffer auth gate (security review, HIGH DoS)
+# --------------------------------------------------------------------------
+
+
+def test_auth_routes_are_gated_before_the_body_is_buffered(
+    channel: WebSocketChannel,
+) -> None:
+    """``/auth/*`` POST bodies must not be buffered for an unauthenticated caller."""
+    good = TransportRequest(
+        method="POST",
+        path="/auth/shared-rooms",
+        headers=_Headers({"Authorization": f"Bearer {SECRET}"}),
+    )
+    bad = TransportRequest(
+        method="POST",
+        path="/auth/shared-rooms",
+        headers=_Headers({"Authorization": "Bearer nope"}),
+    )
+    none = TransportRequest(method="POST", path="/auth/shared-rooms", headers=_Headers({}))
+    assert channel.check_issue_route_secret(good) is True
+    assert channel.check_issue_route_secret(bad) is False
+    assert channel.check_issue_route_secret(none) is False
+
+
+def test_the_pre_buffer_gate_fails_closed_without_a_configured_secret(
+    tmp_path: Path,
+) -> None:
+    """``issue_route_secret_matches`` returns True for an empty secret; the
+    gate must not inherit that fail-open."""
+    config = _config(tokenIssueSecret="")
+    bus = MessageBus()
+    gateway = build_gateway_services(
+        config=config,
+        bus=bus,
+        session_manager=SessionManager(tmp_path),
+        static_dist_path=None,
+        workspace_path=tmp_path,
+        default_restrict_to_workspace=False,
+        runtime_model_name=None,
+        runtime_surface="browser",
+        runtime_capabilities_overrides=None,
+    )
+    channel = WebSocketChannel(config, bus, gateway=gateway)
+    request = TransportRequest(method="POST", path="/auth/shared-rooms", headers=_Headers({}))
+    assert channel.check_issue_route_secret(request) is False
+
+
+# --------------------------------------------------------------------------
+# Handshake wiring (tech-lead review, P0-1)
+# --------------------------------------------------------------------------
+
+
+def test_the_room_token_check_is_wired_into_the_endpoint(
+    channel: WebSocketChannel,
+) -> None:
+    """The listener calls the *endpoint's* handshake, not the channel's.
+
+    A room-token check that lives only on the channel override is dead code and
+    every guest is 401'd, because websocketRequiresToken defaults True.
+    """
+    assert channel.gateway.endpoint.room_token_consumer is not None
+    assert channel.rooms is not None
+    assert channel.gateway.endpoint.room_token_consumer == channel.rooms.consume_ws_token
+
+
+@pytest.mark.asyncio
+async def test_a_guest_token_authorizes_through_the_real_listener_path(
+    channel: WebSocketChannel,
+) -> None:
+    """Drive ``authorize_websocket_handshake`` -- what ``process_request`` calls."""
+    await channel._dispatch_http(
+        _Connection(),
+        _request(
+            "/auth/shared-rooms",
+            body={
+                "source_session_key": f"websocket:{OWNER_CHAT}",
+                "chat_id": ROOM_CHAT,
+                "room_id": ROOM_ID,
+                "title": "Shared conversation",
+                "owner_display_name": "Mihai",
+            },
+        ),
+    )
+    assert channel.rooms is not None
+    token, _ = channel.rooms.mint(
+        room_id=ROOM_ID,
+        chat_id=ROOM_CHAT,
+        participant_id="participant_" + "d" * 32,
+        display_name="Guest",
+        role="contributor",
+    )
+    connection = _Connection()
+    result = channel.gateway.endpoint.authorize_websocket_handshake(
+        connection,
+        {"token": [token]},
+        None,
+    )
+    assert result is None, "a valid room token must authorize the upgrade"
+    assert channel.room_credential(connection) is not None
+    # A room guest must never be promoted to a trusted WebUI connection.
+    assert not channel.gateway.endpoint.is_webui_connection(connection)
+
+
+def test_websocket_requires_token_would_reject_a_guest_without_the_wiring(
+    tmp_path: Path,
+) -> None:
+    """The condition that made the dead-code bug fatal, pinned.
+
+    Production leaves ``websocketRequiresToken`` at its ``True`` default and
+    ``token`` empty, so an unrecognised token is a 401 -- which is what a guest
+    got while the room check sat on the unused channel override.
+    """
+    config = _config(websocketRequiresToken=True)
+    bus = MessageBus()
+    gateway = build_gateway_services(
+        config=config,
+        bus=bus,
+        session_manager=SessionManager(tmp_path),
+        static_dist_path=None,
+        workspace_path=tmp_path,
+        default_restrict_to_workspace=False,
+        runtime_model_name=None,
+        runtime_surface="browser",
+        runtime_capabilities_overrides=None,
+    )
+    channel = WebSocketChannel(config, bus, gateway=gateway)
+    assert channel.config.websocket_requires_token is True
+    assert channel.config.token.strip() == ""
+    response = channel.gateway.endpoint.authorize_websocket_handshake(
+        _Connection(),
+        {"token": ["nbrt_not_a_real_token"]},
+        None,
+    )
+    assert response is not None  # 401
+
+
+# --------------------------------------------------------------------------
+# Tenant config compatibility (tech-lead review, P0-6)
+# --------------------------------------------------------------------------
+
+
+def test_null_ping_interval_from_provision_tenant_still_validates() -> None:
+    """All four live tenant configs carry ``"pingIntervalS": null``."""
+    parsed = WebSocketConfig.model_validate({"pingIntervalS": None, "pingTimeoutS": None})
+    assert parsed.ping_interval_s is None
+    assert parsed.ping_timeout_s is None
+
+
+def test_ping_bounds_still_apply_when_a_value_is_given() -> None:
+    with pytest.raises(Exception):
+        WebSocketConfig.model_validate({"pingIntervalS": 1})
+
+
+# --------------------------------------------------------------------------
+# Guest command confinement (tech-lead review, P0-2)
+# --------------------------------------------------------------------------
+
+
+async def _room_guest(channel: WebSocketChannel) -> Any:
+    await channel._dispatch_http(
+        _Connection(),
+        _request(
+            "/auth/shared-rooms",
+            body={
+                "source_session_key": f"websocket:{OWNER_CHAT}",
+                "chat_id": ROOM_CHAT,
+                "room_id": ROOM_ID,
+                "title": "Shared conversation",
+                "owner_display_name": "Mihai",
+            },
+        ),
+    )
+    assert channel.rooms is not None
+    token, _ = channel.rooms.mint(
+        room_id=ROOM_ID,
+        chat_id=ROOM_CHAT,
+        participant_id="participant_" + "e" * 32,
+        display_name="Guest",
+        role="contributor",
+    )
+    connection = _Connection()
+    assert channel.gateway.endpoint.authorize_websocket_handshake(
+        connection, {"token": [token]}, None
+    ) is None
+    return connection
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "envelope",
+    [
+        {"type": "new_chat"},
+        {"type": "fork_chat", "chat_id": f"websocket:{OWNER_CHAT}"},
+        {"type": "attach", "chat_id": "22222222-3333-4444-5555-666666666666"},
+        {"type": "set_workspace_scope"},
+        {"type": "set_sidebar_state"},
+        {"type": "webui_request", "action": "session.delete"},
+        {"type": "new_temporary_chat"},
+    ],
+    ids=lambda e: e["type"] if isinstance(e, dict) else str(e),
+)
+async def test_a_guest_cannot_send_owner_commands(
+    channel: WebSocketChannel,
+    envelope: dict[str, Any],
+) -> None:
+    """new_chat / fork_chat / attach-elsewhere hydrate arbitrary sessions onto
+    the caller's socket. A guest must reach none of them."""
+    connection = await _room_guest(channel)
+    sent: list[dict[str, Any]] = []
+
+    async def _capture(conn: Any, event: str, **fields: Any) -> None:
+        sent.append({"event": event, **fields})
+
+    channel.webui_send_event = _capture  # type: ignore[assignment]
+    await channel._commands.dispatch(connection, "client-1", envelope)
+
+    assert sent, f"{envelope['type']} produced no rejection"
+    assert sent[0]["event"] == "error"
+    assert sent[0]["detail"] == "room scope violation"
+
+
+@pytest.mark.asyncio
+async def test_a_guest_may_attach_to_its_own_room(channel: WebSocketChannel) -> None:
+    connection = await _room_guest(channel)
+    sent: list[dict[str, Any]] = []
+
+    async def _capture(conn: Any, event: str, **fields: Any) -> None:
+        sent.append({"event": event, **fields})
+
+    channel.webui_send_event = _capture  # type: ignore[assignment]
+    await channel._commands.dispatch(
+        connection,
+        "client-1",
+        {"type": "attach", "chat_id": ROOM_CHAT},
+    )
+    assert [e["event"] for e in sent] == ["attached"]
+    assert sent[0]["chat_id"] == ROOM_CHAT
+
+
+@pytest.mark.asyncio
+async def test_a_normal_connection_keeps_every_command(
+    channel: WebSocketChannel,
+) -> None:
+    """The confinement must not touch owner/WebUI sockets."""
+    sent: list[dict[str, Any]] = []
+
+    async def _capture(conn: Any, event: str, **fields: Any) -> None:
+        sent.append({"event": event, **fields})
+
+    channel.webui_send_event = _capture  # type: ignore[assignment]
+    await channel._commands.dispatch(_Connection(), "client-1", {"type": "new_chat"})
+    assert [e["event"] for e in sent][:1] == ["attached"]

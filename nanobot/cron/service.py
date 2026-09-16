@@ -2,6 +2,7 @@
 
 import asyncio
 import errno
+import hashlib
 import json
 import os
 import time
@@ -191,6 +192,11 @@ class CronService:
         self._active_executions = 0
         self._store_dirty = False
         self.max_sleep_ms = max_sleep_ms
+        # MIT-1010: entries already written to a quarantine file. ``_load_jobs``
+        # runs on essentially every public call, so without this a single bad
+        # record produces one quarantine file and one ERROR line per reload,
+        # forever, on a runtime that never persists the store.
+        self._quarantined_digests: set[str] = set()
 
     def _should_persist_store(self) -> bool:
         """Return whether this instance currently owns the live store."""
@@ -240,10 +246,25 @@ class CronService:
         never block startup, so write errors are logged and swallowed -- the
         records are already reported at ERROR level below.
         """
+        fresh: list[tuple[Any, str, str]] = []
+        for raw, reason in entries:
+            try:
+                digest = hashlib.sha256(
+                    json.dumps(raw, sort_keys=True, default=str).encode()
+                ).hexdigest()
+            except (TypeError, ValueError):
+                digest = repr(raw)[:256]
+            if digest in self._quarantined_digests:
+                continue
+            self._quarantined_digests.add(digest)
+            fresh.append((raw, reason, digest))
+        if not fresh:
+            return
+
         path = self.store_path.with_suffix(
             self.store_path.suffix + f".quarantine-{int(time.time())}.jsonl"
         )
-        for raw, reason in entries:
+        for _raw, reason, _digest in fresh:
             logger.error(
                 "Cron: quarantined malformed job entry in {} ({}); preserved at {}",
                 self.store_path,
@@ -252,7 +273,7 @@ class CronService:
             )
         try:
             with open(path, "a", encoding="utf-8") as handle:
-                for raw, reason in entries:
+                for raw, reason, _digest in fresh:
                     handle.write(
                         json.dumps(
                             {"reason": reason, "entry": raw},

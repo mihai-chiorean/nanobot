@@ -16,6 +16,7 @@ Routing that the pre-0.3.0 payload carried in ``channel_meta`` (``work_chat_id``
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any, Protocol
 
 from loguru import logger
@@ -71,8 +72,15 @@ async def run_work_task_cron_job(
     job: CronJob,
     *,
     agent: WorkCronAgent,
+    deliver: Callable[[Any], Awaitable[None]] | None = None,
 ) -> str | None:
-    """Create the Work task for *job*, run it, and record the terminal status."""
+    """Create the Work task for *job*, run it, deliver it, and record the status.
+
+    ``deliver`` publishes the response to the originating channel. It is not
+    optional in practice: all four owner jobs are ``deliver: false`` at the cron
+    layer and ``process_direct`` does not publish, so without it a scheduled run
+    burns tokens, writes a Work row, and posts nothing.
+    """
     store = agent.work_store
     routing = work_routing(job)
     session_key = work_session_key(job)
@@ -177,6 +185,11 @@ async def run_work_task_cron_job(
         raise
     finally:
         reset_work_context(tokens)
+
+    # Deliver before recording terminal status, mirroring the snapshot: the
+    # owner sees the digest even if the bookkeeping write below fails.
+    if response is not None and deliver is not None and channel == "websocket":
+        await deliver(response)
 
     content = response.content if response is not None else None
     await store.run_io(

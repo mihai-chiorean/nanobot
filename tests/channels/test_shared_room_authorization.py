@@ -680,3 +680,57 @@ async def test_legacy_room_does_not_use_the_intent_path(
         {"room_intent": "discussion", "client_message_id": "c6", "content": "hi"},
     )
     assert handled is False
+
+
+# --------------------------------------------------------------------------
+# Subagents must not escape the room
+# --------------------------------------------------------------------------
+
+
+def test_a_subagent_inherits_the_rooms_scope() -> None:
+    """Without this a guest escapes the gate by spawning: the subagent's
+    RequestContext is built fresh and would carry no room scope at all."""
+    from nanobot.agent.subagent import _inherited_room_scope
+
+    with request_context(guest_request_context()):
+        inherited = _inherited_room_scope()
+    assert inherited is not None
+    assert inherited["chat_id"] == ROOM_CHAT
+    assert inherited["room_id"] == ROOM_ID
+
+
+def test_no_room_scope_is_inherited_outside_a_room() -> None:
+    from nanobot.agent.subagent import _inherited_room_scope
+
+    with request_context(RequestContext(channel="websocket", chat_id=OWNER_CHAT)):
+        assert _inherited_room_scope() is None
+    assert _inherited_room_scope() is None
+
+
+def test_an_inherited_scope_still_blocks_denied_tools() -> None:
+    """End-to-end: the scope a subagent inherits gates its tools too."""
+    from nanobot.agent.subagent import _inherited_room_scope
+
+    with request_context(guest_request_context()):
+        inherited = _inherited_room_scope()
+
+    registry = ToolRegistry()
+    registry.register(_StubTool("read_session"))
+    subagent_ctx = RequestContext(
+        channel="websocket",
+        chat_id=ROOM_CHAT,
+        metadata={INBOUND_META_ROOM_SCOPE: inherited},
+    )
+    with request_context(subagent_ctx):
+        _tool, _params, error = registry.prepare_call("read_session", {})
+    assert isinstance(error, ToolResult) and error.is_error
+
+
+def test_fan_out_tools_are_denied_in_a_room() -> None:
+    registry = ToolRegistry()
+    for name in ("spawn", "long_task"):
+        registry.register(_StubTool(name))
+    with request_context(guest_request_context()):
+        for name in ("spawn", "long_task"):
+            _tool, _params, error = registry.prepare_call(name, {})
+            assert isinstance(error, ToolResult) and error.is_error, name
