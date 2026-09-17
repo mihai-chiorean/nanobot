@@ -271,8 +271,8 @@ def test_recall_tool_is_not_offered_without_an_index(tmp_path):
     class _Ctx:
         config = type("_Cfg", (), {"memory": MemoryToolConfig()})()
         sessions = bare
-        workspace = str(workspace)
 
+    _Ctx.workspace = str(workspace)
     assert RecallTool.enabled(_Ctx()) is False
 
     manager, _ = _manager(tmp_path, "owner")
