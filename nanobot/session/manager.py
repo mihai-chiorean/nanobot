@@ -523,6 +523,14 @@ class SessionRestoreResult:
     conflicts: tuple[Path, ...]
 
 
+class SessionIndexer(Protocol):
+    """Derived index fed by the durable session write path (Ziggy-local)."""
+
+    def on_session_saved(self, session: "Session") -> None: ...
+
+    def on_session_deleted(self, key: str) -> None: ...
+
+
 class SessionStore(Protocol):
     def load(self, key: str) -> Session | None: ...
 
@@ -576,6 +584,7 @@ class JsonlSessionStore:
                 canonical_workspace,
                 workspace_id,
             )
+            self.workspace_id = workspace_id
             self.sessions_dir = ensure_dir(root / workspace_id)
             self.legacy_sessions_dir = get_legacy_sessions_dir()
             self._session_files_lock = FileLock(
@@ -1655,7 +1664,11 @@ class SessionManager:
         self._jsonl_store = JsonlSessionStore(workspace, sessions_root=sessions_root)
         self._store: SessionStore = store if store is not None else self._jsonl_store
         self.sessions_dir = self._jsonl_store.sessions_dir
+        self.workspace_id = self._jsonl_store.workspace_id
         self.legacy_sessions_dir = self._jsonl_store.legacy_sessions_dir
+        # Ziggy-local (fork, MIT-1013): the recall index is fed from the durable
+        # save path, so ingestion cannot depend on the model asking for it.
+        self._indexer: SessionIndexer | None = None
         self._cache: OrderedDict[str, Session] = OrderedDict()
         # Preserve identity for sessions held by active callers without retaining idle ones.
         self._overflow_cache: WeakValueDictionary[str, Session] = WeakValueDictionary()
@@ -1689,6 +1702,19 @@ class SessionManager:
     def set_delete_observer(self, observer: Callable[[str], None]) -> None:
         """Observe explicit session deletion for process-local state cleanup."""
         self._delete_observer = observer
+
+    def set_indexer(self, indexer: "SessionIndexer | None") -> None:
+        """Attach the recall indexer fed by every durable session write.
+
+        Ziggy-local (fork, MIT-1013). ``save`` and ``delete_session`` are the
+        only durable entrypoints, so observing them here is what makes recall
+        ingestion automatic instead of model-invoked.
+        """
+        self._indexer = indexer
+
+    @property
+    def indexer(self) -> "SessionIndexer | None":
+        return self._indexer
 
     @staticmethod
     def safe_key(key: str) -> str:
@@ -1790,6 +1816,12 @@ class SessionManager:
 
         self._store.save(session, fsync=fsync)
         self._remember(session)
+        if self._indexer is not None:
+            # Indexing is derived bookkeeping: it must never fail a turn.
+            try:
+                self._indexer.on_session_saved(session)
+            except Exception:
+                logger.exception("Recall index update failed for {}", session.key)
 
     def save_runtime_checkpoint(self, session: Session) -> None:
         """Persist volatile recovery state without rewriting long history."""
@@ -1873,6 +1905,11 @@ class SessionManager:
         deleted = self._store.delete(key)
         if self._delete_observer is not None:
             self._delete_observer(key)
+        if self._indexer is not None:
+            try:
+                self._indexer.on_session_deleted(key)
+            except Exception:
+                logger.exception("Recall index delete failed for {}", key)
         return deleted
 
     def restore_sessions_to_workspace(self) -> SessionRestoreResult:

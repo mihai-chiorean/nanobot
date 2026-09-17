@@ -78,50 +78,27 @@ async def test_ordinary_writes_still_work(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# ingest reads file contents into the RAG store, where recall hands them back
-# to the model. Registration used to be a try/except in loop.py; upstream's
-# auto-discovering ToolLoader widened that to "registered whenever chromadb is
-# importable", so the containment bound and the blocklist both matter more.
+# `ingest` was removed with the ChromaDB RAG store (MIT-1013). It was the only
+# writer that store ever had, it was model-invoked, and nothing ever called it.
+# These two tests used to pin its containment bound and its credential
+# blocklist; what has to hold now is that the tool is gone and that the
+# replacement never reads arbitrary paths on the model's say-so.
 # ---------------------------------------------------------------------------
 
 
-def test_ingest_tool_honours_restrict_to_workspace():
-    from nanobot.agent.tools.recall import IngestTool
+def test_ingest_tool_is_gone():
+    import nanobot.agent.tools.recall as recall_module
 
-    workspace = Path(tempfile.mkdtemp())
-
-    class _Cfg:
-        restrict_to_workspace = True
-
-    class _Ctx:
-        config = _Cfg()
-
-    _Ctx.workspace = str(workspace)
-    tool = IngestTool.create(_Ctx())
-    assert tool._allowed_dir == workspace
-
-    class _CfgOpen:
-        restrict_to_workspace = False
-
-    class _CtxOpen:
-        config = _CfgOpen()
-
-    _CtxOpen.workspace = str(workspace)
-    assert IngestTool.create(_CtxOpen())._allowed_dir is None
+    assert not hasattr(recall_module, "IngestTool")
+    assert not hasattr(recall_module, "RAGStore")
 
 
-@pytest.mark.parametrize(
-    "target",
-    ["~/.ssh/id_rsa", "~/.aws/credentials", "credentials.json", "certs/server.pem"],
-)
-async def test_ingest_refuses_sensitive_paths(tmp_path, target):
-    from nanobot.agent.tools.recall import IngestTool
+def test_recall_tool_takes_no_path_argument():
+    """Recall searches an index bound to this workspace; it opens no files."""
+    from nanobot.agent.tools.recall import RecallTool
 
-    tool = IngestTool(workspace=tmp_path, allowed_dir=None)
-    # Stub the store so the test does not require chromadb.
-    tool._rag = object()
-    result = await tool.execute(path=target)
-    assert "blocked (sensitive path" in str(result), result
+    properties = RecallTool.parameters.fget(RecallTool.__new__(RecallTool))["properties"]
+    assert set(properties) == {"query", "scope", "limit"}
 
 
 # ---------------------------------------------------------------------------

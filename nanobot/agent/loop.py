@@ -34,6 +34,7 @@ from nanobot.agent.hook import (
     AgentTurnHookFactory,
 )
 from nanobot.agent.memory import Consolidator
+from nanobot.agent.memory_index import MemoryIndex, SessionRecallIndexer
 from nanobot.agent.model_runtime import ModelRuntimeResolver
 from nanobot.agent.runner import (
     _MAX_INJECTIONS_PER_TURN,
@@ -440,6 +441,7 @@ class AgentLoop:
         local_trigger_store: LocalTriggerStore | None = None,
         idle_compact_check_interval_seconds: int = 0,
         recovery_admission: RecoveryAdmission | None = None,
+        memory_index_enabled: bool = True,
     ):
         from nanobot.config.schema import ToolsConfig
 
@@ -528,6 +530,22 @@ class AgentLoop:
         # WebUI and fork rollback paths.  Observe that boundary once instead of
         # duplicating cleanup in each consumer.
         self.sessions.set_delete_observer(self._file_state_store.discard)
+        # Ziggy-local (fork, MIT-1013): recall is only real if something writes
+        # to it without being asked. The index lives inside this workspace's own
+        # session namespace, so it is per-tenant by construction and is covered
+        # by whatever already backs up and deletes that namespace.
+        self.memory_index: MemoryIndex | None = None
+        self._recall_indexer: SessionRecallIndexer | None = None
+        if memory_index_enabled:
+            try:
+                self.memory_index = MemoryIndex(self.sessions.sessions_dir)
+                self._recall_indexer = SessionRecallIndexer(self.memory_index)
+                self.sessions.set_indexer(self._recall_indexer)
+                self.context.memory.set_recall_indexer(self._recall_indexer)
+            except Exception:
+                logger.exception("Recall index could not be initialised")
+                self.memory_index = None
+                self._recall_indexer = None
         self.tools = tool_registry if tool_registry is not None else ToolRegistry()
         self._exec_session_manager = ExecSessionManager()
         self.runner = AgentRunner()

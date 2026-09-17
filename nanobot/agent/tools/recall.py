@@ -1,67 +1,102 @@
-"""Recall and ingest tools backed by the RAG semantic store."""
+"""The ``recall`` tool: search this workspace's own conversation history.
+
+Ziggy-local (fork, MIT-1013). This replaces a ChromaDB-backed implementation
+that never returned anything. The old version depended on a second tool,
+``ingest``, which the model had to choose to call on a directory of files;
+nothing ever called it, no vector store was ever created on the host, and
+``recall`` answered "no results" for every tenant for the life of the
+deployment without ever erroring.
+
+Two things changed. Ingestion is now automatic — the index is written from
+:meth:`SessionManager.save`, so it is current whether or not the model thinks
+about memory. And ``ingest`` is gone: with automatic ingestion it has no job
+left, and a model-invoked "read this directory into permanent memory" primitive
+is a liability, not a feature.
+"""
 
 from __future__ import annotations
 
-import json
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from loguru import logger
+from pydantic import BaseModel, Field
 
+from nanobot.agent.memory_index import KINDS, MemoryIndex, render_hits
 from nanobot.agent.tools.base import Tool, ToolResult
-from nanobot.utils.sensitive import is_sensitive_path
 
 if TYPE_CHECKING:
     from nanobot.agent.tools.context import ToolContext
 
-_SUPPORTED_SUFFIXES = {
-    ".md", ".txt", ".py", ".json",
-    ".pdf", ".docx", ".doc",
-    ".csv", ".html", ".htm", ".xml",
-    ".yaml", ".yml", ".rst", ".log",
-}
+
+class MemoryToolConfig(BaseModel):
+    """Off-switch for conversation recall.
+
+    The fork keeps an explicit knob because the 0.3.0 upgrade removed
+    ``tools.rag`` and let RAG auto-register from a bare ``import chromadb``
+    (cutover memo C13). Every tenant generator that wants recall off needs a
+    key that actually exists in the schema.
+    """
+
+    enable: bool = True
+    max_results: int = Field(default=5, ge=1, le=10)
+
+
+_SCOPES = {"all", *KINDS}
 
 
 class RecallTool(Tool):
-    """Semantic search across RAG collections (conversations, documents, knowledge)."""
+    """Keyword search over this workspace's conversations and curated memory."""
+
+    config_key = "memory"
 
     @classmethod
     def enabled(cls, ctx: "ToolContext") -> bool:
-        """Only register when the optional ``ziggy`` extra (chromadb) is installed.
+        if not bool(getattr(getattr(ctx.config, "memory", None), "enable", True)):
+            return False
+        # Only offer the tool when a real index is attached. A capability that
+        # is present but inert is worse than one that is absent: the model
+        # spends a turn on it and concludes the user has no history.
+        return cls._index_for(ctx) is not None
 
-        Ziggy-local (fork): RAG is behind ``pip install nanobot-ai[ziggy]``.
-        Upstream's ToolLoader auto-discovers every Tool subclass in this
-        package, so this gate is what keeps a chromadb-less install clean.
-        """
-        import importlib.util
-
-        return importlib.util.find_spec("chromadb") is not None
+    @staticmethod
+    def _index_for(ctx: "ToolContext") -> MemoryIndex | None:
+        sessions = getattr(ctx, "sessions", None)
+        indexer = getattr(sessions, "indexer", None) if sessions is not None else None
+        index = getattr(indexer, "index", None)
+        return index if isinstance(index, MemoryIndex) else None
 
     @classmethod
     def create(cls, ctx: "ToolContext") -> Tool:
-        return cls(workspace=Path(ctx.workspace))
+        # The index is taken from the SessionManager this agent was built with,
+        # never from a path. A tool therefore cannot be pointed at another
+        # workspace's memory even if its arguments say otherwise.
+        index = cls._index_for(ctx)
+        if index is None:
+            raise RuntimeError("recall requires an attached memory index")
+        limit = int(getattr(getattr(ctx.config, "memory", None), "max_results", 5))
+        return cls(index=index, default_limit=limit)
 
-    def __init__(self, workspace: Path) -> None:
-        self._workspace = workspace
-        self._rag: Any = None  # lazy: nanobot.agent.rag.RAGStore
-
-    def _get_rag(self):
-        if self._rag is None:
-            from nanobot.agent.rag import RAGStore
-            self._rag = RAGStore(self._workspace)
-        return self._rag
+    def __init__(self, index: MemoryIndex, *, default_limit: int = 5) -> None:
+        self._index = index
+        self._default_limit = default_limit
 
     @property
     def name(self) -> str:
         return "recall"
 
     @property
+    def read_only(self) -> bool:
+        return True
+
+    @property
     def description(self) -> str:
         return (
-            "Semantic search over long-term memory: past conversations, ingested documents, "
-            "and extracted knowledge facts. Use this to find things like 'what did we discuss "
-            "about GPUs last week?' or 'find notes about deployment'. "
-            "Scope can be 'all', 'conversations', 'documents', or 'knowledge'."
+            "Search your own past conversations with this user, plus their "
+            "long-term memory notes. Use it when they refer to something from "
+            "before that is not in the current conversation — 'what did we "
+            "decide about X', 'that thing I mentioned last month', a name or "
+            "number you no longer have in context. Searches by keyword, so "
+            "include the distinctive words the user used."
         )
 
     @property
@@ -71,24 +106,26 @@ class RecallTool(Tool):
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Natural-language search query.",
+                    "description": (
+                        "What to look for. Include distinctive words — names, "
+                        "projects, places — rather than a full sentence."
+                    ),
                 },
                 "scope": {
                     "type": "string",
-                    "enum": ["all", "conversations", "documents", "knowledge"],
+                    "enum": sorted(_SCOPES),
                     "description": (
-                        "Which collection to search. "
-                        "'all' searches everywhere (default). "
-                        "'conversations' finds past chat segments. "
-                        "'documents' searches ingested files. "
-                        "'knowledge' searches extracted facts."
+                        "'all' (default) searches everything. 'conversation' "
+                        "searches past chat turns. 'fact' searches long-term "
+                        "memory notes. 'history' searches consolidation "
+                        "summaries of older conversations."
                     ),
                 },
-                "n_results": {
+                "limit": {
                     "type": "integer",
-                    "description": "Number of results to return (default 5, max 20).",
+                    "description": "How many excerpts to return (1-10, default 5).",
                     "minimum": 1,
-                    "maximum": 20,
+                    "maximum": 10,
                 },
             },
             "required": ["query"],
@@ -98,222 +135,24 @@ class RecallTool(Tool):
         self,
         query: str,
         scope: str = "all",
-        n_results: int = 5,
+        limit: int | None = None,
         **kwargs: Any,
     ) -> str:
-        try:
-            rag = self._get_rag()
-        except RuntimeError as exc:
-            return ToolResult.error(f"Error: {exc}")
-
-        valid_scopes = {"all", "conversations", "documents", "knowledge"}
-        if scope not in valid_scopes:
-            return ToolResult.error(f"Error: invalid scope '{scope}'. Must be one of: {', '.join(sorted(valid_scopes))}")
-
-        collection = None if scope == "all" else scope
-        n = min(max(n_results, 1), 20)
-
-        try:
-            results = rag.search(query=query, n_results=n, collection=collection)
-        except Exception as exc:
-            logger.exception("recall tool: search failed")
-            return ToolResult.error(f"Error performing semantic search: {exc}")
-
-        if not results:
-            return f"No results found for: {query!r} (scope={scope})"
-
-        lines = [f"Semantic recall: {len(results)} result(s) for {query!r} (scope={scope})\n"]
-        for i, r in enumerate(results, 1):
-            meta = r.get("metadata", {})
-            coll = r.get("collection", "?")
-            dist = r.get("distance", 0.0)
-            content = r.get("content", "")
-
-            # Build a compact metadata summary for the agent.
-            meta_parts: list[str] = [f"collection={coll}"]
-            if ts := meta.get("timestamp", "")[:16]:
-                meta_parts.append(f"time={ts}")
-            if src := meta.get("source") or meta.get("path") or meta.get("session_id"):
-                meta_parts.append(f"source={src}")
-            meta_parts.append(f"similarity={1 - dist:.2f}")
-
-            lines.append(f"[{i}] {' | '.join(meta_parts)}")
-            # Indent content for readability.
-            for content_line in content.splitlines():
-                lines.append(f"    {content_line}")
-            lines.append("")
-
-        return "\n".join(lines).rstrip()
-
-
-class IngestTool(Tool):
-    """Ingest a file or directory into the RAG semantic store."""
-
-    @classmethod
-    def enabled(cls, ctx: "ToolContext") -> bool:
-        """Only register when the optional ``ziggy`` extra (chromadb) is installed.
-
-        Ziggy-local (fork): RAG is behind ``pip install nanobot-ai[ziggy]``.
-        Upstream's ToolLoader auto-discovers every Tool subclass in this
-        package, so this gate is what keeps a chromadb-less install clean.
-        """
-        import importlib.util
-
-        return importlib.util.find_spec("chromadb") is not None
-
-    @classmethod
-    def create(cls, ctx: "ToolContext") -> Tool:
-        # Ziggy-local (fork): honour restrict_to_workspace. The pre-merge
-        # registration hardcoded allowed_dir=None, which disabled the only
-        # containment check in the tool; upstream's auto-discovering loader
-        # then widened that from "registered by loop.py" to "registered
-        # whenever chromadb is importable", so it needs the real bound.
-        workspace = Path(ctx.workspace)
-        restrict = bool(getattr(ctx.config, "restrict_to_workspace", False))
-        return cls(workspace=workspace, allowed_dir=workspace if restrict else None)
-
-    def __init__(self, workspace: Path, allowed_dir: Path | None = None) -> None:
-        self._workspace = workspace
-        self._allowed_dir = allowed_dir
-        self._rag: Any = None  # lazy: nanobot.agent.rag.RAGStore
-
-    def _get_rag(self):
-        if self._rag is None:
-            from nanobot.agent.rag import RAGStore
-            self._rag = RAGStore(self._workspace)
-        return self._rag
-
-    @property
-    def name(self) -> str:
-        return "ingest"
-
-    @property
-    def description(self) -> str:
-        return (
-            "Ingest a file or directory into the RAG semantic store so its contents "
-            "can be found later via the recall tool. "
-            f"Supported file types: {', '.join(sorted(_SUPPORTED_SUFFIXES))}. "
-            "For directories, all matching files are ingested recursively."
-        )
-
-    @property
-    def parameters(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Absolute or workspace-relative path to a file or directory.",
-                },
-                "glob": {
-                    "type": "string",
-                    "description": (
-                        "Glob pattern for directory ingestion (default '**/*.md'). "
-                        "Only used when path is a directory."
-                    ),
-                },
-            },
-            "required": ["path"],
-        }
-
-    async def execute(self, path: str, glob: str = "**/*.md", **kwargs: Any) -> str:
-        try:
-            rag = self._get_rag()
-        except RuntimeError as exc:
-            return ToolResult.error(f"Error: {exc}")
-
-        target = Path(path).expanduser()
-        if not target.is_absolute():
-            target = self._workspace / target
-        target = target.resolve()
-
-        if self._allowed_dir is not None:
-            allowed = self._allowed_dir.resolve()
-            try:
-                target.relative_to(allowed)
-            except ValueError:
-                return ToolResult.error(f"Error: path {path} is outside the allowed directory ({allowed})")
-
-        # Ziggy-local (fork, MIT-121): ingest reads file contents into the RAG
-        # store, where `recall` can hand them straight back to the model, so
-        # it needs the same credential/key blocklist as read_file. Checked on
-        # the raw input and the resolved path.
-        if is_sensitive_path(path) or is_sensitive_path(target):
+        if not query or not query.strip():
+            return ToolResult.error("Error: query must not be empty.")
+        if scope not in _SCOPES:
             return ToolResult.error(
-                f"Error: Ingesting {path} is blocked (sensitive path — credentials or key material)."
+                f"Error: invalid scope {scope!r}. Must be one of: "
+                f"{', '.join(sorted(_SCOPES))}"
             )
-
-        if not target.exists():
-            return ToolResult.error(f"Error: path does not exist: {path}")
-
+        kinds = None if scope == "all" else [scope]
         try:
-            if target.is_dir():
-                count = rag.ingest_directory(target, glob=glob)
-                return (
-                    f"Ingested {count} file(s) from {target} into the RAG store. "
-                    "Use recall to search the content."
-                )
-
-            # Single file.
-            if target.suffix not in _SUPPORTED_SUFFIXES:
-                return ToolResult.error(
-                    f"Error: unsupported file type '{target.suffix}'. "
-                    f"Supported: {', '.join(sorted(_SUPPORTED_SUFFIXES))}"
-                )
-
-            # --- Extract text based on file type ---
-            suffix = target.suffix.lower()
-
-            if suffix == ".pdf":
-                try:
-                    import pdfplumber
-                except ImportError:
-                    return ToolResult.error(
-                        "Error: pdfplumber is not installed. "
-                        "Run: pip install pdfplumber"
-                    )
-                pages_text: list[str] = []
-                with pdfplumber.open(target) as pdf:
-                    for page in pdf.pages:
-                        page_text = page.extract_text()
-                        if page_text:
-                            pages_text.append(page_text)
-                content = "\n\n".join(pages_text)
-
-            elif suffix in (".docx", ".doc"):
-                try:
-                    import docx as python_docx
-                except ImportError:
-                    return ToolResult.error(
-                        "Error: python-docx is not installed. "
-                        "Run: pip install python-docx"
-                    )
-                doc = python_docx.Document(str(target))
-                content = "\n\n".join(
-                    para.text for para in doc.paragraphs if para.text.strip()
-                )
-
-            elif suffix == ".csv":
-                content = target.read_text(encoding="utf-8", errors="replace")
-
-            else:
-                # All other text-based formats (.md, .txt, .py, .json,
-                # .html, .htm, .xml, .yaml, .yml, .rst, .log)
-                content = target.read_text(encoding="utf-8", errors="replace")
-
-            if not content.strip():
-                return f"Warning: file {path} is empty, nothing ingested."
-
-            rag.add_document(
-                path=str(target),
-                content=content,
-                metadata={"source": "manual_ingest", "filename": target.name},
+            hits = self._index.search(
+                query,
+                limit=limit or self._default_limit,
+                kinds=kinds,
             )
-            return (
-                f"Ingested {target.name} ({len(content)} chars, "
-                f"{len(content.split())} words) into the RAG store. "
-                "Use recall to search the content."
-            )
-        except Exception as exc:
-            logger.exception("ingest tool: failed for {}", path)
-            return ToolResult.error(f"Error ingesting {path}: {exc}")
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("recall: search failed")
+            return ToolResult.error(f"Error searching memory: {exc}")
+        return render_hits(hits, query)
