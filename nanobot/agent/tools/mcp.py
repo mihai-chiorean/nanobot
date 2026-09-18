@@ -1360,6 +1360,9 @@ def _load_current_servers(workspace: Path | None = None) -> dict[str, MCPServerC
 # draining reload before it gives up and starts anyway.  Both are bounded on
 # purpose: neither side may pin the other indefinitely.
 RELOAD_DRAIN_TIMEOUT_SECONDS = 5.0
+# Must stay strictly greater than the drain: a nested run that calls
+# begin_turn() from inside a turn the drain is waiting on would otherwise give
+# up before the reload it is waiting for could finish.
 _TURN_GATE_TIMEOUT_SECONDS = 10.0
 
 
@@ -1620,6 +1623,11 @@ class MCPProvider:
         Concurrent reloads (the config watcher and the WebUI settings route can
         overlap) nest: the gate stays closed until the last of them has
         finished swapping.
+
+        Only reloads that remove or change a live server drain at all; adding a
+        server or retrying a failed connection unregisters nothing and skips
+        the wait entirely.  And only runs that carry ``_MCPReadinessHook``
+        register themselves, so ephemeral runs are invisible to the drain.
         """
         if not self._reload_would_disturb_turns():
             # Nothing is being unregistered or closed, so no turn can lose a
@@ -1664,7 +1672,7 @@ class MCPProvider:
     async def _reload_locked(self, drained: bool) -> dict[str, Any]:
         async with self._lock:
             if self._closing:
-                return self._closing_result()
+                return self._closing_result(drained)
             try:
                 next_servers = dict(self._server_loader())
             except Exception as exc:
@@ -1727,7 +1735,7 @@ class MCPProvider:
                     raise
                 if self._closing:
                     await _close_mcp_connections(connected)
-                    return self._closing_result()
+                    return self._closing_result(drained)
                 self._connections.update(connected)
                 self._record_connection_result(to_connect, connected)
                 self._attach_reconnect_handlers(connected)
@@ -1774,11 +1782,12 @@ class MCPProvider:
             }
 
     @staticmethod
-    def _closing_result() -> dict[str, Any]:
+    def _closing_result(drained: bool = True) -> dict[str, Any]:
         return {
             "ok": False,
             "message": "MCP connections are shutting down.",
             "requires_restart": True,
+            "drained": drained,
         }
 
     def _attach_reconnect_handlers(self, server_names: Iterable[str]) -> None:
@@ -1859,7 +1868,13 @@ class MCPProvider:
         await _close_mcp_connection(server_name, connection)
 
     async def aclose(self) -> None:
-        """Close every connection while excluding reconnect and hot reload."""
+        """Close every connection while excluding reconnect and hot reload.
+
+        Deliberately does *not* drain in-flight turns the way ``reload()``
+        does.  Shutdown has already cancelled and awaited the runtime's tasks
+        by the time this runs, and a turn whose output nobody will see is not
+        worth delaying an exit for.
+        """
         self._closing = True
         async with self._lock:
             connections = dict(self._connections)
