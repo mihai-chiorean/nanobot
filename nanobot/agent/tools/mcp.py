@@ -1387,7 +1387,10 @@ class MCPProvider:
         self._active_turns: set[object] = set()
         self._turns_idle = asyncio.Event()
         self._turns_idle.set()
-        self._reload_draining = False
+        # A depth, not a flag: the config watcher and the WebUI settings route
+        # can reload concurrently, and a flag would let whichever finished
+        # first reopen the gate while the other was still draining.
+        self._reload_drain_depth = 0
         self._reload_gate = asyncio.Event()
         self._reload_gate.set()
 
@@ -1425,14 +1428,20 @@ class MCPProvider:
 
         Returns a token the caller must hand back to :meth:`end_turn`.
         """
-        if self._reload_draining:
-            try:
-                await asyncio.wait_for(self._reload_gate.wait(), timeout=gate_timeout_s)
-            except (TimeoutError, asyncio.TimeoutError):
-                logger.warning(
-                    "MCP reload gate still closed after {}s; starting the turn anyway",
-                    gate_timeout_s,
-                )
+        if self._reload_drain_depth:
+            deadline = asyncio.get_running_loop().time() + gate_timeout_s
+            while self._reload_drain_depth:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    logger.warning(
+                        "MCP reload gate still closed after {}s; starting the turn anyway",
+                        gate_timeout_s,
+                    )
+                    break
+                try:
+                    await asyncio.wait_for(self._reload_gate.wait(), timeout=remaining)
+                except (TimeoutError, asyncio.TimeoutError):
+                    continue
         # No await between here and the add, so the gate check and the
         # registration cannot be interleaved with a reload starting its drain.
         token = object()
@@ -1607,15 +1616,21 @@ class MCPProvider:
         The lock is never held across a turn.  The drain runs outside it, so an
         in-flight turn whose MCP session terminates can still take the lock via
         the reconnect path and finish.
+
+        Concurrent reloads (the config watcher and the WebUI settings route can
+        overlap) nest: the gate stays closed until the last of them has
+        finished swapping.
         """
-        self._reload_draining = True
+        self._reload_drain_depth += 1
         self._reload_gate.clear()
         try:
             drained = await self._drain_active_turns(drain_timeout_s)
             return await self._reload_locked(drained)
         finally:
-            self._reload_draining = False
-            self._reload_gate.set()
+            self._reload_drain_depth -= 1
+            if self._reload_drain_depth <= 0:
+                self._reload_drain_depth = 0
+                self._reload_gate.set()
 
     async def _reload_locked(self, drained: bool) -> dict[str, Any]:
         async with self._lock:

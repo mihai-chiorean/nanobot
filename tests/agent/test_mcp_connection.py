@@ -903,8 +903,45 @@ async def test_begin_turn_gives_up_waiting_rather_than_wedging_the_runtime(
     registry = ToolRegistry()
     provider = MCPProvider({}, registry, server_loader=dict)
 
-    provider._reload_draining = True  # simulate a reload that died without cleanup
+    provider._reload_drain_depth = 1  # simulate a reload that died without cleanup
     provider._reload_gate.clear()
 
     token = await asyncio.wait_for(provider.begin_turn(gate_timeout_s=0.05), timeout=5.0)
     provider.end_turn(token)
+
+
+@pytest.mark.asyncio
+async def test_overlapping_reloads_keep_the_turn_gate_closed(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The watcher and the WebUI settings route can both reload at once.
+
+    A boolean flag would let whichever reload finished first reopen the gate
+    while the other was still draining, reopening the very window the drain
+    exists to close.
+    """
+    _reload_probe(monkeypatch)
+    configured: dict[str, MCPServerConfig] = {
+        "browserbase": MCPServerConfig(type="stdio", command="browserbase-mcp")
+    }
+    registry = ToolRegistry()
+    provider = MCPProvider({}, registry, server_loader=lambda: configured)
+    await provider.reload()
+
+    held = await provider.begin_turn()
+    configured = {"browserbase": MCPServerConfig(type="stdio", command="v2")}
+
+    slow = asyncio.create_task(provider.reload(drain_timeout_s=5.0))
+    quick = asyncio.create_task(provider.reload(drain_timeout_s=0.05))
+    await asyncio.wait_for(quick, timeout=5.0)
+    await asyncio.sleep(0.05)
+
+    late = asyncio.create_task(provider.begin_turn())
+    await asyncio.sleep(0.05)
+    assert not late.done(), (
+        "the finished reload reopened the gate while another was still draining"
+    )
+
+    provider.end_turn(held)
+    await asyncio.wait_for(slow, timeout=5.0)
+    provider.end_turn(await asyncio.wait_for(late, timeout=5.0))
