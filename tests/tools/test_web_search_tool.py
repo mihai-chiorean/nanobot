@@ -985,7 +985,10 @@ def test_pinned_backend_resolves_to_duckduckgo_only_inside_ddgs():
     raising, so a typo would quietly restore the fan-out while every
     mock-based test above kept passing. Assert against the installed registry.
     """
-    ddgs_module = pytest.importorskip("ddgs")
+    # ddgs is a hard runtime dependency (pyproject: ddgs>=9.5.5,<10.0.0), so
+    # this must never degrade to a skip — it is the only test that would catch
+    # a registry rename silently restoring the fan-out in production.
+    import ddgs as ddgs_module
     from ddgs.engines import ENGINES
 
     from nanobot.agent.tools.web import _DDGS_TEXT_BACKEND
@@ -1004,3 +1007,33 @@ def test_pinned_backend_resolves_to_duckduckgo_only_inside_ddgs():
 
     # Positive control: the default really is a fan-out, so the pin matters.
     assert len(client._get_engines("text", "auto")) > 1
+
+
+@pytest.mark.asyncio
+async def test_pinned_backend_refusal_surfaces_as_a_tool_error(monkeypatch):
+    """A pinned engine that refuses us must be loud, not silently empty.
+
+    ddgs never returns an empty list — `_search_sync` raises DDGSException
+    when no engine produced results — so the "No results for:" branch is
+    unreachable and the real path is the `except`. This matters in
+    production: html.duckduckgo.com answers HTTP 202 (an anti-scraping
+    challenge) from some egress, and the honest outcome is a tool error the
+    model can report, not a quiet "nothing found" that reads like a fact
+    about the world.
+    """
+    from ddgs.exceptions import DDGSException
+
+    class RefusingDDGS:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def text(self, query, **kwargs):
+            assert kwargs.get("backend") == "duckduckgo"
+            raise DDGSException("No results found.")
+
+    monkeypatch.setattr("ddgs.DDGS", RefusingDDGS)
+
+    result = await _tool(provider="duckduckgo").execute("anything", count=3)
+
+    assert is_tool_error_result(result)
+    assert "DuckDuckGo search failed" in result
