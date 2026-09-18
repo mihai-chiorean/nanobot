@@ -604,3 +604,118 @@ async def test_a_normal_connection_keeps_every_command(
     channel.webui_send_event = _capture  # type: ignore[assignment]
     await channel._commands.dispatch(_Connection(), "client-1", {"type": "new_chat"})
     assert [e["event"] for e in sent][:1] == ["attached"]
+
+
+# --------------------------------------------------------------------------
+# Revocation must not promote a guest to owner (PR review, C1)
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_revoking_a_guest_does_not_promote_it_to_owner(
+    channel: WebSocketChannel,
+) -> None:
+    """store.revoke() used to delete the credential while the socket close was
+    fire-and-forget. In that window room_credential() returned None, so the
+    guest allow-list was skipped and effective_room_credential fell through to
+    owner_credential with role="owner"."""
+    connection = await _room_guest(channel)
+    assert channel.room_credential(connection) is not None
+
+    assert channel.rooms is not None
+    channel.rooms.revoke(room_id=ROOM_ID, chat_id=ROOM_CHAT)
+
+    # Still resolvable as a guest, and explicitly marked revoked.
+    assert channel.rooms.is_revoked(connection) is True
+    assert channel.room_credential(connection) is not None
+
+    # The scope it now mints denies everything; it is not an owner scope.
+    metadata = channel.room_turn_metadata(connection, ROOM_CHAT)
+    scope = metadata["_room_scope"]
+    assert scope["role"] != "owner"
+    assert scope["chat_id"] == ""
+
+    # And the command allow-list still applies.
+    sent: list[dict[str, Any]] = []
+
+    async def _capture(conn: Any, event: str, **fields: Any) -> None:
+        sent.append({"event": event, **fields})
+
+    channel.webui_send_event = _capture  # type: ignore[assignment]
+    await channel._commands.dispatch(
+        connection,
+        "client-1",
+        {"type": "attach", "chat_id": f"websocket:{OWNER_CHAT}"},
+    )
+    assert sent and sent[0]["detail"] == "room scope violation"
+
+
+@pytest.mark.asyncio
+async def test_a_revoked_guest_cannot_even_attach_to_its_own_room(
+    channel: WebSocketChannel,
+) -> None:
+    connection = await _room_guest(channel)
+    assert channel.rooms is not None
+    channel.rooms.revoke(room_id=ROOM_ID, chat_id=ROOM_CHAT)
+
+    sent: list[dict[str, Any]] = []
+
+    async def _capture(conn: Any, event: str, **fields: Any) -> None:
+        sent.append({"event": event, **fields})
+
+    channel.webui_send_event = _capture  # type: ignore[assignment]
+    await channel._commands.dispatch(
+        connection,
+        "client-1",
+        {"type": "attach", "chat_id": ROOM_CHAT},
+    )
+    assert sent and sent[0]["detail"] == "room scope violation"
+
+
+@pytest.mark.asyncio
+async def test_the_revoke_route_awaits_the_socket_close(
+    channel: WebSocketChannel,
+) -> None:
+    """A fire-and-forget close leaves a window where the socket is open."""
+    closed: list[tuple[int, str]] = []
+
+    class _Closable(_Connection):
+        async def close(self, *, code: int = 1000, reason: str = "") -> None:
+            closed.append((code, reason))
+
+    connection = _Closable()
+    assert channel.rooms is not None
+    await channel._dispatch_http(
+        _Connection(),
+        _request(
+            "/auth/shared-rooms",
+            body={
+                "source_session_key": f"websocket:{OWNER_CHAT}",
+                "chat_id": ROOM_CHAT,
+                "room_id": ROOM_ID,
+                "title": "Shared conversation",
+                "owner_display_name": "Mihai",
+            },
+        ),
+    )
+    token, _ = channel.rooms.mint(
+        room_id=ROOM_ID,
+        chat_id=ROOM_CHAT,
+        participant_id="participant_" + "f" * 32,
+        display_name="Guest",
+        role="contributor",
+    )
+    channel.gateway.endpoint.authorize_websocket_handshake(
+        connection, {"token": [token]}, None
+    )
+
+    response = await channel._dispatch_http(
+        _Connection(),
+        _request(
+            "/auth/shared-room-revoke",
+            body={"room_id": ROOM_ID, "chat_id": ROOM_CHAT},
+        ),
+    )
+    assert response.status_code == 200
+    # Closed synchronously within the request, not on a detached task.
+    assert closed == [(1008, "shared room revoked")]

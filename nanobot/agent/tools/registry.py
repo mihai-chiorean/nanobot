@@ -222,6 +222,19 @@ class ToolRegistry:
             mcp_tools.sort(key=self._schema_name)
             self._cached_definitions = builtins + mcp_tools
 
+        # Ziggy-local (MIT-1010): narrow the advertised schemas to what a
+        # shared-room turn may actually call. prepare_call is the enforcing
+        # gate; this only stops the model from being shown -- and repeatedly
+        # trying -- tools the room prompt already tells it it does not have.
+        # Applied after the cache, exactly where upstream's available() filter
+        # used to sit, so the cached prefix stays prompt-cache stable.
+        ctx = current_request_context()
+        if ctx is not None and room_scope(ctx.metadata) is not None:
+            return [
+                schema
+                for schema in self._cached_definitions
+                if room_policy_for(self._schema_name(schema)) is RoomPolicy.ALLOWED
+            ]
         return self._cached_definitions
 
     def prepare_call(

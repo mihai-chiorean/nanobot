@@ -823,3 +823,48 @@ def test_fan_out_tools_are_denied_in_a_room() -> None:
         for name in ("spawn", "long_task"):
             _tool, _params, error = registry.prepare_call(name, {})
             assert isinstance(error, ToolResult) and error.is_error, name
+
+
+# --------------------------------------------------------------------------
+# The model must not be shown tools it cannot call
+# --------------------------------------------------------------------------
+
+
+def _registry_with(*names: str) -> ToolRegistry:
+    registry = ToolRegistry()
+    for name in names:
+        registry.register(_StubTool(name))
+    return registry
+
+
+def test_a_room_turn_is_only_shown_allow_listed_schemas() -> None:
+    """prepare_call is the gate; this stops the model burning iterations on
+    tools the room prompt already says it does not have."""
+    registry = _registry_with(
+        "web_search",
+        "read_session",
+        "grep",
+        "message",
+        "mcp_ziggy_gmail_gmail_search",
+    )
+    with request_context(guest_request_context()):
+        shown = {registry._schema_name(s) for s in registry.get_definitions()}
+    assert shown == {"web_search"}
+
+
+def test_a_normal_turn_is_shown_every_schema() -> None:
+    registry = _registry_with("web_search", "read_session", "grep", "message")
+    ctx = RequestContext(channel="websocket", chat_id=OWNER_CHAT, metadata={})
+    with request_context(ctx):
+        shown = {registry._schema_name(s) for s in registry.get_definitions()}
+    assert shown == {"web_search", "read_session", "grep", "message"}
+
+
+def test_schema_narrowing_does_not_poison_the_cache() -> None:
+    """A room turn must not leave the owner with a narrowed tool list."""
+    registry = _registry_with("web_search", "read_session")
+    with request_context(guest_request_context()):
+        assert len(registry.get_definitions()) == 1
+    ctx = RequestContext(channel="websocket", chat_id=OWNER_CHAT, metadata={})
+    with request_context(ctx):
+        assert len(registry.get_definitions()) == 2
