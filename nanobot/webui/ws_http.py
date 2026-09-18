@@ -389,6 +389,9 @@ class GatewayHTTPHandler:
         # owns the credential store; ``None`` leaves every room route absent,
         # which is the correct posture for a runtime without shared rooms.
         self.shared_rooms: Any | None = None
+        # Ziggy-local (MIT-1010): /api/work*. Attached by the channel once it
+        # owns the Work store; ``None`` leaves every Work route absent.
+        self.work: Any | None = None
 
         from nanobot.webui.settings_api import runtime_capabilities as _rc
         from nanobot.webui.settings_routes import WebUISettingsRouter
@@ -579,6 +582,12 @@ class GatewayHTTPHandler:
         # WebUI session routes so the room-scoped /messages read is not shadowed.
         if self.shared_rooms is not None:
             response = await self.shared_rooms.dispatch(request, got)
+            if response is not None:
+                return response
+
+        # Work routes (Ziggy-local, MIT-1010).
+        if self.work is not None:
+            response = await self.work.dispatch(request, got)
             if response is not None:
                 return response
 

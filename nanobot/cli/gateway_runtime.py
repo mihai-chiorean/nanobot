@@ -952,6 +952,13 @@ def _run_gateway(
             # accepting new input.  That makes a new user message reliably
             # supersede an old recoverable turn instead of racing its queue.
             await recovery.scan()
+            # Ziggy-local (MIT-1010): same ordering requirement as recovery --
+            # the Work restart sweep cannot distinguish a task left running by
+            # the last process from one this process just accepted, so it has
+            # to finish before the WebSocket channel can serve work.create.
+            interrupted = await agent.reconcile_work_store()
+            if interrupted:
+                logger.info("Work: marked {} interrupted task(s) from a previous run", interrupted)
             async def _run_agent() -> None:
                 try:
                     await mcp_provider.connect()

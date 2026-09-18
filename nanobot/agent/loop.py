@@ -117,6 +117,7 @@ from nanobot.utils.progress_events import output_events
 from nanobot.utils.runtime import (
     EMPTY_FINAL_RESPONSE_MESSAGE,
 )
+from nanobot.work.context import reset_work_context, set_work_context
 from nanobot.work.store import WorkStore
 
 if TYPE_CHECKING:
@@ -335,6 +336,113 @@ class _ZiggyTurnHook(AgentHook):
                     await self._status(f"{pick_thinking_emoji()} {sentence}")
 
 
+# Stop reasons that make a Work task ``failed`` rather than ``succeeded``.
+_WORK_FAILURE_STOP_REASONS = frozenset(
+    {
+        "error",
+        "tool_error",
+        "max_iterations",
+        "empty_final_response",
+        "incomplete_response",
+    }
+)
+
+
+def work_task_id(metadata: Mapping[str, Any] | None) -> str | None:
+    """The Work task a turn belongs to, or ``None`` (Ziggy-local, MIT-1010)."""
+    if not isinstance(metadata, Mapping):
+        return None
+    value = metadata.get("work_task_id")
+    return value if isinstance(value, str) and value.startswith("work_") else None
+
+
+class _WorkHook(AgentHook):
+    """Persist and publish the event stream for one Work task (Ziggy-local, MIT-1010).
+
+    The Work app's unit of rendering is an ordered ``work_events`` row, not a
+    chat message: it shows which tool is running, which step the agent declared
+    and which artifacts it published.  This hook is what turns one agent run
+    into those rows and pushes each one out as it is written, so a subscriber
+    sees progress live rather than only on completion.
+
+    Attached through :data:`AgentTurnHookFactory`; the factory returns ``None``
+    for a turn without ``work_task_id``, so an ordinary turn pays one lookup.
+    """
+
+    def __init__(
+        self,
+        agent_loop: AgentLoop,
+        *,
+        task_id: str,
+        channel: str,
+        chat_id: str,
+    ) -> None:
+        super().__init__()
+        self._loop = agent_loop
+        self._task_id = task_id
+        self._channel = channel
+        self._chat_id = chat_id
+        self._last_published_seq = 0
+
+    async def _publish(self, event: Any) -> None:
+        if event is None:
+            return
+        await self._loop.publish_work_event(self._channel, self._chat_id, event)
+        data = event.to_api() if hasattr(event, "to_api") else event
+        seq = data.get("seq") if isinstance(data, dict) else None
+        if isinstance(seq, int):
+            self._last_published_seq = max(self._last_published_seq, seq)
+
+    async def before_iteration(self, context: AgentHookContext) -> None:
+        if context.iteration != 0:
+            return
+        store = self._loop.work_store
+        event = await store.run_io(store.update_status, self._task_id, "running")
+        await self._publish(event)
+
+    async def before_execute_tools(self, context: AgentHookContext) -> None:
+        store = self._loop.work_store
+        for tool_call in context.tool_calls:
+            event = await store.run_io(
+                store.append_event,
+                self._task_id,
+                "tool.started",
+                {"name": tool_call.name, "arguments": tool_call.arguments or {}},
+                actor="main_agent",
+            )
+            await self._publish(event)
+
+    async def after_iteration(self, context: AgentHookContext) -> None:
+        store = self._loop.work_store
+        # report_progress / publish_artifact append step and artifact rows
+        # synchronously during the tool call.  Replay whatever they added
+        # before the generic completion rows so the stream stays in seq order.
+        events = await store.run_io(
+            store.list_events,
+            self._task_id,
+            after_seq=self._last_published_seq,
+        )
+        for event in events:
+            await self._publish(event)
+        for tool_event in context.tool_events or []:
+            event = await store.run_io(
+                store.append_event,
+                self._task_id,
+                "tool.finished",
+                dict(tool_event),
+                actor="main_agent",
+            )
+            await self._publish(event)
+        if context.stop_reason == "ask_user":
+            event = await store.run_io(
+                store.update_status,
+                self._task_id,
+                "waiting",
+                result_summary=context.final_content,
+            )
+            await self._publish(event)
+
+
 class AgentLoop:
     """
     The agent loop is the core processing engine.
@@ -516,12 +624,21 @@ class AgentLoop:
         self._hook_factories.append(
             lambda turn: _ZiggyTurnHook(self, turn)
         )
+        # Ziggy-local (MIT-1010): the Work event stream. Returns None for an
+        # ordinary turn, so only Work turns build the hook.
+        self._hook_factories.append(self._work_turn_hook)
 
         self.context = ContextBuilder(workspace, timezone=timezone, disabled_skills=disabled_skills)
         self.sessions = session_manager or SessionManager(workspace)
         # Ziggy-local (MIT-1010): durable Work store for report_progress /
         # publish_artifact / schedule_work and the ``work_task`` cron kind.
-        self.work_store = WorkStore(workspace)
+        # The restart sweep is *not* run on open. The schema comes up lazily
+        # (so an unwritable workspace does not fail construction), which means
+        # an on-open sweep would fire at first agent use -- by which time the
+        # gateway has already accepted work.create and inserted a task, and the
+        # sweep would mark that live task interrupted. Startup calls
+        # ``reconcile_work_store`` explicitly, before any channel accepts input.
+        self.work_store = WorkStore(workspace, reconcile_on_open=False)
         self.tools = ToolRegistry()
         self._audit_logger = AuditLogger()
         self.tools.set_audit_logger(self._audit_logger)
@@ -792,6 +909,137 @@ class AgentLoop:
         registered = loader.load(ctx, self.tools)
 
         logger.info("Registered {} tools: {}", len(registered), registered)
+
+    # -- Work event stream (Ziggy-local, MIT-1010) --------------------------
+
+    async def reconcile_work_store(self) -> int:
+        """Fail Work tasks left mid-flight by a previous process.
+
+        Must be awaited during startup *before* any channel accepts input: it
+        sweeps every task still ``queued``/``running``, and it cannot tell one
+        left over from the last process from one this process just accepted.
+        """
+        return await self.work_store.run_io(self.work_store.reconcile_interrupted)
+
+    def _work_turn_hook(self, turn: AgentTurnHookContext) -> AgentHook | None:
+        """Build the Work hook for a Work turn; ``None`` for every other turn."""
+        task_id = work_task_id(turn.metadata)
+        if task_id is None:
+            return None
+        return _WorkHook(
+            self,
+            task_id=task_id,
+            channel=turn.channel,
+            chat_id=turn.chat_id,
+        )
+
+    async def publish_work_event(self, channel: str, chat_id: str, event: Any) -> None:
+        """Hand one Work event to the channel that owns the subscriber fan-out.
+
+        The agent loop has no connection table, so the event rides the outbound
+        bus as metadata and the WebSocket channel intercepts it in ``send``.
+        Channels that know nothing about Work drop it: the content is empty, so
+        nothing renders as a chat message.
+        """
+        payload = event.to_api() if hasattr(event, "to_api") else event
+        await self.bus.publish_outbound(
+            OutboundMessage(
+                channel=channel,
+                chat_id=chat_id,
+                content="",
+                metadata={"_work_event": payload},
+            )
+        )
+
+    async def record_work_status(
+        self,
+        msg: InboundMessage,
+        status: str,
+        *,
+        error: str | None = None,
+        result_summary: str | None = None,
+    ) -> None:
+        """Move a Work task to *status* and publish the resulting event.
+
+        Terminal statuses are load-bearing rather than cosmetic: ziggy-work's
+        executor returns from its River job when it sees a terminal (or
+        ``waiting``) ``status.changed``, so a turn that finishes without one
+        leaves the job blocked until its own timeout.
+        """
+        task_id = work_task_id(msg.metadata)
+        if task_id is None:
+            return
+        event = await self.work_store.run_io(
+            self.work_store.update_status,
+            task_id,
+            status,
+            error=error,
+            result_summary=result_summary,
+        )
+        if event is not None:
+            await self.publish_work_event(msg.channel, msg.chat_id, event)
+
+    def work_artifact_refs(self, msg: InboundMessage) -> list[dict[str, Any]]:
+        """Artifact references published during *msg*'s Work turn."""
+        task_id = work_task_id(msg.metadata)
+        if task_id is None:
+            return []
+        refs: list[dict[str, Any]] = []
+        for artifact in self.work_store.list_artifacts(task_id):
+            artifact_id = artifact.get("artifact_id")
+            if isinstance(artifact_id, str):
+                refs.append(
+                    {
+                        "artifact_id": artifact_id,
+                        "name": artifact.get("name"),
+                        "kind": artifact.get("kind"),
+                        "mime": artifact.get("mime"),
+                    }
+                )
+        return refs
+
+    @staticmethod
+    def _attach_work_artifacts_to_last_assistant(
+        session: Session,
+        artifact_refs: list[dict[str, Any]],
+    ) -> None:
+        """Record artifact refs on the turn's reply so history replays them."""
+        if not artifact_refs:
+            return
+        for entry in reversed(session.messages):
+            if isinstance(entry, dict) and entry.get("role") == "assistant":
+                entry["work_artifacts"] = artifact_refs
+                return
+
+    async def _record_work_outcome(self, ctx: TurnContext) -> None:
+        """Turn stage: publish the terminal Work status for a Work turn."""
+        if work_task_id(ctx.msg.metadata) is None:
+            return
+        stop_reason = ctx.stop_reason
+        final_content = ctx.final_content
+        if stop_reason == "ask_user":
+            # _WorkHook already recorded ``waiting`` with the question text.
+            return
+        if stop_reason in _WORK_FAILURE_STOP_REASONS:
+            await self.record_work_status(
+                ctx.msg,
+                "failed",
+                error=final_content,
+                result_summary=final_content,
+            )
+            return
+        await self.record_work_status(
+            ctx.msg,
+            "succeeded",
+            result_summary=final_content,
+        )
+        artifact_refs = self.work_artifact_refs(ctx.msg)
+        if not artifact_refs:
+            return
+        if ctx.outbound is not None:
+            ctx.outbound.metadata["_work_artifacts"] = artifact_refs
+        if ctx.session is not None:
+            self._attach_work_artifacts_to_last_assistant(ctx.session, artifact_refs)
 
     def register_runtime_context_provider(
         self,
@@ -1303,6 +1551,18 @@ class AgentLoop:
         file_state_token = bind_file_states(self._file_state_store.for_session(active_session_key))
         request_token = bind_request_context(request_ctx)
         workspace_token = bind_workspace_scope(effective_scope)
+        # Ziggy-local (MIT-1010): report_progress / publish_artifact resolve the
+        # task from contextvars. The work_task cron runner binds them around its
+        # own process_direct call; a task created over work.create arrives as an
+        # ordinary inbound message, so bind them here from the turn metadata too.
+        # Binding to None for a non-Work turn is deliberate: a nested run must
+        # not inherit an outer task and write rows against it.
+        run_task_id = work_task_id(request_metadata)
+        work_tokens = set_work_context(
+            store=self.work_store if run_task_id else None,
+            task_id=run_task_id,
+            workspace=self.workspace if run_task_id else None,
+        )
         turn_scope_stack = ExitStack()
         # Compute lazily because create_goal may create goal metadata during this run.
         def _goal_continue() -> str | None:
@@ -1390,6 +1650,7 @@ class AgentLoop:
             ))
         finally:
             turn_scope_stack.close()
+            reset_work_context(work_tokens)
             reset_workspace_scope(workspace_token)
             reset_request_context(request_token)
             reset_file_states(file_state_token)
@@ -1606,6 +1867,16 @@ class AgentLoop:
                             "Only my owner can authorize that. Let me know if there's something "
                             "else I can help you with!",
                 ))
+                # Ziggy-local (MIT-1010): a Work subscriber is waiting on a
+                # terminal status.changed. A Work turn's sender is the creating
+                # client, never the owner, so a task whose prompt trips this
+                # guard would otherwise hang until the executor's read deadline.
+                with suppress(Exception):
+                    await self.record_work_status(
+                        msg,
+                        "failed",
+                        error="Work tasks cannot request changes to the agent's own system.",
+                    )
                 return
 
         try:
@@ -1670,9 +1941,20 @@ class AgentLoop:
                             session_key,
                             exc_info=True,
                         )
+                    # Ziggy-local (MIT-1010): a Work subscriber is waiting on a
+                    # terminal status.changed; without one the task is left
+                    # "running" forever on every client.
+                    with suppress(Exception):
+                        await self.record_work_status(msg, "cancelled")
                     raise
                 except Exception as exc:
                     logger.exception("Error processing message for session {}", session_key)
+                    with suppress(Exception):
+                        await self.record_work_status(
+                            msg,
+                            "failed",
+                            error="Sorry, I encountered an error.",
+                        )
                     await delivery.fail(
                         publish_completion=not turn_continuation.internal_continuation_pending(
                             msg.metadata
@@ -1910,11 +2192,20 @@ class AgentLoop:
         await self._run_turn_stage(ctx, "restore", self._restore_turn)
         await self._run_turn_stage(ctx, "compact", self._compact_session)
         if await self._run_turn_stage(ctx, "command", self._dispatch_command):
+            # Ziggy-local (MIT-1010): a command short-circuits every later
+            # stage, including the one that closes the Work task out. Cancel
+            # is the expected case -- work.cancel publishes "/stop", and
+            # cancel_task has already written the terminal row, so this is a
+            # no-op there and a real close-out for anything else.
+            await self._run_turn_stage(ctx, "work", self._record_work_outcome)
             return ctx.outbound
         await self._run_turn_stage(ctx, "build", self._build_turn)
         await self._run_turn_stage(ctx, "run", self._run_turn)
         await self._run_turn_stage(ctx, "save", self._persist_turn)
         await self._run_turn_stage(ctx, "respond", self._prepare_outbound)
+        # Ziggy-local (MIT-1010): runs after RESPOND so the artifact refs can be
+        # stamped on the outbound the Work app is about to receive.
+        await self._run_turn_stage(ctx, "work", self._record_work_outcome)
         return ctx.outbound
 
     async def _run_turn_stage(

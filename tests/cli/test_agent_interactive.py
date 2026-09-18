@@ -66,6 +66,11 @@ def test_interactive_agent_routes_a_complete_user_turn(
             self.stopped = asyncio.Event()
             self.aclose_calls = 0
 
+        async def reconcile_work_store(self) -> int:
+            # Ziggy-local (MIT-1010): the interactive CLI sweeps Work tasks
+            # left running by the previous process before it starts the loop.
+            return 0
+
         async def run(self) -> None:
             message = await self.bus.consume_inbound()
             seen["inbound"] = message
