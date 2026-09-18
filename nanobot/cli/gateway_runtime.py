@@ -363,6 +363,7 @@ def _run_gateway(
     from nanobot.cron.service import CronJobSkippedError, CronService
     from nanobot.cron.session_turns import is_bound_cron_job
     from nanobot.cron.types import CronJob, CronRunResult
+    from nanobot.cron.work_runner import run_work_task_cron_job
     from nanobot.llm_usage import record_llm_call
     from nanobot.llm_usage.context import llm_usage_source
     from nanobot.providers.factory import (
@@ -685,6 +686,24 @@ def _run_gateway(
                 logger.info("Heartbeat: silenced by post-run evaluation")
             return response
 
+        # Ziggy-local (MIT-1010): scheduled Work runs in its own durable session.
+        if job.payload.kind == "work_task":
+            if not is_bound_cron_job(job):
+                reason = "unbound work_task cron job must be recreated from a chat session"
+                logger.warning(
+                    "Cron: skipped unbound work job '{}' ({}): {}",
+                    job.name,
+                    job.id,
+                    reason,
+                )
+                raise CronJobSkippedError(reason)
+            await mcp_provider.connect()
+            return await run_work_task_cron_job(
+                job,
+                agent=agent,
+                deliver=lambda msg: _deliver_to_channel(msg, record=True),
+            )
+
         if is_bound_cron_job(job):
             return await run_bound_cron_job(job, agent=agent, cron=cron)
 
@@ -745,6 +764,25 @@ def _run_gateway(
             sessions=session_manager.list_sessions(),
             archived_keys=sidebar_state.get("archived_keys", []),
             unified_session_metadata=unified_metadata,
+        )
+
+    # Ziggy-local (MIT-1010): bind the shared-room connected-read executor to
+    # exactly one configured connector server. The executor is never reachable
+    # from the model -- the owner approves one exact operation in Room work and
+    # the app dispatches it out of band.
+    get_channel = getattr(channels, "get_channel", None)
+    websocket_channel = get_channel("websocket") if callable(get_channel) else None
+    if getattr(
+        getattr(websocket_channel, "config", None),
+        "shared_room_collaboration_enabled",
+        False,
+    ):
+        from nanobot.channels.websocket.room_work import connected_read_executor
+
+        websocket_channel.connected_room_executor = connected_read_executor(
+            agent,
+            websocket_channel.config.shared_room_connector_server,
+            mcp_provider,
         )
 
     if channels.enabled_channels:

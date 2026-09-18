@@ -12,7 +12,7 @@ import uuid
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Self, TypeGuard, cast
+from typing import TYPE_CHECKING, Any, Literal, Self, TypeGuard, cast
 from urllib.parse import urlsplit, urlunsplit
 from weakref import WeakSet
 
@@ -21,12 +21,21 @@ from websockets.asyncio.server import Server, ServerConnection, serve, unix_serv
 from websockets.exceptions import ConnectionClosed
 from websockets.http11 import Request as WsRequest
 
+from nanobot.agent.tools.room_policy import DENY_EVERYTHING_SCOPE
 from nanobot.bus.events import (
+    INBOUND_META_ROOM_SCOPE,
     OUTBOUND_META_AGENT_UI,
     OutboundMessage,
 )
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
+
+# Ziggy-local (MIT-1010): shared rooms.
+from nanobot.channels.websocket.rooms import (
+    RoomCredential,
+    SharedRoomStore,
+    room_scope_metadata,
+)
 from nanobot.config.schema import Base
 from nanobot.session.webui_turns import (
     clear_websocket_turn_if_current,
@@ -34,6 +43,9 @@ from nanobot.session.webui_turns import (
     websocket_turn_transcript_persistence_failed,
 )
 from nanobot.webui.gateway_services import GatewayServices
+from nanobot.webui.http_utils import (
+    issue_route_secret_matches as _issue_route_secret_matches,
+)
 from nanobot.webui.http_utils import (
     normalize_config_path as _normalize_config_path,
 )
@@ -212,10 +224,39 @@ class WebSocketConfig(Base):
     # (base64 overhead) + envelope framing stays under 36 MB; the 40 MB ceiling
     # leaves a small margin for sender slop without opening a DoS avenue.
     max_message_bytes: int = Field(default=37_748_736, ge=1024, le=41_943_040)
-    ping_interval_s: float = Field(default=20.0, ge=5.0, le=300.0)
-    ping_timeout_s: float = Field(default=20.0, ge=5.0, le=300.0)
+    # Ziggy-local (MIT-1010): nullable again. The fork these tenants run typed
+    # these as ``float | None`` and provision_tenant.py writes
+    # ``"pingIntervalS": null``; all four live config files on disk carry it.
+    # 0.3.0 narrowing them to ``float`` makes every tenant config fail
+    # validation at cutover. Both listeners accept None (``websockets``
+    # ping_interval= and aiohttp heartbeat=), so widening is the cheap fix and
+    # avoids a config migration.
+    ping_interval_s: float | None = Field(default=20.0, ge=5.0, le=300.0)
+    ping_timeout_s: float | None = Field(default=20.0, ge=5.0, le=300.0)
     ssl_certfile: str = ""
     ssl_keyfile: str = ""
+    # Ziggy-local (MIT-1010): shared rooms. ``sharedRoomCollaborationEnabled``
+    # gates room-v1 collaboration (proposals, connected reads, publication);
+    # ``sharedRoomConnectorServer`` names the single MCP server the connected
+    # read executor is bound to. Both are set by the Ziggy provisioner
+    # (deploy/releases/editorial/configure.py).
+    shared_room_collaboration_enabled: bool = False
+    shared_room_connector_server: str = "ziggy-connectors"
+    shared_rooms_enabled: bool = False
+    # Listener implementation. ``websockets`` is upstream's and the default.
+    # ``aiohttp`` is required for HTTP request bodies -- see
+    # ``channels/websocket/transport.py`` -- and is selected automatically when
+    # shared rooms are enabled.
+    transport: Literal["websockets", "aiohttp"] = "websockets"
+
+    @model_validator(mode="after")
+    def shared_rooms_require_body_capable_transport(self) -> Self:
+        """Shared rooms need POST bodies, which upstream's listener cannot read."""
+        if (
+            self.shared_rooms_enabled or self.shared_room_collaboration_enabled
+        ) and self.transport != "aiohttp":
+            self.transport = "aiohttp"
+        return self
 
     @field_validator("unix_socket_path")
     @classmethod
@@ -406,6 +447,35 @@ class WebSocketChannel(BaseChannel):
         self._stream_text_buffers: dict[tuple[str, str], list[str]] = {}
         self._reasoning_text_buffers: dict[tuple[str, str], list[str]] = {}
 
+        # -- Shared rooms (Ziggy-local, MIT-1010) ---------------------------
+        # The store owns room credentials and liveness; the router owns the
+        # /auth/shared-room* control plane and the room-scoped session read.
+        # Both are absent unless shared rooms are configured, so a runtime
+        # without them keeps exactly upstream's route table and handshake.
+        self.rooms: SharedRoomStore | None = None
+        self.connected_room_executor: Any | None = None
+        if (
+            self.config.shared_rooms_enabled
+            or self.config.shared_room_collaboration_enabled
+        ) and gateway.session_manager is not None:
+            from nanobot.webui.shared_rooms_http import SharedRoomRouter
+
+            self.rooms = SharedRoomStore(
+                gateway.session_manager,
+                token_ttl_s=self.config.token_ttl_s,
+            )
+            gateway.http.shared_rooms = SharedRoomRouter(
+                config=self.config,
+                sessions=gateway.session_manager,
+                store=self.rooms,
+                channel=self,
+            )
+            # The listener calls the *endpoint's* handshake, not this class's,
+            # so the room-token check has to be injected there. Without this a
+            # guest presenting a valid nbrt_ token is simply 401'd and shared
+            # rooms never work at all.
+            gateway.endpoint.room_token_consumer = self.rooms.consume_ws_token
+
     # -- Subscription bookkeeping -------------------------------------------
 
     def webui_subscribers(self, chat_id: str) -> tuple[ServerConnection, ...]:
@@ -516,9 +586,26 @@ class WebSocketChannel(BaseChannel):
         try:
             await self._commands.cleanup_connection(connection)
         finally:
-            for chat_id in tuple(self._conn_chats.get(connection, ())):
+            chats_before_detach = tuple(self._conn_chats.get(connection, ()))
+            for chat_id in chats_before_detach:
                 self._detach(connection, chat_id)
             self._conn_default.pop(connection, None)
+            if self.rooms is not None:
+                room_chats = [
+                    chat_id
+                    for chat_id in chats_before_detach
+                    if self.rooms.is_collaborative(chat_id)
+                ]
+                self.rooms.forget_connection(connection)
+                if room_chats:
+                    from nanobot.channels.websocket.room_editorial import (
+                        broadcast_room_presence,
+                    )
+
+                    for chat_id in room_chats:
+                        # The roster must shrink when a participant leaves.
+                        with suppress(Exception):
+                            await broadcast_room_presence(self, chat_id)
             self.gateway.endpoint.discard_connection(connection)
             if self._connection_outbound.get(connection) is state:
                 self._connection_outbound.pop(connection, None)
@@ -573,12 +660,139 @@ class WebSocketChannel(BaseChannel):
         query: dict[str, list[str]],
         headers: Any = None,
     ) -> Any:
-        """Compatibility proxy for handshake tests and integrations."""
+        """Compatibility proxy for handshake tests and integrations.
+
+        The room-token check lives on the endpoint
+        (``WebUIGatewayEndpoint.room_token_consumer``), because that is what the
+        listener actually calls; this proxy must not duplicate it or the two
+        could drift.
+        """
         return self.gateway.endpoint.authorize_websocket_handshake(
             connection,
             query,
             headers,
         )
+
+    def check_api_token(self, request: Any) -> bool:
+        """Expose the HTTP handler's API-token check to the aiohttp transport."""
+        return self.gateway.http.check_api_token(request)
+
+    def check_issue_route_secret(self, request: Any) -> bool:
+        """Pre-buffer gate for ``/auth/*`` bodies (Ziggy-local, MIT-1010).
+
+        The room control-plane handlers check this themselves, but only after
+        the body has been read. Running the same constant-time compare before
+        ``request.read()`` keeps an unauthenticated caller from making the
+        gateway buffer ``max_message_bytes`` per in-flight request. Fails
+        closed when no secret is configured, matching the handlers' own 503.
+        """
+        secret = self.config.token_issue_secret.strip()
+        if not secret:
+            return False
+        return _issue_route_secret_matches(getattr(request, "headers", {}), secret)
+
+    # -- Shared rooms -------------------------------------------------------
+
+    def room_credential(self, connection: Any) -> RoomCredential | None:
+        """The room credential bound to *connection*, if it is a guest socket."""
+        if self.rooms is None:
+            return None
+        return self.rooms.connection_credential(connection)
+
+    def effective_room_credential(self, connection: Any, chat_id: str) -> RoomCredential | None:
+        """Guest credential if present, else the owner's implicit room credential.
+
+        The owner fallback is deliberately *not* narrowed to trusted-WebUI
+        sockets. A nanobot runtime is single-tenant: any connection that
+        completed the handshake without a room credential holds a tenant
+        credential, and the tenant is the owner. Gating on
+        ``is_webui_connection`` would instead break the owner, because
+        ``/auth/token`` -- the route ziggy-control and the iOS app use -- issues
+        ``audience="client"`` and only ``/webui/bootstrap`` issues ``"webui"``
+        (``webui/ws_http.py``). The owner would silently lose their own room.
+
+        The fallback is safe because an owner credential only ever authorizes
+        the room named by ``chat_id``, which the caller already resolved.
+        """
+        if self.rooms is None:
+            return None
+        return self.rooms.connection_credential(connection) or self.rooms.owner_credential(
+            chat_id
+        )
+
+    def room_turn_metadata(self, connection: Any, chat_id: str) -> dict[str, Any]:
+        """Metadata every inbound frame in a room must carry.
+
+        Empty **only** when this is genuinely not a room turn. Inside a room it
+        carries ``shared_room`` (which the agent loop reads) and
+        ``INBOUND_META_ROOM_SCOPE`` (which ``ToolRegistry.prepare_call`` gates
+        on), minted from a validated credential and never copied from the
+        client envelope.
+
+        A room whose authority cannot be established -- revoked, expired, or
+        whose session metadata will not read -- returns a deny-everything scope
+        rather than ``{}``. Returning ``{}`` there was a fail-open: no scope
+        means no gate, so an expiring room briefly handed a guest an
+        unrestricted turn.
+        """
+        if self.rooms is None:
+            return {}
+        if self.rooms.is_revoked(connection):
+            return self._denied_room_metadata()
+        guest = self.rooms.connection_credential(connection)
+        if guest is not None and guest.chat_id != chat_id:
+            # A guest addressing someone else's room: deny, never fall through
+            # to the owner fallback below.
+            return self._denied_room_metadata()
+        if guest is None and not self.rooms.is_shared_room(chat_id):
+            return {}
+        if not self.rooms.is_active(chat_id):
+            return self._denied_room_metadata()
+        credential = self.effective_room_credential(connection, chat_id)
+        if credential is None or credential.chat_id != chat_id:
+            return self._denied_room_metadata()
+        return room_scope_metadata(credential)
+
+    @staticmethod
+    def _denied_room_metadata() -> dict[str, Any]:
+        """A room turn whose authority could not be established."""
+        return {
+            "shared_room": True,
+            INBOUND_META_ROOM_SCOPE: dict(DENY_EVERYTHING_SCOPE),
+        }
+
+    async def forget_room_connection(self, connection: Any) -> None:
+        """Drop a revoked room connection from every subscription set."""
+        if self.rooms is not None:
+            self.rooms.forget_connection(connection)
+        await self._cleanup_connection(connection)
+
+    def room_work_store(self) -> Any:
+        from nanobot.channels.websocket.room_work import RoomWorkStore
+
+        return RoomWorkStore(self.gateway.session_manager.workspace)
+
+    async def handle_room_editorial(
+        self,
+        action: str,
+        *,
+        room_id: str,
+        chat_id: str,
+        body: dict[str, Any],
+    ) -> Any:
+        from nanobot.channels.websocket.room_editorial import handle_room_editorial
+
+        return await handle_room_editorial(
+            self,
+            action,
+            room_id=room_id,
+            chat_id=chat_id,
+            body=body,
+        )
+
+    async def broadcast_room_event(self, chat_id: str, event: str, **fields: Any) -> None:
+        for connection in self.webui_subscribers(chat_id):
+            await self._send_event(connection, event, chat_id=chat_id, **fields)
 
     # -- Server lifecycle and connection ingress ---------------------------
 
@@ -696,6 +910,36 @@ class WebSocketChannel(BaseChannel):
         async def handler(connection: ServerConnection) -> None:
             await self._connection_loop(connection)
 
+        if self.config.transport == "aiohttp":
+            # Ziggy-local (MIT-1010): shared rooms need HTTP request bodies,
+            # which upstream's listener cannot read. See transport.py.
+            from nanobot.channels.websocket.transport import run_channel_server
+
+            self._running = True
+            self._log_listener_ready(scheme)
+
+            async def aiohttp_runner() -> None:
+                await run_channel_server(
+                    self,
+                    host=self.config.host,
+                    port=self.config.port,
+                    max_message_bytes=self.config.max_message_bytes,
+                    ping_interval_s=self.config.ping_interval_s,
+                    ssl_context=ssl_context,
+                    stop_event=stop_event,
+                    unix_socket_path=self.config.unix_socket_path,
+                )
+
+            task = asyncio.create_task(aiohttp_runner())
+            self._server_task = task
+            try:
+                await task
+            finally:
+                self._running = False
+                if self._server_task is task:
+                    self._server_task = None
+            return
+
         async def runner() -> None:
             socket_path = self.config.unix_socket_path
             failures = 0
@@ -804,7 +1048,13 @@ class WebSocketChannel(BaseChannel):
             self.logger.warning("client_id too long ({} chars), truncating", len(client_id))
             client_id = client_id[:128]
 
-        default_chat_id = str(uuid.uuid4())
+        # Ziggy-local (MIT-1010): a guest socket opens straight into its room
+        # rather than a fresh chat, so the `ready` frame names the room and the
+        # client needs no separate attach.
+        guest_credential = self.room_credential(connection)
+        default_chat_id = (
+            guest_credential.chat_id if guest_credential is not None else str(uuid.uuid4())
+        )
 
         try:
             await connection.send(
@@ -840,6 +1090,22 @@ class WebSocketChannel(BaseChannel):
 
                 content = _parse_inbound_payload(raw)
                 if content is None:
+                    continue
+                # Ziggy-local (MIT-1010). The legacy untyped-frame path below
+                # dispatches straight to BaseChannel._handle_message with a
+                # fresh chat_id and hand-built metadata -- it never consults the
+                # connection's room credential, so it carries no
+                # INBOUND_META_ROOM_SCOPE and every room-denied tool would be
+                # allowed. A guest could therefore drive a fully unrestricted
+                # turn simply by omitting "type" from its frame. Room
+                # connections speak envelopes only.
+                if guest_credential is not None:
+                    await self._send_event(
+                        connection,
+                        "error",
+                        chat_id=guest_credential.chat_id,
+                        detail="shared room connections must send typed envelopes",
+                    )
                     continue
                 # WebSocket already authenticates at handshake time (token),
                 # so pairing is not applicable. Treat as non-DM to avoid

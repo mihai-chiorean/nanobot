@@ -107,6 +107,29 @@ class WebuiSessionAccess:
         self._sessions = sessions
         self._handles = SessionHandleResolver(sessions)
 
+    @staticmethod
+    def _room_allowed_key() -> str | None:
+        """Ziggy-local (MIT-1010): the only key a shared-room turn may resolve.
+
+        Defence in depth behind the ``prepare_call`` room gate: even if a
+        cross-session reader is reached some other way -- a plugin tool, a future
+        upstream caller, a mis-registered name -- a room turn resolves nothing
+        but its own session.  Returns ``None`` outside a room, which leaves
+        upstream behaviour untouched.
+        """
+        from nanobot.agent.tools.context import current_request_context
+        from nanobot.agent.tools.room_policy import room_scope, room_scope_session_key
+
+        ctx = current_request_context()
+        if ctx is None:
+            return None
+        scope = room_scope(ctx.metadata)
+        if scope is None:
+            return None
+        # A scope with no chat_id is a minting bug; deny everything rather than
+        # falling through to unrestricted access.
+        return room_scope_session_key(scope, ctx.channel or "websocket") or "\0"
+
     def _metadata(
         self,
         session_key: str,
@@ -114,6 +137,9 @@ class WebuiSessionAccess:
         exclude_session_key: str | None,
     ) -> dict[str, Any] | None:
         if session_key == exclude_session_key:
+            return None
+        allowed = self._room_allowed_key()
+        if allowed is not None and session_key != allowed:
             return None
         return self._sessions.read_session_metadata(session_key)
 
@@ -146,11 +172,15 @@ class WebuiSessionAccess:
         exclude_session_key: str | None = None,
     ) -> list[SessionMatch]:
         needle = query.casefold()
+        allowed = self._room_allowed_key()
         rows: list[dict[str, Any]] = []
         for row in list_webui_sessions(self._sessions):
             key = row.get("key")
-            if isinstance(key, str) and key != exclude_session_key:
-                rows.append(row)
+            if not isinstance(key, str) or key == exclude_session_key:
+                continue
+            if allowed is not None and key != allowed:
+                continue
+            rows.append(row)
         ranked: list[tuple[int, SessionMatch]] = []
         remaining: list[dict[str, Any]] = []
         for row in rows:

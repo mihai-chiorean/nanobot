@@ -385,6 +385,10 @@ class GatewayHTTPHandler:
         self.local_trigger_pending_ids = local_trigger_pending_ids
         self._log = log
         self._runtime_surface = runtime_surface
+        # Ziggy-local (MIT-1010): shared rooms. Attached by the channel once it
+        # owns the credential store; ``None`` leaves every room route absent,
+        # which is the correct posture for a runtime without shared rooms.
+        self.shared_rooms: Any | None = None
 
         from nanobot.webui.settings_api import runtime_capabilities as _rc
         from nanobot.webui.settings_routes import WebUISettingsRouter
@@ -570,6 +574,13 @@ class GatewayHTTPHandler:
             return self._handle_bootstrap(connection, request)
         if got == "/webui/terminal":
             return self._handle_bootstrap(connection, request, terminal_probe=True)
+
+        # Shared-room routes (Ziggy-local, MIT-1010). Dispatched before the
+        # WebUI session routes so the room-scoped /messages read is not shadowed.
+        if self.shared_rooms is not None:
+            response = await self.shared_rooms.dispatch(request, got)
+            if response is not None:
+                return response
 
         # Settings routes (delegated)
         response = await self.settings_routes.dispatch(connection, request, got)

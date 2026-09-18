@@ -1935,6 +1935,150 @@ class SessionManager:
         self.save(target, fsync=True)
         return target
 
+    # -- Shared rooms (Ziggy-local, MIT-1010) --------------------------------
+    #
+    # A shared room is a *branch* of an owner conversation that guests can
+    # read and post into.  The content boundary is ``shareable_messages``:
+    # only the transcript a reader could already see is copied forward.
+    # Summaries, tool context, instruction metadata, runtime-context blocks and
+    # every other private field stay in the owner's session.
+
+    SHAREABLE_MESSAGE_FIELDS: frozenset[str] = frozenset(
+        {
+            "role",
+            "content",
+            "timestamp",
+            "client_message_id",
+            "client_message_ids",
+            "participant_id",
+            "participant_display_name",
+        }
+    )
+
+    @classmethod
+    def shareable_messages(
+        cls,
+        messages: list[dict[str, Any]],
+        owner_display_name: str,
+    ) -> list[dict[str, Any]]:
+        """Copy only the transcript users could see before a room was shared.
+
+        Allowlist, not denylist: a new private field added to a message
+        elsewhere in the codebase is excluded by default rather than leaking
+        into every room created afterwards.
+        """
+        owner = (owner_display_name or "").strip()[:64] or "Owner"
+        shareable: list[dict[str, Any]] = []
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            if message.get("role") not in {"user", "assistant"}:
+                continue
+            if is_hidden_history_message(message):
+                continue
+            visible = {
+                key: deepcopy(value)
+                for key, value in message.items()
+                if key in cls.SHAREABLE_MESSAGE_FIELDS
+            }
+            content = visible.get("content")
+            if not isinstance(content, str) or not content.strip():
+                continue
+            if visible.get("role") == "user":
+                visible.setdefault("participant_id", "owner")
+                visible.setdefault("participant_display_name", owner)
+            shareable.append(visible)
+        return shareable
+
+    def clone_session_for_shared_room(
+        self,
+        source_key: str,
+        destination_key: str,
+        *,
+        metadata: dict[str, Any],
+        owner_display_name: str,
+        snapshot_message_count: int | None = None,
+        snapshot_sha256: str | None = None,
+    ) -> Session:
+        """Branch *source_key* into a guest-visible room session.
+
+        Unlike :meth:`fork_session` the clone does **not** inherit the source
+        metadata: room metadata is supplied explicitly so nothing private rides
+        along.  ``snapshot_message_count`` / ``snapshot_sha256`` pin the clone to
+        the exact prefix the owner reviewed; a mismatch raises ``ValueError`` so
+        a changed conversation is never shared unseen.
+        """
+        if self._get_session_path(destination_key).exists():
+            raise FileExistsError(destination_key)
+        if self.read_session_file(source_key) is None:
+            raise FileNotFoundError(source_key)
+        source = self.get_or_create(source_key)
+        messages = deepcopy(source.messages)
+        if snapshot_message_count is not None:
+            if (
+                type(snapshot_message_count) is not int
+                or not 0 <= snapshot_message_count <= len(messages)
+            ):
+                raise ValueError("Invalid snapshot boundary")
+            messages = messages[:snapshot_message_count]
+            digest = hashlib.sha256(
+                json.dumps(messages, sort_keys=True, default=str).encode()
+            ).hexdigest()
+            if not isinstance(snapshot_sha256, str) or digest != snapshot_sha256:
+                raise ValueError("The preview changed; review it again")
+        now = datetime.now()
+        clone = Session(
+            key=destination_key,
+            messages=self.shareable_messages(messages, owner_display_name),
+            created_at=now,
+            updated_at=now,
+            metadata=deepcopy(metadata),
+            last_consolidated=0,
+        )
+        self.save(clone, fsync=True)
+        return clone
+
+    def set_session_title(
+        self,
+        key: str,
+        title: str,
+        *,
+        room_id: str | None = None,
+        title_revision: int | None = None,
+    ) -> str:
+        """Rename a session, honouring the shared-room revision protocol.
+
+        Returns ``updated`` / ``missing`` / ``shared`` / ``older``.  Without a
+        ``room_id`` a shared-room session refuses the rename (``shared``) so the
+        owner route cannot create a split-brain title against ziggy-control's
+        mirror.  With one, an out-of-order mirror write loses (``older``) rather
+        than overwriting a newer title.
+        """
+        persisted = self.read_session_file(key)
+        if persisted is None or persisted.get("key") != key:
+            return "missing"
+        session = self.get_or_create(key)
+        metadata = session.metadata if isinstance(session.metadata, dict) else {}
+        if room_id is None and metadata.get("shared_room") is True:
+            return "shared"
+        if room_id is not None and (
+            metadata.get("shared_room") is not True or metadata.get("room_id") != room_id
+        ):
+            return "missing"
+        if title_revision is not None:
+            current = metadata.get("shared_room_title_revision", 0)
+            current = current if isinstance(current, int) and not isinstance(current, bool) else 0
+            if title_revision < current:
+                return "older"
+            metadata["shared_room_title_revision"] = title_revision
+        metadata["title"] = title
+        # Explicit names such as "Chat" are meaningful; clients must not
+        # substitute a message preview for them.
+        metadata["title_user_defined"] = True
+        session.metadata = metadata
+        self.save(session, fsync=True)
+        return "updated"
+
     def read_session_file(self, key: str) -> dict[str, Any] | None:
         """Read a session without populating the cache."""
         return cast(dict[str, Any] | None, self._store.read(key))

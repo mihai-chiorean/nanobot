@@ -48,6 +48,12 @@ class WebUIGatewayEndpoint:
         self._http = http
         self._tokens = tokens
         self.webui_connections: set[ServerConnection] = set()
+        # Ziggy-local (MIT-1010): shared rooms. Set by ``WebSocketChannel`` when
+        # rooms are configured. Consulted first in the handshake so an ``nbrt_``
+        # room token binds the connection to exactly one room before any of the
+        # tenant-wide credential paths run. ``None`` leaves the handshake
+        # exactly as upstream wrote it.
+        self.room_token_consumer: Callable[[ServerConnection, str], bool] | None = None
 
     async def process_request(
         self,
@@ -81,11 +87,30 @@ class WebUIGatewayEndpoint:
         headers: Any = None,
     ) -> Any:
         """Authorize a WebSocket upgrade and remember trusted WebUI connections."""
+        supplied = query_first(query, "token")
+        # A room token is checked before the trusted-proxy shortcut: a guest
+        # arriving through ziggy-control must land as a room participant, never
+        # as a trusted WebUI connection.
+        if (
+            self.room_token_consumer is not None
+            and supplied
+            and self.room_token_consumer(connection, supplied)
+        ):
+            return None
+
+        # A room token that did not consume above is spent, expired, or names a
+        # revoked room. It must never fall through to a branch that grants
+        # owner-equivalent access: the no-auth and trusted-proxy branches below
+        # both reach the owner fallback in effective_room_credential. Today all
+        # four tenant configs make that unreachable, but that is a property of
+        # the configs, not of the runtime.
+        if supplied and supplied.startswith("nbrt_"):
+            return connection.respond(401, "Unauthorized")
+
         if is_trusted_proxy_authenticated_request(connection, headers or {}, self._config):
             self.webui_connections.add(connection)
             return None
 
-        supplied = query_first(query, "token")
         static_token = self._config.token.strip()
         if static_token:
             if supplied and hmac.compare_digest(supplied, static_token):

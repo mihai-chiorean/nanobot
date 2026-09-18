@@ -27,7 +27,7 @@ from nanobot.agent.tools.loader import ToolLoader
 # Ziggy-local (fork, MIT-202/MIT-186): Langfuse subagent span helpers.
 from nanobot.observability import capture_trace_context, observe_subagent
 from nanobot.agent.tools.registry import ToolRegistry
-from nanobot.bus.events import InboundMessage
+from nanobot.bus.events import INBOUND_META_ROOM_SCOPE, InboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.config.schema import AgentDefaults, ToolsConfig
 from nanobot.llm_usage.context import LLMUsageSource, current_llm_usage_source
@@ -42,11 +42,25 @@ from nanobot.utils.llm_runtime import LLMRuntime
 from nanobot.utils.prompt_templates import render_template
 
 
+def _inherited_room_scope() -> dict[str, Any] | None:
+    """The spawning turn's room scope, so a subagent cannot escape the room."""
+    from nanobot.agent.tools.context import current_request_context
+    from nanobot.agent.tools.room_policy import room_scope
+
+    ctx = current_request_context()
+    return room_scope(ctx.metadata) if ctx is not None else None
+
+
 class _SubagentOrigin(TypedDict):
     channel: str
     chat_id: str
     session_key: str | None
     llm_usage_source: NotRequired[LLMUsageSource]
+    # Ziggy-local (MIT-1010): the parent turn's room scope, if any. A subagent
+    # spawned from a shared-room turn must stay inside that room's authority;
+    # building its RequestContext without this silently drops the gate that
+    # ToolRegistry.prepare_call keys off.
+    room_scope: NotRequired[dict[str, Any] | None]
 
 
 @dataclass(slots=True)
@@ -251,6 +265,7 @@ class SubagentManager:
             "chat_id": origin_chat_id,
             "session_key": session_key,
             "llm_usage_source": current_llm_usage_source(),
+            "room_scope": _inherited_room_scope(),
         }
 
         status = SubagentStatus(
@@ -323,6 +338,7 @@ class SubagentManager:
             "chat_id": origin_chat_id,
             "session_key": session_key,
             "llm_usage_source": current_llm_usage_source(),
+            "room_scope": _inherited_room_scope(),
         }
         status = SubagentStatus(
             task_id=task_id,
@@ -432,12 +448,18 @@ class SubagentManager:
             ]
 
             sess_key = origin.get("session_key")
+            inherited_room_scope = origin.get("room_scope")
             request_token = bind_request_context(RequestContext(
                 channel=origin["channel"],
                 chat_id=origin["chat_id"],
                 message_id=origin_message_id,
                 session_key=sess_key,
                 runtime=runtime,
+                metadata=(
+                    {INBOUND_META_ROOM_SCOPE: inherited_room_scope}
+                    if inherited_room_scope
+                    else {}
+                ),
             ))
             token = bind_workspace_scope(workspace_scope) if workspace_scope is not None else None
             try:

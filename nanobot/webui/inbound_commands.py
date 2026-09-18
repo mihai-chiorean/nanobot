@@ -125,6 +125,11 @@ class WebUICommandTransport(Protocol):
     ) -> None: ...
 
 
+# Ziggy-local (MIT-1010). The only commands a shared-room guest may send.
+# ``attach`` is additionally checked against the guest's own chat_id.
+_ROOM_GUEST_COMMANDS = frozenset({"message", "attach"})
+
+
 class WebUICommandRouter:
     """Own WebUI command semantics while a transport host owns raw connections."""
 
@@ -282,6 +287,29 @@ class WebUICommandRouter:
             )
             return None
 
+    async def _send_room_attach_state(
+        self,
+        connection: ServerConnection,
+        chat_id: str,
+    ) -> None:
+        """Seed a collaborative room's mode, proposals and roster on attach."""
+        rooms = getattr(self._transport, "rooms", None)
+        if rooms is None or not rooms.is_collaborative(chat_id) or not rooms.is_active(chat_id):
+            return
+        credential = self._transport.effective_room_credential(connection, chat_id)
+        if credential is None:
+            return
+        from nanobot.channels.websocket.room_editorial import broadcast_room_presence
+
+        await self._transport.webui_send_event(
+            connection,
+            "room.state",
+            chat_id=chat_id,
+            mode="collaborative-v1",
+            proposals=self._transport.room_work_store().list(credential.room_id),
+        )
+        await broadcast_room_presence(self._transport, chat_id)
+
     async def dispatch(
         self,
         connection: ServerConnection,
@@ -290,6 +318,35 @@ class WebUICommandRouter:
     ) -> None:
         """Execute one typed WebUI command."""
         command_type = envelope.get("type")
+
+        # -- Shared rooms (Ziggy-local, MIT-1010) ---------------------------
+        # A guest socket is confined to its own room. Everything else on this
+        # router is an owner capability: ``new_chat`` / ``fork_chat`` create and
+        # hydrate arbitrary sessions, ``attach`` hydrates any chat_id onto the
+        # caller's socket, and the settings/sidebar/workspace commands mutate
+        # tenant state. The snapshot rejected these with "room scope violation";
+        # allow-list rather than deny-list so a future command type is confined
+        # by default.
+        guest = self._transport.room_credential(connection)
+        rooms = getattr(self._transport, "rooms", None)
+        revoked = rooms is not None and rooms.is_revoked(connection)
+        if guest is not None or revoked:
+            # A revoked guest is still a guest. Its socket close is asynchronous,
+            # so between revocation and close it must be denied outright rather
+            # than read as "not a guest" -- which previously skipped this
+            # allow-list entirely and promoted it to owner downstream.
+            allowed = not revoked and command_type in _ROOM_GUEST_COMMANDS
+            if allowed and command_type == "attach":
+                allowed = envelope.get("chat_id") == guest.chat_id
+            if not allowed:
+                await self._transport.webui_send_event(
+                    connection,
+                    "error",
+                    **({"chat_id": guest.chat_id} if guest is not None else {}),
+                    detail="room scope violation",
+                )
+                return
+
         if command_type == "webui_request":
             await self.start_webui_request(connection, envelope)
             return
@@ -388,6 +445,12 @@ class WebUICommandRouter:
                 **self._session_projection.attach_fields(webui_session_key(chat_id)),
             )
             await self._transport.webui_hydrate(chat_id)
+            # Ziggy-local (MIT-1010): a collaborative room needs its mode and
+            # proposal list on attach, and the roster needs refreshing for
+            # everyone already in the room. Without these the web client renders
+            # a collaborative room as legacy with an empty participant list
+            # until some unrelated event happens to fire.
+            await self._send_room_attach_state(connection, chat_id)
             return
         if command_type == "set_sidebar_state":
             if connection not in self._webui_connections:
@@ -506,6 +569,36 @@ class WebUICommandRouter:
                 **rejection_fields,
             )
             return
+
+        # -- Shared rooms (Ziggy-local, MIT-1010) ---------------------------
+        # A guest socket may address exactly the room it was credentialled for.
+        # Checked before anything is stored, hydrated or dispatched.
+        guest_credential = self._transport.room_credential(connection)
+        if guest_credential is not None and guest_credential.chat_id != chat_id:
+            await self._transport.webui_send_event(
+                connection,
+                "error",
+                detail="access_denied",
+                **rejection_fields,
+            )
+            return
+        # Owners post into their own rooms through the same intent path as
+        # guests, so a discussion or proposal frame is recorded and broadcast
+        # the same way whoever sent it. ``effective_room_credential`` resolves
+        # the guest credential when there is one and the owner's implicit
+        # credential otherwise; it is ``None`` outside a room.
+        room_credential = self._transport.effective_room_credential(connection, chat_id)
+        if room_credential is not None:
+            from nanobot.channels.websocket.room_editorial import handle_room_intent
+
+            if await handle_room_intent(
+                self._transport,
+                connection,
+                room_credential,
+                envelope,
+            ):
+                return
+
         message_rejection = self._ingress.validate_text(content)
         if message_rejection is not None:
             await self._transport.webui_send_event(
@@ -640,6 +733,16 @@ class WebUICommandRouter:
             if session_mentions:
                 metadata["session_mentions"] = session_mentions
         metadata[WORKSPACE_SCOPE_METADATA_KEY] = scope.metadata()
+        # Room turns carry shared_room (read by the agent loop) plus the room
+        # scope that ToolRegistry.prepare_call gates cross-session tools on.
+        # Minted from a validated credential; never copied from the envelope.
+        room_metadata = self._transport.room_turn_metadata(connection, chat_id)
+        metadata.update(room_metadata)
+        if room_metadata and self._transport.rooms is not None:
+            if self._transport.rooms.is_collaborative(chat_id):
+                # Anything reaching the agent from a collaborative room is an
+                # explicit request for help; discussion never gets this far.
+                metadata["room_intent"] = "ask_ziggy"
         is_webui = metadata.get("webui") is True
         queued_owner = None
         if is_webui and not is_user_shell and builtin_command_starts_agent_turn(content):
