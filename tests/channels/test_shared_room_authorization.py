@@ -213,7 +213,7 @@ def test_unclassified_and_mcp_tools_are_denied_in_a_room(name: str) -> None:
 
 def test_the_allow_list_is_small_and_deliberate() -> None:
     """A large allow-list is the same bug in a different shape."""
-    assert set(ROOM_ALLOWED_TOOLS) == {"web_search", "web_fetch", "report_progress"}
+    assert set(ROOM_ALLOWED_TOOLS) == {"web_search", "report_progress"}
     assert all(reason.strip() for reason in ROOM_ALLOWED_TOOLS.values())
 
 
@@ -868,3 +868,74 @@ def test_schema_narrowing_does_not_poison_the_cache() -> None:
     ctx = RequestContext(channel="websocket", chat_id=OWNER_CHAT, metadata={})
     with request_context(ctx):
         assert len(registry.get_definitions()) == 2
+
+
+# --------------------------------------------------------------------------
+# web_fetch must stay denied whatever the SSRF knobs say (PR review, N1)
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def permissive_ssrf():
+    """Both global SSRF knobs at their most permissive, then restored.
+
+    ``tools.exec.allow_loopback: true`` (cutover memo C22 plans to enable this
+    for MCP on 127.0.0.1:8790) and the owner's real
+    ``ssrfWhitelist: ["192.168.68.0/24"]``.
+    """
+    from nanobot.security import network
+
+    previous_loopback = network._loopback_allowed_default
+    previous_networks = list(network._allowed_networks)
+    network.configure_loopback_exception(True)
+    network.configure_ssrf_whitelist(["192.168.68.0/24"])
+    try:
+        yield network
+    finally:
+        network.configure_loopback_exception(previous_loopback)
+        network._allowed_networks = previous_networks
+
+
+def test_the_knobs_really_would_open_loopback_and_the_lan(permissive_ssrf) -> None:
+    """Guard the guard: if these pass unconditionally the next test is vacuous."""
+    network = permissive_ssrf
+    ok_loopback, _ = network.validate_url_target("http://127.0.0.1:8790/mcp")
+    assert ok_loopback is True, "loopback should be reachable with allow_loopback on"
+    assert network._is_private(__import__("ipaddress").ip_address("192.168.68.10")) is False
+
+
+def test_web_fetch_is_denied_in_a_room_even_with_both_knobs_permissive(
+    permissive_ssrf,
+) -> None:
+    """A room guest must not reach loopback or the owner's LAN, and that must
+    not depend on two config knobs owned by unrelated subsystems."""
+    registry = ToolRegistry()
+    registry.register(_StubTool("web_fetch"))
+    with request_context(guest_request_context()):
+        _tool, _params, error = registry.prepare_call("web_fetch", {"url": "http://127.0.0.1:8790/"})
+        assert isinstance(error, ToolResult) and error.is_error
+        _tool, _params, error = registry.prepare_call(
+            "web_fetch", {"url": "http://192.168.68.10/"}
+        )
+        assert isinstance(error, ToolResult) and error.is_error
+        # And it is not advertised either.
+        shown = {registry._schema_name(sch) for sch in registry.get_definitions()}
+        assert shown == set()
+
+
+def test_the_owner_keeps_web_fetch(permissive_ssrf) -> None:
+    registry = ToolRegistry()
+    registry.register(_StubTool("web_fetch"))
+    ctx = RequestContext(channel="websocket", chat_id=OWNER_CHAT, metadata={})
+    with request_context(ctx):
+        _tool, _params, error = registry.prepare_call("web_fetch", {"url": "http://example.com"})
+    assert error is None
+
+
+def test_every_allow_listed_tool_is_url_independent() -> None:
+    """The invariant behind the allow-list: no entry may take a caller-chosen
+    host, or its safety becomes a function of the SSRF configuration."""
+    assert "web_fetch" not in ROOM_ALLOWED_TOOLS
+    assert "web_read" not in ROOM_ALLOWED_TOOLS
+    for name in ROOM_ALLOWED_TOOLS:
+        assert "fetch" not in name, name

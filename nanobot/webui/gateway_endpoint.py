@@ -98,6 +98,15 @@ class WebUIGatewayEndpoint:
         ):
             return None
 
+        # A room token that did not consume above is spent, expired, or names a
+        # revoked room. It must never fall through to a branch that grants
+        # owner-equivalent access: the no-auth and trusted-proxy branches below
+        # both reach the owner fallback in effective_room_credential. Today all
+        # four tenant configs make that unreachable, but that is a property of
+        # the configs, not of the runtime.
+        if supplied and supplied.startswith("nbrt_"):
+            return connection.respond(401, "Unauthorized")
+
         if is_trusted_proxy_authenticated_request(connection, headers or {}, self._config):
             self.webui_connections.add(connection)
             return None

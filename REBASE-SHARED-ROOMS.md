@@ -258,8 +258,8 @@ The replacement for the deleted request-scoped grant is:
 - **The gate moves from `Tool.available()` to `ToolRegistry.prepare_call()`.**
   `prepare_call` is the single funnel every tool call passes through and it
   still exists. `room_policy_for()` returns `ALLOWED` only for names in
-  `ROOM_ALLOWED_TOOLS` — currently `web_search`, `web_fetch`, `report_progress`
-  — and `DENIED` for **everything else**, including every name it has never
+  `ROOM_ALLOWED_TOOLS` — currently `web_search` and `report_progress` — and
+  `DENIED` for **everything else**, including every name it has never
   seen. That covers all 26 MCP connector tools, `message`, the filesystem
   tools, `create_goal`/`update_goal`, `spawn`, `exec` and anything added later.
 - **The advertised schemas are narrowed to match.** `get_definitions()` filters
@@ -278,6 +278,16 @@ The replacement for the deleted request-scoped grant is:
   `normalize_mentions` resolve nothing but the room's own session key. This
   restores a *narrower* version of the deleted `SessionAccessScope`, scoped to
   one key rather than to a namespace prefix.
+
+An allow-list entry must be safe for reasons that **do not move**. `web_fetch`
+was dropped for failing that test: its safety is a function of
+`tools.exec.allow_loopback` (which C22 plans to enable) and `tools.ssrfWhitelist`
+(which already lists the owner's home LAN), two module-global knobs owned by
+other subsystems. Threading a room-strict mode through the SSRF guard was
+rejected — it adds a second path through `resolve_url_target` / `_is_private` /
+`PinnedDNSAsyncTransport` exercised only by rooms, and it would not fix the
+class: the next knob re-raises the same question. `web_search` stays because it
+takes a query, not a URL, so a guest never chooses the host contacted.
 
 **Unclassified means denied**, at every layer: an unknown tool name, an
 unreadable room, a malformed scope and a revoked credential all deny. The
@@ -368,3 +378,5 @@ which is C5 and out of scope here.
       re-attachment `shareable_messages` had); until then room file downloads 404
 - [ ] Canary one tenant with `sharedRoomCollaborationEnabled` before repointing
       `current-nanobot`
+- [ ] If a room guest is ever given URL fetch again, it needs its own
+      room-strict fetch path, not a re-entry on `ROOM_ALLOWED_TOOLS`

@@ -65,10 +65,37 @@ class RoomPolicy(str, Enum):
 #   every MCP tool                   a connector speaks for the owner's
 #                                    identity: gmail, linkedin, calendar
 ROOM_ALLOWED_TOOLS: dict[str, str] = {
-    "web_search": "public web search; reads nothing tenant-local",
-    "web_fetch": "public URL fetch, already SSRF-guarded; reads nothing tenant-local",
+    "web_search": (
+        "takes a query, not a URL: the endpoint is the configured search "
+        "provider, so a guest never chooses the host that gets contacted"
+    ),
     "report_progress": "writes only to the Work task this turn already owns",
 }
+
+# ``web_fetch`` was here, justified as "public URL fetch, already SSRF-guarded".
+# That justification does not hold, for a reason worth recording: the guard's
+# behaviour is set by two module-global knobs owned by other subsystems.
+#
+#   * ``tools.exec.allow_loopback`` flips ``network._loopback_allowed_default``,
+#     and ``web.py`` passes no explicit ``allow_loopback``, so ``web_fetch``
+#     inherits it. Cutover memo C22 contemplates enabling exactly that so MCP
+#     can reach 127.0.0.1:8790.
+#   * ``tools.ssrfWhitelist`` exempts CIDRs inside ``network._is_private``; the
+#     owner's config already lists their home LAN (192.168.68.0/24).
+#
+# So a guest's ``web_fetch`` could reach loopback services and the owner's LAN
+# depending on settings that have nothing to do with rooms.
+#
+# The fix is not to thread a room-strict mode through the SSRF guard. That
+# would add a second path through ``resolve_url_target`` / ``_is_private`` /
+# ``PinnedDNSAsyncTransport`` exercised only by shared rooms -- low traffic,
+# easy to get subtly wrong, and only tests would hold it. More importantly it
+# would not fix the class: the next knob added to the guard re-raises the same
+# question and this entry silently stops being true again, which is exactly the
+# failure mode that produced the deny-list/allow-list inversion.
+#
+# An allow-list entry has to be safe for reasons that do not move. A guest
+# keeps ``web_search``; the owner keeps ``web_fetch`` on their own turns.
 
 
 def room_policy_for(tool_name: str) -> RoomPolicy:

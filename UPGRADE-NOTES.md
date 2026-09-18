@@ -490,8 +490,32 @@ the workspace (`_WORKSPACE_ID_FILE = "workspace-id"`), recovered via the
 and differs per machine — never hard-code it; enumerate
 `~/.nanobot/sessions/*/` instead.
 
-Downgrade path: `nanobot sessions restore-workspace` copies sessions back into
-the workspace before reinstalling an older nanobot.
+Downgrade path — **`nanobot sessions restore-workspace` does not work on
+sessions this migration produced.** Verified on the Spark 2026-09-15 against
+the owner's 112 relocated transcripts: it printed `Restored 0 session file(s)
+to ~/.nanobot/workspace/sessions; 0 already matched.` and exited 0.
+
+The round trip does not close. `_migrate_from_workspace()` copies with
+`dst = self.sessions_dir / src.name`, preserving the legacy `safe_key` filename
+(`websocket_<id>.jsonl`). But `restore_to_workspace()` iterates
+`self.sessions_dir.glob("*.jsonl")` and skips every file for which
+`session_key_from_path(src) is None` — and that helper only accepts the 0.3.0
+canonical name, the urlsafe-base64 `storage_key`. Legacy-named files therefore
+match nothing and are silently skipped. Restoring zero files out of a full
+namespace is reported as success, because "restored 0, conflicts 0" is also
+what a correctly-already-restored workspace looks like.
+
+Do not trust that command as a rollback safety net. Copy the files instead
+(they are byte-identical and the pre-0.3.0 runtime reads the legacy names
+directly):
+
+```
+cp -n -p ~/.nanobot/sessions/<workspace_id>/*.jsonl ~/.nanobot/workspace/sessions/
+```
+
+then assert equal counts and matching `sha256sum` output on both directories.
+Worth reporting upstream; until it is fixed, any plan whose rollback step is
+`restore-workspace` is a plan that loses history without saying so.
 
 **`ziggy-backup.service` does not cover the new path.** As of 2026-09-14 it
 binds only:
@@ -532,3 +556,74 @@ control is a prerequisite for trusting any of this.
 Verify with one backup run that both archives appear and that
 `ziggy-sessions.tgz` is megabytes, not ~115 bytes (an empty `sessions/`
 directory entry tars to about that and looks like success).
+
+### Step 7a — installing the upgrade does not deploy it (MIT-1008, 2026-09-14)
+
+Reinstalling `vendor/nanobot` into the venv upgraded the *library* and left
+every gateway running the old code. Both are true at once, and nothing on the
+box reports the discrepancy. This caused the owner-visible outage: the 0.3.0
+CLI relocated the sessions, the still-0.2.x gateway kept reading the emptied
+workspace directory, and the iOS app showed zero conversations.
+
+Two mechanisms combine:
+
+1. The editable install is a **legacy path-appending `.pth`**
+   (`site-packages/_editable_impl_nanobot_ai.pth`, one line:
+   `/home/mihai/workspace/ziggy/vendor/nanobot`). It *appends* to `sys.path`,
+   so anything earlier on the path wins. It is not a PEP 660 meta-path finder,
+   which would have taken precedence.
+2. Every gateway runs `python3 -m nanobot`, and `-m` puts **the working
+   directory first on `sys.path`**. The `99-release.conf` drop-in sets
+   `WorkingDirectory=/home/mihai/workspace/ziggy/current-nanobot`, a symlink to
+   a pinned release snapshot that contains its own `nanobot/` package.
+
+So the gateways import the snapshot and the `nanobot` CLI imports
+`vendor/nanobot`. On 2026-09-14 those were different major versions for four
+hours.
+
+`nanobot.__version__` **cannot** distinguish them. `_resolve_version()` reads
+installed distribution metadata, so the Sep-10 snapshot cheerfully reports
+`0.3.0` because `nanobot_ai-0.3.0.dist-info` is what the venv now holds. Ask
+the filesystem, not the package:
+
+```
+readlink -f ~/workspace/ziggy/current-nanobot
+cd ~/workspace/ziggy/current-nanobot && \
+  ~/workspace/ziggy/.venv/bin/python3 -c 'import nanobot; print(nanobot.__file__)'
+```
+
+The 0.2.x/0.3.0 tell is the layout: 0.2.x has the
+`nanobot/channels/websocket.py` monolith; 0.3.0 has the
+`nanobot/channels/websocket/` package plus `nanobot/webui/ws_http.py`.
+
+**The cutover is still pending.** `current-nanobot` has pointed at
+`releases/editorial-20260910/runtime` since Sep 10 and was never repointed, so
+none of the 0.3.0 API changes are live yet. When it is repointed, these land
+at once and are client-visible — re-check each before flipping the symlink:
+
+| Change | Live today | Ziggy callers to fix first |
+| --- | --- | --- |
+| `GET /api/sessions/<key>/messages` deleted, replaced by `/webui-thread` (different shape) | no, legacy route still serves 200 | `ios/Ziggy/Networking/ZiggyRESTClient.swift:239`, `services/ziggy-worker/internal/control/client.go:291`, allow-list in `services/ziggy-control/internal/httpapi/shared_rooms.go:607-609` |
+| All mutations 405; only reachable as an authenticated `webui_request` WS frame | no | `POST /api/sessions/<key>/delete` at `ZiggyRESTClient.swift:320` |
+| `/api/sessions` served from a cached `.webui_session_index.json`, extra fields | no | additive — confirm no strict decoding on the Go proxy path |
+| Token issuance / bootstrap auth hardened | n/a | `channels/websocket.trustedProxyAuth` is **absent** from every config on the Spark; ziggy-control proxies `/api/*` with the client's bearer and `proxy.go` does not inject one |
+
+Because all four land together, repointing the symlink is a client-compat
+change, not a runtime bump. Sequence the caller fixes first.
+
+### Step 7b — post-deploy gate
+
+`deploy/runtime/session-visibility-smoke.py` asserts the invariant that failed:
+every transcript readable on disk (in **either** layout) appears in that
+runtime's own authenticated `GET /api/sessions`, and the newest one reads back
+a non-empty body. Run it on Spark after any upgrade, `current-nanobot` change,
+or session migration:
+
+```
+~/workspace/ziggy/.venv/bin/python3 deploy/runtime/session-visibility-smoke.py
+```
+
+It covers the owner and all tenants and exits non-zero on the first failure. A
+liveness probe cannot replace it: the outage served `200 {"sessions": []}`,
+which is indistinguishable from a healthy new account. The canary gate that
+was recorded as "authenticated connect unproven" is exactly this check.
