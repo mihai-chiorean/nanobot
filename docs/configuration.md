@@ -2034,7 +2034,11 @@ otherwise the WebUI asks for a restart. The gateway also watches `config.json`
 itself: an `mcpServers` edit saved by hand or by tooling (a server added,
 removed, or changed, including `enabledTools`) is reconciled the same way
 before the next turn, while edits that only touch model settings never
-reconnect an MCP server. OAuth tokens and dynamic client
+reconnect an MCP server. A turn that is already running keeps the tools it
+started with: the reload waits for it (up to five seconds) and holds new
+turns back until the swap is done, so an edit never removes a tool
+mid-answer. A turn still running after that wait is not cancelled, but it may
+see the tool disappear. OAuth tokens and dynamic client
 registration data are stored in the nanobot data directory under
 `auth/mcp.json`; they are not written to `config.json`. Removing the MCP server
 from Apps also removes its saved OAuth credentials. Normal gateway startup never
