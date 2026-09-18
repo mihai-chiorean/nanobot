@@ -345,7 +345,7 @@ class ExecTool(Tool):
 
         # Belt and braces for a session-bound cron job, which is the case that
         # makes the session key useless here: run_bound_cron_job reuses the
-        # originating *chat's* session key ("websocket:<chat_id>") and spends
+        # originating *chat's* own session key, unchanged, and spends
         # "cron:{job.id}" only as a turn seed, so there is no cron namespace to
         # match on. This marker is set on every bound run, including channels
         # where the WebUI source metadata is not added.
