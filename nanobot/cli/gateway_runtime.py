@@ -15,7 +15,7 @@ from nanobot import __logo__, __version__
 from nanobot.agent.hook import AgentHook, AgentRunHookContext
 from nanobot.agent.hooks import create_file_edit_activity_hook
 from nanobot.agent.loop import AgentLoop
-from nanobot.agent.tools.mcp import MCPProvider
+from nanobot.agent.tools.mcp import RELOAD_DRAIN_TIMEOUT_SECONDS, MCPProvider
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.cli import terminal as cli_terminal
 from nanobot.cli.runtime_config import _migrate_cron_store
@@ -50,20 +50,42 @@ console = Console()
 
 
 class _MCPReadinessHook(AgentHook):
-    """Retry application-owned MCP connections before the runner reads tools."""
+    """Retry MCP connections before a run, and keep its tools alive for it.
+
+    The hook instance is shared by every concurrent run, so the provider's
+    turn token is kept per ``AgentRunHookContext`` (one object per run, and
+    ``slots=True`` rules out stashing it on the context itself).  Registration
+    is what lets ``MCPProvider.reload()`` avoid closing a transport or
+    unregistering a tool under a run that is already using it; ``on_finally``
+    is the release point because the runner calls it in a ``finally``, so it
+    also covers the error and cancellation paths.
+    """
 
     def __init__(self, provider: MCPProvider) -> None:
         super().__init__()
         self._provider = provider
+        self._turn_tokens: dict[int, object] = {}
 
     async def before_run(self, context: AgentRunHookContext) -> None:
         await self._provider.connect()
+        # After connect(), so a reload that is draining holds the run here
+        # rather than letting it pick up tools the reload is about to close.
+        self._turn_tokens[id(context)] = await self._provider.begin_turn()
+
+    async def on_finally(self, context: AgentRunHookContext) -> None:
+        token = self._turn_tokens.pop(id(context), None)
+        if token is not None:
+            self._provider.end_turn(token)
 
 
 # Bound a watcher-driven reload the same way the WebUI settings route does:
 # ``reload()`` holds the provider lock the pre-turn readiness hook also takes,
 # so an unreachable server must not stall every turn until its transport gives up.
-_MCP_HOT_RELOAD_TIMEOUT_SECONDS = 15.0
+# The budget covers both phases: draining turns that are already running
+# (``RELOAD_DRAIN_TIMEOUT_SECONDS``) and then reconnecting.  If the timeout
+# fired during the drain nothing would reload at all, so it has to be strictly
+# larger than the drain.
+_MCP_HOT_RELOAD_TIMEOUT_SECONDS = 15.0 + RELOAD_DRAIN_TIMEOUT_SECONDS
 
 
 class _RuntimeConfigInvalidator(Protocol):

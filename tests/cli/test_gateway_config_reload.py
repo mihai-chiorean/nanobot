@@ -483,3 +483,80 @@ async def test_hot_reload_returns_none_when_nothing_changed(
 
     assert await _hot_reload_mcp_servers(provider) is None
     assert len(connections.attempts) == 1
+
+
+# ---------------------------------------------------------------------------
+# The readiness hook is what makes the provider's turn drain real: it is the
+# only thing on the gateway's turn path that knows a run has started and
+# finished, so it must register the run for the whole of its life.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_readiness_hook_registers_the_turn_for_its_whole_life(monkeypatch):
+    """Without this the provider's drain has nothing to wait for."""
+    from nanobot.agent.hook import AgentRunHookContext
+    from nanobot.cli.gateway_runtime import _MCPReadinessHook
+
+    registry = ToolRegistry()
+    provider = MCPProvider({}, registry, server_loader=dict)
+    hook = _MCPReadinessHook(provider)
+    context = AgentRunHookContext(messages=[])
+
+    assert provider.active_turn_count == 0
+    await hook.before_run(context)
+    assert provider.active_turn_count == 1, "the running turn is invisible to reload()"
+    await hook.on_finally(context)
+    assert provider.active_turn_count == 0
+
+
+@pytest.mark.asyncio
+async def test_readiness_hook_releases_the_turn_when_the_run_raises(monkeypatch):
+    """`on_finally` runs on the error and cancellation paths too."""
+    from nanobot.agent.hook import AgentRunHookContext
+    from nanobot.cli.gateway_runtime import _MCPReadinessHook
+
+    provider = MCPProvider({}, ToolRegistry(), server_loader=dict)
+    hook = _MCPReadinessHook(provider)
+    context = AgentRunHookContext(messages=[])
+
+    await hook.before_run(context)
+    context.exception = RuntimeError("boom")
+    await hook.on_finally(context)
+
+    assert provider.active_turn_count == 0
+
+
+@pytest.mark.asyncio
+async def test_readiness_hook_keeps_concurrent_turns_independent(monkeypatch):
+    """The hook instance is shared across turns, so it must not keep one token."""
+    from nanobot.agent.hook import AgentRunHookContext
+    from nanobot.cli.gateway_runtime import _MCPReadinessHook
+
+    provider = MCPProvider({}, ToolRegistry(), server_loader=dict)
+    hook = _MCPReadinessHook(provider)
+    first = AgentRunHookContext(messages=[])
+    second = AgentRunHookContext(messages=[])
+
+    await hook.before_run(first)
+    await hook.before_run(second)
+    assert provider.active_turn_count == 2
+
+    await hook.on_finally(first)
+    assert provider.active_turn_count == 1
+    await hook.on_finally(second)
+    assert provider.active_turn_count == 0
+
+
+@pytest.mark.asyncio
+async def test_readiness_hook_on_finally_without_before_run_is_a_no_op():
+    """`before_run` can raise before it registers; on_finally still fires."""
+    from nanobot.agent.hook import AgentRunHookContext
+    from nanobot.cli.gateway_runtime import _MCPReadinessHook
+
+    provider = MCPProvider({}, ToolRegistry(), server_loader=dict)
+    hook = _MCPReadinessHook(provider)
+
+    await hook.on_finally(AgentRunHookContext(messages=[]))
+
+    assert provider.active_turn_count == 0

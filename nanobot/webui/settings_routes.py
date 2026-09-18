@@ -12,6 +12,7 @@ from websockets.http11 import Request as WsRequest
 from websockets.http11 import Response
 
 from nanobot.agent.tools.image_generation import request_image_generation_reload
+from nanobot.agent.tools.mcp import RELOAD_DRAIN_TIMEOUT_SECONDS
 from nanobot.agent.tools.mcp_oauth import MCP_OAUTH_CALLBACK_PATH
 from nanobot.api.runtime import ApiRuntime, api_runtime_paths
 from nanobot.bus.queue import MessageBus
@@ -71,7 +72,10 @@ _WEBUI_MUTATION_PAYLOAD_ATTR = "_nanobot_webui_mutation_payload"
 _WEBUI_MUTATION_REQUEST_ATTR = "_nanobot_webui_mutation_request"
 _CHANNEL_CONNECT_ACTIONS = frozenset({"start", "poll", "cancel"})
 _MCP_OAUTH_CALLBACK_URL_MAX_BYTES = 8 * 1024
-_MCP_RELOAD_TIMEOUT_SECONDS = 15.0
+# Covers both phases of ``MCPProvider.reload()``: draining turns that are
+# already running, then reconnecting.  It has to exceed the drain, or the
+# timeout would fire before anything was reloaded.
+_MCP_RELOAD_TIMEOUT_SECONDS = 15.0 + RELOAD_DRAIN_TIMEOUT_SECONDS
 _query_first = contracts.query_first
 
 
