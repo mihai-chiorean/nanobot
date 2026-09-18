@@ -517,3 +517,42 @@ def test_two_different_bad_entries_are_both_quarantined(tmp_path: Path) -> None:
         if line.strip()
     ]
     assert len(records) == 2
+
+
+# --------------------------------------------------------------------------
+# Disabling must stay reversible (PR review, C5)
+# --------------------------------------------------------------------------
+
+
+def test_disabling_a_malformed_work_task_preserves_its_routing(tmp_path: Path) -> None:
+    """Restoring work_task into BINDABLE_PAYLOAD_KINDS routes it through
+    _disable_malformed_legacy_job, which clears channel_meta -- where a
+    work_task's work_chat_id and work_plan_task_id live. Losing them turns a
+    recoverable failure into a permanent one."""
+    raw = json.loads(json.dumps(OWNER_WORK_JOBS[0]))
+    raw["payload"]["to"] = None  # unroutable: forces the disable path
+    store_path = tmp_path / "cron" / "jobs.json"
+    _write_store(store_path, [raw])
+
+    service = CronService(store_path)
+    loaded = service._load_jobs()
+    assert loaded is not None
+    (job,) = loaded[0]
+
+    assert job.enabled is False
+    assert job.state.last_status == "error"
+    # The hints survive, so the job can be rebuilt.
+    routing = work_routing(job)
+    assert routing["work_chat_id"] == "bbed5fcf-25b6-44e1-ad52-ba5f489dac34"
+    assert routing["work_plan_task_id"] == "work_d52a3a497f664e5fb329322cecc796d4"
+    assert routing["work_deliverable"] == "markdown_digest"
+
+
+def test_a_healthy_work_task_is_never_disabled(tmp_path: Path) -> None:
+    store_path = tmp_path / "cron" / "jobs.json"
+    _write_store(store_path, list(OWNER_WORK_JOBS))
+    service = CronService(store_path)
+    loaded = service._load_jobs()
+    assert loaded is not None
+    assert all(job.enabled for job in loaded[0])
+    assert all(job.state.last_status != "error" for job in loaded[0])

@@ -106,7 +106,17 @@ def _legacy_session_key(payload: CronPayload) -> str | None:
 
 
 def _disable_malformed_legacy_job(job: CronJob) -> None:
+    """Disable a job that cannot be routed, without destroying its routing hints.
+
+    MIT-1010: this clears ``channel_meta``, and for a ``work_task`` payload that
+    is where ``work_chat_id`` / ``work_plan_task_id`` / ``work_deliverable``
+    live. Wiping them turns "this job is disabled until you fix it" into "this
+    job can never be fixed", because the hints needed to rebuild it are gone.
+    Snapshot them into ``origin_metadata`` first so disabling stays reversible.
+    """
     reason = "legacy cron payload is missing channel/to; recreate it from a chat session"
+    if job.payload.channel_meta and not job.payload.origin_metadata:
+        job.payload.origin_metadata = _persistable_origin_metadata(job.payload.channel_meta)
     job.payload.deliver = False
     job.payload.channel = None
     job.payload.to = None
