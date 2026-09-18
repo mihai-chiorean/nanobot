@@ -1122,3 +1122,43 @@ def test_resolver_raises_on_a_key_ddgs_would_have_silently_downgraded():
     from nanobot.agent.tools.web import _DDGS_TEXT_BACKEND
 
     assert _resolve_ddgs_text_backend(_DDGS_TEXT_BACKEND) == _DDGS_TEXT_BACKEND
+
+
+def _registry_with_reassigned_duckduckgo(monkeypatch):
+    """Simulate a ddgs release that reused the key for a different engine."""
+    from ddgs.engines import ENGINES
+
+    stripped = {k: dict(v) for k, v in ENGINES.items()}
+    stripped["text"]["duckduckgo"] = stripped["text"]["mojeek"]
+    monkeypatch.setattr("ddgs.engines.ENGINES", stripped)
+
+
+def test_resolver_rejects_a_key_that_no_longer_points_at_duckduckgo(monkeypatch):
+    """Key presence is not identity.
+
+    A removed key is not the only way the registry can churn: ddgs could reuse
+    `"duckduckgo"` for a different engine in a refactor. That resolves cleanly,
+    produces no fan-out-shaped signal, and would quietly send private queries
+    somewhere else — the same disclosure, one step subtler. Check what the key
+    actually points at, not just that it is there.
+    """
+    from nanobot.agent.tools.web import (
+        SearchBackendUnavailableError,
+        _resolve_ddgs_text_backend,
+    )
+
+    _registry_with_reassigned_duckduckgo(monkeypatch)
+
+    with pytest.raises(SearchBackendUnavailableError, match="mojeek.com"):
+        _resolve_ddgs_text_backend()
+
+
+@pytest.mark.asyncio
+async def test_duckduckgo_search_refuses_a_reassigned_backend_key(monkeypatch):
+    _registry_with_reassigned_duckduckgo(monkeypatch)
+    calls = _recording_ddgs(monkeypatch)
+
+    result = await _tool(provider="duckduckgo").execute("a private sounding query", count=3)
+
+    assert not calls, "searched through an engine that is no longer DuckDuckGo"
+    assert is_tool_error_result(result)
