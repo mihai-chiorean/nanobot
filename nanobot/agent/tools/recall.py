@@ -16,13 +16,19 @@ is a liability, not a feature.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from loguru import logger
 from pydantic import BaseModel, Field
 
-from nanobot.agent.memory_index import KINDS, MemoryIndex, render_hits
+from nanobot.agent.memory_index import (
+    CURATED_SOURCES,
+    KINDS,
+    MemoryIndex,
+    render_hits,
+)
 from nanobot.agent.tools.base import Tool, ToolResult
+from nanobot.agent.tools.context import current_request_session_key
 
 if TYPE_CHECKING:
     from nanobot.agent.tools.context import ToolContext
@@ -39,6 +45,28 @@ class MemoryToolConfig(BaseModel):
 
     enable: bool = True
     max_results: int = Field(default=5, ge=1, le=10)
+    scope: Literal["session", "channel", "workspace"] = "session"
+    """How far a recall query may reach across conversations.
+
+    One workspace holds every conversation its runtime serves. The index is
+    per-tenant, but *inside* a tenant the owner's Telegram DMs, a Discord
+    channel and — once shared rooms land — a room with guests in it all share
+    one store. Scope is the audience boundary within that store.
+
+    - ``session`` (default): the calling conversation's own transcript and its
+      consolidation summaries, plus the curated memory files. Safe in a shared
+      room, because a guest reaches only the room they are already in.
+    - ``channel``: additionally every conversation on the same channel. For a
+      runtime where one channel means one audience.
+    - ``workspace``: everything. **Only** for a runtime where every
+      conversation has the same single audience. This is true of the owner's
+      gateway today and stops being true the moment shared rooms land
+      (cutover memo C2) — at which point this must become audience-derived
+      rather than configured.
+
+    The default is the narrow one on purpose: a safe default must not depend
+    on a feature merely being absent.
+    """
 
 
 _SCOPES = {"all", *KINDS}
@@ -73,12 +101,48 @@ class RecallTool(Tool):
         index = cls._index_for(ctx)
         if index is None:
             raise RuntimeError("recall requires an attached memory index")
-        limit = int(getattr(getattr(ctx.config, "memory", None), "max_results", 5))
-        return cls(index=index, default_limit=limit)
+        memory_config = getattr(ctx.config, "memory", None)
+        limit = int(getattr(memory_config, "max_results", 5))
+        scope = str(getattr(memory_config, "scope", "session"))
+        return cls(index=index, default_limit=limit, scope=scope)
 
-    def __init__(self, index: MemoryIndex, *, default_limit: int = 5) -> None:
+    def __init__(
+        self,
+        index: MemoryIndex,
+        *,
+        default_limit: int = 5,
+        scope: str = "session",
+    ) -> None:
         self._index = index
         self._default_limit = default_limit
+        self._scope = scope if scope in {"session", "channel", "workspace"} else "session"
+
+    def _visible_sources(self) -> tuple[list[str] | None, list[str] | None]:
+        """Resolve the audience this call may search.
+
+        The session key comes from the per-request contextvar the agent loop
+        binds around tool execution — server-side, per turn, and never from a
+        tool argument, so the model cannot widen its own reach by asking. The
+        tool object itself is shared across every conversation this runtime
+        serves, so the boundary has to be resolved per call, not per tool.
+
+        Fails closed: a call with no bound session key (an internal or
+        malformed invocation) sees curated memory only, never another
+        conversation's transcript.
+        """
+        if self._scope == "workspace":
+            return None, None
+
+        session_key = current_request_session_key()
+        if not session_key:
+            logger.warning("recall: no bound session key; restricting to curated memory")
+            return list(CURATED_SOURCES), None
+
+        sources = [*CURATED_SOURCES, session_key, f"history:{session_key}"]
+        if self._scope == "channel" and ":" in session_key:
+            channel = session_key.split(":", 1)[0]
+            return sources, [f"{channel}:", f"history:{channel}:"]
+        return sources, None
 
     @property
     def name(self) -> str:
@@ -146,11 +210,14 @@ class RecallTool(Tool):
                 f"{', '.join(sorted(_SCOPES))}"
             )
         kinds = None if scope == "all" else [scope]
+        sources, prefixes = self._visible_sources()
         try:
             hits = self._index.search(
                 query,
                 limit=limit or self._default_limit,
                 kinds=kinds,
+                sources=sources,
+                source_prefixes=prefixes,
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception("recall: search failed")

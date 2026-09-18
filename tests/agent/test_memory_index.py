@@ -390,3 +390,195 @@ def test_window_covers_long_text_without_losing_the_tail():
     assert len(pieces) > 1
     assert all(len(p) <= 800 for p in pieces)
     assert "word1999" in pieces[-1]
+
+
+# ---------------------------------------------------------------------------
+# 6. Audience scope *inside* one workspace.
+#
+# The per-tenant boundary was never the weak point: the index is per-workspace
+# and the path is derived server-side. The hole was one level in. A workspace
+# holds every conversation its runtime serves, so an unscoped `recall` issued
+# from a shared room returned a private DM's text verbatim, owner chat id in
+# the provenance line. `recall` created that capability -- before it, recall
+# returned nothing to anyone -- so these tests sit at the tool level, where the
+# bug was, not at the index level, which was already correct.
+# ---------------------------------------------------------------------------
+
+
+import contextlib  # noqa: E402
+
+from nanobot.agent.tools.context import RequestContext, request_context  # noqa: E402
+from nanobot.agent.tools.recall import MemoryToolConfig, RecallTool  # noqa: E402
+
+
+@contextlib.contextmanager
+def _calling_from(session_key: str | None):
+    """Bind the per-request context the agent loop binds around a tool call."""
+    with request_context(
+        RequestContext(
+            channel=(session_key or "cli").split(":", 1)[0],
+            chat_id="chat",
+            session_key=session_key,
+        )
+    ):
+        yield
+
+
+def _two_audiences(tmp_path):
+    manager, indexer = _manager(tmp_path, "owner")
+    _say(
+        manager,
+        "telegram:ownerDM",
+        ("user", "my flight to zanzibar leaves on the 14th, seat 3A"),
+    )
+    _say(
+        manager,
+        "slack:shared-room-42",
+        ("user", "can someone confirm the zanzibar offsite budget"),
+    )
+    return manager, indexer
+
+
+def _tool(manager, scope: str = "session") -> RecallTool:
+    class _Ctx:
+        config = type("_Cfg", (), {"memory": MemoryToolConfig(scope=scope)})()
+        sessions = manager
+
+    _Ctx.workspace = str(manager.workspace)
+    return RecallTool.create(_Ctx())
+
+
+async def test_shared_room_cannot_recall_a_private_dm(tmp_path):
+    """The reported leak: reproduce it at the tool level and keep it fixed."""
+    manager, _ = _two_audiences(tmp_path)
+    tool = _tool(manager)
+
+    with _calling_from("slack:shared-room-42"):
+        out = str(await tool.execute(query="zanzibar"))
+
+    assert "telegram:ownerDM" not in out
+    assert "seat 3A" not in out
+    assert "the 14th" not in out
+    # The room still recalls its own history.
+    assert "offsite budget" in out
+
+
+async def test_a_conversation_recalls_its_own_history(tmp_path):
+    manager, _ = _two_audiences(tmp_path)
+    tool = _tool(manager)
+
+    with _calling_from("telegram:ownerDM"):
+        out = str(await tool.execute(query="zanzibar"))
+
+    assert "seat 3A" in out
+    assert "slack:shared-room-42" not in out
+
+
+async def test_curated_memory_is_in_scope_everywhere(tmp_path):
+    """SOUL/USER/MEMORY are already in every system prompt; recall adds nothing."""
+    from nanobot.agent.memory import MemoryStore
+
+    manager, indexer = _two_audiences(tmp_path)
+    store = MemoryStore(manager.workspace)
+    store.set_recall_indexer(indexer)
+    store.write_memory("- Prefers window seats on long zanzibar flights.\n")
+
+    with _calling_from("slack:shared-room-42"):
+        out = str(await _tool(manager).execute(query="zanzibar window seats"))
+
+    assert "window seats" in out
+    assert "seat 3A" not in out
+
+
+async def test_unbound_session_key_fails_closed(tmp_path):
+    """No audience means no transcript, not every transcript."""
+    manager, _ = _two_audiences(tmp_path)
+    tool = _tool(manager)
+
+    with _calling_from(None):
+        out = str(await tool.execute(query="zanzibar"))
+
+    assert "seat 3A" not in out
+    assert "offsite budget" not in out
+
+
+async def test_channel_scope_stays_on_its_own_channel(tmp_path):
+    manager, _ = _two_audiences(tmp_path)
+    _say(manager, "telegram:otherDM", ("user", "zanzibar hotel is the mnarani"))
+    tool = _tool(manager, scope="channel")
+
+    with _calling_from("telegram:ownerDM"):
+        out = str(await tool.execute(query="zanzibar"))
+
+    assert "mnarani" in out, "same channel is in scope"
+    assert "offsite budget" not in out, "a different channel is not"
+
+
+async def test_workspace_scope_is_opt_in_and_does_reach_everything(tmp_path):
+    """The owner's single-audience runtime can still search across channels."""
+    manager, _ = _two_audiences(tmp_path)
+
+    with _calling_from("slack:shared-room-42"):
+        narrow = str(await _tool(manager, scope="session").execute(query="zanzibar"))
+        wide = str(await _tool(manager, scope="workspace").execute(query="zanzibar"))
+
+    assert "seat 3A" not in narrow
+    assert "seat 3A" in wide
+
+
+def test_scope_defaults_to_the_narrow_one():
+    """A safe default must not depend on shared rooms merely being absent."""
+    assert MemoryToolConfig().scope == "session"
+
+
+async def test_model_cannot_widen_its_own_scope(tmp_path):
+    """Scope comes from the request contextvar, never from a tool argument."""
+    manager, _ = _two_audiences(tmp_path)
+    tool = _tool(manager)
+    assert "source" not in tool.parameters["properties"]
+    assert "session" not in tool.parameters["properties"]
+
+    with _calling_from("slack:shared-room-42"):
+        out = str(await tool.execute(
+            query="zanzibar",
+            scope="all",
+            session_key="telegram:ownerDM",  # ignored: not a declared parameter
+        ))
+    assert "seat 3A" not in out
+
+
+# ---------------------------------------------------------------------------
+# 7. The two bounds the review measured as wrong.
+# ---------------------------------------------------------------------------
+
+
+def test_render_budget_bounds_what_actually_reaches_the_prompt(tmp_path):
+    """The cap is a prompt-injection bound, so it must count formatted bytes."""
+    from nanobot.agent.memory_index import MAX_TOTAL_CHARS, MemoryHit
+
+    hits = [
+        MemoryHit(
+            source=f"discord:{i}",
+            kind=KIND_CONVERSATION,
+            ts="2026-09-17T09:00:00",
+            # Many short lines: each one grows by a 4-space indent.
+            body="\n".join(["quokka survey line"] * 40),
+            score=-1.0,
+        )
+        for i in range(10)
+    ]
+    rendered = render_hits(hits, "quokka")
+    assert len(rendered) < MAX_TOTAL_CHARS + 500, len(rendered)
+
+
+def test_change_detection_survives_a_restart(tmp_path):
+    """str(hash(...)) is PYTHONHASHSEED-randomised and never matched again."""
+    manager, indexer = _manager(tmp_path, "owner")
+    index = indexer.index
+    assert index.index_text("USER.md", "Mihai likes trilobites.", kind=KIND_FACT) > 0
+
+    index.close()
+    reopened = MemoryIndex(manager.sessions_dir)
+    # Same content, fresh process-equivalent connection: must short-circuit.
+    assert reopened.index_text("USER.md", "Mihai likes trilobites.", kind=KIND_FACT) == 0
+    assert reopened.index_text("USER.md", "Mihai likes ammonites.", kind=KIND_FACT) > 0

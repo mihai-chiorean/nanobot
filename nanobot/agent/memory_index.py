@@ -28,6 +28,7 @@ chose it over a vector store.
 
 from __future__ import annotations
 
+import hashlib
 import re
 import sqlite3
 import threading
@@ -68,6 +69,12 @@ UNTRUSTED_BANNER = (
 # and credential-leak surface. Recall exists to find what was said and decided,
 # not to re-serve a web page someone's assistant read in April.
 INDEXED_ROLES = frozenset({"user", "assistant"})
+
+# The curated layer. These three are the owner's deliberately-written persona
+# and profile, already injected into every system prompt, so recalling them
+# discloses nothing a turn did not already have. They are therefore in scope
+# for every conversation, including a shared room.
+CURATED_SOURCES = ("memory/MEMORY.md", "USER.md", "SOUL.md")
 
 KIND_CONVERSATION = "conversation"
 KIND_FACT = "fact"
@@ -140,6 +147,12 @@ class MemoryHit:
     ts: str
     body: str
     score: float
+
+
+def _like_prefix(prefix: str) -> str:
+    """Escape a source prefix for a LIKE pattern anchored at the start."""
+    escaped = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"{escaped}%"
 
 
 def strip_reasoning(text: str) -> str:
@@ -399,7 +412,10 @@ class MemoryIndex:
             if db is None:
                 return 0
             try:
-                digest = str(hash(text))
+                # sha256, not hash(): PYTHONHASHSEED is randomised per process,
+                # so a builtin hash never matches across a restart and the
+                # change-detection short-circuit silently never fires.
+                digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
                 row = db.execute(
                     "SELECT digest FROM sources WHERE source=?", (source,)
                 ).fetchone()
@@ -489,7 +505,19 @@ class MemoryIndex:
         *,
         limit: int = 5,
         kinds: Iterable[str] | None = None,
+        sources: Sequence[str] | None = None,
+        source_prefixes: Sequence[str] | None = None,
     ) -> list[MemoryHit]:
+        """Search the index, optionally narrowed to named sources.
+
+        ``sources``/``source_prefixes`` are an audience boundary, not a
+        convenience filter. One workspace holds every conversation the runtime
+        serves — private DMs, group channels and (once shared rooms land)
+        rooms with guests in them — so an unscoped search crosses between
+        audiences inside a single tenant. Callers that cannot name their
+        audience get nothing but explicitly curated memory; see
+        ``RecallScope`` in ``nanobot/agent/tools/recall.py``.
+        """
         expression = build_match_expression(query)
         if not expression:
             return []
@@ -508,6 +536,21 @@ class MemoryIndex:
             if wanted:
                 sql += f" AND c.kind IN ({','.join('?' * len(wanted))})"
                 params.extend(wanted)
+            if sources is not None or source_prefixes is not None:
+                clauses: list[str] = []
+                for source in sources or ():
+                    clauses.append("c.source = ?")
+                    params.append(source)
+                for prefix in source_prefixes or ():
+                    # LIKE with an escaped prefix: session keys are operator- and
+                    # channel-derived, never free text, but escape anyway so a
+                    # key containing % or _ cannot widen its own scope.
+                    clauses.append("c.source LIKE ? ESCAPE '\\'")
+                    params.append(_like_prefix(prefix))
+                if not clauses:
+                    # An explicit empty scope means "nothing is in scope".
+                    return []
+                sql += f" AND ({' OR '.join(clauses)})"
             sql += " ORDER BY score LIMIT ?"
             params.append(limit)
             try:
@@ -560,14 +603,18 @@ def render_hits(hits: Sequence[MemoryHit], query: str) -> str:
         body = hit.body[:MAX_SNIPPET_CHARS]
         if len(body) > budget:
             body = body[:budget]
-        budget -= len(body)
         provenance = f"[{position}] {hit.kind} | {hit.source}"
         if hit.ts:
             provenance += f" | {hit.ts}"
-        lines.append(provenance)
-        for line in body.splitlines():
-            lines.append(f"    {line}")
-        lines.append("")
+        # Charge the budget for what is actually emitted, indentation and
+        # provenance included. Charging it for the raw body let a capped
+        # "4000 char" render reach ~9.8k once every line grew a 4-space
+        # indent -- the cap is a prompt-injection bound, so it has to bound
+        # the bytes that reach the prompt, not the bytes before formatting.
+        block = [provenance, *(f"    {line}" for line in body.splitlines()), ""]
+        rendered = "\n".join(block)
+        budget -= len(rendered) + 1
+        lines.extend(block)
         if budget <= 0:
             lines.append("(remaining results omitted: recall output limit reached)")
             break
