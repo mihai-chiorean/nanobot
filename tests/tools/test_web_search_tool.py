@@ -979,15 +979,16 @@ async def test_fallback_to_duckduckgo_also_pins_the_ddgs_backend(monkeypatch):
 
 
 def test_pinned_backend_resolves_to_duckduckgo_only_inside_ddgs():
-    """The pinned value must be a real ddgs engine key, not a silent fallback.
+    """Canary: the pinned value is a real engine in the ddgs CI resolved.
 
-    `DDGS._get_engines` falls back to "auto" on an unknown key instead of
-    raising, so a typo would quietly restore the fan-out while every
-    mock-based test above kept passing. Assert against the installed registry.
+    This is *not* the guarantee — it only speaks for whichever 9.x pip picked,
+    and the text registry churns inside our range. The guarantee is
+    `_resolve_ddgs_text_backend`, which refuses to search when the key is
+    absent (see the tests below). Keep this one for the extra thing it proves:
+    that the key resolves to exactly one engine, and that it is DuckDuckGo's.
     """
     # ddgs is a hard runtime dependency (pyproject: ddgs>=9.5.5,<10.0.0), so
-    # this must never degrade to a skip — it is the only test that would catch
-    # a registry rename silently restoring the fan-out in production.
+    # this must never degrade to a skip.
     import ddgs as ddgs_module
     from ddgs.engines import ENGINES
 
@@ -1037,3 +1038,87 @@ async def test_pinned_backend_refusal_surfaces_as_a_tool_error(monkeypatch):
 
     assert is_tool_error_result(result)
     assert "DuckDuckGo search failed" in result
+
+
+# ---------------------------------------------------------------------------
+# MIT-1017 (follow-up) — the pin must fail loudly when ddgs drops the engine.
+#
+# `DDGS._get_engines` treats an unknown backend key as a *warning*: it logs
+# "backends do not exist or are disabled", ends up with zero engines, then
+# recurses into backend="auto" — the exact fan-out this pin exists to close.
+# `pyproject` allows any ddgs 9.x and there is no lockfile, and the text
+# registry demonstrably churns in that range (yandex is already gone from
+# 9.16.0). So the pin can be silently undone by a routine dependency bump.
+#
+# The runtime check is therefore the guarantee, not the registry assertion
+# below it: if the pinned key is not in the installed registry we refuse to
+# search rather than searching via "auto".
+# ---------------------------------------------------------------------------
+
+
+def _registry_without_duckduckgo(monkeypatch):
+    """Simulate a ddgs release that renamed or dropped the duckduckgo engine."""
+    from ddgs.engines import ENGINES
+
+    stripped = {k: dict(v) for k, v in ENGINES.items()}
+    stripped["text"].pop("duckduckgo", None)
+    monkeypatch.setattr("ddgs.engines.ENGINES", stripped)
+    return stripped
+
+
+@pytest.mark.asyncio
+async def test_duckduckgo_search_refuses_when_pinned_backend_is_missing(monkeypatch):
+    """A ddgs bump that drops the engine must break loudly, not fan out."""
+    _registry_without_duckduckgo(monkeypatch)
+    calls = _recording_ddgs(monkeypatch)
+
+    result = await _tool(provider="duckduckgo").execute("a private sounding query", count=3)
+
+    assert not calls, (
+        "ddgs.text() was called even though the pinned backend is not in the "
+        'installed registry — ddgs would have silently run backend="auto".'
+    )
+    assert is_tool_error_result(result)
+    assert "duckduckgo" in str(result).lower()
+
+
+@pytest.mark.asyncio
+async def test_provider_fallback_also_refuses_when_pinned_backend_is_missing(monkeypatch):
+    """Every keyless provider falls back here; the refusal must hold there too."""
+    _registry_without_duckduckgo(monkeypatch)
+    calls = _recording_ddgs(monkeypatch)
+
+    result = await _tool(provider="brave", api_key="").execute("another private query", count=3)
+
+    assert not calls
+    assert is_tool_error_result(result)
+
+
+def test_resolver_raises_on_a_key_ddgs_would_have_silently_downgraded():
+    """Version-independent: our resolver rejects what ddgs merely warns about.
+
+    This asserts the *mechanism* rather than the contents of one ddgs
+    release's registry, so it keeps its meaning across 9.x bumps.
+    """
+    import ddgs as ddgs_module
+
+    from nanobot.agent.tools.web import (
+        SearchBackendUnavailableError,
+        _resolve_ddgs_text_backend,
+    )
+
+    # Positive control: ddgs itself downgrades an unknown key to the fan-out.
+    client = ddgs_module.DDGS()
+    downgraded = client._get_engines("text", "definitely-not-an-engine")
+    assert len(downgraded) > 1, (
+        "ddgs no longer downgrades unknown backends to auto; re-check whether "
+        "the runtime guard is still the thing standing between us and a fan-out"
+    )
+
+    with pytest.raises(SearchBackendUnavailableError):
+        _resolve_ddgs_text_backend("definitely-not-an-engine")
+
+    # And the value we actually ship resolves.
+    from nanobot.agent.tools.web import _DDGS_TEXT_BACKEND
+
+    assert _resolve_ddgs_text_backend(_DDGS_TEXT_BACKEND) == _DDGS_TEXT_BACKEND

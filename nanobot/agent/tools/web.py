@@ -308,6 +308,49 @@ async def _stream_with_safe_redirects(
     )
 
 
+class SearchBackendUnavailableError(RuntimeError):
+    """The pinned ddgs engine is not in the installed ddgs registry."""
+
+
+def _resolve_ddgs_text_backend(backend: str = _DDGS_TEXT_BACKEND) -> str:
+    """Return `backend` if the installed ddgs really has that text engine.
+
+    `DDGS._get_engines` treats an unknown backend key as a *warning*: it logs
+    "backends do not exist or are disabled", collects zero engines, and then
+    recurses into ``backend="auto"`` — the fan-out across Grokipedia (xAI),
+    Yandex, Yahoo, Mojeek and friends that pinning a backend exists to prevent.
+    Our dependency range is `ddgs>=9.5.5,<10` with no lockfile, and the text
+    registry churns inside it (yandex is already gone as of 9.16.0), so a
+    routine bump could otherwise reinstate the disclosure with no error and no
+    failing test.
+
+    Raises:
+        SearchBackendUnavailableError: if the registry cannot be read or does
+            not contain `backend`. Callers must refuse to search rather than
+            fall through to ddgs' "auto" fan-out.
+    """
+    try:
+        from ddgs.engines import ENGINES  # pyright: ignore[reportMissingTypeStubs]
+
+        text_engines = ENGINES["text"]
+        available = sorted(text_engines)
+        known = backend in text_engines
+    except Exception as e:  # pragma: no cover - registry shape changed entirely
+        raise SearchBackendUnavailableError(
+            f"cannot read the ddgs text engine registry to confirm the {backend!r} "
+            f"pin ({e!r}); refusing to search rather than risk ddgs' \"auto\" fan-out"
+        ) from e
+
+    if not known:
+        raise SearchBackendUnavailableError(
+            f"the installed ddgs has no {backend!r} text backend (available: "
+            f"{', '.join(available) or 'none'}); ddgs would silently downgrade "
+            'this to backend="auto" and fan the query out across every engine '
+            "it knows, so refusing to search instead"
+        )
+    return backend
+
+
 def _format_results(query: str, items: list[dict[str, Any]], n: int) -> str:
     """Format provider results into shared plaintext output."""
     if not items:
@@ -1025,6 +1068,12 @@ class WebSearchTool(Tool):
 
     async def _search_duckduckgo(self, query: str, n: int) -> str:
         try:
+            backend = _resolve_ddgs_text_backend()
+        except SearchBackendUnavailableError as e:
+            logger.error("DuckDuckGo search refused: {}", e)
+            return ToolResult.error(f"Error: DuckDuckGo search refused ({e})")
+
+        try:
             # Note: duckduckgo_search is synchronous and does its own requests
             # We run it in a thread to avoid blocking the loop
             from ddgs import DDGS  # pyright: ignore[reportUnknownVariableType]
@@ -1036,7 +1085,7 @@ class WebSearchTool(Tool):
                     ddgs.text,
                     query,
                     max_results=n,
-                    backend=_DDGS_TEXT_BACKEND,
+                    backend=backend,
                 ),
                 timeout=self.config.timeout,
             )
