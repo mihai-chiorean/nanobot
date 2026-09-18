@@ -318,17 +318,40 @@ class ExecTool(Tool):
     #: Channels that carry a live human conversation.
     _INTERACTIVE_CHANNELS = frozenset({"websocket"})
     #: Session-key namespaces that reuse a chat channel for unattended runs.
-    _UNATTENDED_SESSION_PREFIXES = ("cron:", "heartbeat")
+    #: Only ``heartbeat`` is real today (cli/gateway_runtime.py); a
+    #: session-bound cron job does NOT get its own namespace -- see below.
+    _UNATTENDED_SESSION_PREFIXES = ("heartbeat",)
 
     @classmethod
     def _is_interactive_turn(cls, ctx: RequestContext | None) -> bool:
         if ctx is None or ctx.channel not in cls._INTERACTIVE_CHANNELS:
             return False
         metadata = ctx.metadata or {}
+
+        # An automation-generated turn carries a message source describing who
+        # produced it: "cron" (cron/webui_metadata.py), "local_trigger"
+        # (triggers/local_runner.py), "subagent_result" (agent/loop.py). The
+        # key is only ever set by automation, so any value means the turn was
+        # not typed by a person.
+        source = metadata.get("_webui_message_source")
+        if isinstance(source, dict) and source.get("kind"):
+            return False
+
+        # Belt and braces for a session-bound cron job, which is the case that
+        # makes the session key useless here: run_bound_cron_job reuses the
+        # originating *chat's* session key ("websocket:<chat_id>") and spends
+        # "cron:{job.id}" only as a turn seed, so there is no cron namespace to
+        # match on. This marker is set on every bound run, including channels
+        # where the WebUI source metadata is not added.
+        if metadata.get("_cron_trigger"):
+            return False
+
         # A background or scheduled Work task is dispatched over the same
         # websocket channel as chat and is marked in metadata instead.
+        # Inert until the Work app lands; harmless before then.
         if metadata.get("work_mode") or metadata.get("work_task_id"):
             return False
+
         session_key = ctx.session_key or ""
         return not session_key.startswith(cls._UNATTENDED_SESSION_PREFIXES)
 

@@ -110,23 +110,101 @@ async def test_no_request_context_means_no_restriction(tmp_path):
     assert "Installing software is not available" not in result
 
 
-@pytest.mark.parametrize(
-    ("overrides", "why"),
-    [
-        ({"metadata": {"work_mode": "background", "work_task_id": "t1"}},
+# The turn shapes below are built from what the runtime actually emits, not
+# from hand-written metadata. A synthetic session_key like "cron:job-1" proves
+# nothing: `run_bound_cron_job` binds the job to the originating *chat's*
+# session key and only uses `cron:{job.id}` as a turn seed, so a test that
+# invents the namespace passes while the real shape is misclassified.
+
+
+def _bound_cron_turn() -> RequestContext:
+    """The shape `nanobot.cron.bound_runner.run_bound_cron_job` really emits."""
+    from nanobot.cron.bound_runner import _bound_session_delivery_context
+    from nanobot.cron.session_turns import (
+        CRON_DEFER_UNTIL_IDLE_META,
+        CRON_TRIGGER_META,
+    )
+    from nanobot.cron.types import CronJob, CronPayload
+
+    job = CronJob(
+        id="job-7",
+        name="nightly digest",
+        payload=CronPayload(
+            kind="agent_turn",
+            message="post the digest",
+            # Session-bound: the job runs inside the chat it was created from.
+            session_key="websocket:chat-1",
+            origin_channel="websocket",
+            origin_chat_id="chat-1",
+        ),
+    )
+    channel, chat_id, metadata = _bound_session_delivery_context(
+        job, turn_seed=f"cron:{job.id}", source_label=job.name,
+    )
+    metadata[CRON_TRIGGER_META] = {"job_id": job.id, "job_name": job.name}
+    metadata[CRON_DEFER_UNTIL_IDLE_META] = True
+    return RequestContext(
+        channel=channel,
+        chat_id=chat_id,
+        message_id=None,
+        session_key=job.payload.session_key,
+        metadata=metadata,
+        turn_id=metadata.get("webui_turn_id"),
+    )
+
+
+def _local_trigger_turn() -> RequestContext:
+    """A local trigger firing into a bound chat (nanobot.triggers.local_runner)."""
+    from nanobot.webui.metadata import (
+        WEBUI_MESSAGE_SOURCE_METADATA_KEY,
+        WEBUI_TURN_METADATA_KEY,
+    )
+
+    return RequestContext(
+        channel="websocket",
+        chat_id="chat-1",
+        session_key="websocket:chat-1",
+        metadata={
+            "webui": True,
+            WEBUI_TURN_METADATA_KEY: "local:trigger-3:abcdef",
+            WEBUI_MESSAGE_SOURCE_METADATA_KEY: {"kind": "local_trigger"},
+        },
+        turn_id="local:trigger-3:abcdef",
+    )
+
+
+def test_bound_cron_really_reuses_the_chat_session_key():
+    """Guards the guard: if this ever changes, the scoping test below is stale."""
+    ctx = _bound_cron_turn()
+    assert ctx.channel == "websocket"
+    assert ctx.session_key == "websocket:chat-1"
+    assert not ctx.session_key.startswith("cron:")
+    assert ctx.metadata.get("_cron_trigger", {}).get("job_id") == "job-7"
+    assert ctx.metadata.get("_webui_message_source", {}).get("kind") == "cron"
+
+
+def _turn_kinds():
+    return [
+        (_bound_cron_turn(), "session-bound cron run"),
+        (_local_trigger_turn(), "local trigger run"),
+        # Heartbeat really does use this session key, on the originating
+        # channel (nanobot/cli/gateway_runtime.py: session_key="heartbeat").
+        (_chat(session_key="heartbeat", turn_id=None), "heartbeat run"),
+        # Dead code on this base; live once the Work app lands (#58).
+        (_chat(metadata={"work_mode": "background", "work_task_id": "t1"}),
          "background Work task"),
-        ({"metadata": {"work_mode": "scheduled", "work_task_id": "t2"}},
+        (_chat(metadata={"work_mode": "scheduled", "work_task_id": "t2"}),
          "scheduled Work task"),
-        ({"session_key": "cron:job-1"}, "cron run"),
-        ({"session_key": "heartbeat"}, "heartbeat run"),
-        ({"channel": "cli", "session_key": "cli:direct"}, "cli"),
-        ({"channel": "api", "session_key": "api:x"}, "api"),
-        ({"channel": "system", "session_key": "system:sub"}, "subagent"),
-    ],
-)
+        (_chat(channel="cli", chat_id="direct", session_key="cli:direct"), "cli"),
+        (_chat(channel="api", chat_id="x", session_key="api:x"), "api"),
+        (_chat(channel="system", chat_id="sub", session_key="system:sub"), "subagent"),
+    ]
+
+
+@pytest.mark.parametrize(("ctx", "why"), _turn_kinds())
 @pytest.mark.asyncio
-async def test_non_interactive_turns_are_not_restricted(tmp_path, overrides, why):
+async def test_non_interactive_turns_are_not_restricted(tmp_path, ctx, why):
     tool = ExecTool(working_dir=str(tmp_path))
-    with request_context(_chat(**overrides)):
+    with request_context(ctx):
         result = await tool.execute(command="pip install --help")
     assert "Installing software is not available" not in result, why
