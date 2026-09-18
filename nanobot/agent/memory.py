@@ -83,6 +83,10 @@ class MemoryStore:
         self._oversize_logged = False  # rate-limit oversized-entry warning
         self._dream_prompt_oversize_logged = False
         self._append_lock = threading.Lock()  # serialize cursor allocation + append
+        # Ziggy-local (fork, MIT-1013): the curated layer feeds recall too, so
+        # `recall` can surface a remembered fact and not only raw chat. Set by
+        # the Agent once the per-workspace index exists; None in plain CLI use.
+        self._recall: Any = None
         self._git = GitStore(workspace, tracked_files=[
             "SOUL.md", "USER.md", "memory/MEMORY.md", "memory/.dream_cursor",
         ])
@@ -91,6 +95,19 @@ class MemoryStore:
     @property
     def git(self) -> GitStore:
         return self._git
+
+    def set_recall_indexer(self, indexer: Any) -> None:
+        """Attach the recall index fed by curated-memory writes (Ziggy-local)."""
+        self._recall = indexer
+        self._reindex_curated()
+
+    def _reindex_curated(self) -> None:
+        if self._recall is None:
+            return
+        try:
+            self._recall.index_memory_files(self)
+        except Exception:
+            logger.exception("Recall index update failed for curated memory")
 
     # -- generic helpers -----------------------------------------------------
 
@@ -229,6 +246,7 @@ class MemoryStore:
 
     def write_memory(self, content: str) -> None:
         self.memory_file.write_text(content, encoding="utf-8")
+        self._reindex_curated()
 
     # -- SOUL.md -------------------------------------------------------------
 
@@ -237,6 +255,7 @@ class MemoryStore:
 
     def write_soul(self, content: str) -> None:
         self.soul_file.write_text(content, encoding="utf-8")
+        self._reindex_curated()
 
     # -- USER.md -------------------------------------------------------------
 
@@ -245,6 +264,7 @@ class MemoryStore:
 
     def write_user(self, content: str) -> None:
         self.user_file.write_text(content, encoding="utf-8")
+        self._reindex_curated()
 
     # -- context injection (used by context.py) ------------------------------
 
@@ -317,6 +337,18 @@ class MemoryStore:
             with open(self.history_file, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
             self._cursor_file.write_text(str(cursor), encoding="utf-8")
+        # Consolidation summaries are the densest thing in memory: one line per
+        # archived chunk, already stripped. Index them as they are written.
+        if content and self._recall is not None:
+            try:
+                self._recall.index.append_text(
+                    f"history:{session_key or 'shared'}",
+                    content,
+                    kind="history",
+                    ts=ts,
+                )
+            except Exception:
+                logger.exception("Recall index update failed for history entry")
         return cursor
 
     @staticmethod
