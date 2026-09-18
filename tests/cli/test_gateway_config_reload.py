@@ -560,3 +560,34 @@ async def test_readiness_hook_on_finally_without_before_run_is_a_no_op():
     await hook.on_finally(AgentRunHookContext(messages=[]))
 
     assert provider.active_turn_count == 0
+
+
+@pytest.mark.asyncio
+async def test_turn_token_is_released_when_an_earlier_hook_cancels_in_on_finally():
+    """The leak this guards against is permanent, so cover it end to end.
+
+    Hook order puts the file-edit activity hook ahead of the readiness hook,
+    and that one awaits an event emit on the cancelled path. If its
+    `CancelledError` escaped the composite fan-out, the readiness hook never
+    released its turn token, and every later reload burned its full drain.
+    """
+    from nanobot.agent.hook import AgentHook, AgentRunHookContext, CompositeHook
+    from nanobot.cli.gateway_runtime import _MCPReadinessHook
+
+    provider = MCPProvider({}, ToolRegistry(), server_loader=dict)
+    readiness = _MCPReadinessHook(provider)
+
+    class _CancelsInFinally(AgentHook):
+        async def on_finally(self, context: AgentRunHookContext) -> None:
+            raise asyncio.CancelledError
+
+    composite = CompositeHook([_CancelsInFinally(), readiness])
+    context = AgentRunHookContext(messages=[])
+
+    await composite.before_run(context)
+    assert provider.active_turn_count == 1
+
+    with pytest.raises(asyncio.CancelledError):
+        await composite.on_finally(context)
+
+    assert provider.active_turn_count == 0, "the turn token leaked permanently"

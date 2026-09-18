@@ -1621,6 +1621,12 @@ class MCPProvider:
         overlap) nest: the gate stays closed until the last of them has
         finished swapping.
         """
+        if not self._reload_would_disturb_turns():
+            # Nothing is being unregistered or closed, so no turn can lose a
+            # tool. Skipping keeps the common add-only/retry reload off the
+            # turn-latency path entirely.
+            return await self._reload_locked(True)
+
         self._reload_drain_depth += 1
         self._reload_gate.clear()
         try:
@@ -1631,6 +1637,29 @@ class MCPProvider:
             if self._reload_drain_depth <= 0:
                 self._reload_drain_depth = 0
                 self._reload_gate.set()
+
+    def _reload_would_disturb_turns(self) -> bool:
+        """Whether the pending config would remove or change a live server.
+
+        Only those two cases unregister tools and close transports; added
+        servers and reconnect retries are additive and cannot pull anything out
+        from under a running turn.  A config that cannot be read counts as
+        disturbing, so an unreadable config takes the cautious path rather than
+        skipping the drain on the way to reporting the read error.
+        """
+        try:
+            next_servers = dict(self._server_loader())
+        except Exception:
+            return True
+        current = self._servers
+        current_names = set(current)
+        next_names = set(next_servers)
+        if current_names - next_names:
+            return True
+        return any(
+            _server_signature(current[name]) != _server_signature(next_servers[name])
+            for name in current_names & next_names
+        )
 
     async def _reload_locked(self, drained: bool) -> dict[str, Any]:
         async with self._lock:

@@ -945,3 +945,57 @@ async def test_overlapping_reloads_keep_the_turn_gate_closed(
     provider.end_turn(held)
     await asyncio.wait_for(slow, timeout=5.0)
     provider.end_turn(await asyncio.wait_for(late, timeout=5.0))
+
+
+@pytest.mark.asyncio
+async def test_an_add_only_reload_does_not_stall_on_a_running_turn(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Nothing is unregistered or closed, so there is nothing to protect.
+
+    Agent turns run for minutes. If every reload drained, one long turn would
+    make every config write burn the full drain timeout and park every new
+    turn behind the gate for it — on a gateway whose tenant config is
+    rewritten by provisioning. Pay that cost only when a server is actually
+    being removed or changed.
+    """
+    _reload_probe(monkeypatch)
+    configured: dict[str, MCPServerConfig] = {
+        "browserbase": MCPServerConfig(type="stdio", command="browserbase-mcp")
+    }
+    registry = ToolRegistry()
+    provider = MCPProvider({}, registry, server_loader=lambda: configured)
+    await provider.reload()
+
+    held = await provider.begin_turn()  # a long-running turn
+    configured = {
+        "browserbase": MCPServerConfig(type="stdio", command="browserbase-mcp"),
+        "linkedin": MCPServerConfig(type="stdio", command="linkedin-mcp"),
+    }
+
+    result = await asyncio.wait_for(provider.reload(drain_timeout_s=30.0), timeout=5.0)
+
+    assert result["added"] == ["linkedin"]
+    assert result["drained"] is True
+    assert registry.has("mcp_browserbase_navigate"), "the running turn lost its tool"
+    provider.end_turn(held)
+
+
+@pytest.mark.asyncio
+async def test_an_add_only_reload_does_not_close_the_turn_gate(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _reload_probe(monkeypatch)
+    configured: dict[str, MCPServerConfig] = {}
+    registry = ToolRegistry()
+    provider = MCPProvider({}, registry, server_loader=lambda: configured)
+
+    held = await provider.begin_turn()
+    configured = {"linkedin": MCPServerConfig(type="stdio", command="linkedin-mcp")}
+
+    reload_task = asyncio.create_task(provider.reload(drain_timeout_s=30.0))
+    late = await asyncio.wait_for(provider.begin_turn(), timeout=1.0)
+
+    await asyncio.wait_for(reload_task, timeout=5.0)
+    provider.end_turn(held)
+    provider.end_turn(late)
