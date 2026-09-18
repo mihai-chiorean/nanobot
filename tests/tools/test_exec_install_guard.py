@@ -14,7 +14,7 @@ import pytest
 
 from nanobot.agent.tools.context import RequestContext, request_context
 from nanobot.agent.tools.env_guard import INSTALL_ATTEMPT_BUDGET
-from nanobot.agent.tools.shell import ExecTool
+from nanobot.agent.tools.shell import USER_SHELL_COMMAND_ATTR, ExecTool
 
 
 def _chat(turn_id: str = "turn-1", **overrides) -> RequestContext:
@@ -208,3 +208,56 @@ async def test_non_interactive_turns_are_not_restricted(tmp_path, ctx, why):
     with request_context(ctx):
         result = await tool.execute(command="pip install --help")
     assert "Installing software is not available" not in result, why
+
+
+# --- the owner's own typed command is not the model escalating -------------
+
+
+def test_the_user_shell_command_path_marks_itself_as_user_issued():
+    """Guards the guard: the marker below must be set by the real code path."""
+    import inspect
+
+    from nanobot.agent.loop import AgentLoop
+
+    source = inspect.getsource(AgentLoop.execute_user_shell_command)
+    assert USER_SHELL_COMMAND_ATTR in source
+
+
+@pytest.mark.asyncio
+async def test_explicit_user_shell_command_is_not_refused(tmp_path):
+    """`!pip install x` is the owner typing it, not escalation-by-habit."""
+    tool = ExecTool(working_dir=str(tmp_path))
+    ctx = _chat()
+    ctx = RequestContext(
+        channel=ctx.channel,
+        chat_id=ctx.chat_id,
+        message_id=ctx.message_id,
+        session_key=ctx.session_key,
+        original_user_text="!pip install --help",
+        metadata=ctx.metadata,
+        turn_id=ctx.turn_id,
+        attributes={USER_SHELL_COMMAND_ATTR: True},
+    )
+    with request_context(ctx):
+        result = await tool.execute(command="pip install --help")
+    assert "Installing software is not available" not in result
+
+
+@pytest.mark.asyncio
+async def test_user_shell_command_does_not_spend_the_turn_budget(tmp_path):
+    """A user-issued install must not make the model's next refusal escalate."""
+    tool = ExecTool(working_dir=str(tmp_path))
+    user_ctx = RequestContext(
+        channel="websocket",
+        chat_id="chat-1",
+        session_key="websocket:chat-1",
+        turn_id="turn-1",
+        attributes={USER_SHELL_COMMAND_ATTR: True},
+    )
+    with request_context(user_ctx):
+        for _ in range(INSTALL_ATTEMPT_BUDGET + 2):
+            await tool.execute(command="pip install --help")
+    with request_context(_chat("turn-1")):
+        result = await tool.execute(command="pip3 install playwright")
+    assert "Installing software is not available" in result
+    assert "Stop building an environment" not in result

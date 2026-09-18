@@ -53,6 +53,12 @@ from nanobot.security.workspace_policy import is_path_within
 from nanobot.utils.sensitive import check_shell_command
 
 _IS_WINDOWS = sys.platform == "win32"
+
+# Ziggy-local (fork, MIT-1014): RequestContext.attributes marker set by
+# AgentLoop.execute_user_shell_command, the trusted `!<command>` path. A
+# command the user typed themselves is not the model escalating, so the
+# install guard stands aside for it.
+USER_SHELL_COMMAND_ATTR = "user_shell_command"
 _PROCESS_TREE_OWNER_ATTR = "_nanobot_process_tree_owner"
 
 
@@ -359,6 +365,11 @@ class ExecTool(Tool):
         """Refuse package installs / env construction inside a chat turn."""
         ctx = current_request_context()
         if not self._is_interactive_turn(ctx):
+            return None
+        # The owner typing `!pip install x` is an explicit instruction, not
+        # the escalation-by-habit this guard targets. Only the trusted
+        # user-shell path sets this, and it never wraps a model tool call.
+        if ctx is not None and (ctx.attributes or {}).get(USER_SHELL_COMMAND_ATTR):
             return None
         detected = detect_environment_build(command)
         if detected is None:
