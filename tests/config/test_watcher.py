@@ -35,6 +35,87 @@ async def test_watch_config_file_filters_directory_events(
 
 
 @pytest.mark.asyncio
+async def test_watch_config_file_awaits_async_callbacks(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config_path = tmp_path / "config.json"
+    events: list[str] = []
+
+    async def fake_awatch(*_paths, **_kwargs):
+        yield {(Change.modified, str(config_path))}
+        events.append("second-batch")
+        yield {(Change.modified, str(config_path))}
+
+    async def on_change() -> None:
+        events.append("start")
+        await asyncio.sleep(0)
+        events.append("done")
+
+    monkeypatch.setattr(config_watcher, "awatch", fake_awatch)
+
+    await config_watcher.watch_config_file(config_path, on_change)
+
+    # The awaitable is awaited, and fully, before the next batch is consumed.
+    assert events == ["start", "done", "second-batch", "start", "done"]
+
+
+@pytest.mark.asyncio
+async def test_watch_config_file_logs_handler_errors_and_keeps_watching(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config_path = tmp_path / "config.json"
+    calls = 0
+    records: list = []
+
+    async def fake_awatch(*_paths, **_kwargs):
+        yield {(Change.modified, str(config_path))}
+        yield {(Change.modified, str(config_path))}
+
+    async def on_change() -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("handler exploded")
+
+    monkeypatch.setattr(config_watcher, "awatch", fake_awatch)
+    sink = config_watcher.logger.add(
+        lambda message: records.append(message.record),
+        level="DEBUG",
+        filter=lambda record: record["name"] == config_watcher.__name__,
+    )
+    try:
+        await config_watcher.watch_config_file(config_path, on_change)
+    finally:
+        config_watcher.logger.remove(sink)
+
+    assert calls == 2
+    assert [r["level"].name for r in records] == ["ERROR"]
+    assert "handler exploded" in str(records[0]["exception"])
+
+
+@pytest.mark.asyncio
+async def test_watch_config_file_propagates_cancellation_from_handler(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config_path = tmp_path / "config.json"
+
+    async def fake_awatch(*_paths, **_kwargs):
+        yield {(Change.modified, str(config_path))}
+        raise AssertionError("watch must stop once cancelled")
+
+    async def on_change() -> None:
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(config_watcher, "awatch", fake_awatch)
+
+    with pytest.raises(asyncio.CancelledError):
+        await config_watcher.watch_config_file(config_path, on_change)
+
+
+@pytest.mark.asyncio
 async def test_watch_config_file_observes_atomic_replace(tmp_path: Path) -> None:
     config_path = tmp_path / "config.json"
     config_path.write_text("{}", encoding="utf-8")

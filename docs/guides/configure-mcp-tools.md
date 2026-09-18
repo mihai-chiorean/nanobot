@@ -56,7 +56,10 @@ For manual or deployment-managed config, add this to `~/.nanobot/config.json`:
 }
 ```
 
-Restart nanobot and ask a question that requires the MCP tool.
+Save the file and ask a question that requires the MCP tool. A running
+gateway picks up `mcpServers` changes (servers added, removed, or changed,
+including `enabledTools`) before the next turn; a restart is only needed if
+the log reports that hot reload could not apply the change.
 
 ## Production notes
 
