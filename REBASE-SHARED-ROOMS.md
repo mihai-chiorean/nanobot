@@ -257,24 +257,40 @@ The replacement for the deleted request-scoped grant is:
   `RequestContext.metadata` that `6e9ae5bd` left in place, so no new plumbing.
 - **The gate moves from `Tool.available()` to `ToolRegistry.prepare_call()`.**
   `prepare_call` is the single funnel every tool call passes through and it
-  still exists. A new `Tool.room_policy()` on the base class defaults to
-  `RoomPolicy.ALLOWED`; tools that cross a session boundary
-  (`search_sessions`, `read_session`, `list_sessions`, `send_session_message`),
-  mutate runtime state (`my`, `cron`, `schedule_work`) or touch memory
-  (`recall`, `ingest`) declare `RoomPolicy.DENIED`. When a room scope is bound,
-  `prepare_call` returns `ToolResult.error(...)` for a `DENIED` tool. Unknown
-  and third-party tools default to `ALLOWED` — the same posture as today,
-  since today a room turn can already call every registered tool.
+  still exists. `room_policy_for()` returns `ALLOWED` only for names in
+  `ROOM_ALLOWED_TOOLS` — currently `web_search`, `web_fetch`, `report_progress`
+  — and `DENIED` for **everything else**, including every name it has never
+  seen. That covers all 26 MCP connector tools, `message`, the filesystem
+  tools, `create_goal`/`update_goal`, `spawn`, `exec` and anything added later.
+- **The advertised schemas are narrowed to match.** `get_definitions()` filters
+  to the allow-list when a room scope is bound, after the cache is built —
+  exactly where upstream's `available()` filter sat. Without it the model is
+  shown tools the room prompt tells it it does not have, and burns iterations
+  discovering they are denied.
+- **Absent authority denies, it does not fall through.**
+  `room_turn_metadata` returns a deny-everything scope (not `{}`) for a
+  revoked, expired or unreadable room; `room_scope()` normalises a malformed
+  value the same way; `room_scope_session_key()` yields a `"\0"` sentinel
+  rather than `None` when a scope carries no `chat_id`; and `revoke()` *marks*
+  a connection rather than dropping it, so a revoked guest never reads as "not
+  a guest" and is never promoted to owner by the owner fallback.
 - **Defence in depth in `WebuiSessionAccess`.** `search`/`read`/
-  `normalize_mentions` gain an `allowed_session_key: str | None` narrow.
-  A room turn passes its own key, so even a tool reached another way resolves
-  nothing but the room's own session. This restores a *narrower* version of the
-  deleted `SessionAccessScope`, scoped to one key rather than to a namespace
-  prefix — it does not re-widen anything.
+  `normalize_mentions` resolve nothing but the room's own session key. This
+  restores a *narrower* version of the deleted `SessionAccessScope`, scoped to
+  one key rather than to a namespace prefix.
 
-Fail-closed by classification, never by widening: a tool has to be explicitly
-`ALLOWED` at the class level to be reachable from a room turn, and the session
-reader has to be handed the exact key.
+**Unclassified means denied**, at every layer: an unknown tool name, an
+unreadable room, a malformed scope and a revoked credential all deny. The
+allow-list is three entries with written reasons, so adding to it is a
+deliberate act rather than the default.
+
+> **Correction, PR #57 review.** The first version of this section described an
+> allow-list while `room_policy.py` implemented an 11-entry *deny-list* keyed on
+> tool name. That inversion was the root cause of three criticals: every MCP
+> connector tool and most built-ins were unclassified and therefore open, a
+> missing scope meant unrestricted rather than denied, and a missing credential
+> resolved to owner. The code below is now what the text says.
+
 
 ---
 
