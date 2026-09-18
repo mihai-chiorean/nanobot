@@ -127,3 +127,61 @@ ALLOWED_COMMANDS = [
 @pytest.mark.parametrize("command", ALLOWED_COMMANDS)
 def test_leaves_ordinary_commands_alone(command):
     assert detect_environment_build(command) is None, command
+
+
+# --------------------------------------------------------------------------
+# heredoc bodies are data, not commands (PR #62 review, P1)
+# --------------------------------------------------------------------------
+#
+# ``\n`` is a top-level list operator, so without heredoc handling every line
+# of a written-out script is parsed as a command. Asking Ziggy to *write* a
+# bootstrap script is an ordinary request; refusing it also burns the
+# per-turn budget, so the turn degrades twice over.
+
+HEREDOC_COMMANDS = [
+    # the exact shape from the review
+    "cat > setup.sh <<'EOF'\npip install requests\nEOF",
+    # unquoted delimiter (the body is still data as far as we are concerned)
+    "cat > setup.sh <<EOF\npip install requests\nEOF",
+    # double-quoted delimiter
+    'cat > setup.sh <<"EOF"\nnpm install express\nEOF',
+    # <<- strips leading tabs from the terminator
+    "cat > s.sh <<-EOF\n\tapt-get install -y curl\n\tEOF",
+    # a realistic multi-line bootstrap script
+    (
+        "cat > /tmp/bootstrap.sh <<'SH'\n"
+        "#!/bin/sh\n"
+        "python3 -m venv .venv\n"
+        ". .venv/bin/activate\n"
+        "pip install -r requirements.txt\n"
+        "playwright install chromium\n"
+        "SH"
+    ),
+    # tee instead of cat, and a command chained after the heredoc ends
+    "tee setup.sh <<'EOF' > /dev/null\npip3 install playwright\nEOF\necho written",
+    # two heredocs on one line, delimiters consumed in order
+    "cat <<'A' <<'B'\npip install x\nA\nnpm install y\nB",
+    # a here-string is not a heredoc and must not swallow the rest
+    "grep -q x <<< 'pip install y'",
+]
+
+
+@pytest.mark.parametrize("command", HEREDOC_COMMANDS)
+def test_heredoc_bodies_are_not_parsed_as_commands(command):
+    assert detect_environment_build(command) is None, command
+
+
+def test_commands_after_a_heredoc_terminator_are_still_parsed():
+    """Only the body is data; the script resumes at the terminator."""
+    command = (
+        "cat > setup.sh <<'EOF'\n"
+        "echo hello\n"
+        "EOF\n"
+        "pip3 install playwright"
+    )
+    assert detect_environment_build(command) == "pip install"
+
+
+def test_an_unterminated_heredoc_does_not_leak_into_parsing():
+    command = "cat > setup.sh <<'EOF'\npip install requests\n"
+    assert detect_environment_build(command) is None

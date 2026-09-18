@@ -151,6 +151,11 @@ def _scan(text: str, *, depth: int, budget: list[int]) -> str | None:
     if depth > _MAX_RECURSION or budget[0] <= 0:
         return None
 
+    # A newline is a list operator, so without this every line of a script
+    # being *written out* would be parsed as a command to run. Writing a
+    # bootstrap script is an ordinary request; the heredoc body is data.
+    text = _strip_heredocs(text)
+
     for chunk in _split_on(text, _LIST_OPS):
         if budget[0] <= 0:
             return None
@@ -395,6 +400,96 @@ def _classify_uv(prog: str, words: list[str]) -> str | None:
 # --------------------------------------------------------------------------
 # shell-aware splitting / tokenizing
 # --------------------------------------------------------------------------
+
+
+def _strip_heredocs(text: str) -> str:
+    """Drop heredoc bodies, keeping the command lines around them.
+
+    ``cat > setup.sh <<'EOF' / pip install requests / EOF`` writes a file; it
+    does not install anything. The introducing line is kept (so ``cat`` is
+    still classified normally) and everything from the following line up to
+    and including the terminator is removed. An unterminated heredoc consumes
+    the rest of the text, which is the shell's own behaviour.
+    """
+    if "<<" not in text:
+        return text
+    lines = text.split("\n")
+    kept: list[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        kept.append(line)
+        index += 1
+        for delimiter, strip_tabs in _heredoc_delimiters(line):
+            while index < len(lines):
+                body = lines[index]
+                index += 1
+                candidate = body.lstrip("\t") if strip_tabs else body
+                if candidate.rstrip() == delimiter:
+                    break
+    return "\n".join(kept)
+
+
+def _heredoc_delimiters(line: str) -> list[tuple[str, bool]]:
+    """Return ``(delimiter, strips_leading_tabs)`` for each heredoc the line opens."""
+    found: list[tuple[str, bool]] = []
+    quote: str | None = None
+    escaped = False
+    index = 0
+    length = len(line)
+
+    while index < length:
+        ch = line[index]
+        if escaped:
+            escaped = False
+            index += 1
+            continue
+        if ch == "\\" and quote != "'":
+            escaped = True
+            index += 1
+            continue
+        if quote is not None:
+            if ch == quote:
+                quote = None
+            index += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            index += 1
+            continue
+        # `<<<` is a here-string: the word after it is the data itself, on the
+        # same line, so there is no body to strip.
+        if line.startswith("<<", index) and not line.startswith("<<<", index):
+            cursor = index + 2
+            strip_tabs = False
+            if cursor < length and line[cursor] == "-":
+                strip_tabs = True
+                cursor += 1
+            while cursor < length and line[cursor] in " \t":
+                cursor += 1
+            delimiter = ""
+            if cursor < length and line[cursor] in ("'", '"'):
+                closer = line[cursor]
+                cursor += 1
+                start = cursor
+                while cursor < length and line[cursor] != closer:
+                    cursor += 1
+                delimiter = line[start:cursor]
+                cursor = min(cursor + 1, length)
+            else:
+                start = cursor
+                while cursor < length and (
+                    line[cursor].isalnum() or line[cursor] in "_-.\\"
+                ):
+                    cursor += 1
+                delimiter = line[start:cursor].replace("\\", "")
+            if delimiter:
+                found.append((delimiter, strip_tabs))
+            index = cursor
+            continue
+        index += 1
+
+    return found
 
 
 def _split_on(text: str, operators: tuple[str, ...]) -> list[str]:
