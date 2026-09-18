@@ -1422,9 +1422,9 @@ class MCPProvider:
 
         Parks while a reload is draining, so a turn that has not started yet
         does not pick up tools the reload is about to close.  The wait is
-        bounded by `gate_timeout_s`: a reload that somehow never clears the
-        flag degrades to today's behaviour (a turn that may race a swap)
-        rather than wedging the runtime.
+        bounded by `gate_timeout_s`: a reload that dies without decrementing
+        the drain depth degrades to today's behaviour (a turn that may race a
+        swap) rather than wedging every turn behind it.
 
         Returns a token the caller must hand back to :meth:`end_turn`.
         """
