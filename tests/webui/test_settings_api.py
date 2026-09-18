@@ -149,6 +149,10 @@ def test_settings_payload_includes_relocated_capabilities(
     monkeypatch.setattr("nanobot.config.loader._current_config_path", config_path)
     monkeypatch.setenv("LANGFUSE_SECRET_KEY", "secret")
     monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "public")
+    # Keys alone no longer count as configured: tracing fails closed without
+    # an explicit destination, and the settings payload has to agree with the
+    # runtime gate rather than implying prompts are being shipped.
+    monkeypatch.setenv("LANGFUSE_HOST", "http://langfuse.invalid:3000")
 
     payload = settings_payload()
 
@@ -156,6 +160,31 @@ def test_settings_payload_includes_relocated_capabilities(
     assert payload["api"]["api_key_hint"] is None
     assert payload["observability"]["provider"] == "langfuse"
     assert payload["observability"]["configured"] is True
+    assert payload["observability"]["base_url"] == "http://langfuse.invalid:3000"
+
+
+def test_settings_payload_reports_langfuse_unconfigured_without_a_host(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keys without a host must not read as "prompts are going to Langfuse".
+
+    The SDK would default to Langfuse Cloud, but the runtime gate fails
+    closed, so the settings payload must say unconfigured rather than
+    advertising a destination nothing is actually sending to.
+    """
+    config_path = tmp_path / "config.json"
+    save_config(Config(), config_path)
+    monkeypatch.setattr("nanobot.config.loader._current_config_path", config_path)
+    monkeypatch.setenv("LANGFUSE_SECRET_KEY", "secret")
+    monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "public")
+    monkeypatch.delenv("LANGFUSE_HOST", raising=False)
+    monkeypatch.delenv("LANGFUSE_BASE_URL", raising=False)
+
+    payload = settings_payload()
+
+    assert payload["observability"]["configured"] is False
+    assert payload["observability"]["base_url"] == ""
 
 
 def test_settings_payload_exposes_modelscope_image_model(

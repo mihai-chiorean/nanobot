@@ -19,8 +19,11 @@ Design goals
 Environment gate
 ----------------
 ``LANGFUSE_ENABLED`` is ``True`` iff the Langfuse client is importable AND
-env vars are configured (``LANGFUSE_SECRET_KEY`` is the canonical gate,
-matching the gate already present in ``providers/openai_compat_provider.py``).
+``LANGFUSE_SECRET_KEY`` is set AND ``LANGFUSE_HOST`` names a destination.
+The host is not optional: the SDK falls back to Langfuse Cloud when it is
+unset, so tracing fails closed instead — see
+:func:`langfuse_destination_is_pinned`. ``providers/openai_compat_provider.py``
+and ``webui/settings_capabilities.py`` gate on the same helper.
 The provider-level gate emits one ``generation`` per LLM call via the
 ``langfuse.openai`` drop-in wrapper; this module adds the span hierarchy
 (turn → llm-iteration → tool / subagent) that gives those generations

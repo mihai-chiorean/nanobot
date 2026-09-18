@@ -628,14 +628,12 @@ class OpenAICompatProvider(LLMProvider):
                     langfuse_destination_is_pinned,
                 )
 
-                if (
-                    os.environ.get("LANGFUSE_SECRET_KEY")
-                    and langfuse_destination_is_pinned()
-                    and importlib.util.find_spec("langfuse")
-                ):
+                wanted = bool(os.environ.get("LANGFUSE_SECRET_KEY"))
+                installed = importlib.util.find_spec("langfuse") is not None
+                if wanted and installed and langfuse_destination_is_pinned():
                     from langfuse.openai import AsyncOpenAI as _AsyncOpenAI
                 else:
-                    if os.environ.get("LANGFUSE_SECRET_KEY") and importlib.util.find_spec("langfuse") is None:
+                    if wanted and not installed:
                         logger.warning(
                             "LANGFUSE_SECRET_KEY is set but langfuse is not installed; "
                             "run `nanobot plugins enable langfuse` to enable tracing"
