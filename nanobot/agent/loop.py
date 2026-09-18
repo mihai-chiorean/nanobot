@@ -49,6 +49,8 @@ from nanobot.agent.tools.file_state import FileStateStore, bind_file_states, res
 from nanobot.agent.tools.message import capture_message_deliveries
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.runtime_control import AgentRuntimeControl
+# Ziggy-local (fork, MIT-1014): marker for the trusted user `!<command>` path.
+from nanobot.agent.tools.shell import USER_SHELL_COMMAND_ATTR
 from nanobot.agent.turn_delivery import (
     TurnDelivery,
     TurnDeliveryFactory,
@@ -1003,6 +1005,9 @@ class AgentLoop:
                 sender_id=ctx.msg.sender_id,
                 turn_id=metadata.get("webui_turn_id"),
                 workspace=scope.project_path,
+                # Ziggy-local (fork, MIT-1014): this is the user's own typed
+                # command, so the exec install guard stands aside for it.
+                attributes={USER_SHELL_COMMAND_ATTR: True},
             ))
             workspace_token = bind_workspace_scope(scope)
             turn_scope_stack = ExitStack()

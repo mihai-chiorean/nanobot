@@ -20,7 +20,14 @@ from loguru import logger
 from pydantic import Field
 
 from nanobot.agent.tools.base import Tool, ToolResult, tool_parameters
-from nanobot.agent.tools.context import ToolContext, current_request_session_key
+from nanobot.agent.tools.context import (
+    RequestContext,
+    ToolContext,
+    current_request_context,
+    current_request_session_key,
+)
+# Ziggy-local (fork, MIT-1014): mid-conversation environment-build refusal.
+from nanobot.agent.tools.env_guard import detect_environment_build, install_refusal
 from nanobot.agent.tools.exec_session import (
     DEFAULT_EXEC_SESSION_MANAGER,
     DEFAULT_MAX_OUTPUT_CHARS,
@@ -46,6 +53,12 @@ from nanobot.security.workspace_policy import is_path_within
 from nanobot.utils.sensitive import check_shell_command
 
 _IS_WINDOWS = sys.platform == "win32"
+
+# Ziggy-local (fork, MIT-1014): RequestContext.attributes marker set by
+# AgentLoop.execute_user_shell_command, the trusted `!<command>` path. A
+# command the user typed themselves is not the model escalating, so the
+# install guard stands aside for it.
+USER_SHELL_COMMAND_ATTR = "user_shell_command"
 _PROCESS_TREE_OWNER_ATTR = "_nanobot_process_tree_owner"
 
 
@@ -271,6 +284,9 @@ class ExecTool(Tool):
         self.sandbox_rw_binds = self._normalize_bind_roots(sandbox_rw_binds)
         self.allowed_env_keys = allowed_env_keys or []
         self._session_manager = session_manager or DEFAULT_EXEC_SESSION_MANAGER
+        # Ziggy-local (fork, MIT-1014): per-turn install-attempt budget.
+        self._install_turn: str | None = None
+        self._install_attempts = 0
 
     @property
     def name(self) -> str:
@@ -300,6 +316,94 @@ class ExecTool(Tool):
     def exclusive(self) -> bool:
         return True
 
+    # --- Ziggy-local (fork, MIT-1014): interactive-turn install guard -------
+    #
+    # ``exec`` is an unrestricted shell, so when a web lookup dead-ends the
+    # model escalates into building an environment (pip install playwright,
+    # python -m venv, playwright install chromium) instead of concluding --
+    # minutes of a live conversation spent on setup the user never asked for.
+    # The guard refuses that *as information*, never as a turn-fatal error.
+    #
+    # Scope: this runtime's turn kind comes from the RequestContext ContextVar
+    # (nanobot.agent.tools.context), so we gate on it rather than guessing.
+    # Only the interactive app websocket is restricted. CLI, API, subagents
+    # (channel "system"), cron and heartbeat runs -- which reuse the
+    # originating channel but carry their own session-key namespace -- and any
+    # caller with no bound context at all are left completely alone.
+
+    #: Channels that carry a live human conversation.
+    _INTERACTIVE_CHANNELS = frozenset({"websocket"})
+    #: Session-key namespaces that reuse a chat channel for unattended runs.
+    #: Only ``heartbeat`` is real today (cli/gateway_runtime.py); a
+    #: session-bound cron job does NOT get its own namespace -- see below.
+    _UNATTENDED_SESSION_PREFIXES = ("heartbeat",)
+
+    @classmethod
+    def _is_interactive_turn(cls, ctx: RequestContext | None) -> bool:
+        if ctx is None or ctx.channel not in cls._INTERACTIVE_CHANNELS:
+            return False
+        metadata = ctx.metadata or {}
+
+        # An automation-generated turn carries a message source describing who
+        # produced it: "cron" (cron/webui_metadata.py), "local_trigger"
+        # (triggers/local_runner.py), "subagent_result" (agent/loop.py). The
+        # key is only ever set by automation, so any value means the turn was
+        # not typed by a person.
+        source = metadata.get("_webui_message_source")
+        if isinstance(source, dict) and source.get("kind"):
+            return False
+
+        # Belt and braces for a session-bound cron job, which is the case that
+        # makes the session key useless here: run_bound_cron_job reuses the
+        # originating *chat's* own session key, unchanged, and spends
+        # "cron:{job.id}" only as a turn seed, so there is no cron namespace to
+        # match on. This marker is set on every bound run, including channels
+        # where the WebUI source metadata is not added.
+        if metadata.get("_cron_trigger"):
+            return False
+
+        # A background or scheduled Work task is dispatched over the same
+        # websocket channel as chat and is marked in metadata instead.
+        # Inert until the Work app lands; harmless before then.
+        if metadata.get("work_mode") or metadata.get("work_task_id"):
+            return False
+
+        session_key = ctx.session_key or ""
+        return not session_key.startswith(cls._UNATTENDED_SESSION_PREFIXES)
+
+    def _install_guard(self, command: str) -> str | None:
+        """Refuse package installs / env construction inside a chat turn."""
+        ctx = current_request_context()
+        if not self._is_interactive_turn(ctx):
+            return None
+        # The owner typing `!pip install x` is an explicit instruction, not
+        # the escalation-by-habit this guard targets. Only the trusted
+        # user-shell path sets this, and it never wraps a model tool call.
+        if ctx is not None and (ctx.attributes or {}).get(USER_SHELL_COMMAND_ATTR):
+            return None
+        detected = detect_environment_build(command)
+        if detected is None:
+            return None
+
+        assert ctx is not None
+        turn = ctx.turn_id or f"{ctx.session_key}:{ctx.message_id}"
+        if turn != self._install_turn:
+            self._install_turn = turn
+            self._install_attempts = 0
+        self._install_attempts += 1
+
+        logger.warning(
+            "exec refused an environment build in a chat turn ({}): {}",
+            detected,
+            command.strip().replace("\n", " ")[:200],
+        )
+        return install_refusal(command, detected, self._install_attempts)
+
+    def start_turn(self) -> None:
+        """Reset the per-turn install budget."""
+        self._install_turn = None
+        self._install_attempts = 0
+
     async def execute(
         self, command: str | None = None, cmd: str | None = None,
         working_dir: str | None = None, workdir: str | None = None,
@@ -313,6 +417,13 @@ class ExecTool(Tool):
         working_dir = working_dir or workdir
         if not command:
             return ToolResult.error("Error: Missing command. Provide command or cmd.")
+        # Ziggy-local (fork, MIT-1014). Deliberately returned as an ordinary
+        # tool observation, not a ToolResult.error: an error here would be
+        # decorated with "try a different approach", which is exactly the
+        # behaviour this guard exists to stop.
+        refusal = self._install_guard(command)
+        if refusal is not None:
+            return refusal
         if max_output_chars is None:
             max_output_chars = max_output_tokens
 
