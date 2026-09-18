@@ -620,10 +620,20 @@ class OpenAICompatProvider(LLMProvider):
                 return self._client
             global AsyncOpenAI
             if AsyncOpenAI is None:
-                if os.environ.get("LANGFUSE_SECRET_KEY") and importlib.util.find_spec("langfuse"):
+                # `langfuse.openai` is the wrapper that ships prompts and
+                # completions, so it stays behind the same fail-closed
+                # destination check the observability layer uses: an unset
+                # LANGFUSE_HOST means Langfuse Cloud, which nobody asked for.
+                from nanobot.observability.langfuse import (  # noqa: PLC0415
+                    langfuse_destination_is_pinned,
+                )
+
+                wanted = bool(os.environ.get("LANGFUSE_SECRET_KEY"))
+                installed = importlib.util.find_spec("langfuse") is not None
+                if wanted and installed and langfuse_destination_is_pinned():
                     from langfuse.openai import AsyncOpenAI as _AsyncOpenAI
                 else:
-                    if os.environ.get("LANGFUSE_SECRET_KEY"):
+                    if wanted and not installed:
                         logger.warning(
                             "LANGFUSE_SECRET_KEY is set but langfuse is not installed; "
                             "run `nanobot plugins enable langfuse` to enable tracing"
