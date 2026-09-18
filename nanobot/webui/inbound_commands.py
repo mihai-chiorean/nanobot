@@ -328,15 +328,21 @@ class WebUICommandRouter:
         # allow-list rather than deny-list so a future command type is confined
         # by default.
         guest = self._transport.room_credential(connection)
-        if guest is not None:
-            allowed = command_type in _ROOM_GUEST_COMMANDS
+        rooms = getattr(self._transport, "rooms", None)
+        revoked = rooms is not None and rooms.is_revoked(connection)
+        if guest is not None or revoked:
+            # A revoked guest is still a guest. Its socket close is asynchronous,
+            # so between revocation and close it must be denied outright rather
+            # than read as "not a guest" -- which previously skipped this
+            # allow-list entirely and promoted it to owner downstream.
+            allowed = not revoked and command_type in _ROOM_GUEST_COMMANDS
             if allowed and command_type == "attach":
                 allowed = envelope.get("chat_id") == guest.chat_id
             if not allowed:
                 await self._transport.webui_send_event(
                     connection,
                     "error",
-                    chat_id=guest.chat_id,
+                    **({"chat_id": guest.chat_id} if guest is not None else {}),
                     detail="room scope violation",
                 )
                 return

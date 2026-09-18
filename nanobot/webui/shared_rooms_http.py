@@ -24,6 +24,7 @@ import asyncio
 import hashlib
 import json
 import re
+from contextlib import suppress
 from typing import Any
 
 from loguru import logger
@@ -377,12 +378,17 @@ class SharedRoomRouter:
             room_id=str(room_id),
             chat_id=str(chat_id),
         )
+        # Await the close rather than firing it off. Combined with the store
+        # marking (not dropping) the credential, this leaves no window in which
+        # a revoked socket is still open but no longer reads as a guest.
         for connection in connections:
-            if self.channel is not None:
-                await self.channel.forget_room_connection(connection)
             close = getattr(connection, "close", None)
             if close is not None:
-                asyncio.create_task(close(code=1008, reason="shared room revoked"))
+                with suppress(Exception):
+                    await close(code=1008, reason="shared room revoked")
+            if self.channel is not None:
+                with suppress(Exception):
+                    await self.channel.forget_room_connection(connection)
         return http_json_response(
             {
                 "room_id": room_id,

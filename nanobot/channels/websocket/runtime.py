@@ -21,7 +21,12 @@ from websockets.asyncio.server import Server, ServerConnection, serve, unix_serv
 from websockets.exceptions import ConnectionClosed
 from websockets.http11 import Request as WsRequest
 
-from nanobot.bus.events import OUTBOUND_META_AGENT_UI, OutboundMessage
+from nanobot.agent.tools.room_policy import DENY_EVERYTHING_SCOPE
+from nanobot.bus.events import (
+    INBOUND_META_ROOM_SCOPE,
+    OUTBOUND_META_AGENT_UI,
+    OutboundMessage,
+)
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 
@@ -718,17 +723,43 @@ class WebSocketChannel(BaseChannel):
     def room_turn_metadata(self, connection: Any, chat_id: str) -> dict[str, Any]:
         """Metadata every inbound frame in a room must carry.
 
-        Empty outside a room. Inside one it carries ``shared_room`` (which the
-        agent loop reads) and ``INBOUND_META_ROOM_SCOPE`` (which
-        ``ToolRegistry.prepare_call`` gates on). Minted here from a validated
-        credential, never copied from the client envelope.
+        Empty **only** when this is genuinely not a room turn. Inside a room it
+        carries ``shared_room`` (which the agent loop reads) and
+        ``INBOUND_META_ROOM_SCOPE`` (which ``ToolRegistry.prepare_call`` gates
+        on), minted from a validated credential and never copied from the
+        client envelope.
+
+        A room whose authority cannot be established -- revoked, expired, or
+        whose session metadata will not read -- returns a deny-everything scope
+        rather than ``{}``. Returning ``{}`` there was a fail-open: no scope
+        means no gate, so an expiring room briefly handed a guest an
+        unrestricted turn.
         """
+        if self.rooms is None:
+            return {}
+        if self.rooms.is_revoked(connection):
+            return self._denied_room_metadata()
+        guest = self.rooms.connection_credential(connection)
+        if guest is not None and guest.chat_id != chat_id:
+            # A guest addressing someone else's room: deny, never fall through
+            # to the owner fallback below.
+            return self._denied_room_metadata()
+        if guest is None and not self.rooms.is_shared_room(chat_id):
+            return {}
+        if not self.rooms.is_active(chat_id):
+            return self._denied_room_metadata()
         credential = self.effective_room_credential(connection, chat_id)
         if credential is None or credential.chat_id != chat_id:
-            return {}
-        if self.rooms is not None and not self.rooms.is_active(chat_id):
-            return {}
+            return self._denied_room_metadata()
         return room_scope_metadata(credential)
+
+    @staticmethod
+    def _denied_room_metadata() -> dict[str, Any]:
+        """A room turn whose authority could not be established."""
+        return {
+            "shared_room": True,
+            INBOUND_META_ROOM_SCOPE: dict(DENY_EVERYTHING_SCOPE),
+        }
 
     async def forget_room_connection(self, connection: Any) -> None:
         """Drop a revoked room connection from every subscription set."""
