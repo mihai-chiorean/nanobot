@@ -252,7 +252,7 @@ async def test_serper_fallback_to_duckduckgo_when_no_key(monkeypatch):
         def __init__(self, **kw):
             pass
 
-        def text(self, query, max_results=5):
+        def text(self, query, max_results=5, **kwargs):
             return [{"title": "Fallback", "href": "https://ddg.example", "body": "DuckDuckGo fallback"}]
 
     monkeypatch.setattr("ddgs.DDGS", MockDDGS)
@@ -425,7 +425,7 @@ async def test_bocha_missing_key_falls_back_to_duckduckgo(monkeypatch):
         def __init__(self, **kw):
             pass
 
-        def text(self, query, max_results=5):
+        def text(self, query, max_results=5, **kwargs):
             return [{"title": "Fallback", "href": "https://ddg.example", "body": "DuckDuckGo fallback"}]
 
     monkeypatch.setattr("ddgs.DDGS", MockDDGS)
@@ -493,7 +493,7 @@ async def test_volcengine_missing_key_falls_back_to_duckduckgo(monkeypatch):
         def __init__(self, **kw):
             pass
 
-        def text(self, query, max_results=5):
+        def text(self, query, max_results=5, **kwargs):
             return [{"title": "Fallback", "href": "https://ddg.example", "body": "DuckDuckGo fallback"}]
 
     monkeypatch.setattr("ddgs.DDGS", MockDDGS)
@@ -535,7 +535,7 @@ async def test_duckduckgo_search(monkeypatch):
         def __init__(self, **kw):
             pass
 
-        def text(self, query, max_results=5):
+        def text(self, query, max_results=5, **kwargs):
             return [{"title": "DDG Result", "href": "https://ddg.example", "body": "From DuckDuckGo"}]
 
     monkeypatch.setattr("nanobot.agent.tools.web.DDGS", MockDDGS, raising=False)
@@ -559,7 +559,7 @@ async def test_duckduckgo_search_passes_proxy(monkeypatch):
         def __init__(self, **kw):
             captured.update(kw)
 
-        def text(self, query, max_results=5):
+        def text(self, query, max_results=5, **kwargs):
             return [{"title": "Result", "href": "https://example.com", "body": "OK"}]
 
     monkeypatch.setattr("ddgs.DDGS", ProxyCaptorDDGS)
@@ -580,7 +580,7 @@ async def test_brave_fallback_to_duckduckgo_when_no_key(monkeypatch):
         def __init__(self, **kw):
             pass
 
-        def text(self, query, max_results=5):
+        def text(self, query, max_results=5, **kwargs):
             return [{"title": "Fallback", "href": "https://ddg.example", "body": "DuckDuckGo fallback"}]
 
     monkeypatch.setattr("ddgs.DDGS", MockDDGS)
@@ -725,7 +725,7 @@ async def test_searxng_no_base_url_falls_back(monkeypatch):
         def __init__(self, **kw):
             pass
 
-        def text(self, query, max_results=5):
+        def text(self, query, max_results=5, **kwargs):
             return [{"title": "Fallback", "href": "https://ddg.example", "body": "fallback"}]
 
     monkeypatch.setattr("ddgs.DDGS", MockDDGS)
@@ -749,7 +749,7 @@ async def test_jina_422_falls_back_to_duckduckgo(monkeypatch):
         def __init__(self, **kw):
             pass
 
-        def text(self, query, max_results=5):
+        def text(self, query, max_results=5, **kwargs):
             return [{"title": "Fallback", "href": "https://ddg.example", "body": "DuckDuckGo fallback"}]
 
     async def mock_get(self, url, **kw):
@@ -774,7 +774,7 @@ async def test_kagi_fallback_to_duckduckgo_when_no_key(monkeypatch):
         def __init__(self, **kw):
             pass
 
-        def text(self, query, max_results=5):
+        def text(self, query, max_results=5, **kwargs):
             return [{"title": "Fallback", "href": "https://ddg.example", "body": "DuckDuckGo fallback"}]
 
     monkeypatch.setattr("ddgs.DDGS", MockDDGS)
@@ -791,7 +791,7 @@ async def test_exa_fallback_to_duckduckgo_when_no_key(monkeypatch):
         def __init__(self, **kw):
             pass
 
-        def text(self, query, max_results=5):
+        def text(self, query, max_results=5, **kwargs):
             return [{"title": "Fallback", "href": "https://ddg.example", "body": "DuckDuckGo fallback"}]
 
     monkeypatch.setattr("ddgs.DDGS", MockDDGS)
@@ -830,7 +830,7 @@ async def test_duckduckgo_timeout_returns_error(monkeypatch):
         def __init__(self, **kw):
             pass
 
-        def text(self, query, max_results=5):
+        def text(self, query, max_results=5, **kwargs):
             gate.wait(timeout=10)
             return []
 
@@ -894,7 +894,7 @@ async def test_olostep_missing_key_falls_back_to_duckduckgo(monkeypatch):
         def __init__(self, **kw):
             pass
 
-        def text(self, query, max_results=5):
+        def text(self, query, max_results=5, **kwargs):
             return [{"title": "Fallback", "href": "https://ddg.example", "body": "fallback"}]
 
     fake_mod = types.ModuleType("olostep")
@@ -921,3 +921,244 @@ async def test_olostep_package_missing_returns_install_hint(monkeypatch):
     assert result == (
         "Error: Olostep support is not installed. Run `nanobot plugins enable olostep`."
     )
+
+
+# ---------------------------------------------------------------------------
+# MIT-1017 — the DuckDuckGo provider must stay on DuckDuckGo.
+#
+# `ddgs.text()` defaults to backend="auto", which fans one query out across
+# every engine ddgs knows — Grokipedia (xAI), Yandex, Yahoo, Mojeek, Wikipedia
+# — and for the text category deliberately queries Grokipedia and Wikipedia
+# *first*. Queries here are synthesised from private conversations, so the
+# fan-out discloses user intent to parties nobody configured.
+#
+# Asserting `provider == "duckduckgo"` is what let this through: the provider
+# was right the whole time. These assert the ddgs *call argument*.
+# ---------------------------------------------------------------------------
+
+
+def _recording_ddgs(monkeypatch):
+    """Install a ddgs.DDGS stand-in that records how text() was called."""
+    calls = []
+
+    class RecordingDDGS:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def text(self, query, **kwargs):
+            calls.append({"query": query, **kwargs})
+            return [{"title": "t", "href": "https://example.invalid/", "body": "b"}]
+
+    monkeypatch.setattr("ddgs.DDGS", RecordingDDGS)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_duckduckgo_search_pins_the_ddgs_backend(monkeypatch):
+    calls = _recording_ddgs(monkeypatch)
+
+    await _tool(provider="duckduckgo").execute("a private sounding query", count=3)
+
+    assert calls, "ddgs.text() was never called"
+    assert "backend" in calls[0], (
+        "ddgs.text() was called without a `backend` argument, so ddgs runs "
+        'backend="auto" and fans the query out across every engine it knows.'
+    )
+    assert calls[0]["backend"] == "duckduckgo"
+
+
+@pytest.mark.asyncio
+async def test_fallback_to_duckduckgo_also_pins_the_ddgs_backend(monkeypatch):
+    """Every other provider falls back here when its key is missing."""
+    calls = _recording_ddgs(monkeypatch)
+
+    await _tool(provider="brave", api_key="").execute("another private query", count=3)
+
+    assert calls, "ddgs.text() was never called"
+    assert calls[0].get("backend") == "duckduckgo"
+
+
+def test_pinned_backend_resolves_to_duckduckgo_only_inside_ddgs():
+    """Canary: the pinned value is a real engine in the ddgs CI resolved.
+
+    This is *not* the guarantee — it only speaks for whichever 9.x pip picked,
+    and the text registry churns inside our range. The guarantee is
+    `_resolve_ddgs_text_backend`, which refuses to search when the key is
+    absent (see the tests below). Keep this one for the extra thing it proves:
+    that the key resolves to exactly one engine, and that it is DuckDuckGo's.
+    """
+    # ddgs is a hard runtime dependency (pyproject: ddgs>=9.5.5,<10.0.0), so
+    # this must never degrade to a skip.
+    import ddgs as ddgs_module
+    from ddgs.engines import ENGINES
+
+    from nanobot.agent.tools.web import _DDGS_TEXT_BACKEND
+
+    text_engines = ENGINES["text"]
+    assert _DDGS_TEXT_BACKEND in text_engines, (
+        f"{_DDGS_TEXT_BACKEND!r} is not a text backend in this ddgs; "
+        f"available: {sorted(text_engines)}"
+    )
+
+    client = ddgs_module.DDGS()
+    pinned = client._get_engines("text", _DDGS_TEXT_BACKEND)
+    pinned_urls = {str(getattr(e, "search_url", "")) for e in pinned}
+    assert len(pinned) == 1, f"pinned backend resolved to {len(pinned)} engines: {pinned_urls}"
+    assert all("duckduckgo.com" in url for url in pinned_urls), pinned_urls
+
+    # Positive control: the default really is a fan-out, so the pin matters.
+    assert len(client._get_engines("text", "auto")) > 1
+
+
+@pytest.mark.asyncio
+async def test_pinned_backend_refusal_surfaces_as_a_tool_error(monkeypatch):
+    """A pinned engine that refuses us must be loud, not silently empty.
+
+    ddgs never returns an empty list — `_search_sync` raises DDGSException
+    when no engine produced results — so the "No results for:" branch is
+    unreachable and the real path is the `except`. This matters in
+    production: html.duckduckgo.com answers HTTP 202 (an anti-scraping
+    challenge) from some egress, and the honest outcome is a tool error the
+    model can report, not a quiet "nothing found" that reads like a fact
+    about the world.
+    """
+    from ddgs.exceptions import DDGSException
+
+    class RefusingDDGS:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def text(self, query, **kwargs):
+            assert kwargs.get("backend") == "duckduckgo"
+            raise DDGSException("No results found.")
+
+    monkeypatch.setattr("ddgs.DDGS", RefusingDDGS)
+
+    result = await _tool(provider="duckduckgo").execute("anything", count=3)
+
+    assert is_tool_error_result(result)
+    assert "DuckDuckGo search failed" in result
+
+
+# ---------------------------------------------------------------------------
+# MIT-1017 (follow-up) — the pin must fail loudly when ddgs drops the engine.
+#
+# `DDGS._get_engines` treats an unknown backend key as a *warning*: it logs
+# "backends do not exist or are disabled", ends up with zero engines, then
+# recurses into backend="auto" — the exact fan-out this pin exists to close.
+# `pyproject` allows any ddgs 9.x and there is no lockfile, and the text
+# registry demonstrably churns in that range (yandex is already gone from
+# 9.16.0). So the pin can be silently undone by a routine dependency bump.
+#
+# The runtime check is therefore the guarantee, not the registry assertion
+# below it: if the pinned key is not in the installed registry we refuse to
+# search rather than searching via "auto".
+# ---------------------------------------------------------------------------
+
+
+def _registry_without_duckduckgo(monkeypatch):
+    """Simulate a ddgs release that renamed or dropped the duckduckgo engine."""
+    from ddgs.engines import ENGINES
+
+    stripped = {k: dict(v) for k, v in ENGINES.items()}
+    stripped["text"].pop("duckduckgo", None)
+    monkeypatch.setattr("ddgs.engines.ENGINES", stripped)
+    return stripped
+
+
+@pytest.mark.asyncio
+async def test_duckduckgo_search_refuses_when_pinned_backend_is_missing(monkeypatch):
+    """A ddgs bump that drops the engine must break loudly, not fan out."""
+    _registry_without_duckduckgo(monkeypatch)
+    calls = _recording_ddgs(monkeypatch)
+
+    result = await _tool(provider="duckduckgo").execute("a private sounding query", count=3)
+
+    assert not calls, (
+        "ddgs.text() was called even though the pinned backend is not in the "
+        'installed registry — ddgs would have silently run backend="auto".'
+    )
+    assert is_tool_error_result(result)
+    assert "duckduckgo" in str(result).lower()
+
+
+@pytest.mark.asyncio
+async def test_provider_fallback_also_refuses_when_pinned_backend_is_missing(monkeypatch):
+    """Every keyless provider falls back here; the refusal must hold there too."""
+    _registry_without_duckduckgo(monkeypatch)
+    calls = _recording_ddgs(monkeypatch)
+
+    result = await _tool(provider="brave", api_key="").execute("another private query", count=3)
+
+    assert not calls
+    assert is_tool_error_result(result)
+
+
+def test_resolver_raises_on_a_key_ddgs_would_have_silently_downgraded():
+    """Version-independent: our resolver rejects what ddgs merely warns about.
+
+    This asserts the *mechanism* rather than the contents of one ddgs
+    release's registry, so it keeps its meaning across 9.x bumps.
+    """
+    import ddgs as ddgs_module
+
+    from nanobot.agent.tools.web import (
+        SearchBackendUnavailableError,
+        _resolve_ddgs_text_backend,
+    )
+
+    # Positive control: ddgs itself downgrades an unknown key to the fan-out.
+    client = ddgs_module.DDGS()
+    downgraded = client._get_engines("text", "definitely-not-an-engine")
+    assert len(downgraded) > 1, (
+        "ddgs no longer downgrades unknown backends to auto; re-check whether "
+        "the runtime guard is still the thing standing between us and a fan-out"
+    )
+
+    with pytest.raises(SearchBackendUnavailableError):
+        _resolve_ddgs_text_backend("definitely-not-an-engine")
+
+    # And the value we actually ship resolves.
+    from nanobot.agent.tools.web import _DDGS_TEXT_BACKEND
+
+    assert _resolve_ddgs_text_backend(_DDGS_TEXT_BACKEND) == _DDGS_TEXT_BACKEND
+
+
+def _registry_with_reassigned_duckduckgo(monkeypatch):
+    """Simulate a ddgs release that reused the key for a different engine."""
+    from ddgs.engines import ENGINES
+
+    stripped = {k: dict(v) for k, v in ENGINES.items()}
+    stripped["text"]["duckduckgo"] = stripped["text"]["mojeek"]
+    monkeypatch.setattr("ddgs.engines.ENGINES", stripped)
+
+
+def test_resolver_rejects_a_key_that_no_longer_points_at_duckduckgo(monkeypatch):
+    """Key presence is not identity.
+
+    A removed key is not the only way the registry can churn: ddgs could reuse
+    `"duckduckgo"` for a different engine in a refactor. That resolves cleanly,
+    produces no fan-out-shaped signal, and would quietly send private queries
+    somewhere else — the same disclosure, one step subtler. Check what the key
+    actually points at, not just that it is there.
+    """
+    from nanobot.agent.tools.web import (
+        SearchBackendUnavailableError,
+        _resolve_ddgs_text_backend,
+    )
+
+    _registry_with_reassigned_duckduckgo(monkeypatch)
+
+    with pytest.raises(SearchBackendUnavailableError, match="mojeek.com"):
+        _resolve_ddgs_text_backend()
+
+
+@pytest.mark.asyncio
+async def test_duckduckgo_search_refuses_a_reassigned_backend_key(monkeypatch):
+    _registry_with_reassigned_duckduckgo(monkeypatch)
+    calls = _recording_ddgs(monkeypatch)
+
+    result = await _tool(provider="duckduckgo").execute("a private sounding query", count=3)
+
+    assert not calls, "searched through an engine that is no longer DuckDuckGo"
+    assert is_tool_error_result(result)
