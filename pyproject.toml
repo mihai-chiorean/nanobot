@@ -77,12 +77,16 @@ azure = [
 bedrock = [
     "boto3>=1.43.0",
 ]
-# Ziggy-local (fork): optional extras for the Ziggy runtime — ChromaDB RAG
-# store, Prometheus metrics/dashboard, and the Langfuse 4.x observability
-# hooks. Upstream also ships a `langfuse` extra pinned to 3.x; Ziggy needs
-# 4.x, so the two are intentionally separate.
+# Ziggy-local (fork): optional extras for the Ziggy runtime — Prometheus
+# metrics/dashboard and the Langfuse 4.x observability hooks. Upstream also
+# ships a `langfuse` extra pinned to 3.x; Ziggy needs 4.x, so the two are
+# intentionally separate.
+#
+# chromadb was dropped here (MIT-1013). It backed a semantic store that nothing
+# ever wrote to, and carrying it meant ~170 MB of ONNX embedding model fetched
+# on first use — on a host with ~13 GiB free that has hard-reset twice, and
+# across four runtimes. Recall now uses SQLite FTS5 from the standard library.
 ziggy = [
-    "chromadb>=0.6.0,<1.0.0",
     "prometheus-client>=0.20.0,<1.0.0",
     "langfuse>=4.0.0,<5.0.0",
 ]
