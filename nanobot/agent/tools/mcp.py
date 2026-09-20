@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import json
 import os
@@ -11,6 +12,7 @@ import shutil
 import urllib.parse
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
 from contextlib import AsyncExitStack, suppress
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 
 import httpx
@@ -1337,10 +1339,31 @@ def _configured_servers(config: Config) -> dict[str, MCPServerConfig]:
     )
 
 
-def _load_current_servers() -> dict[str, MCPServerConfig]:
+def _load_current_servers(workspace: Path | None = None) -> dict[str, MCPServerConfig]:
+    """Re-read MCP servers from the config file plus enabled workspace plugins.
+
+    ``workspace`` pins the plugin directory to the one the running gateway was
+    built with (``--workspace`` is applied in memory and is not on disk).
+    """
+    from nanobot.agent.plugins import agent_plugin_mcp_servers
     from nanobot.config.loader import load_config, resolve_config_env_vars
 
-    return _configured_servers(resolve_config_env_vars(load_config()))
+    config = resolve_config_env_vars(load_config())
+    return agent_plugin_mcp_servers(
+        workspace if workspace is not None else config.workspace_path,
+        config.tools.mcp_servers,
+    )
+
+
+# How long ``reload()`` waits for turns that are already running before it
+# closes transports out from under them, and how long a turn waits for a
+# draining reload before it gives up and starts anyway.  Both are bounded on
+# purpose: neither side may pin the other indefinitely.
+RELOAD_DRAIN_TIMEOUT_SECONDS = 5.0
+# Must stay strictly greater than the drain: a nested run that calls
+# begin_turn() from inside a turn the drain is waiting on would otherwise give
+# up before the reload it is waiting for could finish.
+_TURN_GATE_TIMEOUT_SECONDS = 10.0
 
 
 class MCPProvider:
@@ -1360,6 +1383,19 @@ class MCPProvider:
         self._runtime_statuses: dict[str, MCPRuntimeStatus] = {}
         self._lock = asyncio.Lock()
         self._closing = False
+        # Turn-drain state.  ``reload()`` closes transports and unregisters the
+        # tools of removed/changed servers; turn execution takes no lock, so
+        # without this a turn that was already handed those tools would hit
+        # "Tool ... not found" or a closed transport mid-flight.
+        self._active_turns: set[object] = set()
+        self._turns_idle = asyncio.Event()
+        self._turns_idle.set()
+        # A depth, not a flag: the config watcher and the WebUI settings route
+        # can reload concurrently, and a flag would let whichever finished
+        # first reopen the gate while the other was still draining.
+        self._reload_drain_depth = 0
+        self._reload_gate = asyncio.Event()
+        self._reload_gate.set()
 
     @classmethod
     def from_config(
@@ -1372,7 +1408,8 @@ class MCPProvider:
         return cls(
             _configured_servers(config),
             registry,
-            server_loader=server_loader,
+            server_loader=server_loader
+            or functools.partial(_load_current_servers, config.workspace_path),
         )
 
     @property
@@ -1382,6 +1419,87 @@ class MCPProvider:
     @property
     def connected_server_names(self) -> set[str]:
         return set(self._connections)
+
+    async def begin_turn(self, *, gate_timeout_s: float = _TURN_GATE_TIMEOUT_SECONDS) -> object:
+        """Register a turn as in flight so ``reload()`` will not swap under it.
+
+        Parks while a reload is draining, so a turn that has not started yet
+        does not pick up tools the reload is about to close.  The wait is
+        bounded by `gate_timeout_s`: a reload that dies without decrementing
+        the drain depth degrades to today's behaviour (a turn that may race a
+        swap) rather than wedging every turn behind it.
+
+        Returns a token the caller must hand back to :meth:`end_turn`.
+        """
+        if self._reload_drain_depth:
+            deadline = asyncio.get_running_loop().time() + gate_timeout_s
+            while self._reload_drain_depth:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    logger.warning(
+                        "MCP reload gate still closed after {}s; starting the turn anyway",
+                        gate_timeout_s,
+                    )
+                    break
+                try:
+                    await asyncio.wait_for(self._reload_gate.wait(), timeout=remaining)
+                except (TimeoutError, asyncio.TimeoutError):
+                    continue
+        # No await between here and the add, so the gate check and the
+        # registration cannot be interleaved with a reload starting its drain.
+        token = object()
+        self._active_turns.add(token)
+        self._turns_idle.clear()
+        return token
+
+    def end_turn(self, token: object) -> None:
+        """Release a turn registered by :meth:`begin_turn`. Idempotent."""
+        self._active_turns.discard(token)
+        if not self._active_turns:
+            self._turns_idle.set()
+
+    @property
+    def active_turn_count(self) -> int:
+        return len(self._active_turns)
+
+    async def _drain_active_turns(self, timeout_s: float) -> bool:
+        """Wait up to `timeout_s` for in-flight turns to finish.
+
+        Returns whether they all finished.  Proceeding on a timeout is
+        deliberate: a stuck turn must not be able to pin the runtime to a
+        stale MCP config indefinitely.
+        """
+        if not self._active_turns:
+            return True
+        try:
+            await asyncio.wait_for(self._turns_idle.wait(), timeout=timeout_s)
+        except (TimeoutError, asyncio.TimeoutError):
+            logger.warning(
+                "MCP hot reload: {} turn(s) still in flight after {}s; "
+                "applying the new config anyway (those turns may see a tool "
+                "disappear or a closed transport)",
+                len(self._active_turns),
+                timeout_s,
+            )
+            return False
+        return True
+
+    def has_pending_config_changes(self) -> bool:
+        """Return whether the configured MCP servers differ from the live set.
+
+        Reads the current configuration through the provider's server loader
+        and compares it with the servers ``reload()`` last applied, using the
+        same per-server signature ``reload()`` uses to detect changed servers
+        (so an ``enabledTools`` edit counts as a change).  Raises whatever the
+        loader raises when the configuration cannot be read.
+
+        Runs without ``_lock``: ``reload()`` rebinds ``_servers`` wholesale
+        rather than mutating it, so this only ever sees a complete server set,
+        and a stale answer is harmless because ``reload()`` re-reads and diffs
+        under the lock itself.
+        """
+        next_servers = dict(self._server_loader())
+        return _servers_signature(next_servers) != _servers_signature(self._servers)
 
     def runtime_status(self) -> dict[str, MCPRuntimeStatus]:
         """Return the latest connection-attempt result for configured servers."""
@@ -1473,11 +1591,88 @@ class MCPProvider:
                     exc,
                 )
 
-    async def reload(self) -> dict[str, Any]:
-        """Reconcile live MCP connections with the current configuration."""
+    async def reload(
+        self,
+        *,
+        drain_timeout_s: float = RELOAD_DRAIN_TIMEOUT_SECONDS,
+    ) -> dict[str, Any]:
+        """Reconcile live MCP connections with the current configuration.
+
+        Turn semantics
+        --------------
+        Removed and changed servers have their tools unregistered and their
+        transports closed.  Turn execution takes no lock, so this first waits
+        up to `drain_timeout_s` for turns that are *already running* to finish,
+        and holds back turns that have not started yet (they park in
+        :meth:`begin_turn`) until the swap is done.  A turn therefore keeps the
+        tools it was handed for its whole life, and a turn that starts after a
+        reload begins sees the new set.
+
+        If the wait times out the reload **proceeds anyway** and reports
+        ``drained: False``: a stuck turn must not be able to pin the runtime to
+        a stale MCP config, and the alternative — waiting without bound — turns
+        one hung tool call into a permanently unreloadable gateway.  Those
+        turns can still see a missing tool or a closed transport, which is
+        exactly today's behaviour; the drain narrows the window, it does not
+        make the swap transactional.
+
+        The lock is never held across a turn.  The drain runs outside it, so an
+        in-flight turn whose MCP session terminates can still take the lock via
+        the reconnect path and finish.
+
+        Concurrent reloads (the config watcher and the WebUI settings route can
+        overlap) nest: the gate stays closed until the last of them has
+        finished swapping.
+
+        Only reloads that remove or change a live server drain at all; adding a
+        server or retrying a failed connection unregisters nothing and skips
+        the wait entirely.  And only runs that carry ``_MCPReadinessHook``
+        register themselves, so ephemeral runs are invisible to the drain.
+        """
+        if not self._reload_would_disturb_turns():
+            # Nothing is being unregistered or closed, so no turn can lose a
+            # tool. Skipping keeps the common add-only/retry reload off the
+            # turn-latency path entirely.
+            return await self._reload_locked(True)
+
+        self._reload_drain_depth += 1
+        self._reload_gate.clear()
+        try:
+            drained = await self._drain_active_turns(drain_timeout_s)
+            return await self._reload_locked(drained)
+        finally:
+            self._reload_drain_depth -= 1
+            if self._reload_drain_depth <= 0:
+                self._reload_drain_depth = 0
+                self._reload_gate.set()
+
+    def _reload_would_disturb_turns(self) -> bool:
+        """Whether the pending config would remove or change a live server.
+
+        Only those two cases unregister tools and close transports; added
+        servers and reconnect retries are additive and cannot pull anything out
+        from under a running turn.  A config that cannot be read counts as
+        disturbing, so an unreadable config takes the cautious path rather than
+        skipping the drain on the way to reporting the read error.
+        """
+        try:
+            next_servers = dict(self._server_loader())
+        except Exception:
+            return True
+        current = self._servers
+        current_names = set(current)
+        next_names = set(next_servers)
+        if current_names - next_names:
+            return True
+        return any(
+            _server_signature(current[name]) != _server_signature(next_servers[name])
+            for name in current_names & next_names
+        )
+
+    async def _reload_locked(self, drained: bool) -> dict[str, Any]:
         async with self._lock:
             if self._closing:
-                return self._closing_result()
+                return self._closing_result(drained)
             try:
                 next_servers = dict(self._server_loader())
             except Exception as exc:
@@ -1487,6 +1682,7 @@ class MCPProvider:
                     "message": "Could not reload MCP config. Restart nanobot to pick up changes.",
                     "requires_restart": True,
                     "error": str(exc),
+                    "drained": drained,
                 }
 
             current_servers = dict(self._servers)
@@ -1539,7 +1735,7 @@ class MCPProvider:
                     raise
                 if self._closing:
                     await _close_mcp_connections(connected)
-                    return self._closing_result()
+                    return self._closing_result(drained)
                 self._connections.update(connected)
                 self._record_connection_result(to_connect, connected)
                 self._attach_reconnect_handlers(connected)
@@ -1582,14 +1778,16 @@ class MCPProvider:
                 "failed": failed,
                 "tools_removed": tools_removed,
                 "requires_restart": False,
+                "drained": drained,
             }
 
     @staticmethod
-    def _closing_result() -> dict[str, Any]:
+    def _closing_result(drained: bool = True) -> dict[str, Any]:
         return {
             "ok": False,
             "message": "MCP connections are shutting down.",
             "requires_restart": True,
+            "drained": drained,
         }
 
     def _attach_reconnect_handlers(self, server_names: Iterable[str]) -> None:
@@ -1670,7 +1868,13 @@ class MCPProvider:
         await _close_mcp_connection(server_name, connection)
 
     async def aclose(self) -> None:
-        """Close every connection while excluding reconnect and hot reload."""
+        """Close every connection while excluding reconnect and hot reload.
+
+        Deliberately does *not* drain in-flight turns the way ``reload()``
+        does.  Shutdown has already cancelled and awaited the runtime's tasks
+        by the time this runs, and a turn whose output nobody will see is not
+        worth delaying an exit for.
+        """
         self._closing = True
         async with self._lock:
             connections = dict(self._connections)
@@ -1685,6 +1889,10 @@ def _server_signature(cfg: Any) -> Any:
     if hasattr(cfg, "model_dump"):
         return cfg.model_dump(mode="json")
     return cfg
+
+
+def _servers_signature(servers: Mapping[str, Any]) -> dict[str, Any]:
+    return {name: _server_signature(cfg) for name, cfg in servers.items()}
 
 
 def _tool_prefix(server_name: str) -> str:

@@ -44,7 +44,8 @@ Add a stdio MCP server to `~/.nanobot/config.json`:
 }
 ```
 
-Restart nanobot, then ask a question that needs the MCP tool.
+Save the file, then ask a question that needs the MCP tool. A running gateway
+applies `mcpServers` edits before the next turn without a restart.
 
 ## Production notes
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -609,3 +610,52 @@ async def test_agent_loop_no_hooks_backward_compat(tmp_path):
         "without completing the task. You can try breaking the task into smaller steps."
     )
     assert result.tools_used == ["list_dir", "list_dir"]
+
+
+@pytest.mark.asyncio
+async def test_on_finally_runs_every_hook_even_when_one_raises_base_exception():
+    """`on_finally` must behave like a `finally`, or later hooks leak resources.
+
+    `_for_each_hook_safe` caught `Exception`, so a `CancelledError` from an
+    earlier hook — `FileEditActivityHook.on_finally` awaits an event emit
+    exactly on the cancelled path, inside a task that is already unwinding a
+    cancellation — skipped every hook after it. `_MCPReadinessHook` releases
+    the provider's turn token there, and the leak is permanent: one lost
+    token makes every later MCP reload burn its whole drain timeout and park
+    new turns behind a gate that never reopens.
+    """
+    released: list[str] = []
+
+    class _Canceller(AgentHook):
+        async def on_finally(self, context: AgentRunHookContext) -> None:
+            raise asyncio.CancelledError
+
+    class _Releaser(AgentHook):
+        async def on_finally(self, context: AgentRunHookContext) -> None:
+            released.append("released")
+
+    composite = CompositeHook([_Canceller(), _Releaser()])
+
+    with pytest.raises(asyncio.CancelledError):
+        await composite.on_finally(AgentRunHookContext(messages=[]))
+
+    assert released == ["released"], "a later hook's cleanup was skipped"
+
+
+@pytest.mark.asyncio
+async def test_on_finally_reraises_the_first_base_exception_it_saw():
+    class _Boom(AgentHook):
+        def __init__(self, exc: BaseException) -> None:
+            super().__init__()
+            self._exc = exc
+
+        async def on_finally(self, context: AgentRunHookContext) -> None:
+            raise self._exc
+
+    first = asyncio.CancelledError()
+    composite = CompositeHook([_Boom(first), _Boom(asyncio.CancelledError())])
+
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await composite.on_finally(AgentRunHookContext(messages=[]))
+
+    assert caught.value is first

@@ -196,8 +196,43 @@ class CompositeHook(AgentHook):
     async def on_error(self, context: AgentRunHookContext) -> None:
         await self._for_each_hook_safe("on_error", context)
 
+    async def _for_each_hook_finally(self, *args: Any, **kwargs: Any) -> None:
+        """Fan out ``on_finally`` with the semantics its name promises.
+
+        ``_for_each_hook_safe`` catches ``Exception``, so a ``BaseException``
+        from one hook skipped every hook after it.  That is wrong here
+        specifically: ``on_finally`` is where hooks release resources, and the
+        cancelled path is where it matters most — ``FileEditActivityHook``
+        awaits an event emit exactly then, inside a task that is already
+        unwinding a cancellation, and ``_MCPReadinessHook`` behind it releases
+        the MCP provider's turn token.  A token lost that way is lost for good
+        and makes every later MCP reload burn its full drain timeout.
+
+        So: every hook runs, and the first ``BaseException`` is re-raised
+        afterwards so cancellation still propagates.
+        """
+        first: BaseException | None = None
+        for h in self._hooks:
+            try:
+                await h.on_finally(*args, **kwargs)
+            except Exception:
+                if getattr(h, "_reraise", False):
+                    raise
+                logger.exception("AgentHook.on_finally error in {}", type(h).__name__)
+            except BaseException as exc:
+                logger.warning(
+                    "AgentHook.on_finally in {} raised {}; continuing with the "
+                    "remaining hooks so their cleanup still runs",
+                    type(h).__name__,
+                    type(exc).__name__,
+                )
+                if first is None:
+                    first = exc
+        if first is not None:
+            raise first
+
     async def on_finally(self, context: AgentRunHookContext) -> None:
-        await self._for_each_hook_safe("on_finally", context)
+        await self._for_each_hook_finally(context)
 
     async def on_stream(self, context: AgentHookContext, delta: str) -> None:
         await self._for_each_hook_safe("on_stream", context, delta)
