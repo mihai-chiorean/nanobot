@@ -14,11 +14,11 @@ from __future__ import annotations
 from unittest.mock import patch
 
 from nanobot.providers.openai_compat_provider import OpenAICompatProvider
+from nanobot.providers.registry import find_by_name
 from nanobot.providers.request_context import (
     reset_scheduling_class,
     set_scheduling_class,
 )
-from nanobot.providers.registry import find_by_name
 
 HEADER = "X-Ziggy-Scheduling-Class"
 

@@ -34,7 +34,6 @@ from nanobot.providers.base import (
     resolve_stream_idle_timeout_s,
     tool_arguments_json_for_replay,
 )
-from nanobot.providers.request_context import current_scheduling_class
 from nanobot.providers.openai_responses import (
     ResponsesStreamCapture,
     build_responses_compaction_state,
@@ -48,6 +47,7 @@ from nanobot.providers.openai_responses import (
     resolve_compact_threshold,
     responses_state_matches,
 )
+from nanobot.providers.request_context import current_scheduling_class
 
 if TYPE_CHECKING:
     from openai import AsyncOpenAI as AsyncOpenAIType
