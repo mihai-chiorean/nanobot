@@ -69,7 +69,7 @@ def project_activity_history(payload, *, active: bool):
         item = {
             "version": "1",
             "id": "tool-" + record.get("call_id", ""),
-            "chat_id": payload.get("key", "").removeprefix("websocket:"),
+            "chat_id": webui_chat_id(payload.get("key", "")) or "",
             "role": "assistant",
             "kind": "tool_hint",
             "content": record.get("summary", "Tool activity"),
