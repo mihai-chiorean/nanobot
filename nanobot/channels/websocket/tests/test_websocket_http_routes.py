@@ -4185,3 +4185,137 @@ def test_bootstrap_secret_also_enforced_on_localhost(bus: MagicMock) -> None:
     channel = _ch(bus, host="0.0.0.0", tokenIssueSecret="s3cret")
     resp = channel.gateway.http._handle_bootstrap(_LOCAL, _NO_HEADERS)
     assert resp.status_code == 401
+
+
+def _activity_record(call_id: str = "call-a") -> dict[str, Any]:
+    return {
+        "call_id": call_id,
+        "started_at": "2026-09-21T12:00:00+00:00",
+        "completed_at": "2026-09-21T12:00:01+00:00",
+        "before_message_count": 1,
+        "name": "exec",
+        "summary": "Running a command",
+        "status": "completed",
+        "text": '{"arguments": {"command": "ls"}, "error": null}',
+    }
+
+
+def _tool_hint_frame(call_id: str = "call-a") -> dict[str, Any]:
+    return {
+        "version": 1,
+        "phase": "end",
+        "call_id": call_id,
+        "name": "exec",
+        "arguments": {"command": "ls"},
+        "result": "notes.md",
+        "error": None,
+        "files": [],
+        "embeds": [],
+    }
+
+
+async def _get_thread(port: int, token: str, chat_id: str) -> Any:
+    return await _http_get(
+        f"http://127.0.0.1:{port}/api/sessions/{chat_id}/webui-thread",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_webui_thread_recovers_activity_rows_the_journal_missed(
+    bus: MagicMock, tmp_path: Path
+) -> None:
+    """A turn whose tool never journaled still shows its Activity row."""
+    from nanobot.webui.transcript import append_transcript_object
+
+    key = "websocket:activity-recovery"
+    sm = SessionManager(tmp_path / "workspace")
+    session = Session(key=key)
+    session.add_message("user", "list the files")
+    session.add_message("assistant", "one file: notes.md")
+    session.metadata["activity_v1"] = [_activity_record()]
+    sm.save(session)
+
+    append_transcript_object(
+        key, {"event": "user", "chat_id": "activity-recovery", "text": "list the files"},
+    )
+    append_transcript_object(
+        key, {"event": "message", "chat_id": "activity-recovery", "text": "one file: notes.md"},
+    )
+
+    port = _free_port()
+    channel = _ch(bus, session_manager=sm, port=port)
+    server_task = asyncio.create_task(channel.start())
+    try:
+        token = channel.gateway.tokens.issue_api_token(300)
+        response = await _get_thread(port, token, "websocket%3Aactivity-recovery")
+        assert response.status_code == 200
+        rows = response.json()["messages"]
+        activity_index = next(
+            index for index, row in enumerate(rows) if row.get("id") == "tool-call-a"
+        )
+        assert rows[activity_index - 1]["role"] == "user"
+        assert rows[activity_index + 1]["content"] == "one file: notes.md"
+        activity = rows[activity_index]
+        assert activity["role"] == "tool"
+        assert activity["kind"] == "trace"
+        assert activity["content"] == "Running a command"
+        assert activity["traces"] == ["Running a command"]
+        (tool_event,) = activity["toolEvents"]
+        assert tool_event["call_id"] == "call-a"
+        assert tool_event["phase"] == "end"
+        assert tool_event["arguments"] == {"command": "ls"}
+        assert "activity_v1" not in json.dumps(response.json())
+    finally:
+        await channel.stop()
+        await server_task
+
+
+@pytest.mark.asyncio
+async def test_webui_thread_does_not_duplicate_journaled_activity(
+    bus: MagicMock, tmp_path: Path
+) -> None:
+    """The same call id the journal already rendered must not appear twice."""
+    from nanobot.webui.transcript import append_transcript_object
+
+    key = "websocket:activity-dedup"
+    sm = SessionManager(tmp_path / "workspace")
+    session = Session(key=key)
+    session.add_message("user", "list the files")
+    session.add_message("assistant", "one file: notes.md")
+    session.metadata["activity_v1"] = [_activity_record()]
+    sm.save(session)
+
+    append_transcript_object(
+        key, {"event": "user", "chat_id": "activity-dedup", "text": "list the files"},
+    )
+    append_transcript_object(
+        key,
+        {
+            "event": "message",
+            "chat_id": "activity-dedup",
+            "text": "exec(ls)",
+            "kind": "tool_hint",
+            "tool_events": [_tool_hint_frame()],
+        },
+    )
+    append_transcript_object(
+        key, {"event": "message", "chat_id": "activity-dedup", "text": "one file: notes.md"},
+    )
+
+    port = _free_port()
+    channel = _ch(bus, session_manager=sm, port=port)
+    server_task = asyncio.create_task(channel.start())
+    try:
+        token = channel.gateway.tokens.issue_api_token(300)
+        response = await _get_thread(port, token, "websocket%3Aactivity-dedup")
+        assert response.status_code == 200
+        coverages = [
+            row for row in response.json()["messages"]
+            if any(event.get("call_id") == "call-a" for event in row.get("toolEvents") or [])
+        ]
+        assert len(coverages) == 1
+        assert coverages[0]["id"] != "tool-call-a"
+    finally:
+        await channel.stop()
+        await server_task
