@@ -34,6 +34,7 @@ from nanobot.providers.base import (
     resolve_stream_idle_timeout_s,
     tool_arguments_json_for_replay,
 )
+from nanobot.providers.request_context import current_scheduling_class
 from nanobot.providers.openai_responses import (
     ResponsesStreamCapture,
     build_responses_compaction_state,
@@ -1112,6 +1113,23 @@ class OpenAICompatProvider(LLMProvider):
         # otherwise lets extra_body.tools replace nanobot's generated functions.
         if self._extra_body:
             kwargs = _merge_chat_extra_body(kwargs, self._extra_body)
+
+        # Ziggy: the admission gateway in front of the local vLLM caps
+        # background concurrency separately from foreground chat. It reads the
+        # class off this header; with no header every request looks alike and
+        # the cap silently stops separating them, so background Work can take
+        # all of vLLM's slots and stall an interactive turn. Only sent to the
+        # local endpoint -- it is a Ziggy-private header and has no meaning to
+        # Anthropic, OpenAI, or any other upstream.
+        if (
+            "qwen" in model_name.lower()
+            and bool(spec and spec.name == "custom")
+            and _is_local_endpoint(spec, self.api_base)
+        ):
+            headers = dict(extra_headers or {})
+            headers["X-Ziggy-Scheduling-Class"] = current_scheduling_class()
+            extra_headers = headers
+
         if extra_headers:
             kwargs["extra_headers"] = extra_headers
 
