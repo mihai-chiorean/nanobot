@@ -60,6 +60,7 @@ from nanobot.agent.turn_delivery import TurnRoute as TurnRoute
 from nanobot.agent.turn_hooks import AgentTurnHookSpec, build_agent_turn_hook
 from nanobot.bus.events import INBOUND_META_USER_SHELL, InboundMessage, OutboundMessage
 from nanobot.bus.outbound_events import (
+    ProgressEvent,
     StreamDeltaEvent,
     StreamedResponseEvent,
     StreamEndEvent,
@@ -112,6 +113,7 @@ from nanobot.session.summary import (
     SessionSummaryCheckpoint,
 )
 from nanobot.triggers.local_turns import LocalTriggerTurnCoordinator
+from nanobot.utils.activity_history import record_tool_activity
 from nanobot.utils.cancellation import task_is_cancelling
 from nanobot.utils.document import reference_non_image_attachments
 from nanobot.utils.helpers import image_placeholder_text
@@ -1158,6 +1160,27 @@ class AgentLoop:
         Returns the complete result produced by ``AgentRunner``.
         """
         self._sync_subagent_runtime_limits()
+
+        if (
+            events.publish is not None
+            and session is not None
+            and not ephemeral
+            and session.policy.persist
+        ):
+            # Tool activity must survive a mid-turn crash: an interrupted turn
+            # still needs its Activity rows, and they can only be rebuilt from
+            # what reached the session file. Record at publish time so every
+            # lifecycle phase (start / end / error) is durable as it happens,
+            # mirroring the 0.2.x progress-callback seam.
+            _publish_events = events.publish
+
+            async def _record_tool_activity(event: AgentEvent) -> None:
+                if isinstance(event, ProgressEvent) and event.tool_events:
+                    record_tool_activity(session, event.tool_events)
+                    self.sessions.save(session, fsync=True)
+                await _publish_events(event)
+
+            events = EventSink(_record_tool_activity, events.accepts)
 
         async def _checkpoint(payload: dict[str, Any]) -> None:
             if session is None:
