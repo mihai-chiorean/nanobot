@@ -347,6 +347,25 @@ async def test_unified_turn_probes_the_real_session_and_creates_nothing(setup):
 
 
 @pytest.mark.asyncio
+async def test_disk_only_shared_room_session_is_denied_without_a_cache_entry(setup):
+    # A shared flag that lives only on disk -- the session was evicted from the
+    # runtime cache -- must still deny the turn. read_session_metadata returns the
+    # {key, created_at, updated_at, metadata} envelope, so the probe has to read
+    # shared_room from the nested metadata, not the top level.
+    tool, api, sessions = setup
+    key = webui_session_key("chat-one")
+    session = sessions.get_or_create(key)
+    session.metadata["shared_room"] = True
+    sessions.save(session)
+    sessions.invalidate(key)
+    assert sessions.get_cached(key) is None
+    assert (sessions.read_session_metadata(key) or {}).get("metadata", {}).get("shared_room") is True
+    with private_turn(message_id="message-one"):
+        assert "private owner conversation" in await tool.execute("inspect")
+    assert not api.calls
+
+
+@pytest.mark.asyncio
 async def test_turn_without_bound_request_context_is_inert(setup):
     tool, api, _ = setup
     assert "private owner conversation" in await tool.execute("inspect")

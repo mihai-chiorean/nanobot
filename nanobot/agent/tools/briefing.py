@@ -202,7 +202,9 @@ class BriefingTool(Tool):
         if turn_session is not None:
             session_metadata = dict(turn_session.metadata or {})
         else:
-            session_metadata = dict(self._sessions.read_session_metadata(turn_key) or {})
+            session_metadata = dict(
+                (self._sessions.read_session_metadata(turn_key) or {}).get("metadata") or {}
+            )
         private = (
             is_webui_session_key(key)
             and key == expected_key
