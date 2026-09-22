@@ -55,8 +55,8 @@ class RoomPolicy(str, Enum):
 #     edit_file, apply_patch         allowlists memory/history.jsonl even under
 #                                    restrictToWorkspace
 #   notebook_edit                    ported MIT-1031.  A cell-level .ipynb editor
-#                                    (auto-discovered, so it WOULD register in a
-#                                    guest turn if unclassified); it rewrites the
+#                                    (already denied by the allow-list default;
+#                                    listed so the decision is recorded); it rewrites the
 #                                    whole notebook JSON through ``_resolve_write``
 #                                    exactly like write_file, so it has the same
 #                                    arbitrary-file blast radius inside the

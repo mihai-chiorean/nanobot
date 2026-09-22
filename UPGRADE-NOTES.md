@@ -103,8 +103,9 @@ one decision:
 * **Shared-room policy:** `notebook_edit` is a file-write tool, so it is
   deliberately **denied** in `room_policy.py` (added to the denied-with-reason
   list, not the allow-list, which stays `{web_search, report_progress}`). A
-  guest turn must not be able to edit arbitrary workspace files; the ported tool
-  is auto-discovered, so leaving it unclassified would have opened a hole.
+  guest turn must not be able to edit arbitrary workspace files. The allow-list
+  already denies any unclassified tool; the explicit entry records the decision
+  so nobody later adds it to the allow-list by accident.
 
 ---
 
