@@ -57,6 +57,9 @@ class RoomPolicy(str, Enum):
 #   message                          can address another channel/chat and attach
 #                                    arbitrary local files as media
 #   my, cron, schedule_work          mutate tenant runtime state
+#   briefing                         mutates owner briefing workflows through
+#                                    the control plane (its private-turn gate
+#                                    is defense in depth, not the boundary)
 #   create_goal, update_goal         durable sustained-goal state (the real
 #                                    tools; "long_task" was never a tool name)
 #   spawn                            a fresh turn one level down
