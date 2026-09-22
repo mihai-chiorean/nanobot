@@ -398,7 +398,7 @@ def _turn_driving_provider(tool_calls):
 
 @pytest.mark.asyncio
 async def test_enabled_config_registers_the_tool_and_reaches_the_control_url(
-    tmp_path, setup
+    tmp_path, setup, monkeypatch
 ):
     from nanobot.agent.loop import AgentLoop
     from nanobot.bus.events import InboundMessage
@@ -420,7 +420,19 @@ async def test_enabled_config_registers_the_tool_and_reaches_the_control_url(
     )
     registered = loop.tools.get("briefing")
     assert registered is not None
-    registered._transport = httpx.MockTransport(api.handle)
+    # Seam the HTTP boundary instead of reaching into the loader-created
+    # tool's private transport attribute: default-set the transport on every
+    # client the tool constructs (repo convention -- see the slack/whatsapp
+    # transport monkeypatches).
+    real_client = httpx.AsyncClient
+    mock_transport = httpx.MockTransport(api.handle)
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda *args, transport=None, **kwargs: real_client(
+            *args, transport=transport or mock_transport, **kwargs
+        ),
+    )
     system_prompt = loop.context.build_system_prompt(channel="websocket")
     assert "Workflow Scheduling Policy" in system_prompt
 
