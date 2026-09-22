@@ -142,6 +142,9 @@ _SLOW_WEBUI_HTTP_LOG_MS = 1_000
 _WEBUI_MUTATION_PAYLOAD_ATTR = "_nanobot_webui_mutation_payload"
 _WEBUI_MUTATION_REQUEST_ATTR = "_nanobot_webui_mutation_request"
 _NO_STORE_HEADERS = [("Cache-Control", "no-store")]
+# Publication ids are 128-bit hex tokens minted by ``SessionManager``; any
+# other spelling is not a capability and must not reach the store (MIT-1030).
+_PUBLISHED_FILE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
 
 def _quoted_etag(revision: str) -> str:
@@ -793,6 +796,14 @@ class GatewayHTTPHandler:
         if m:
             return self._handle_file_preview(request, m.group(1))
 
+        m = re.match(r"^/api/sessions/([^/]+)/files/([^/]+)$", got)
+        if m:
+            # Publication URLs are exact capabilities scoped by session grants;
+            # no query/fragment-shaped override surface is accepted.
+            if "?" in request.path or "#" in request.path:
+                return _http_error(404, "Not Found")
+            return await self._handle_published_file(request, m.group(1), m.group(2))
+
         m = re.match(r"^/api/sessions/([^/]+)/automations$", got)
         if m:
             return self._handle_session_automations(request, m.group(1))
@@ -1120,6 +1131,71 @@ class GatewayHTTPHandler:
             data,
             accept_encoding=_combined_list_header(request.headers, "Accept-Encoding"),
             extra_headers=_NO_STORE_HEADERS,
+        )
+
+    async def _handle_published_file(
+        self,
+        request: WsRequest,
+        raw_key: str,
+        raw_file_id: str,
+    ) -> Response:
+        """Serve one granted private publication, or reveal nothing (404).
+
+        Ported from the 0.2.x lineage (MIT-1030). API transport tokens are
+        owner credentials. Deliberately use the same response for malformed
+        ids, absent grants, wrong sessions, and unauthenticated probes.
+        """
+
+        def missing() -> Response:
+            return _http_error(404, "Not Found")
+
+        if self.session_manager is None:
+            return _http_error(503, "session manager unavailable")
+        key = _decode_api_key(raw_key)
+        # The tool emits one canonical URI: a percent-encoded session key and
+        # an already-lowercase hexadecimal id. Reject alternate spellings
+        # rather than silently treating encoding as another route parameter.
+        file_id = raw_file_id if _PUBLISHED_FILE_ID_RE.fullmatch(raw_file_id) else None
+        if key is None or quote(key, safe="") != raw_key or file_id is None:
+            return missing()
+        canonical_path = f"/api/sessions/{raw_key}/files/{raw_file_id}"
+        # ``_parse_request_path`` normalizes a trailing slash and query
+        # parsing drops blank parameters. The original request must be the
+        # canonical path too, so that normalization never broadens a grant.
+        request_target = getattr(request, "raw_path", None) or request.path
+        if request_target != canonical_path:
+            return missing()
+        if not self.check_api_token(request):
+            return missing()
+        published = await asyncio.to_thread(
+            self.session_manager.read_published_file,
+            key,
+            file_id,
+        )
+        if published is None:
+            return missing()
+        filename, payload = published
+        # RFC 6266-compatible fallback and UTF-8 filename. Never reflect
+        # control bytes into a response header, even if a host filesystem
+        # permits them in a filename.
+        clean_name = "".join(ch for ch in filename if ord(ch) >= 32 and ch != "\x7f")
+        ascii_name = "".join(
+            ch if ord(ch) < 127 and ch not in {'"', '\\'} else "_" for ch in clean_name
+        )
+        if not ascii_name or not ascii_name.endswith(".md"):
+            ascii_name = "download.md"
+        utf8_name = quote(clean_name or "download.md", safe="")
+        return _http_response(
+            payload,
+            content_type="text/markdown; charset=utf-8",
+            extra_headers=[
+                ("Cache-Control", "private, no-store"),
+                ("X-Content-Type-Options", "nosniff"),
+                (
+                    "Content-Disposition",
+                    f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{utf8_name}",
+                ),
+            ],
         )
 
     def _handle_file_preview(self, request: WsRequest, key: str) -> Response:

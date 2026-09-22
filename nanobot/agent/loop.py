@@ -48,6 +48,11 @@ from nanobot.agent.tools.exec_session import ExecSessionManager
 from nanobot.agent.tools.audit import AuditLogger
 from nanobot.agent.tools.file_state import FileStateStore, bind_file_states, reset_file_states
 from nanobot.agent.tools.message import capture_message_deliveries
+from nanobot.agent.tools.publish_file import (
+    PublishFileTurn,
+    bind_publish_file_turn,
+    reset_publish_file_turn,
+)
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.runtime_control import AgentRuntimeControl
 # Ziggy-local (fork, MIT-1014): marker for the trusted user `!<command>` path.
@@ -196,6 +201,11 @@ class TurnContext:
 
     input_persisted_early: bool = False
     save_skip: int = 0
+    # Server-owned publication capability for this turn (MIT-1030). ``None``
+    # means the conversation may not publish files at all; the binding is
+    # installed only around the runner call and released on every exit path.
+    publish_file_turn: PublishFileTurn | None = None
+    published_message_start: int = 0
 
     outbound: OutboundMessage | None = None
     suppress_response: bool = False
@@ -1147,6 +1157,7 @@ class AgentLoop:
         tools: ToolRegistry | None = None,
         request_context: RequestContext | None = None,
         provider_state: ProviderConversationState | None = None,
+        publish_file_turn: PublishFileTurn | None = None,
     ) -> AgentRunResult:
         """Run the agent iteration loop.
 
@@ -1326,6 +1337,16 @@ class AgentLoop:
         file_state_token = bind_file_states(self._file_state_store.for_session(active_session_key))
         request_token = bind_request_context(request_ctx)
         workspace_token = bind_workspace_scope(effective_scope)
+        # The publication binding is task-scoped contextvars state: it is set
+        # here, inside the single task that executes this turn, and undone in
+        # the ``finally`` below so it can never leak past the run. A leaked
+        # binding would let the next turn publish into this conversation's
+        # slot (MIT-1030).
+        publication_token = (
+            bind_publish_file_turn(publish_file_turn)
+            if publish_file_turn is not None
+            else None
+        )
         turn_scope_stack = ExitStack()
         # Compute lazily because create_goal may create goal metadata during this run.
         def _goal_continue() -> str | None:
@@ -1412,6 +1433,11 @@ class AgentLoop:
                 events=events,
             ))
         finally:
+            # Every exit path — happy, error, and cancellation (CancelledError
+            # unwinds through ``finally``) — must release the publication
+            # binding before the other turn-scoped tokens.
+            if publication_token is not None:
+                reset_publish_file_turn(publication_token)
             turn_scope_stack.close()
             reset_workspace_scope(workspace_token)
             reset_request_context(request_token)
@@ -2250,12 +2276,37 @@ class AgentLoop:
         ctx.transcript_input = self._build_transcript_input(ctx)
 
 
+    def _publish_file_turn_for_turn(self, ctx: TurnContext) -> PublishFileTurn | None:
+        """Mint the server-owned publication capability for this turn, if any.
+
+        Publication links are a WebSocket-client capability. Background Work
+        may explicitly opt in (``work_mode`` metadata) so reports tied to its
+        own session can be handed back through the same authenticated route.
+        Shared-room turns never receive one: guests drive the agent, and a
+        private download must not be mintable from a guest prompt. ``None``
+        keeps the ``publish_file`` tool inert for this turn.
+        """
+        if ctx.ephemeral or self._shared_room_turn(ctx.msg):
+            return None
+        metadata = ctx.msg.metadata
+        enabled = ctx.msg.channel == "websocket" or metadata.get("work_mode") in {
+            "background",
+            "scheduled",
+        }
+        if not enabled:
+            return None
+        return PublishFileTurn(self.sessions, ctx.session_key)
+
     async def _run_turn(self, ctx: TurnContext) -> None:
         runtime = ctx.require_runtime()
         if ctx.visible_run_started_at is None:
             ctx.visible_run_started_at = time.time()
         await ctx.delivery.running(started_at=ctx.visible_run_started_at)
         assert ctx.transcript_input is not None
+        ctx.publish_file_turn = self._publish_file_turn_for_turn(ctx)
+        # Boundary for provenance matching in ``grant_published_files``:
+        # only messages appended by this run may grant a publication.
+        ctx.published_message_start = len(ctx.require_session().messages)
         with capture_message_deliveries() as message_sends:
             result = await self._run_agent_loop(
                 ctx.transcript_input,
@@ -2272,6 +2323,7 @@ class AgentLoop:
                 request_context=ctx.request_context,
                 provider_state=ctx.provider_state,
                 events=ctx.events,
+                publish_file_turn=ctx.publish_file_turn,
             )
         ctx.final_content = result.final_content
         ctx.all_messages = result.messages
@@ -2319,6 +2371,14 @@ class AgentLoop:
             summary_checkpoint=ctx.summary_checkpoint,
             input_persisted_early=ctx.input_persisted_early,
         )
+        if ctx.publish_file_turn is not None and not ctx.ephemeral:
+            # Grants attach only to publications whose canonical link was
+            # actually rendered in a final visible assistant message.
+            self.sessions.grant_published_files(
+                session,
+                ctx.publish_file_turn.publications,
+                message_start=ctx.published_message_start,
+            )
         if (
             not ctx.ephemeral
             and ctx.provider_compaction_applied
