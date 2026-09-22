@@ -96,11 +96,14 @@ async def test_searxng_search(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_duckduckgo_search(monkeypatch):
+    calls = []
+
     class MockDDGS:
         def __init__(self, **kw):
             pass
 
-        def text(self, query, max_results=5):
+        def text(self, query, max_results=5, backend=None):
+            calls.append(backend)
             return [{"title": "DDG Result", "href": "https://ddg.example", "body": "From DuckDuckGo"}]
 
     monkeypatch.setattr("nanobot.agent.tools.web.DDGS", MockDDGS, raising=False)
@@ -112,6 +115,10 @@ async def test_duckduckgo_search(monkeypatch):
     tool = _tool(provider="duckduckgo")
     result = await tool.execute(query="hello")
     assert "DDG Result" in result
+    # MIT-1017: the query must be pinned to a single engine. ddgs' auto
+    # backend fans a private-conversation-derived query out across engines
+    # nobody configured, disclosing user intent to third parties.
+    assert calls == [web_mod._DDGS_TEXT_BACKEND] == ["duckduckgo"]
 
 
 @pytest.mark.asyncio
@@ -120,7 +127,7 @@ async def test_brave_fallback_to_duckduckgo_when_no_key(monkeypatch):
         def __init__(self, **kw):
             pass
 
-        def text(self, query, max_results=5):
+        def text(self, query, max_results=5, backend=None):
             return [{"title": "Fallback", "href": "https://ddg.example", "body": "DuckDuckGo fallback"}]
 
     monkeypatch.setattr("ddgs.DDGS", MockDDGS)
@@ -196,7 +203,7 @@ async def test_searxng_no_base_url_falls_back(monkeypatch):
         def __init__(self, **kw):
             pass
 
-        def text(self, query, max_results=5):
+        def text(self, query, max_results=5, backend=None):
             return [{"title": "Fallback", "href": "https://ddg.example", "body": "fallback"}]
 
     monkeypatch.setattr("ddgs.DDGS", MockDDGS)
@@ -220,7 +227,7 @@ async def test_jina_422_falls_back_to_duckduckgo(monkeypatch):
         def __init__(self, **kw):
             pass
 
-        def text(self, query, max_results=5):
+        def text(self, query, max_results=5, backend=None):
             return [{"title": "Fallback", "href": "https://ddg.example", "body": "DuckDuckGo fallback"}]
 
     async def mock_get(self, url, **kw):
@@ -245,7 +252,7 @@ async def test_kagi_fallback_to_duckduckgo_when_no_key(monkeypatch):
         def __init__(self, **kw):
             pass
 
-        def text(self, query, max_results=5):
+        def text(self, query, max_results=5, backend=None):
             return [{"title": "Fallback", "href": "https://ddg.example", "body": "DuckDuckGo fallback"}]
 
     monkeypatch.setattr("ddgs.DDGS", MockDDGS)
@@ -284,7 +291,7 @@ async def test_duckduckgo_timeout_returns_error(monkeypatch):
         def __init__(self, **kw):
             pass
 
-        def text(self, query, max_results=5):
+        def text(self, query, max_results=5, backend=None):
             gate.wait(timeout=10)
             return []
 
@@ -348,7 +355,7 @@ async def test_olostep_missing_key_falls_back_to_duckduckgo(monkeypatch):
         def __init__(self, **kw):
             pass
 
-        def text(self, query, max_results=5):
+        def text(self, query, max_results=5, backend=None):
             return [{"title": "Fallback", "href": "https://ddg.example", "body": "fallback"}]
 
     fake_mod = types.ModuleType("olostep")

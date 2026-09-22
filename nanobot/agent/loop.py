@@ -652,10 +652,20 @@ class AgentLoop:
             effective_key = UNIFIED_SESSION_KEY
         else:
             effective_key = f"{channel}:{chat_id}"
-        for name in ("message", "spawn", "cron", "schedule_work", "briefing", "my"):
+        for name in ("message", "spawn", "cron", "schedule_work", "briefing", "my", "exec"):
             if tool := self.tools.get(name):
                 if hasattr(tool, "set_context"):
-                    if name == "spawn":
+                    if name == "exec":
+                        # Ziggy-local (fork, MIT-1014): exec needs the turn
+                        # kind (channel + session namespace + Work metadata)
+                        # to know whether it is inside a live conversation.
+                        tool.set_context(
+                            channel, chat_id,
+                            message_id=message_id,
+                            metadata=metadata,
+                            session_key=effective_key,
+                        )
+                    elif name == "spawn":
                         tool.set_context(channel, chat_id, effective_key=effective_key)
                         if hasattr(tool, "set_origin_message_id"):
                             tool.set_origin_message_id(message_id)
@@ -1413,6 +1423,14 @@ class AgentLoop:
             msg.chat_id.split(":", 1)[1] if ":" in msg.chat_id else msg.chat_id
         )
         turn_input = msg.content[:200] if isinstance(msg.content, str) else None
+        # Ziggy-local (fork, MIT-1014): one reset per inbound turn, here
+        # rather than beside MessageTool.start_turn() because that call sits
+        # under `if not shared_room` and would leave the budget stale for
+        # shared-room turns. This is the single funnel every turn passes
+        # through, including system/subagent and command dispatch.
+        exec_tool = self.tools.get("exec")
+        if exec_tool is not None and hasattr(exec_tool, "start_turn"):
+            exec_tool.start_turn()
         with observe_turn(
             name=f"turn:{turn_channel}",
             session_id=effective_key,
