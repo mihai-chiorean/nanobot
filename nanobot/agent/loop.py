@@ -521,7 +521,14 @@ class AgentLoop:
             lambda turn: _ZiggyTurnHook(self, turn)
         )
 
-        self.context = ContextBuilder(workspace, timezone=timezone, disabled_skills=disabled_skills)
+        self.context = ContextBuilder(
+            workspace,
+            timezone=timezone,
+            disabled_skills=disabled_skills,
+            # Ziggy-local (MIT-1028): the intake policy names the scheduling
+            # tools; it must only reach turns that can actually act on them.
+            workflow_scheduling=cron_service is not None or _tc.briefing.enable,
+        )
         self.sessions = session_manager or SessionManager(workspace)
         # Ziggy-local (MIT-1010): durable Work store for report_progress /
         # publish_artifact / schedule_work and the ``work_task`` cron kind.
