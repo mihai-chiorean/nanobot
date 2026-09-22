@@ -14,8 +14,6 @@ Shared-room turns are additionally denied by the room allow-list in
 ``room_policy.py``; the private-conversation check here is defense in depth.
 """
 
-# pyright: reportIncompatibleMethodOverride=false
-
 from __future__ import annotations
 
 import hashlib
@@ -37,6 +35,7 @@ from nanobot.agent.tools.schema import (
 )
 from nanobot.config_base import Base
 from nanobot.session.keys import UNIFIED_SESSION_KEY
+from nanobot.webui.session_identity import is_webui_session_key, webui_session_key
 
 if TYPE_CHECKING:
     from nanobot.session.manager import SessionManager
@@ -184,18 +183,29 @@ class BriefingTool(Tool):
         Reads the authoritative per-turn request snapshot; ``None`` means the
         current turn may not manage owner briefings (not the private WebUI
         conversation, a room/work-mode turn, or a non-matching session key).
+        The persisted WebUI key is owned by
+        :mod:`nanobot.webui.session_identity`, and the session probe reads
+        the turn's own session without creating one, so a denied turn cannot
+        leave a stray empty session behind.
         """
         ctx = current_request_context()
         if ctx is None:
             return None
-        channel, chat_id = ctx.channel or "", ctx.chat_id or ""
-        raw_key = f"{channel}:{chat_id}"
-        key = raw_key if ctx.session_key in (None, UNIFIED_SESSION_KEY) else ctx.session_key
+        chat_id = ctx.chat_id or ""
+        expected_key = webui_session_key(chat_id)
+        key = (
+            expected_key if ctx.session_key in (None, UNIFIED_SESSION_KEY) else ctx.session_key
+        )
+        turn_key = ctx.session_key or expected_key
         metadata = dict(ctx.metadata or {})
-        session_metadata = dict(self._sessions.get_or_create(key).metadata or {})
+        turn_session = self._sessions.get_cached(turn_key)
+        if turn_session is not None:
+            session_metadata = dict(turn_session.metadata or {})
+        else:
+            session_metadata = dict(self._sessions.read_session_metadata(turn_key) or {})
         private = (
-            channel == "websocket"
-            and key == raw_key
+            is_webui_session_key(key)
+            and key == expected_key
             and not metadata.get("shared_room")
             and not session_metadata.get("shared_room")
             and not metadata.get("work_mode")
@@ -205,7 +215,7 @@ class BriefingTool(Tool):
         origin = metadata.get("client_message_id") or ctx.message_id
         return chat_id, str(origin or "")
 
-    async def execute(
+    async def execute(  # pyright: ignore[reportIncompatibleMethodOverride]
         self, action: str, workflow_id: str | None = None, **changes: Any
     ) -> ToolResult | str:
         turn = self._turn_identity()

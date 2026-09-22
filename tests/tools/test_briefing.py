@@ -15,7 +15,9 @@ from nanobot.agent.tools.context import RequestContext, ToolContext, request_con
 from nanobot.agent.tools.loader import ToolLoader
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.config.schema import Config, ToolsConfig
+from nanobot.session.keys import UNIFIED_SESSION_KEY
 from nanobot.session.manager import SessionManager
+from nanobot.webui.session_identity import webui_session_key
 
 
 class WorkAPI:
@@ -321,6 +323,26 @@ async def test_shared_and_background_context_cannot_change_owner_work(setup):
         assert "private owner conversation" in await tool.execute("create", **CREATE)
     with private_turn(metadata={"shared_room": True}, message_id="room-one"):
         assert "private owner conversation" in await tool.execute("create", **CREATE)
+    assert not api.calls
+
+
+@pytest.mark.asyncio
+async def test_unified_turn_probes_the_real_session_and_creates_nothing(setup):
+    # In unified-session mode the turn runs in UNIFIED_SESSION_KEY, so the
+    # shared_room probe must read *that* session -- and must never mint the
+    # fallback per-chat session it does not run in.
+    tool, api, sessions = setup
+    with private_turn(session_key=UNIFIED_SESSION_KEY, message_id="message-one"):
+        result = json.loads(await tool.execute("create", **CREATE))
+    assert result["status"] == "first_edition_requested"
+    assert sessions.get_cached(webui_session_key("chat-one")) is None
+    assert sessions.read_session_metadata(webui_session_key("chat-one")) is None
+    # A shared flag on the session this turn actually runs in denies it,
+    # even though the never-created fallback key would have read as private.
+    sessions.get_or_create(UNIFIED_SESSION_KEY).metadata["shared_room"] = True
+    api.calls.clear()
+    with private_turn(session_key=UNIFIED_SESSION_KEY, message_id="message-two"):
+        assert "private owner conversation" in await tool.execute("inspect")
     assert not api.calls
 
 
