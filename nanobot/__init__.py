@@ -3,6 +3,7 @@ nanobot - A lightweight AI agent framework
 """
 
 import tomllib
+import warnings
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 from pathlib import Path
@@ -36,7 +37,7 @@ if TYPE_CHECKING:
 
 
 def _read_pyproject_version() -> str | None:
-    """Read the source-tree version when package metadata is unavailable."""
+    """Read the version declared by the source tree that owns this package."""
     pyproject = Path(__file__).resolve().parent.parent / "pyproject.toml"
     if not pyproject.exists():
         return None
@@ -44,12 +45,36 @@ def _read_pyproject_version() -> str | None:
     return data.get("project", {}).get("version")
 
 
-def _resolve_version() -> str:
+def _dist_version() -> str | None:
     try:
         return _pkg_version("nanobot-ai")
     except PackageNotFoundError:
-        # Source checkouts often import nanobot without installed dist-info.
-        return _read_pyproject_version() or "0.3.0"
+        return None
+
+
+def _resolve_version() -> str:
+    # The version of the tree being imported is the version of the code that
+    # executes. Dist metadata can describe a different install from the one
+    # actually running: `python -m nanobot` puts the current directory first on
+    # sys.path, so a release snapshot's package beats the path-appending
+    # editable .pth -- __version__ used to report the venv's metadata while
+    # the snapshot's code executed (MIT-1011 / MIT-1032).
+    source_version = _read_pyproject_version()
+    dist = _dist_version()
+    if source_version is not None:
+        if dist is not None and dist != source_version:
+            warnings.warn(
+                f"nanobot dist metadata reports {dist} but the executing tree at "
+                f"{Path(__file__).resolve().parent.parent} declares {source_version}; "
+                "reporting the executing tree (MIT-1032)",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        return source_version
+    if dist is not None:
+        return dist
+    # Source checkouts without pyproject and installs without dist-info.
+    return "0.3.0"
 
 
 __version__ = _resolve_version()
