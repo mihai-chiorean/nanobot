@@ -1194,6 +1194,11 @@ class AgentLoop:
                         session.key,
                         {ACTIVITY_HISTORY_KEY: records},
                         fsync=True,
+                        # A metadata-only write leaves ``updated_at`` untouched,
+                        # which would freeze the webui-thread ETag variant (it
+                        # hashes ``session_updated_at``) and let a poller sit on
+                        # 304s and miss the freshly recoverable row. Bump it.
+                        touch_updated_at=True,
                     ):
                         self.sessions.save(session, fsync=True)
                 await _publish_events(event)

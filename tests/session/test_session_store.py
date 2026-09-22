@@ -56,6 +56,38 @@ def test_manager_delegates_persistence_to_store(tmp_path) -> None:
     assert manager.get_cached(stored.key) is None
 
 
+def test_update_session_metadata_bumps_updated_at_only_when_touched(tmp_path) -> None:
+    """A metadata-only write must refresh ``updated_at`` so caches observe it.
+
+    The webui-thread ETag folds ``session_updated_at`` into its variant; the
+    activity recorder writes metadata without rewriting the transcript, so
+    without the bump a poller could sit on a 304 and miss a newly recoverable
+    Activity row. A plain metadata update (no touch) must leave the stamp alone.
+    """
+    manager = SessionManager(tmp_path / "workspace", sessions_root=tmp_path / "sessions")
+    session = manager.get_or_create("websocket:touched")
+    session.add_message("user", "hello")
+    manager.save(session)
+    baseline = (manager.read_session_metadata("websocket:touched") or {})["updated_at"]
+
+    # Default (no touch): metadata changes, the stamp is preserved.
+    assert manager.update_session_metadata("websocket:touched", {"activity_v1": []}) is True
+    assert (manager.read_session_metadata("websocket:touched") or {})["updated_at"] == baseline
+
+    # Touch: the stamp moves even though only metadata was written.
+    assert (
+        manager.update_session_metadata(
+            "websocket:touched", {"activity_v1": [{"call_id": "c1"}]}, touch_updated_at=True
+        )
+        is True
+    )
+    bumped = (manager.read_session_metadata("websocket:touched") or {})["updated_at"]
+    assert bumped != baseline
+    # The transcript itself was never rewritten by either metadata write.
+    persisted = manager.read_session_file("websocket:touched") or {}
+    assert [m["content"] for m in persisted.get("messages", [])] == ["hello"]
+
+
 def test_manager_renames_model_preset_in_live_and_persisted_sessions(tmp_path) -> None:
     workspace = tmp_path / "workspace"
     sessions_root = tmp_path / "sessions"

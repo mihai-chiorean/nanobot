@@ -36,16 +36,22 @@ async def test_tool_call_persists_activity_rows_before_turn_end(tmp_path: Path) 
     # Durability is the point: the rows are fsync-written as the tools run, so
     # a mid-turn crash still leaves them for the interrupted turn to render.
     # The write must be the metadata-only one; a full save would rewrite and
-    # fsync the whole transcript on every tool start/end.
-    update_calls: list[bool] = []
+    # fsync the whole transcript on every tool start/end. It must also bump
+    # ``updated_at`` so the webui-thread ETag (which hashes it) changes and a
+    # poller is not served a stale 304 that hides the newly recoverable row.
+    update_calls: list[tuple[bool, bool]] = []
     real_update = loop.sessions.update_session_metadata
 
     def spy_update(
-        key: str, updates: dict[str, object], *, fsync: bool = False
+        key: str,
+        updates: dict[str, object],
+        *,
+        fsync: bool = False,
+        touch_updated_at: bool = False,
     ) -> bool:
         if KEY in updates:
-            update_calls.append(fsync)
-        return real_update(key, updates, fsync=fsync)
+            update_calls.append((fsync, touch_updated_at))
+        return real_update(key, updates, fsync=fsync, touch_updated_at=touch_updated_at)
 
     loop.sessions.update_session_metadata = spy_update  # type: ignore[method-assign]
 
@@ -67,7 +73,8 @@ async def test_tool_call_persists_activity_rows_before_turn_end(tmp_path: Path) 
     assert record["name"] == "exec"
     assert record["status"] == "completed"
     assert isinstance(record["before_message_count"], int)
-    assert any(fsync for fsync in update_calls)
+    assert any(fsync for fsync, _ in update_calls)
+    assert update_calls and all(touch for _fsync, touch in update_calls)
 
 
 @pytest.mark.asyncio
