@@ -69,10 +69,42 @@ are dropped in favour of upstream — see "Local patches dropped".
 | **MIT-162 process-group teardown** (`os.killpg` in a `finally`) | `ExecTool._kill_process_tree` | Upstream spawns with `start_new_session=True`, kills the whole group, reaps with `_reap_pid`, and adds Windows Job Object support. Superset of ours. |
 | **MIT-144 / MIT-185 TTFT capture in `OpenAICompatProvider`** | `LLMResponse.ttft_ms` + provider-base streaming instrumentation | Upstream measures TTFT for *every* provider, not just the OpenAI-compatible one. `openai_compat_provider.py` is now identical to upstream. `tests/providers/test_openai_compat_ttft.py` deleted. |
 | **MIT-203 "classify by explicit marker, not `startswith('Error')`"** (the *detection* half) | `ToolResult.is_error` | Upstream made failure detection structural. `_looks_like_error` now just defers to it, and the fork's string-marker scan is gone. The *classification* half (prescreen / timeout / nonzero_exit / exception / misclassified, for the audit log) is kept. **Behaviour change: a tool returning a bare string that merely starts with `"Error"` is no longer treated as a failure.** That was the original MIT-203 goal. |
-| **`.ipynb` edit guard in `EditFileTool`** | Upstream supports editing `.ipynb` as JSON | Dropped; upstream has tests asserting the new behaviour. |
+| **`.ipynb` edit guard in `EditFileTool`** | Upstream supports editing `.ipynb` as JSON | Dropped; upstream has tests asserting the new behaviour (`test_edit_enhancements.TestEditIpynbFiles`, `test_file_edit_coding_enhancements.test_edit_file_can_edit_ipynb_as_json`). |
+| **`NotebookEditTool` (`nanobot/agent/tools/notebook.py`)** | — (not an upstream feature) | **Ported**, per the MIT-1031 owner decision ("nothing from the 0.2.x line may be dropped in the cutover"). On `feat/shared-rooms` the guard and this tool were a coupled pair — the guard existed only to route `.ipynb` to `notebook_edit`. 0.3.0 drops the guard, so the two now **coexist**: `edit_file` edits notebooks as JSON, `notebook_edit` does cell-level edits, and the tool's description states when to prefer each. See §2a. |
 | **Verbose `ExecTool.description`** | Upstream's concise one | Upstream has `test_exec_tool_descriptions_are_concise` enforcing brevity; the guidance moved into the prompt templates. |
 | **Fork's removal of `ToolRegistry.prepare_call`** (commit `1d18d24`, worked around in `execute()`) | Upstream reinstated and extended `prepare_call` | Fork's re-targeted tests reverted to upstream's. |
 | **`get_workspace_path` in `nanobot/utils/helpers.py`** | `nanobot/config/paths.py` | Upstream's is canonical; ours stays only as a re-export shim. |
+
+### 2a. The `.ipynb` pair: one dropped half, one ported half
+
+On `feat/shared-rooms` the `.ipynb` handling was a *coupled fork patch*, not two
+independent decisions. `EditFileTool.execute` refused any `.ipynb` path and told
+the model to "Use the `notebook_edit` tool instead"; that refusal existed for the
+sole purpose of routing notebook writes to `NotebookEditTool`. The rows above
+record dropping the guard and porting the tool, which look contradictory in
+isolation ("removed notebook support" *and* "kept the notebook tool"). They are
+one decision:
+
+* 0.3.0 drops the guard so `edit_file` edits `.ipynb` as JSON — upstream behaviour,
+  pinned by `test_edit_enhancements.TestEditIpynbFiles` and
+  `test_file_edit_coding_enhancements.test_edit_file_can_edit_ipynb_as_json`.
+* The MIT-1031 owner decision ("nothing from the 0.2.x line may be dropped in the
+  cutover") overrides the earlier won't-do recommendation, so `NotebookEditTool` is
+  **ported** rather than deleted. It now does the cell-level edits the guard used to
+  divert to it; its `description` tells the model when to prefer it (cell-level
+  replace/insert/delete) over `edit_file` (small text/JSON edits), since both can
+  edit a notebook and there is no longer a hard refusal forcing the split.
+* `NotebookEditTool` subclasses `_FsTool`, so it inherits the MIT-121
+  sensitive-path/credential write guard and the `file.enable` gate, and the write
+  goes through `_resolve_write` (never a raw path `open`). Registration is
+  automatic via the `pkgutil` `ToolLoader` — `tests/tools/test_notebook_tool_registration.py`
+  proves it is discovered and registered end-to-end (a construction-only test would
+  not catch a missed registration, which is the actual cutover risk here).
+* **Shared-room policy:** `notebook_edit` is a file-write tool, so it is
+  deliberately **denied** in `room_policy.py` (added to the denied-with-reason
+  list, not the allow-list, which stays `{web_search, report_progress}`). A
+  guest turn must not be able to edit arbitrary workspace files; the ported tool
+  is auto-discovered, so leaving it unclassified would have opened a hole.
 
 ---
 

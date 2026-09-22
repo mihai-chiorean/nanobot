@@ -54,6 +54,20 @@ class RoomPolicy(str, Enum):
 #     list_dir, write_file,          config and credentials; filesystem.py:130
 #     edit_file, apply_patch         allowlists memory/history.jsonl even under
 #                                    restrictToWorkspace
+#   notebook_edit                    ported MIT-1031.  A cell-level .ipynb editor
+#                                    (auto-discovered, so it WOULD register in a
+#                                    guest turn if unclassified); it rewrites the
+#                                    whole notebook JSON through ``_resolve_write``
+#                                    exactly like write_file, so it has the same
+#                                    arbitrary-file blast radius inside the
+#                                    workspace and inherits the read_file/
+#                                    edit_file denial above — being "a notebook
+#                                    tool" is not a safety property.  The
+#                                    0.2.x .ipynb refusal in EditFileTool was
+#                                    dropped on this branch (0.3.0 edits .ipynb
+#                                    as JSON), so notebook_edit must earn its
+#                                    own place here rather than ride an old
+#                                    tool's decision.
 #   message                          can address another channel/chat and attach
 #                                    arbitrary local files as media
 #   my, cron, schedule_work          mutate tenant runtime state
