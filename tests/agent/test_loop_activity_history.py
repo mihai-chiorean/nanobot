@@ -33,14 +33,21 @@ def _make_loop(tmp_path: Path) -> tuple[AgentLoop, MessageBus]:
 async def test_tool_call_persists_activity_rows_before_turn_end(tmp_path: Path) -> None:
     loop, bus = _make_loop(tmp_path)
 
-    save_calls: list[bool] = []
-    real_save = loop.sessions.save
+    # Durability is the point: the rows are fsync-written as the tools run, so
+    # a mid-turn crash still leaves them for the interrupted turn to render.
+    # The write must be the metadata-only one; a full save would rewrite and
+    # fsync the whole transcript on every tool start/end.
+    update_calls: list[bool] = []
+    real_update = loop.sessions.update_session_metadata
 
-    def spy_save(session, *, fsync: bool = False) -> None:
-        save_calls.append(fsync)
-        real_save(session, fsync=fsync)
+    def spy_update(
+        key: str, updates: dict[str, object], *, fsync: bool = False
+    ) -> bool:
+        if KEY in updates:
+            update_calls.append(fsync)
+        return real_update(key, updates, fsync=fsync)
 
-    loop.sessions.save = spy_save  # type: ignore[method-assign]
+    loop.sessions.update_session_metadata = spy_update  # type: ignore[method-assign]
 
     await loop._dispatch(InboundMessage(
         channel="websocket",
@@ -60,9 +67,7 @@ async def test_tool_call_persists_activity_rows_before_turn_end(tmp_path: Path) 
     assert record["name"] == "exec"
     assert record["status"] == "completed"
     assert isinstance(record["before_message_count"], int)
-    # Durability is the point: the rows are fsync-written as the tools run, so
-    # a mid-turn crash still leaves them for the interrupted turn to render.
-    assert any(fsync for fsync in save_calls)
+    assert any(fsync for fsync in update_calls)
 
 
 @pytest.mark.asyncio

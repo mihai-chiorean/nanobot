@@ -113,6 +113,7 @@ from nanobot.session.summary import (
     SessionSummaryCheckpoint,
 )
 from nanobot.triggers.local_turns import LocalTriggerTurnCoordinator
+from nanobot.utils.activity_history import KEY as ACTIVITY_HISTORY_KEY
 from nanobot.utils.activity_history import record_tool_activity
 from nanobot.utils.cancellation import task_is_cancelling
 from nanobot.utils.document import reference_non_image_attachments
@@ -1176,8 +1177,25 @@ class AgentLoop:
 
             async def _record_tool_activity(event: AgentEvent) -> None:
                 if isinstance(event, ProgressEvent) and event.tool_events:
-                    record_tool_activity(session, event.tool_events)
-                    self.sessions.save(session, fsync=True)
+                    # Copy first: the payload is frozen for everything else that
+                    # consumes it (websocket wire, transcript journal).
+                    record_tool_activity(
+                        session,
+                        [dict(tool_event) for tool_event in event.tool_events],
+                    )
+                    # Metadata-only atomic write (manager.py update_metadata).
+                    # A full save would rewrite and fsync the whole transcript
+                    # on every tool start/end, which is exactly the cost
+                    # save_runtime_checkpoint/update_session_metadata exist to
+                    # avoid. Fall back to a full save only when the file is not
+                    # there yet (e.g. the first turn raced its turn-start save).
+                    records = list(session.metadata.get(ACTIVITY_HISTORY_KEY, []))
+                    if not self.sessions.update_session_metadata(
+                        session.key,
+                        {ACTIVITY_HISTORY_KEY: records},
+                        fsync=True,
+                    ):
+                        self.sessions.save(session, fsync=True)
                 await _publish_events(event)
 
             events = EventSink(_record_tool_activity, events.accepts)
