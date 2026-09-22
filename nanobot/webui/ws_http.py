@@ -1098,13 +1098,14 @@ class GatewayHTTPHandler:
             raw_persisted: dict[str, Any] = latest_session_metadata or {}
             # ``read_session_metadata`` returns a wrapper; the activity records
             # live in the inner session-metadata payload.
-            inner: Any = raw_persisted.get("metadata")
-            persisted: Any = (  # pyright: ignore[reportUnknownVariableType]
-                inner if isinstance(inner, dict) else raw_persisted
-            )
+            raw_inner = raw_persisted.get("metadata")
+            if isinstance(raw_inner, dict):
+                persisted: dict[str, Any] = cast(dict[str, Any], raw_inner)
+            else:
+                persisted = raw_persisted
             activity_payload: dict[str, Any] = {
                 "key": decoded_key,
-                "metadata": dict(cast(dict[str, Any], persisted)),
+                "metadata": dict(persisted),
                 "messages": thread_messages,
             }
             project_activity_history(
@@ -1113,6 +1114,9 @@ class GatewayHTTPHandler:
                     active_turn_id is not None
                     or active_turn_started_at is not None
                 ),
+                # Only the latest page can host the open turn whose unjournaled
+                # activity is recovered; older pages stay journal-driven.
+                is_latest_page=before is None,
             )
             data["messages"] = activity_payload["messages"]
         revision_variant["session_updated_at"] = (
