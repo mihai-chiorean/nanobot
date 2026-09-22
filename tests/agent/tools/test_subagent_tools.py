@@ -442,7 +442,7 @@ async def test_runner_executes_inline_spawn_batch_concurrently(tmp_path):
         ))
         await asyncio.wait_for(both_entered.wait(), timeout=1.0)
         release.set()
-        results, events = await execution
+        results, events, fatal_error = await execution
 
     assert set(entered) == {"first", "second"}
     assert results == ["first", "second"]

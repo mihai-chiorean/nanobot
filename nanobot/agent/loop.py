@@ -5,9 +5,9 @@
 from __future__ import annotations
 
 import asyncio
-import re
 import dataclasses
 import os
+import re
 import time
 import weakref
 from collections.abc import Coroutine, Iterable, Mapping
@@ -43,13 +43,20 @@ from nanobot.agent.runner import (
     AgentRunSpec,
 )
 from nanobot.agent.subagent import SubagentManager
+from nanobot.agent.tools.ask import (
+    ask_user_options_from_messages,
+    ask_user_outbound,
+    ask_user_tool_result_messages,
+    pending_ask_user_id,
+)
+from nanobot.agent.tools.audit import AuditLogger
 from nanobot.agent.tools.context import RequestContext, bind_request_context, reset_request_context
 from nanobot.agent.tools.exec_session import ExecSessionManager
-from nanobot.agent.tools.audit import AuditLogger
 from nanobot.agent.tools.file_state import FileStateStore, bind_file_states, reset_file_states
 from nanobot.agent.tools.message import capture_message_deliveries
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.runtime_control import AgentRuntimeControl
+
 # Ziggy-local (fork, MIT-1014): marker for the trusted user `!<command>` path.
 from nanobot.agent.tools.shell import USER_SHELL_COMMAND_ATTR
 from nanobot.agent.turn_delivery import (
@@ -70,9 +77,10 @@ from nanobot.command.router import normalize_command_text
 from nanobot.config.schema import AgentDefaults, ModelPresetConfig
 from nanobot.events import NO_EVENTS, AgentEvent, EventSink
 from nanobot.llm_usage.context import source_from_request
-from nanobot.providers.base import LLMProvider, LLMUsage, ProviderConversationState
+
 # Ziggy-local (fork, MIT-202): Langfuse turn span.
 from nanobot.observability import observe_turn
+from nanobot.providers.base import LLMProvider, LLMUsage, ProviderConversationState
 from nanobot.providers.factory import ProviderSnapshot
 from nanobot.runtime_context import (
     RUNTIME_CONTEXT_HISTORY_META,
@@ -183,6 +191,11 @@ class TurnContext:
 
     history: list[dict[str, Any]] = field(default_factory=list)
     transcript_input: TranscriptInput | None = None
+    # Set when this user turn answers a parked ``ask_user`` question: the id
+    # of the pending tool call plus the transcript that injects the answer as
+    # its tool result instead of a fresh user message.
+    ask_user_resume_id: str | None = None
+    initial_messages: list[dict[str, Any]] | None = field(default=None, repr=False)
     provider_state: ProviderConversationState | None = field(default=None, repr=False)
     request_context: RequestContext | None = None
     runtime_context_blocks: list[RuntimeContextBlock] = field(default_factory=list)
@@ -901,6 +914,27 @@ class AgentLoop:
         metadata = msg.metadata
         return isinstance(metadata, dict) and metadata.get("shared_room") is True
 
+    def _detect_ask_user_resume(self, ctx: TurnContext) -> str | None:
+        """Return the parked ``ask_user`` call id this user turn should answer.
+
+        Only a plain private-channel user message may consume a parked
+        question: shared-room chatter, system deliveries, internal goal
+        continuations and ephemeral runs keep the question parked.
+        """
+        if (
+            ctx.kind is not TurnKind.USER
+            or ctx.ephemeral
+            or ctx.session is None
+            or not ctx.session.policy.persist
+            or self._shared_room_turn(ctx.msg)
+            or turn_continuation.internal_continuation_inbound(ctx.msg.metadata)
+        ):
+            return None
+        content = ctx.msg.content
+        if not isinstance(content, str) or not content.strip():
+            return None
+        return pending_ask_user_id(ctx.history)
+
     def _build_transcript_input(self, ctx: TurnContext) -> TranscriptInput:
         """Capture the persisted history and fresh input as separate transcript parts."""
         assert ctx.session is not None
@@ -1147,6 +1181,7 @@ class AgentLoop:
         tools: ToolRegistry | None = None,
         request_context: RequestContext | None = None,
         provider_state: ProviderConversationState | None = None,
+        initial_messages: list[dict[str, Any]] | None = None,
     ) -> AgentRunResult:
         """Run the agent iteration loop.
 
@@ -1154,6 +1189,10 @@ class AgentLoop:
         *streaming*: request incremental output from the runner.
         ``resuming=True`` means the active turn continues. ``merge_next=True`` means
         the next text segment belongs to the same user-visible assistant message.
+
+        When *initial_messages* is given it replaces the built transcript
+        outright (used to resume a turn parked on ``ask_user``); *transcript_input*
+        is then only kept for save-boundary bookkeeping.
 
         Returns the complete result produced by ``AgentRunner``.
         """
@@ -1362,12 +1401,12 @@ class AgentLoop:
                 run_extra_hooks_for_ephemeral=run_extra_hooks_for_ephemeral,
             ))
             result = await self.runner.run(AgentRunSpec(
-                initial_messages=None,
+                initial_messages=initial_messages,
                 tools=effective_tools,
                 runtime=runtime,
                 max_iterations=self.max_iterations,
                 max_tool_result_chars=self.max_tool_result_chars,
-                transcript_input=transcript_input,
+                transcript_input=None if initial_messages is not None else transcript_input,
                 transcript_builder=transcript_builder,
                 hook=hook,
                 concurrent_tools=True,
@@ -1376,24 +1415,28 @@ class AgentLoop:
                 provider_retry_mode=self.provider_retry_mode,
                 checkpoint_callback=_checkpoint,
                 consolidate_history=(
-                    partial(
+                    None
+                    if initial_messages is not None
+                    or session is None
+                    or ephemeral
+                    else partial(
                         self.consolidator.summarize_transcript,
                         runtime=runtime,
                         session_key=session.key,
                         tools=effective_tools.get_definitions(),
                     )
-                    if session is not None and not ephemeral
-                    else None
                 ),
                 consolidate_provider_compaction=(
-                    partial(
+                    None
+                    if initial_messages is not None
+                    or session is None
+                    or ephemeral
+                    else partial(
                         self.consolidator.summarize_provider_compaction,
                         runtime=runtime,
                         session_key=session.key,
                         tools=effective_tools.get_definitions(),
                     )
-                    if session is not None and not ephemeral
-                    else None
                 ),
                 injection_callback=_drain_pending,
                 terminal_injection_callback=_wait_for_pending,
@@ -2001,6 +2044,7 @@ class AgentLoop:
         *,
         log_content: bool = True,
         turn_latency_ms: int | None = None,
+        buttons: list[list[str]] | None = None,
     ) -> OutboundMessage | None:
         """Assemble the final outbound message from turn results."""
         if log_content:
@@ -2011,7 +2055,9 @@ class AgentLoop:
 
         event = None
         meta = dict(msg.metadata or {})
-        if streamed_content and stop_reason not in {"error", "tool_error"}:
+        # ``ask_user`` closes its stream without delivering the question in it;
+        # the question must therefore travel as this fresh payload below.
+        if streamed_content and stop_reason not in {"error", "tool_error", "ask_user"}:
             event = StreamedResponseEvent()
         if turn_latency_ms is not None:
             meta["latency_ms"] = int(turn_latency_ms)
@@ -2022,6 +2068,7 @@ class AgentLoop:
             content=final_content,
             event=event,
             metadata=meta,
+            buttons=list(buttons or []),
         )
 
     async def _restore_turn(self, ctx: TurnContext) -> None:
@@ -2164,6 +2211,7 @@ class AgentLoop:
         is_subagent = ctx.kind is TurnKind.SYSTEM and ctx.msg.sender_id == "subagent"
 
         ctx.history = session.get_history(extend_to_user=is_subagent)
+        ctx.ask_user_resume_id = self._detect_ask_user_resume(ctx)
         stored_state = session.provider_state
         subagent_followup_persisted = False
         if is_subagent:
@@ -2190,9 +2238,15 @@ class AgentLoop:
         if ctx.kind is TurnKind.USER:
             ctx.runtime_context_blocks = await self._resolve_runtime_context_for_turn(ctx)
         staged_provider_state = False
-        if stored_state is not None and runtime.provider.can_resume_conversation_state(
-            stored_state,
-            runtime.model,
+        if (
+            stored_state is not None
+            # A parked ``ask_user`` answer is delivered as a tool result below;
+            # staging it as provider input would double-send it.
+            and ctx.ask_user_resume_id is None
+            and runtime.provider.can_resume_conversation_state(
+                stored_state,
+                runtime.model,
+            )
         ):
             current_provider_message = self.context.build_current_message(
                 ctx.msg.content,
@@ -2236,17 +2290,33 @@ class AgentLoop:
         elif stored_state is not None:
             session.provider_state = None
         if ctx.kind is TurnKind.USER:
-            ctx.input_persisted_early = self._persist_user_message_early(
-                ctx.msg,
-                session,
-                runtime_context_blocks=ctx.runtime_context_blocks,
-            )
-            if staged_provider_state and not ctx.input_persisted_early:
-                session.provider_state = stored_state
+            if ctx.ask_user_resume_id is None:
+                ctx.input_persisted_early = self._persist_user_message_early(
+                    ctx.msg,
+                    session,
+                    runtime_context_blocks=ctx.runtime_context_blocks,
+                )
+                if staged_provider_state and not ctx.input_persisted_early:
+                    session.provider_state = stored_state
+            # else: the answer becomes the parked call's tool result and is
+            # persisted by the save stage, never as a raw user message.
         elif subagent_followup_persisted and staged_provider_state:
             # Upgrade the replay-safe baseline to the resumable state before
             # prompt assembly and the first model checkpoint.
             self.sessions.save(session)
+        if ctx.ask_user_resume_id is not None:
+            assert ctx.request_context is not None
+            ctx.initial_messages = ask_user_tool_result_messages(
+                self.context.build_system_prompt(
+                    channel=ctx.request_context.channel,
+                    session_summary=ctx.pending_summary,
+                    workspace=ctx.request_context.workspace,
+                    include_memory=session.policy.persist,
+                ),
+                ctx.history,
+                ctx.ask_user_resume_id,
+                ctx.msg.content,
+            )
         ctx.transcript_input = self._build_transcript_input(ctx)
 
 
@@ -2271,6 +2341,7 @@ class AgentLoop:
                 tools=ctx.tools,
                 request_context=ctx.request_context,
                 provider_state=ctx.provider_state,
+                initial_messages=ctx.initial_messages,
                 events=ctx.events,
             )
         ctx.final_content = result.final_content
@@ -2355,13 +2426,24 @@ class AgentLoop:
                 latency_ms=ctx.turn_latency_ms,
             )
             return
+        ask_options = (
+            ask_user_options_from_messages(ctx.all_messages)
+            if ctx.stop_reason == "ask_user"
+            else []
+        )
+        final_content, ask_buttons = ask_user_outbound(
+            cast(str, ctx.final_content),
+            ask_options,
+            ctx.msg.channel,
+        )
         ctx.outbound = self._assemble_outbound(
             ctx.delivery.delivery_message,
-            cast(str, ctx.final_content),
+            final_content,
             ctx.stop_reason,
             ctx.streamed_content,
             log_content=ctx.require_session().policy.log_content,
             turn_latency_ms=ctx.turn_latency_ms,
+            buttons=ask_buttons,
         )
         if ctx.ephemeral and ctx.outbound is not None:
             ctx.outbound.metadata["_stop_reason"] = ctx.stop_reason

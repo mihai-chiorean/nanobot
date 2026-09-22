@@ -121,7 +121,9 @@ def build_tool_event_finish_payloads(context: AgentHookContext) -> list[dict[str
         result = context.tool_results[idx]
         event = context.tool_events[idx]
         status = event.get("status")
-        phase = "end" if status == "ok" else "error"
+        # ``waiting`` is the ask_user pause: the call completed by parking the
+        # turn for the user's answer, so it is not an error row.
+        phase = "end" if status in {"ok", "waiting"} else "error"
         files, embeds = tool_event_result_extras(result)
         payload = {
             "version": 1,
