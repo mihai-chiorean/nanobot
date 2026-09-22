@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, cast
 
 from nanobot.agent.tools.base import Tool, tool_parameters
 from nanobot.agent.tools.schema import ArraySchema, StringSchema, tool_parameters_schema
@@ -51,45 +51,66 @@ class AskUserTool(Tool):
     def exclusive(self) -> bool:
         return True
 
-    async def execute(self, question: str, options: list[str] | None = None, **_: Any) -> Any:
+    async def execute(  # pyright: ignore[reportIncompatibleMethodOverride]
+        self,
+        question: str,
+        options: list[str] | None = None,
+        **_: Any,
+    ) -> Any:
         raise AskUserInterrupt(question=question, options=options)
 
 
 def _tool_call_name(tool_call: dict[str, Any]) -> str:
     function = tool_call.get("function")
-    if isinstance(function, dict) and isinstance(function.get("name"), str):
-        return function["name"]
-    name = tool_call.get("name")
-    return name if isinstance(name, str) else ""
+    if isinstance(function, dict):
+        function_data = cast(dict[str, Any], function)
+        name = function_data.get("name")
+        if isinstance(name, str):
+            return name
+    name_value = tool_call.get("name")
+    return name_value if isinstance(name_value, str) else ""
 
 
 def _tool_call_arguments(tool_call: dict[str, Any]) -> dict[str, Any]:
-    function = tool_call.get("function")
-    raw = function.get("arguments") if isinstance(function, dict) else tool_call.get("arguments")
+    function_value = tool_call.get("function")
+    raw: Any
+    if isinstance(function_value, dict):
+        raw = cast(dict[str, Any], function_value).get("arguments")
+    else:
+        raw = tool_call.get("arguments")
     if isinstance(raw, dict):
-        return raw
+        return cast(dict[str, Any], raw)
     if isinstance(raw, str):
         try:
             parsed = json.loads(raw)
         except json.JSONDecodeError:
             return {}
-        return parsed if isinstance(parsed, dict) else {}
+        return cast(dict[str, Any], parsed) if isinstance(parsed, dict) else {}
     return {}
+
+
+def _assistant_tool_calls(message: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = message.get("tool_calls")
+    if not isinstance(raw, list):
+        return []
+    return [cast(dict[str, Any], item) for item in cast(list[object], raw) if isinstance(item, dict)]
 
 
 def pending_ask_user_id(history: list[dict[str, Any]]) -> str | None:
     """Return the tool-call id of the newest unanswered ``ask_user`` call."""
     pending: dict[str, str] = {}
     for message in history:
-        if message.get("role") == "assistant":
-            for tool_call in message.get("tool_calls") or []:
-                if isinstance(tool_call, dict) and isinstance(tool_call.get("id"), str):
-                    pending[tool_call["id"]] = _tool_call_name(tool_call)
-        elif message.get("role") == "tool":
+        role = message.get("role")
+        if role == "assistant":
+            for tool_call in _assistant_tool_calls(message):
+                tool_call_id = tool_call.get("id")
+                if isinstance(tool_call_id, str):
+                    pending[tool_call_id] = _tool_call_name(tool_call)
+        elif role == "tool":
             tool_call_id = message.get("tool_call_id")
             if isinstance(tool_call_id, str):
                 pending.pop(tool_call_id, None)
-    for tool_call_id, name in reversed(pending.items()):
+    for tool_call_id, name in reversed(list(pending.items())):
         if name == "ask_user":
             return tool_call_id
     return None
@@ -119,12 +140,16 @@ def ask_user_options_from_messages(messages: list[dict[str, Any]]) -> list[str]:
     for message in reversed(messages):
         if message.get("role") != "assistant":
             continue
-        for tool_call in reversed(message.get("tool_calls") or []):
-            if not isinstance(tool_call, dict) or _tool_call_name(tool_call) != "ask_user":
+        for tool_call in reversed(_assistant_tool_calls(message)):
+            if _tool_call_name(tool_call) != "ask_user":
                 continue
             options = _tool_call_arguments(tool_call).get("options")
             if isinstance(options, list):
-                return [str(option) for option in options if isinstance(option, str)]
+                return [
+                    option
+                    for option in cast(list[object], options)
+                    if isinstance(option, str)
+                ]
     return []
 
 

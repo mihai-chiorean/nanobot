@@ -930,8 +930,7 @@ class AgentLoop:
             or turn_continuation.internal_continuation_inbound(ctx.msg.metadata)
         ):
             return None
-        content = ctx.msg.content
-        if not isinstance(content, str) or not content.strip():
+        if not ctx.msg.content.strip():
             return None
         return pending_ask_user_id(ctx.history)
 
@@ -2438,7 +2437,7 @@ class AgentLoop:
         )
         ctx.outbound = self._assemble_outbound(
             ctx.delivery.delivery_message,
-            final_content,
+            cast(str, final_content),
             ctx.stop_reason,
             ctx.streamed_content,
             log_content=ctx.require_session().policy.log_content,

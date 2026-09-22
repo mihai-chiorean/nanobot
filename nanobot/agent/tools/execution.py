@@ -102,7 +102,7 @@ async def execute_tool_calls(
             ))
             tool_results.extend(batch_results)
         else:
-            batch_results = []
+            batch_results: list[tuple[Any, dict[str, str], BaseException | None]] = []
             for tool_call in batch:
                 result = await _execute_tool_call(
                     tools,
