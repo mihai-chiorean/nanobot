@@ -1056,6 +1056,17 @@ def read_transcript_lines(session_key: str) -> list[dict[str, Any]]:
     return lines
 
 
+def read_active_transcript_lines(session_key: str) -> list[dict[str, Any]]:
+    """Read only the active (unrotated) transcript chunk.
+
+    The active chunk holds the most recent turns; older turns have moved into
+    immutable segment files. Callers that only care about the tail (e.g. the
+    activity-history projector, which recovers the open turn) can read this
+    instead of :func:`read_transcript_lines`, which parses every chunk.
+    """
+    return _read_transcript_file(webui_transcript_path(session_key))
+
+
 def _write_transcript_lines(session_key: str, rows: list[dict[str, Any]]) -> None:
     delete_webui_transcript(session_key)
     path = webui_transcript_path(session_key)

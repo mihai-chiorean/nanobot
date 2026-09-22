@@ -36,6 +36,7 @@ from nanobot.session.session_handles import (
     SessionHandleResolver,
 )
 from nanobot.triggers.local_types import LocalTrigger
+from nanobot.utils.activity_history import project_activity_history
 from nanobot.webui.automation_results import cron_run_response, trigger_run_response
 from nanobot.webui.file_preview import (
     WebUIFilePreviewError,
@@ -1085,6 +1086,39 @@ class GatewayHTTPHandler:
             if self.session_manager is not None
             else None
         )
+        # Recover the Activity rows that never reached the transcript journal:
+        # a turn that died mid-tool-call, a rotated journal, or a session from
+        # before journalling. While a live turn owns the session a record left
+        # ``running`` really is running; without one it is an interrupted one.
+        # Records the replay already rendered are skipped by call id, so a
+        # journaled turn never shows its activity twice.
+        raw_thread_messages: Any = data.get("messages")
+        if isinstance(raw_thread_messages, list):
+            thread_messages = cast(list[Any], raw_thread_messages)
+            raw_persisted: dict[str, Any] = latest_session_metadata or {}
+            # ``read_session_metadata`` returns a wrapper; the activity records
+            # live in the inner session-metadata payload.
+            raw_inner = raw_persisted.get("metadata")
+            if isinstance(raw_inner, dict):
+                persisted: dict[str, Any] = cast(dict[str, Any], raw_inner)
+            else:
+                persisted = raw_persisted
+            activity_payload: dict[str, Any] = {
+                "key": decoded_key,
+                "metadata": dict(persisted),
+                "messages": thread_messages,
+            }
+            project_activity_history(
+                activity_payload,
+                active=(
+                    active_turn_id is not None
+                    or active_turn_started_at is not None
+                ),
+                # Only the latest page can host the open turn whose unjournaled
+                # activity is recovered; older pages stay journal-driven.
+                is_latest_page=before is None,
+            )
+            data["messages"] = activity_payload["messages"]
         revision_variant["session_updated_at"] = (
             latest_session_metadata.get("updated_at")
             if latest_session_metadata is not None
