@@ -4214,9 +4214,9 @@ def _tool_hint_frame(call_id: str = "call-a") -> dict[str, Any]:
     }
 
 
-async def _get_thread(port: int, token: str, chat_id: str) -> Any:
+async def _get_thread(port: int, token: str, chat_id: str, query: str = "") -> Any:
     return await _http_get(
-        f"http://127.0.0.1:{port}/api/sessions/{chat_id}/webui-thread",
+        f"http://127.0.0.1:{port}/api/sessions/{chat_id}/webui-thread{query}",
         headers={"Authorization": f"Bearer {token}"},
     )
 
@@ -4316,6 +4316,146 @@ async def test_webui_thread_does_not_duplicate_journaled_activity(
         ]
         assert len(coverages) == 1
         assert coverages[0]["id"] != "tool-call-a"
+    finally:
+        await channel.stop()
+        await server_task
+
+
+@pytest.mark.asyncio
+async def test_webui_thread_paginated_reads_do_not_resynthesize_journaled_calls(
+    bus: MagicMock, tmp_path: Path
+) -> None:
+    """A call journaled on an older page must never reappear on another page."""
+    from datetime import datetime, timedelta, timezone
+
+    from nanobot.webui.transcript import append_transcript_object
+
+    key = "websocket:activity-pages"
+    chat = "activity-pages"
+    sm = SessionManager(tmp_path / "workspace")
+    session = Session(key=key)
+    for idx in (1, 2, 3, 4):
+        session.add_message("user", f"question {idx}")
+        session.add_message("assistant", f"answer {idx}")
+    recent = _activity_record("call-a")
+    started = datetime.now(timezone.utc) + timedelta(seconds=60)
+    recent["started_at"] = started.isoformat()
+    recent["completed_at"] = started.isoformat()
+    # Recent enough to survive the stale-record gate: only whole-journal
+    # coverage can keep this journaled call off the other pages.
+    session.metadata["activity_v1"] = [recent]
+    sm.save(session)
+
+    append_transcript_object(key, {"event": "user", "chat_id": chat, "text": "question 1"})
+    append_transcript_object(
+        key,
+        {
+            "event": "message",
+            "chat_id": chat,
+            "text": "exec(ls)",
+            "kind": "tool_hint",
+            "tool_events": [_tool_hint_frame("call-a")],
+        },
+    )
+    append_transcript_object(key, {"event": "turn_end", "chat_id": chat})
+    for idx in (2, 3, 4):
+        append_transcript_object(key, {"event": "user", "chat_id": chat, "text": f"question {idx}"})
+        append_transcript_object(key, {"event": "message", "chat_id": chat, "text": f"answer {idx}"})
+        append_transcript_object(key, {"event": "turn_end", "chat_id": chat})
+
+    port = _free_port()
+    channel = _ch(bus, session_manager=sm, port=port)
+    server_task = asyncio.create_task(channel.start())
+    encoded = "websocket%3Aactivity-pages"
+    try:
+        token = channel.gateway.tokens.issue_api_token(300)
+        seen_ids: list[Any] = []
+        response = await _get_thread(port, token, encoded, "?limit=1&direction=latest")
+        assert response.status_code == 200
+        body = response.json()
+        seen_ids += [row.get("id") for row in body["messages"]]
+        for _ in range(8):
+            cursor = (body.get("page") or {}).get("before_cursor")
+            if not cursor or not (body.get("page") or {}).get("has_more_before"):
+                break
+            response = await _get_thread(port, token, encoded, f"?limit=2&before={cursor}")
+            body = response.json()
+            seen_ids += [row.get("id") for row in body["messages"]]
+        assert "tool-call-a" not in seen_ids
+
+        response = await _get_thread(port, token, encoded)
+        coverages = [
+            row
+            for row in response.json()["messages"]
+            if any(event.get("call_id") == "call-a" for event in row.get("toolEvents") or [])
+        ]
+        assert len(coverages) == 1
+        assert coverages[0]["id"] != "tool-call-a"
+    finally:
+        await channel.stop()
+        await server_task
+
+
+@pytest.mark.asyncio
+async def test_webui_thread_crashed_turn_activity_renders_under_its_own_turn(
+    bus: MagicMock, tmp_path: Path
+) -> None:
+    """The unjournaled call of the open turn lands right after that turn's user row."""
+    from datetime import datetime, timedelta, timezone
+
+    from nanobot.webui.transcript import append_transcript_object
+
+    key = "websocket:activity-crash"
+    chat = "activity-crash"
+    sm = SessionManager(tmp_path / "workspace")
+    session = Session(key=key)
+    session.add_message("user", "question 1")
+    session.add_message("assistant", "answer 1")
+    session.add_message("user", "question 2")
+    started = datetime.now(timezone.utc) + timedelta(seconds=60)
+    session.metadata["activity_v1"] = [
+        {
+            "call_id": "call-crash",
+            "started_at": started.isoformat(),
+            "before_message_count": 3,
+            "name": "exec",
+            "summary": "Running a command",
+            "status": "running",
+            "text": '{"arguments": {"command": "ls"}, "error": null}',
+        }
+    ]
+    sm.save(session)
+
+    append_transcript_object(key, {"event": "user", "chat_id": chat, "text": "question 1"})
+    append_transcript_object(key, {"event": "message", "chat_id": chat, "text": "answer 1"})
+    append_transcript_object(key, {"event": "turn_end", "chat_id": chat})
+    # The crashed turn journaled its user row and nothing else.
+    append_transcript_object(key, {"event": "user", "chat_id": chat, "text": "question 2"})
+
+    port = _free_port()
+    channel = _ch(bus, session_manager=sm, port=port)
+    server_task = asyncio.create_task(channel.start())
+    encoded = "websocket%3Aactivity-crash"
+    try:
+        token = channel.gateway.tokens.issue_api_token(300)
+        response = await _get_thread(port, token, encoded)
+        assert response.status_code == 200
+        rows = response.json()["messages"]
+        assert rows[3]["id"] == "tool-call-crash"
+        assert [row.get("role") for row in rows] == ["user", "assistant", "user", "tool"]
+        ((tool_event,),) = [row["toolEvents"] for row in rows if "toolEvents" in row]
+        assert tool_event["call_id"] == "call-crash"
+        assert tool_event["status"] == "interrupted"
+
+        latest = await _get_thread(port, token, encoded, "?limit=1&direction=latest")
+        latest_rows = latest.json()["messages"]
+        assert [row.get("id") == "tool-call-crash" for row in latest_rows] == [False, True]
+        assert latest_rows[0]["role"] == "user"
+        cursor = (latest.json().get("page") or {}).get("before_cursor")
+        assert cursor
+        older = await _get_thread(port, token, encoded, f"?limit=2&before={cursor}")
+        older_rows = older.json()["messages"]
+        assert all(row.get("id") != "tool-call-crash" for row in older_rows)
     finally:
         await channel.stop()
         await server_task
