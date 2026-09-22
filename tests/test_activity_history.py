@@ -307,3 +307,134 @@ def test_stale_unjournaled_records_are_not_reanchored_to_surviving_turns() -> No
     project_activity_history(payload, active=False)
 
     assert [row.get("id") for row in payload["messages"]] == [None, None]
+
+
+def _iso_ms(ms: int) -> str:
+    return datetime.fromtimestamp(ms / 1000, timezone.utc).isoformat()
+
+
+def test_recovered_call_from_a_crashed_turn_survives_a_later_completed_turn() -> None:
+    """Round-2 repro: a call recorded in a crashed turn is not lost or misplaced.
+
+    The tail after the last journaled ``turn_end`` holds two turns: the crashed
+    one (``q2``, whose tool never journaled) and a later one (``q3``) that has
+    since journaled its own ``turn_end``. The recovered call started inside
+    ``q2``'s window, so it must anchor under ``q2`` (not the last user row) and
+    read ``interrupted`` — the live turn is ``q3``, not the one that ran it.
+    Under the round-1 code the ``started_at > last_turn_end`` gate dropped it
+    entirely once ``q3`` journaled, and the last-user-row anchor would have put
+    it under ``q3`` as ``running``.
+    """
+    key = "websocket:two-crash"
+    from nanobot.webui.transcript import append_transcript_object
+
+    append_transcript_object(
+        key, {"event": "user", "chat_id": "two-crash", "text": "q1", "created_at_ms": 1_000}
+    )
+    append_transcript_object(
+        key, {"event": "message", "chat_id": "two-crash", "text": "a1", "created_at_ms": 1_100}
+    )
+    append_transcript_object(
+        key, {"event": "turn_end", "chat_id": "two-crash", "created_at_ms": 1_200}
+    )
+    # Crashed turn: journaled its user row, the tool call never reached the journal.
+    append_transcript_object(
+        key, {"event": "user", "chat_id": "two-crash", "text": "q2", "created_at_ms": 2_000}
+    )
+    # A later turn completed and journaled its own turn_end.
+    append_transcript_object(
+        key, {"event": "user", "chat_id": "two-crash", "text": "q3", "created_at_ms": 3_000}
+    )
+    append_transcript_object(
+        key, {"event": "message", "chat_id": "two-crash", "text": "a3", "created_at_ms": 3_100}
+    )
+    append_transcript_object(
+        key, {"event": "turn_end", "chat_id": "two-crash", "created_at_ms": 4_000}
+    )
+
+    page = [
+        {"role": "user", "content": "q1", "createdAt": 1_000},
+        {"role": "assistant", "content": "a1", "createdAt": 1_100},
+        {"role": "user", "content": "q2", "createdAt": 2_000},
+        {"role": "user", "content": "q3", "createdAt": 3_000},
+        {"role": "assistant", "content": "a3", "createdAt": 3_100},
+    ]
+    record = {
+        "call_id": "call-x",
+        "name": "exec",
+        "summary": "Running a command",
+        "status": "running",  # the recorder last saw it start; the turn then died
+        "started_at": _iso_ms(2_500),  # inside q2's [2000, 3000) window, before q3
+        "before_message_count": 2,
+        "text": '{"arguments": {"command": "ls"}, "error": null}',
+    }
+    payload = {"key": key, "metadata": {KEY: [record]}, "messages": page}
+
+    # The session currently has a live turn (q3); the recovered call is not its
+    # own, so it must not be shown as running.
+    project_activity_history(payload, active=True, is_latest_page=True)
+
+    ids = [row.get("id") for row in payload["messages"]]
+    assert ids == [None, None, None, "tool-call-x", None, None]
+    row = payload["messages"][3]
+    assert row["role"] == "tool"
+    ((tool_event,),) = [row["toolEvents"]]
+    assert tool_event["call_id"] == "call-x"
+    assert tool_event["status"] == "interrupted"
+
+
+def test_recovered_call_stays_under_its_turn_when_a_newer_turn_is_live() -> None:
+    """The live turn's own recovered call renders as running; an older one does not."""
+    key = "websocket:two-live"
+    from nanobot.webui.transcript import append_transcript_object
+
+    append_transcript_object(
+        key, {"event": "user", "chat_id": "two-live", "text": "q1", "created_at_ms": 1_000}
+    )
+    append_transcript_object(
+        key, {"event": "turn_end", "chat_id": "two-live", "created_at_ms": 1_200}
+    )
+    append_transcript_object(
+        key, {"event": "user", "chat_id": "two-live", "text": "q2", "created_at_ms": 2_000}
+    )
+    append_transcript_object(
+        key, {"event": "user", "chat_id": "two-live", "text": "q3", "created_at_ms": 3_000}
+    )
+
+    page = [
+        {"role": "user", "content": "q1", "createdAt": 1_000},
+        {"role": "user", "content": "q2", "createdAt": 2_000},
+        {"role": "user", "content": "q3", "createdAt": 3_000},
+    ]
+    # call-old ran in the crashed q2 window; call-new is the live q3's tool.
+    old = {
+        "call_id": "call-old",
+        "name": "exec",
+        "summary": "s",
+        "status": "running",
+        "started_at": _iso_ms(2_500),
+        "before_message_count": 1,
+        "text": "{}",
+    }
+    new = {
+        "call_id": "call-new",
+        "name": "exec",
+        "summary": "s",
+        "status": "running",
+        "started_at": _iso_ms(3_500),
+        "before_message_count": 2,
+        "text": "{}",
+    }
+    payload = {"key": key, "metadata": {KEY: [old, new]}, "messages": page}
+
+    project_activity_history(payload, active=True, is_latest_page=True)
+
+    by_id = {row.get("id"): row for row in payload["messages"] if row.get("id")}
+    assert set(by_id) == {"tool-call-old", "tool-call-new"}
+    # call-old sits directly after q2 (index 1 -> inserted at 2); call-new after q3.
+    ids = [row.get("id") for row in payload["messages"]]
+    assert ids == [None, None, "tool-call-old", None, "tool-call-new"]
+    old_event = by_id["tool-call-old"]["toolEvents"][0]
+    new_event = by_id["tool-call-new"]["toolEvents"][0]
+    assert old_event["status"] == "interrupted"  # q2 is not the live turn
+    assert new_event["status"] == "running"  # q3 is the live turn

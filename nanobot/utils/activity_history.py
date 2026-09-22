@@ -75,6 +75,22 @@ def _valid_created_ms(value: Any) -> int | None:
     return int(value)
 
 
+def _row_created_ms(row: Any) -> int | None:
+    """The replayed row's own timestamp, used to place recovered rows.
+
+    Transcript replay always stamps a ``createdAt``; a row without one (a
+    hand-built payload in a test) is not a usable turn boundary.
+    """
+    if not isinstance(row, dict):
+        return None
+    return _valid_created_ms(cast(dict[str, Any], row).get("createdAt"))
+
+
+def _record_started_ms(record: dict[str, Any]) -> int | None:
+    started = _record_timestamp_ms(record.get("started_at"))
+    return started if started > 0 else None
+
+
 def _tool_event_call_ids(raw_tool_events: Any) -> set[str]:
     if not isinstance(raw_tool_events, list):
         return set()
@@ -91,18 +107,41 @@ def _tool_event_call_ids(raw_tool_events: Any) -> set[str]:
 def _journaled_activity_state(
     session_key: str,
 ) -> tuple[set[str], int | None, bool, bool] | None:
-    """Whole-journal view of what the transcript already captured.
+    """Tail view of what the transcript journal already captured.
 
     Returns ``(journaled_call_ids, last_turn_end_ms, has_lines, open_trailing_turn)``,
-    or ``None`` when the journal cannot be read at all. Dedup must span the
-    whole journal, not only the page the route happens to render: the
-    ``webui-thread`` route paginates, and a call whose trace row lives on an
-    older page is otherwise re-synthesized into whichever page is requested.
+    or ``None`` when the journal cannot be read at all.
+
+    Only the active chunk is consulted on the common path. Recovery is gated
+    to the latest page and to records that fall after the last journaled
+    ``turn_end``, so a call that was journaled on an older page is dropped by
+    the timestamp anchor (its turn's user row is not on this page), not by a
+    whole-journal scan. A call whose trace reached the journal is always
+    journaled in the same chunk as the turn that ran it, so the active chunk
+    carries everything still relevant to the latest page. When the active chunk
+    is empty (a journal that has rotated every turn, or none at all) we fall
+    back to the full read so "no journal" is not confused with "journal
+    entirely rotated".
     """
     try:
-        from nanobot.webui.transcript import read_transcript_lines
+        from nanobot.webui.transcript import read_active_transcript_lines, read_transcript_lines
 
-        raw_lines: Any = read_transcript_lines(session_key)
+        active_lines = cast(list[Any], read_active_transcript_lines(session_key))
+        has_turn_end = any(
+            isinstance(line, dict) and cast(dict[str, Any], line).get("event") == "turn_end"
+            for line in active_lines
+        )
+        if has_turn_end:
+            # The active chunk holds the most recent ``turn_end`` and everything
+            # appended after it (the open turn), so it alone answers both the
+            # tail-shape and dedup questions for the latest page.
+            raw_lines: Any = active_lines
+        else:
+            # No turn boundary in the active chunk: either there is no journal, it
+            # has fully rotated, or an oversized turn pushed the last closed one
+            # into a segment. Consult every chunk so "no journal" is not confused
+            # with "tail lives in a segment" (which would mis-place recovered rows).
+            raw_lines = cast(Any, read_transcript_lines(session_key))
     except Exception:
         return None
     if not isinstance(raw_lines, list):
@@ -173,9 +212,12 @@ def _record_tool_event(record: dict[str, Any], status: str) -> dict[str, Any]:
     }
 
 
-def _resolved_status(record: dict[str, Any], *, active: bool) -> str:
+def _resolved_status(record: dict[str, Any], *, active: bool, in_live_turn: bool) -> str:
     status = str(record.get("status") or "interrupted")
-    if status == "running" and not active:
+    # ``running`` is only trustworthy while the turn that made the call is the
+    # live one: a call left ``running`` by a turn that has since been replaced
+    # (a crash, then a newer turn) never came back, so it is interrupted.
+    if status == "running" and not (active and in_live_turn):
         return "interrupted"
     return status
 
@@ -210,7 +252,7 @@ def _splice_by_message_index(
     """
     groups: dict[int, list[dict[str, Any]]] = {}
     for record in recoverable:
-        status = _resolved_status(record, active=active)
+        status = _resolved_status(record, active=active, in_live_turn=active)
         item = _activity_item(record, status, chat_id)
         before = int(record["before_message_count"])
         groups.setdefault(min(before, len(messages)), []).append(item)
@@ -228,30 +270,72 @@ def _splice_into_open_turn(
     *,
     chat_id: str,
     active: bool,
+    last_turn_end_ms: int | None,
 ) -> None:
-    """Anchor recovered rows to the turn that ran the tool.
+    """Anchor recovered rows to the turn that actually ran the tool.
 
     The rows are journaled, so the replayed list also carries trace,
     reasoning and file-edit rows; a ``before_message_count`` index into
     ``session.messages`` would land early as soon as any earlier turn
-    produced an extra row. The only unjournaled turn a latest page can own
-    is the open one, and that turn's user row is its anchor.
+    produced an extra row. Anchor by timestamp instead: each recovered call
+    belongs to the turn whose user row is the latest one at or before the
+    call started, so a call from a crashed turn renders under that turn's
+    user row even after a newer turn has been appended. A call that predates
+    every user row on this page belongs to a turn the journal lost and is
+    dropped rather than re-anchored onto a surviving turn. When the page's
+    user rows carry no usable timestamp (a hand-built payload), fall back to
+    the open turn and lean on ``last_turn_end_ms`` to drop stale records.
     """
-    anchor: int | None = None
-    for index, raw_message in enumerate(messages):
-        if (
-            isinstance(raw_message, dict)
-            and cast(dict[str, Any], raw_message).get("role") == "user"
-        ):
-            anchor = index
-    if anchor is None:
+    user_positions: list[int] = [
+        index
+        for index, raw_message in enumerate(messages)
+        if isinstance(raw_message, dict)
+        and cast(dict[str, Any], raw_message).get("role") == "user"
+    ]
+    if not user_positions:
         # The page does not host the turn that ran the tool; its rows belong
         # to the page that does.
         return
-    messages[anchor + 1 : anchor + 1] = [
-        _activity_item(record, _resolved_status(record, active=active), chat_id)
-        for record in recoverable
-    ]
+    last_user = user_positions[-1]
+    dated = [(index, _row_created_ms(messages[index])) for index in user_positions]
+    rows_are_dated = any(created is not None for _, created in dated)
+    # A session with no journaled ``turn_end`` at all is mid its first (open)
+    # turn: every unjournaled record belongs to that one live turn, so anchor
+    # there directly. Only once a turn has closed do we need timestamps to tell
+    # a still-recoverable crashed-tail call apart from a stale older record.
+    first_turn_open = last_turn_end_ms is None
+    groups: dict[int, list[dict[str, Any]]] = {}
+    for record in recoverable:
+        started = _record_started_ms(record)
+        anchor: int | None = last_user
+        if not first_turn_open and rows_are_dated and started is not None:
+            anchor = None
+            for index, created in dated:
+                if created is None:
+                    continue  # undated row: not a usable boundary, keep scanning
+                if created <= started:
+                    anchor = index
+                else:
+                    break  # user rows are chronological; later ones only start later
+            if anchor is None:
+                # The call predates every dated user row on this page: its turn
+                # is not represented here, so do not mis-place it under a newer one.
+                continue
+        elif started is not None and last_turn_end_ms is not None:
+            # Undated page rows: the last journaled turn_end is the only staleness
+            # signal. A record at or before it belongs to a closed, journaled turn
+            # (already rendered or lost) — not the open turn — so drop it.
+            if not started > last_turn_end_ms:
+                continue
+        in_live_turn = anchor == last_user
+        item = _activity_item(
+            record,
+            _resolved_status(record, active=active, in_live_turn=in_live_turn),
+            chat_id,
+        )
+        groups.setdefault(anchor, []).append(item)
+    for anchor in sorted(groups, reverse=True):
+        messages[anchor + 1 : anchor + 1] = groups[anchor]
 
 
 def project_activity_history(
@@ -291,28 +375,44 @@ def project_activity_history(
         candidates.append(record)
     if not candidates:
         return
+    # Only the latest page can host recovered rows (the open turn lives at the
+    # tail). Bail before reading the journal so an older ``before=`` page does
+    # not pay for a whole-journal scan it cannot render anything from.
+    if not is_latest_page:
+        return
     journal = _journaled_activity_state(str(payload.get("key", "")))
     if journal is None:
         # Without a readable journal coverage cannot be proven; leaving the
         # page untouched is safer than risking a double-rendered call.
         return
-    journaled, last_turn_end_ms, has_journal_lines, open_trailing_turn = journal
+    journaled, last_turn_end_ms, has_journal_lines, _open_trailing_turn = journal
     recoverable: list[dict[str, Any]] = []
     for record in candidates:
         call_id = record.get("call_id")
+        # The whole-journal call-id set (not just this page) is what keeps a
+        # call journaled on an older page from being re-synthesized here; a
+        # genuinely lost call is one its turn never journaled at all, which the
+        # timestamp anchor below places under its own turn's user row.
         if isinstance(call_id, str) and call_id in journaled:
             continue
-        if last_turn_end_ms is not None:
-            # A turn has journaled its end after this record started: the call
-            # belongs to history the journal lost. Re-anchoring it under a
-            # surviving turn would render it under the wrong turn, so drop it.
-            if not _record_timestamp_ms(record.get("started_at")) > last_turn_end_ms:
-                continue
         recoverable.append(record)
     if not recoverable:
         return
     chat_id = webui_chat_id(str(payload.get("key", ""))) or ""
     if not has_journal_lines:
         _splice_by_message_index(messages, recoverable, chat_id=chat_id, active=active)
-    elif open_trailing_turn and is_latest_page:
-        _splice_into_open_turn(messages, recoverable, chat_id=chat_id, active=active)
+    elif is_latest_page:
+        # The open turn's tool call (or a crashed turn that never journaled its
+        # trace) is recovered by anchoring each record to the user row of the
+        # turn that ran it, by timestamp. Runs whether or not the trailing turn
+        # is still open: a turn that crashed without a ``turn_end`` still needs
+        # its rows, and they must survive later turns completing. A record that
+        # predates every user row on this page belongs to a turn the journal
+        # lost (it is not on this page) and is dropped rather than re-anchored.
+        _splice_into_open_turn(
+            messages,
+            recoverable,
+            chat_id=chat_id,
+            active=active,
+            last_turn_end_ms=last_turn_end_ms,
+        )
