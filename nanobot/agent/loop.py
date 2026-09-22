@@ -822,10 +822,18 @@ class AgentLoop:
         # Ziggy-local (MIT-1028): the intake policy names the scheduling tools,
         # so it may only reach turns whose tool set can act on them. The loader
         # deliberately swallows create() failures (a misconfigured-but-enabled
-        # briefing never registers), so derive the flag from what actually
-        # registered -- never from the config alone.
+        # briefing never registers), so derive the flags from what actually
+        # registered -- never from the config alone. ``cron``/``schedule_work``
+        # need a cron service (always present on gateway builds, but a headless
+        # build may omit it), while briefing can stand alone; the policy's closing
+        # paragraph therefore only routes to cron/schedule_work when those tools
+        # are really available, not merely when the briefing tool turned the
+        # policy on.
         self.context.workflow_scheduling = (
             self.cron_service is not None or self.tools.get("briefing") is not None
+        )
+        self.context.cron_scheduling = (
+            self.tools.get("cron") is not None or self.tools.get("schedule_work") is not None
         )
 
         logger.info("Registered {} tools: {}", len(registered), registered)

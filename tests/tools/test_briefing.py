@@ -365,6 +365,37 @@ async def test_disk_only_shared_room_session_is_denied_without_a_cache_entry(set
     assert not api.calls
 
 
+def test_intake_policy_routes_to_cron_only_when_those_tools_registered(tmp_path):
+    # A briefing-only turn (cron service absent, so cron/schedule_work cannot
+    # register) gets the intake policy but must not be told to call the tools it
+    # does not have; the cron/schedule_work routing sentence appears only when
+    # cron_scheduling is on, while the supersession clause always remains.
+    from nanobot.agent.context import ContextBuilder
+
+    briefing_only = ContextBuilder(
+        tmp_path, "UTC", workflow_scheduling=True, cron_scheduling=False
+    )
+    with_cron = ContextBuilder(
+        tmp_path, "UTC", workflow_scheduling=True, cron_scheduling=True
+    )
+    no_policy = ContextBuilder(tmp_path, "UTC", workflow_scheduling=False)
+
+    briefing_prompt = briefing_only.build_system_prompt(channel="websocket")
+    assert "Workflow Scheduling Policy" in briefing_prompt
+    assert "Use `cron` only for simple reminder delivery" not in briefing_prompt
+    assert "Use `schedule_work` for other" not in briefing_prompt
+    assert "supersedes conflicting scheduling guidance" in briefing_prompt
+
+    cron_prompt = with_cron.build_system_prompt(channel="websocket")
+    assert "Use `cron` only for simple reminder delivery" in cron_prompt
+    assert "Use `schedule_work` for other" in cron_prompt
+    assert "supersedes conflicting scheduling guidance" in cron_prompt
+
+    # Negative control: the flag that gates the whole policy is independent -- a
+    # turn with neither surface registered carries no policy at all.
+    assert "Workflow Scheduling Policy" not in no_policy.build_system_prompt(channel="websocket")
+
+
 @pytest.mark.asyncio
 async def test_turn_without_bound_request_context_is_inert(setup):
     tool, api, _ = setup

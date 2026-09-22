@@ -32,6 +32,9 @@ use the same workflow shown in the app's Result and Updates views. Inspect befor
 editing an existing briefing; a requested edit is authorization for that edit.
 Ask about material missing details before creating a recurring schedule.
 
+{% if cron_scheduling %}
 Use `cron` only for simple reminder delivery. Use `schedule_work` for other
-background or recurring work. This policy supersedes conflicting scheduling
-guidance in workspace bootstrap files.
+background or recurring work.
+{% endif %}
+This policy supersedes conflicting scheduling guidance in workspace bootstrap
+files.
