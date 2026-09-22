@@ -521,13 +521,14 @@ class AgentLoop:
             lambda turn: _ZiggyTurnHook(self, turn)
         )
 
+        # Ziggy-local (MIT-1028): the workflow-intake policy is switched on
+        # below in _register_default_tools, after the tool loader has decided
+        # what actually registered -- an enabled-but-misconfigured briefing
+        # registers nothing, and its policy must not reach those tenants.
         self.context = ContextBuilder(
             workspace,
             timezone=timezone,
             disabled_skills=disabled_skills,
-            # Ziggy-local (MIT-1028): the intake policy names the scheduling
-            # tools; it must only reach turns that can actually act on them.
-            workflow_scheduling=cron_service is not None or _tc.briefing.enable,
         )
         self.sessions = session_manager or SessionManager(workspace)
         # Ziggy-local (MIT-1010): durable Work store for report_progress /
@@ -817,6 +818,15 @@ class AgentLoop:
         )
         loader = ToolLoader()
         registered = loader.load(ctx, self.tools)
+
+        # Ziggy-local (MIT-1028): the intake policy names the scheduling tools,
+        # so it may only reach turns whose tool set can act on them. The loader
+        # deliberately swallows create() failures (a misconfigured-but-enabled
+        # briefing never registers), so derive the flag from what actually
+        # registered -- never from the config alone.
+        self.context.workflow_scheduling = (
+            self.cron_service is not None or self.tools.get("briefing") is not None
+        )
 
         logger.info("Registered {} tools: {}", len(registered), registered)
 

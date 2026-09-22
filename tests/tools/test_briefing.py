@@ -223,6 +223,44 @@ def test_misconfigured_enabled_tool_never_registers(tmp_path):
         assert "briefing" not in registry.tool_names
 
 
+def test_misconfigured_enabled_briefing_never_ships_the_intake_policy(tmp_path):
+    # The loader deliberately swallows create() failures, so an enabled
+    # section with a bad value registers nothing. The intake policy *names*
+    # that tool, so it must not reach the system prompt either -- the flag
+    # follows what registered, never the config alone.
+    from nanobot.agent.loop import AgentLoop
+    from nanobot.bus.queue import MessageBus
+    from nanobot.config.loader import set_config_path
+
+    set_config_path(tmp_path / "config.json")
+    credential = tmp_path / "runtime-secret"
+    credential.write_text("b" * 32)
+    sessions = SessionManager(tmp_path / "workspace")
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    provider.generation = SimpleNamespace(max_tokens=4096, temperature=0.1, reasoning_effort=None)
+    loop = AgentLoop(
+        bus=MessageBus(),
+        provider=provider,
+        workspace=sessions.workspace,
+        session_manager=sessions,
+        model="test-model",
+        tools_config=ToolsConfig(
+            briefing=BriefingToolsConfig(
+                enable=True,
+                control_url="http://briefing.example.com",  # remote HTTP origin
+                user_id="owner",
+                workspace_id="w",
+                credential_file=str(credential),
+            )
+        ),
+    )
+    assert loop.tools.get("briefing") is None
+    assert loop.context.workflow_scheduling is False
+    prompt = loop.context.build_system_prompt(channel="websocket")
+    assert "Workflow Scheduling Policy" not in prompt
+
+
 @pytest.mark.asyncio
 async def test_create_recovers_uncertain_first_run_without_duplicate(setup):
     tool, api, _ = setup
