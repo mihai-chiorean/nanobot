@@ -1695,8 +1695,10 @@ class WebSocketChannel(BaseChannel):
             self._stream_text_buffers.setdefault(stream_key, []).append(delta)
         if stream_id is not None:
             body["stream_id"] = stream_id
-        if stream_end and resuming:
-            body["resuming"] = True
+        if stream_end:
+            # Ziggy-local (MIT-1404): always present so a client can tell a
+            # final boundary (false) from a missing key.
+            body["resuming"] = bool(resuming)
         if stream_end and merge_next:
             body["merge_next"] = True
         self._persist_turn_stream_event(

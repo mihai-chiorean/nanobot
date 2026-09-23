@@ -718,6 +718,10 @@ class WebUICommandRouter:
         metadata: dict[str, Any] = {
             "remote": getattr(connection, "remote_address", None)
         }
+        # Ziggy-local (MIT-1404): the ziggy-worker asks for a final ``message``
+        # frame after a streamed reply; the agent loop reads this flag.
+        if envelope.get("explicit_final_message") is True:
+            metadata["explicit_final_message"] = True
         if envelope.get("webui") is True:
             metadata["webui"] = True
             metadata.update(self._transcripts.client_turn_metadata(envelope.get("turn_id")))
