@@ -392,6 +392,11 @@ class MCPServerConfig(Base):
     enabled_tools: list[str] = Field(default_factory=lambda: ["*"])  # Only register these tools; accepts raw MCP names or wrapped mcp_<server>_<tool> names; ["*"] = all capabilities (tools, resources, prompts); any restriction = only listed tools, no resources/prompts
     # Ziggy-local (MIT-1405): non-interactive auth for tenant connectors.
     oauth_client_credentials: OAuthClientCredentialsConfig | None = None
+    # Ziggy-local (MIT-1405): set only by the MCP provider for entries that
+    # came from ``tools.mcpServers`` in the operator's config file (never for
+    # workspace-plugin servers). A private attribute, so no config file, plugin
+    # manifest or model output can set it.
+    _operator_configured: bool = PrivateAttr(default=False)
 
     @model_validator(mode="after")
     def _reject_conflicting_mcp_auth(self) -> MCPServerConfig:

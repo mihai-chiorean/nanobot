@@ -355,3 +355,206 @@ async def test_sse_server_gets_client_credentials_auth(
         await connection.aclose()
 
     assert isinstance(captured["auth"], OAuthClientCredentialsAuth)
+
+
+# -- operator-configured loopback connector (real sockets, no transport mocks) ----
+
+
+class _LoopbackServer:
+    """A plain-HTTP server on 127.0.0.1 that records every request it sees."""
+
+    def __init__(self, redirect_to: str | None = None) -> None:
+        import http.server
+        import threading
+
+        self.requests: list[tuple[str, str, str | None]] = []
+        owner = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *_args: object) -> None:
+                pass
+
+            def do_POST(self) -> None:  # noqa: N802
+                length = int(self.headers.get("Content-Length") or 0)
+                self.rfile.read(length)
+                owner.requests.append(
+                    ("POST", self.path, self.headers.get("Authorization"))
+                )
+                if self.path == "/oauth/token":
+                    body = b'{"access_token":"tok-live","token_type":"Bearer","expires_in":3600}'
+                    self.send_response(200)
+                elif redirect_to is not None:
+                    self.send_response(307)
+                    self.send_header("Location", redirect_to)
+                    body = b""
+                else:
+                    body = b'{"jsonrpc":"2.0","id":1,"result":{}}'
+                    self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self) -> None:  # noqa: N802
+                owner.requests.append(("GET", self.path, self.headers.get("Authorization")))
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"ok")
+
+        self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self._server.server_address[1]
+        self.base = f"http://127.0.0.1:{self.port}"
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+
+    def close(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+
+
+@pytest.fixture
+def loopback_servers():
+    started: list[_LoopbackServer] = []
+
+    def start(**kwargs: object) -> _LoopbackServer:
+        server = _LoopbackServer(**kwargs)  # type: ignore[arg-type]
+        started.append(server)
+        return server
+
+    from nanobot.security.network import configure_loopback_exception, configure_ssrf_whitelist
+
+    # The tenant runtime has neither a loopback exception nor a whitelist.
+    configure_ssrf_whitelist([])
+    configure_loopback_exception(False)
+    yield start
+    for server in started:
+        server.close()
+
+
+def _loopback_config(server: _LoopbackServer, secret_file: Path) -> MCPServerConfig:
+    return MCPServerConfig.model_validate(
+        {
+            "type": "streamableHttp",
+            "url": f"{server.base}/mcp",
+            "oauthClientCredentials": {
+                "tokenUrl": f"{server.base}/oauth/token",
+                "clientId": CLIENT_ID,
+                "clientSecretFile": str(secret_file),
+                "scopes": SCOPES,
+            },
+        }
+    )
+
+
+def _first_post_transport(outcomes: list[object]):
+    @asynccontextmanager
+    async def fake_streamable_http_client(url: str, http_client=None):
+        assert http_client is not None
+        try:
+            outcomes.append(await http_client.post(url, json={"jsonrpc": "2.0", "id": 1}))
+        except Exception as exc:  # the guard raises inside the transport
+            outcomes.append(exc)
+        raise RuntimeError("stop after the first request")
+        yield  # pragma: no cover
+
+    return fake_streamable_http_client
+
+
+async def _connect(servers: dict[str, MCPServerConfig], monkeypatch, outcomes) -> None:
+    monkeypatch.setattr(
+        sys.modules["mcp.client.streamable_http"],
+        "streamable_http_client",
+        _first_post_transport(outcomes),
+    )
+    connections = await connect_mcp_servers(servers, ToolRegistry())
+    for connection in connections.values():
+        await connection.aclose()
+
+
+@pytest.mark.asyncio
+async def test_operator_loopback_mcp_server_and_token_url_connect(
+    loopback_servers, secret_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server = loopback_servers()
+    outcomes: list[object] = []
+
+    servers = mcp_mod._mark_operator_configured({"gmail": _loopback_config(server, secret_file)})
+    await _connect(servers, monkeypatch, outcomes)
+
+    assert [getattr(o, "status_code", o) for o in outcomes] == [200]
+    assert server.requests == [
+        ("POST", "/oauth/token", server.requests[0][2]),
+        ("POST", "/mcp", "Bearer tok-live"),
+    ]
+    assert server.requests[0][2].startswith("Basic ")
+
+
+@pytest.mark.asyncio
+async def test_operator_config_marking_comes_from_tools_mcp_servers(
+    secret_file: Path, tmp_path: Path
+) -> None:
+    config = Config.model_validate(
+        {
+            "agents": {"defaults": {"workspace": str(tmp_path)}},
+            "tools": {"mcpServers": {"gmail": _server_dict(str(secret_file))}},
+        }
+    )
+    servers = mcp_mod._configured_servers(config)
+
+    assert servers["gmail"]._operator_configured is True
+    assert config.tools.mcp_servers["gmail"]._operator_configured is False
+    assert mcp_mod._operator_loopback_origins(servers["gmail"]) == frozenset(
+        {("https", "127.0.0.1", 8790)}
+    )
+
+
+@pytest.mark.asyncio
+async def test_unmarked_loopback_server_is_still_refused(
+    loopback_servers, secret_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A server that did not come from operator config (e.g. a workspace plugin)."""
+    server = loopback_servers()
+    outcomes: list[object] = []
+
+    await _connect({"plugin": _loopback_config(server, secret_file)}, monkeypatch, outcomes)
+
+    assert outcomes == []  # rejected before any transport was opened
+    assert server.requests == []
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_to_loopback_stays_blocked_with_the_same_config(
+    loopback_servers, secret_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from nanobot.agent.tools.web import WebFetchTool
+
+    server = loopback_servers()
+    servers = mcp_mod._mark_operator_configured({"gmail": _loopback_config(server, secret_file)})
+    outcomes: list[object] = []
+    await _connect(servers, monkeypatch, outcomes)
+    seen_before = list(server.requests)
+
+    for path in ("/mcp", "/oauth/token", "/"):
+        result = await WebFetchTool().execute(f"{server.base}{path}")
+        assert "URL validation failed" in str(result)
+
+    assert server.requests == seen_before
+
+
+@pytest.mark.asyncio
+async def test_redirect_from_mcp_server_to_another_loopback_port_is_refused(
+    loopback_servers, secret_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    other = loopback_servers()
+    server = loopback_servers(redirect_to=f"{other.base}/mcp")
+    outcomes: list[object] = []
+
+    servers = mcp_mod._mark_operator_configured({"gmail": _loopback_config(server, secret_file)})
+    await _connect(servers, monkeypatch, outcomes)
+
+    assert len(outcomes) == 1
+    assert isinstance(outcomes[0], httpx.RequestError)
+    assert "Blocked" in str(outcomes[0])
+    assert other.requests == []
+    assert ("POST", "/mcp", "Bearer tok-live") in server.requests
