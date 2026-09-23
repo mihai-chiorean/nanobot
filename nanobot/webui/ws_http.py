@@ -99,7 +99,6 @@ from nanobot.webui.native_folder_picker import (
     native_folder_picker_available,
     pick_native_folder,
 )
-from nanobot.webui.session_access import WebuiSessionAccess
 from nanobot.webui.session_automations import (
     all_automations_payload,
     serialize_automation_jobs,
@@ -928,17 +927,15 @@ class GatewayHTTPHandler:
     async def _handle_conversation_search(self, request: WsRequest) -> Response:
         """``GET /api/search/conversations?q=<text>&limit=<n>`` -- owner only.
 
-        Parity with the 0.2.x production route (feat/shared-rooms a6f0c196):
-        the owner API token is required and room credentials are refused, so a
-        shared-room guest can never read the owner's conversation history through
-        search. The trusted-proxy shortcut in ``check_api_token`` is deliberately
-        bypassed (as for ``/api/sessions/<key>/messages``, MIT-1404): a proxied
-        room guest whose room token fell through as revoked/expired must not be
-        admitted here. Backed by :class:`WebuiSessionAccess.search`; the wire
-        shape is prod's ``{"results": [...]}`` with one message-level entry per
-        match (``session_key``/``title``/``snippet``/``role``/``updated_at`` plus
-        optional ``message_index``/``timestamp``), so the iOS
-        ``ConversationSearchResult`` decodes unchanged.
+        Parity with the 0.2.x production route (``feat/shared-rooms``
+        ``_handle_conversation_search`` + ``SessionManager.search_sessions``).
+        Only a live owner API token from the gateway token store is accepted
+        (``GatewayTokens.check_api_token`` is bearer/``?token=`` only); a
+        shared-room ``nbrt_`` credential is a different audience and gets 401,
+        so a room guest can never read the owner's history through search.
+        Rows come from :func:`_search_conversation_rows`, a line-for-line port
+        of production's algorithm, so the iOS ``ConversationSearchResult``
+        decoder sees byte-identical rows for the same session data.
         """
         if not self.tokens.check_api_token(request):
             return _http_error(401, "Unauthorized")
@@ -955,50 +952,12 @@ class GatewayHTTPHandler:
         if limit < 1 or limit > 50:
             return _http_error(400, "limit must be between 1 and 50")
         results = await asyncio.to_thread(
-            self._conversation_search_results,
+            _search_conversation_rows,
+            self.session_manager,
             search_query,
-            limit,
+            limit=limit,
         )
         return _http_json_response({"results": results})
-
-    def _conversation_search_results(self, query: str, limit: int) -> list[dict[str, Any]]:
-        assert self.session_manager is not None
-        matches = WebuiSessionAccess(self.session_manager).search(query, limit)
-        folded_query = query.casefold()
-        results: list[dict[str, Any]] = []
-        for match in matches:
-            session_key = match["session_key"]
-            title = match["title"]
-            updated_at = match["updated_at"]
-            message_matches = match["messages"]
-            if not message_matches:
-                # A title-ranked match carries no message bodies; surface the
-                # title itself as the snippet, as the 0.2.x title branch did.
-                results.append({
-                    "session_key": session_key,
-                    "title": title,
-                    "snippet": _conversation_search_snippet(title, folded_query),
-                    "role": "title",
-                    "updated_at": updated_at,
-                })
-                continue
-            for message in message_matches:
-                content = message["content"]
-                if not content:
-                    continue
-                entry: dict[str, Any] = {
-                    "session_key": session_key,
-                    "title": title,
-                    "snippet": _conversation_search_snippet(content, folded_query),
-                    "role": message["role"],
-                    "updated_at": updated_at,
-                    "message_index": message["message_index"],
-                }
-                timestamp = message["timestamp"]
-                if isinstance(timestamp, str) and timestamp:
-                    entry["timestamp"] = timestamp
-                results.append(entry)
-        return results[:limit]
 
     async def _handle_webui_thread_get_async(self, request: WsRequest, key: str) -> Response:
         diagnostics = _WebUIThreadDiagnostics()
@@ -2196,26 +2155,149 @@ def _is_websocket_channel_session_key(key: str) -> bool:
     return is_webui_session_key(key)
 
 
-def _conversation_search_snippet(text: str, folded_query: str, *, window: int = 240) -> str:
-    """Return a bounded snippet of *text* centred on the first ``folded_query`` hit.
+# -- Conversation search (MIT-1412) -------------------------------------------
+#
+# Port of production's ``SessionManager.search_sessions`` /
+# ``_search_message_text`` / ``_search_result`` (feat/shared-rooms,
+# nanobot/session/manager.py). Keep these in lock-step with production: the
+# iOS client renders the rows as-is, and tests pin byte-level parity against
+# rows generated by production's own implementation.
 
-    Mirrors the 0.2.x production snippet windowing (feat/shared-rooms
-    a6f0c196): a ~240-char window with ``...`` markers where it was trimmed.
-    The result is at most ``window + 6`` characters.
+_CONVERSATION_SEARCH_MAX_RESULTS = 50
+_CONVERSATION_SEARCH_MATCHES_PER_SESSION = 5
+_CONVERSATION_SEARCH_SNIPPET_CHARS = 240
+
+
+def _search_conversation_rows(
+    session_manager: SessionManager, query: str, *, limit: int = 20
+) -> list[dict[str, Any]]:
+    """Search user-visible WebUI conversation text with production row semantics.
+
+    Sessions are visited newest ``updated_at`` first and only WebUI sessions
+    (``is_webui_session_key``) are searched -- Slack/Telegram/CLI sessions
+    never appear. Per session: one ``role="title"`` row when the persisted
+    ``metadata.title`` matches (untitled sessions get no title row), then
+    ``user``/``assistant`` message rows newest first, capped at 5 rows per
+    session in total. System, tool and reasoning text is never searched.
     """
-    if not text:
-        return ""
-    position = text.casefold().find(folded_query)
-    if position < 0:
-        start = 0
+    normalized_query = " ".join(query.split())
+    if len(normalized_query) < 2:
+        return []
+    limit = min(max(1, limit), _CONVERSATION_SEARCH_MAX_RESULTS)
+    folded_query = normalized_query.casefold()
+    results: list[dict[str, Any]] = []
+
+    for summary in session_manager.list_sessions():
+        key = summary.get("key")
+        if not isinstance(key, str) or not is_webui_session_key(key):
+            continue
+        payload = session_manager.read_session_file(key)
+        if not isinstance(payload, dict):
+            continue
+        metadata = cast(object, payload.get("metadata"))
+        raw_title = (
+            cast(dict[str, object], metadata).get("title")
+            if isinstance(metadata, dict)
+            else None
+        )
+        title = raw_title.strip() if isinstance(raw_title, str) else ""
+        updated_at = summary.get("updated_at")
+        matches: list[dict[str, Any]] = []
+
+        if title and folded_query in title.casefold():
+            matches.append(_conversation_search_row(
+                key=key,
+                title=title,
+                text=title,
+                folded_query=folded_query,
+                role="title",
+                message_index=None,
+                timestamp=updated_at,
+                updated_at=updated_at,
+            ))
+
+        messages = cast(object, payload.get("messages"))
+        if isinstance(messages, list):
+            message_list = cast(list[object], messages)
+            for index in range(len(message_list) - 1, -1, -1):
+                if len(matches) >= _CONVERSATION_SEARCH_MATCHES_PER_SESSION:
+                    break
+                raw_message = message_list[index]
+                if not isinstance(raw_message, dict):
+                    continue
+                message = cast(dict[str, object], raw_message)
+                role = message.get("role")
+                if not isinstance(role, str) or role not in {"user", "assistant"}:
+                    continue
+                text = _conversation_search_text(message.get("content"))
+                if not text or folded_query not in text.casefold():
+                    continue
+                matches.append(_conversation_search_row(
+                    key=key,
+                    title=title,
+                    text=text,
+                    folded_query=folded_query,
+                    role=role,
+                    message_index=index,
+                    timestamp=message.get("timestamp"),
+                    updated_at=updated_at,
+                ))
+
+        results.extend(matches[: max(0, limit - len(results))])
+        if len(results) >= limit:
+            break
+
+    return results
+
+
+def _conversation_search_text(content: Any) -> str:
+    """Flatten message content to single-line text (whitespace collapsed)."""
+    if isinstance(content, str):
+        raw = content
+    elif isinstance(content, list):
+        parts: list[str] = []
+        for item in cast(list[object], content):
+            if isinstance(item, dict):
+                text = cast(dict[str, object], item).get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        raw = " ".join(parts)
     else:
-        start = max(0, position - window // 2)
-    end = min(len(text), start + window)
-    start = max(0, end - window)
+        return ""
+    return " ".join(raw.split())
+
+
+def _conversation_search_row(
+    *,
+    key: str,
+    title: str,
+    text: str,
+    folded_query: str,
+    role: str,
+    message_index: int | None,
+    timestamp: Any,
+    updated_at: Any,
+) -> dict[str, Any]:
+    folded_text = text.casefold()
+    match = folded_text.find(folded_query)
+    context = _CONVERSATION_SEARCH_SNIPPET_CHARS // 2
+    start = max(0, match - context) if match >= 0 else 0
+    end = min(len(text), start + _CONVERSATION_SEARCH_SNIPPET_CHARS)
+    start = max(0, end - _CONVERSATION_SEARCH_SNIPPET_CHARS)
     snippet = text[start:end]
     if start:
         snippet = "..." + snippet.lstrip()
     if end < len(text):
         snippet = snippet.rstrip() + "..."
-    return snippet
-
+    result: dict[str, Any] = {
+        "session_key": key,
+        "title": title,
+        "snippet": snippet,
+        "role": role,
+        "updated_at": updated_at,
+    }
+    if message_index is not None:
+        result["message_index"] = message_index
+    if isinstance(timestamp, str) and timestamp:
+        result["timestamp"] = timestamp
+    return result
