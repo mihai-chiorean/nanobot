@@ -721,6 +721,11 @@ class TestToolEventProgress:
         provider = MagicMock()
         provider.get_default_model.return_value = "openai-codex/gpt-5.5"
         provider.chat_stream_with_retry = AsyncMock(side_effect=[
+            # First empty: initial request. Next two: the MIT-1408
+            # incomplete-final recoveries. Fourth: the silent retry. Fifth:
+            # the no-tools finalization that must still be delivered.
+            LLMResponse(content=None, tool_calls=[]),
+            LLMResponse(content=None, tool_calls=[]),
             LLMResponse(content=None, tool_calls=[]),
             LLMResponse(content=None, tool_calls=[]),
             LLMResponse(content="final answer", tool_calls=[]),
@@ -753,7 +758,9 @@ class TestToolEventProgress:
         final = [message for message in outbound if message.content == "final answer"]
         assert len(final) == 1
         assert final[0].event is None
-        assert provider.chat_stream_with_retry.await_count == 3
+        # 1 initial + 2 incomplete-final recoveries + 1 silent retry +
+        # 1 no-tools finalization.
+        assert provider.chat_stream_with_retry.await_count == 5
 
     @pytest.mark.asyncio
     async def test_independent_late_subagent_result_gets_complete_webui_turn(

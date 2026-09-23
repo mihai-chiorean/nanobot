@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
+import json
 import time
 from collections.abc import Awaitable, Callable, Iterable
 from copy import deepcopy
@@ -43,6 +45,7 @@ from nanobot.providers.base import (
     LLMResponse,
     LLMUsage,
     ProviderConversationState,
+    ToolCallRequest,
 )
 from nanobot.providers.conversation_state import ProviderConversationStateController
 from nanobot.session.summary import SessionSummaryCheckpoint
@@ -75,6 +78,28 @@ _ARREARAGE_ERROR_MESSAGE = (
 _PERSISTED_MODEL_ERROR_PLACEHOLDER = "[Assistant reply unavailable due to model error.]"
 _MAX_EMPTY_RETRIES = 2
 _MAX_LENGTH_RECOVERIES = 3
+_MAX_INCOMPLETE_RECOVERIES = 2
+_REPEATED_EXEC_RECOVERY_THRESHOLD = 3
+_REPEATED_EXEC_STOP_THRESHOLD = 6
+_INCOMPLETE_FINAL_RECOVERY_PROMPT = (
+    "Your last response ended with an unfinished introduction or only a promise to act. "
+    "Complete the answer now, including any questions you intended to ask. "
+    "If authorized work is needed, use the available tools and verify the result. "
+    "Do not bypass approvals or safety controls. If blocked, explain the blocker. "
+    "Do not claim completion without evidence."
+)
+_REPEATED_EXEC_STOP_MESSAGE = (
+    "This run stopped after the same shell command returned "
+    "identical output six times, despite recovery prompts. "
+    "Review the saved work and continue with a different approach. "
+    "This is a repeated-command failure, not a lifetime tool quota."
+)
+_INCOMPLETE_FINAL_EXCLUDED_FINISH_REASONS = frozenset({
+    "error",
+    "cancelled",
+    "refusal",
+    "content_filter",
+})
 _MAX_INJECTIONS_PER_TURN = 3
 _MAX_INJECTION_CYCLES = 5
 
@@ -88,6 +113,64 @@ def _restore_outer_whitespace(content: str, original: str | None) -> str:
     leading = original[:leading_size]
     trailing = original[-trailing_size:] if trailing_size else ""
     return f"{leading}{content}{trailing}"
+
+
+def _repeated_exec_hint(count: int) -> str:
+    """Hint appended to an exec result the model has already seen verbatim."""
+    return (
+        "\n\n[The same shell command has returned identical output "
+        f"{count} times consecutively. Reassess before calling "
+        "it again: check whether the proposed change changes anything, "
+        "inspect the saved result with another tool, then proceed to "
+        "validation/publication if it is already correct. If waiting "
+        "for external work, use its status/poll tool instead. "
+        "Do not repeat this command unchanged.]"
+    )
+
+
+def _incomplete_final(response: LLMResponse) -> bool:
+    """True when the model ended a turn without producing a usable final answer.
+
+    Fires on an empty final answer, or a ``length``-truncated answer that
+    carries no recoverable content, when no tool calls were requested. A
+    truncation that still has content is owned by the length-recovery
+    mechanism, and provider policy/error terminals are never re-prompted.
+    """
+    if response.should_execute_tools or response.has_tool_calls:
+        return False
+    if response.finish_reason in _INCOMPLETE_FINAL_EXCLUDED_FINISH_REASONS:
+        return False
+    return is_blank_text(response.content)
+
+
+@dataclass
+class _ExecProgress:
+    """Track consecutive identical successful exec responses within one run."""
+
+    fingerprint: str | None = None
+    count: int = 0
+
+    def observe(
+        self,
+        calls: list[ToolCallRequest],
+        results: list[Any],
+        events: list[dict[str, Any]],
+    ) -> int:
+        if (
+            len(calls) != 1
+            or calls[0].name != "exec"
+            or len(results) != 1
+            or len(events) != 1
+            or events[0].get("status") != "ok"
+            or not isinstance(results[0], str)
+        ):
+            self.fingerprint, self.count = None, 0
+            return 0
+        payload = json.dumps([calls[0].arguments, results[0]], sort_keys=True, default=str)
+        fingerprint = hashlib.sha256(payload.encode()).hexdigest()
+        self.count = self.count + 1 if fingerprint == self.fingerprint else 1
+        self.fingerprint = fingerprint
+        return self.count
 
 
 @dataclass(slots=True)
@@ -407,6 +490,8 @@ class AgentRunner:
         # Per-turn throttle for repeated attempts against the same outside target.
         workspace_violation_counts: dict[str, int] = {}
         empty_content_retries = 0
+        incomplete_recovery_count = 0
+        exec_progress = _ExecProgress()
         # Segments from one uninterrupted length-recovery chain. Tool work or
         # injected user input starts a new logical answer and clears the chain.
         length_recovery_parts: list[str] = []
@@ -496,6 +581,49 @@ class AgentRunner:
                     await hook.emit_reasoning_end()
                     context.streamed_reasoning = True
 
+                # Incomplete-final recovery: when the model ends the turn with an
+                # empty or cut-off answer and no tool calls in flight, re-prompt it
+                # with an explicit completion instruction (production 83028651).
+                # The instruction rides on the request copy only; the abandoned
+                # attempt is never persisted into the transcript.
+                while (
+                    _incomplete_final(response)
+                    and incomplete_recovery_count < _MAX_INCOMPLETE_RECOVERIES
+                ):
+                    incomplete_recovery_count += 1
+                    logger.warning(
+                        "Incomplete final response; re-prompting ({}/{}) on turn {} for {}",
+                        incomplete_recovery_count,
+                        _MAX_INCOMPLETE_RECOVERIES,
+                        iteration,
+                        spec.session_key or "default",
+                    )
+                    response, raw_usage = await self._request_model(
+                        spec,
+                        self._incomplete_final_recovery_messages(messages_for_model),
+                        hook,
+                        context,
+                        request_state=request_state,
+                        transcript=messages,
+                    )
+                    conversation_state.observe_response(response, messages)
+                    context.response = response
+                    context.tool_calls = list(response.tool_calls)
+                    original_content = response.content
+                    reasoning_text, cleaned_content = extract_reasoning(
+                        response.reasoning_content,
+                        response.thinking_blocks,
+                        response.content,
+                    )
+                    response.content = cleaned_content
+                    round_usages.append(raw_usage)
+                    context.usage = raw_usage
+                    usage = self._merge_usage(usage, raw_usage)
+                    if reasoning_text and not context.streamed_reasoning:
+                        await hook.emit_reasoning(reasoning_text)
+                        await hook.emit_reasoning_end()
+                        context.streamed_reasoning = True
+
                 if response.should_execute_tools:
                     tool_calls = list(response.tool_calls)
                     # ``ask_user`` pauses the turn: drop anything requested after
@@ -541,6 +669,9 @@ class AgentRunner:
                         hook=hook,
                         context=context,
                     )
+                    repeated_exec = exec_progress.observe(tool_calls, results, new_events)
+                    if repeated_exec >= _REPEATED_EXEC_RECOVERY_THRESHOLD:
+                        results[0] += _repeated_exec_hint(repeated_exec)
                     tool_events.extend(new_events)
                     tools_used.extend(
                         tool_call.name
@@ -613,6 +744,17 @@ class AgentRunner:
                     )
                     empty_content_retries = 0
                     length_recovery_parts.clear()
+                    if repeated_exec >= _REPEATED_EXEC_STOP_THRESHOLD:
+                        # Three recovery opportunities preceded this stop. Preserve
+                        # checkpoints and never report unfinished work as successful.
+                        final_content = _REPEATED_EXEC_STOP_MESSAGE
+                        error = final_content
+                        stop_reason = "incomplete_response"
+                        self._append_final_message(messages, final_content)
+                        context.final_content, context.error = final_content, error
+                        context.stop_reason = stop_reason
+                        await hook.after_iteration(context)
+                        break
                     # Checkpoint 1: drain injections after tools, before next LLM call
                     _drained, injection_cycles = await self._try_drain_injections(
                         spec, messages, None, injection_cycles,
@@ -1203,6 +1345,19 @@ class AgentRunner:
     def _finalization_retry_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         retry_messages = list(messages)
         retry_messages.append(build_finalization_retry_message())
+        return retry_messages
+
+    @staticmethod
+    def _incomplete_final_recovery_messages(
+        messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Request copy that re-prompts an empty or cut-off final answer.
+
+        Built on a copy so the completion instruction never enters the
+        transcript, mirroring the finalization-retry candidate pattern.
+        """
+        retry_messages = list(messages)
+        retry_messages.append({"role": "user", "content": _INCOMPLETE_FINAL_RECOVERY_PROMPT})
         return retry_messages
 
     async def _try_finalize_after_max_iterations(

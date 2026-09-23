@@ -134,6 +134,10 @@ class TestMessageToolSuppressLogic:
         calls = iter([
             LLMResponse(content="First answer", tool_calls=[]),
             LLMResponse(content="", tool_calls=[tool_call]),
+            # Two empties feed the incomplete-final recoveries, then the
+            # silent-retry/finalization fallback consumes the rest.
+            LLMResponse(content="", tool_calls=[]),
+            LLMResponse(content="", tool_calls=[]),
             LLMResponse(content="", tool_calls=[]),
             LLMResponse(content="", tool_calls=[]),
             LLMResponse(content="", tool_calls=[]),
