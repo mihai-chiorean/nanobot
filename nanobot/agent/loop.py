@@ -1690,6 +1690,13 @@ class AgentLoop:
         )
         active_session_key = session.key if session else request_ctx.session_key
         request_metadata = request_ctx.metadata
+        # MIT-1400: a shared-room session is never consolidated into the
+        # owner's memory (production feat/shared-rooms skips consolidation and
+        # raw-archiving for room turns). Either signal marks the turn a room.
+        shared_room_turn = transcript_input.shared_room or (
+            isinstance(request_metadata, dict)
+            and request_metadata.get("shared_room") is True
+        )
         effective_scope = self.workspace_scopes.for_turn(
             channel=request_ctx.channel,
             message_metadata=request_metadata,
@@ -1792,6 +1799,7 @@ class AgentLoop:
                     if initial_messages is not None
                     or session is None
                     or ephemeral
+                    or shared_room_turn
                     else partial(
                         self.consolidator.summarize_transcript,
                         runtime=runtime,
@@ -1804,6 +1812,7 @@ class AgentLoop:
                     if initial_messages is not None
                     or session is None
                     or ephemeral
+                    or shared_room_turn
                     else partial(
                         self.consolidator.summarize_provider_compaction,
                         runtime=runtime,
