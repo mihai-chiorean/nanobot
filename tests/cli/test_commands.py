@@ -4033,6 +4033,109 @@ def test_gateway_agent_task_owns_initial_mcp_provider_close(
     assert isinstance(hook, cli_gateway_runtime._MCPReadinessHook)
 
 
+def test_gateway_starts_cron_only_after_the_work_restart_sweep(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """Regression (PR #58 review, P2-1).
+
+    ``cron.start()`` arms a timer that can fire within milliseconds, and a
+    work-task cron job creates a live row on the agent's WorkStore.  If that
+    happened before ``reconcile_work_store`` ran, the sweep marked the new task
+    interrupted at birth.  Cron must start after the sweep and before channels.
+    """
+    config_file = _write_instance_config(tmp_path)
+    config = Config()
+    config.gateway.port = 18792
+    order: list[str] = []
+
+    class _FakeAgentLoop(_GatewayAgentContractStub):
+        @classmethod
+        def from_config(cls, config, bus=None, **extra):
+            return cls(**extra)
+
+        def __init__(self, **_kwargs) -> None:
+            self.model = "test-model"
+            self.provider = object()
+            self.sessions = _EmptyGatewaySessionManager()
+            self.runtime_resolver = MagicMock()
+
+        def llm_runtime(self) -> None:
+            return None
+
+        async def reconcile_work_store(self) -> int:
+            order.append("work-sweep")
+            return 0
+
+        async def run(self) -> None:
+            await asyncio.Event().wait()
+
+        async def aclose(self) -> None:
+            return None
+
+        def stop(self) -> None:
+            return None
+
+    class _FakeChannelManager:
+        def __init__(self, _config, _bus, **_kwargs) -> None:
+            self.enabled_channels = ["telegram"]
+
+        async def start_all(self) -> None:
+            order.append("channels")
+            await asyncio.Event().wait()
+
+        async def stop_all(self) -> None:
+            return None
+
+    class _FakeCronService:
+        def __init__(self, _store_path: Path) -> None:
+            self.on_job = None
+
+        async def start(self) -> None:
+            order.append("cron")
+
+        def stop(self) -> None:
+            return None
+
+        def status(self) -> dict[str, int]:
+            return {"jobs": 0}
+
+        def register_system_job(self, _job) -> None:
+            return None
+
+    class _FakeServer:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> bool:
+            return False
+
+        async def serve_forever(self) -> None:
+            await asyncio.sleep(0)
+            raise _StopGatewayError("stop")
+
+    async def _fake_start_server(_handler, _host: str, _port: int):
+        return _FakeServer()
+
+    _patch_cli_command_runtime(
+        monkeypatch,
+        config,
+        message_bus=MessageBus,
+        session_manager=lambda _workspace: _EmptyGatewaySessionManager(),
+    )
+    monkeypatch.setattr("nanobot.cli.gateway_runtime.AgentLoop", _FakeAgentLoop)
+    monkeypatch.setattr("nanobot.channels.manager.ChannelManager", _FakeChannelManager)
+    monkeypatch.setattr("nanobot.cron.service.CronService", _FakeCronService)
+    monkeypatch.setattr("asyncio.start_server", _fake_start_server)
+
+    runner.invoke(app, ["gateway", "--config", str(config_file)])
+
+    assert "cron" in order and "work-sweep" in order
+    assert order.index("work-sweep") < order.index("cron")
+    if "channels" in order:
+        assert order.index("cron") < order.index("channels")
+
+
 def test_gateway_shutdown_event_exits_forever_runtime_tasks(
     monkeypatch,
     tmp_path: Path,
