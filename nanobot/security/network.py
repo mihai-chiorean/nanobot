@@ -7,6 +7,7 @@ import ipaddress
 import re
 import socket
 from contextlib import contextmanager, suppress
+from collections.abc import Iterable
 from typing import Any, cast
 from urllib.parse import urlparse
 from urllib.request import getproxies, proxy_bypass
@@ -295,8 +296,37 @@ class UnsafeURLRequestError(httpx.RequestError):
     """Raised when an outgoing request is rejected by URL safety validation."""
 
 
+URLOrigin = tuple[str, str, int]
+
+
+def url_origin(url: str) -> URLOrigin | None:
+    """Return ``(scheme, host, port)`` for an http(s) URL, with the default port filled in."""
+    try:
+        parts = urlparse(url)
+        port = parts.port
+    except ValueError:
+        return None
+    scheme = (parts.scheme or "").lower()
+    host = (parts.hostname or "").rstrip(".").lower()
+    if scheme not in ("http", "https") or not host:
+        return None
+    return scheme, host, port or (443 if scheme == "https" else 80)
+
+
+def is_loopback_origin(origin: URLOrigin | None) -> bool:
+    """True when the origin's host is a literal loopback host (not a DNS name)."""
+    return origin is not None and is_loopback_host(origin[1])
+
+
 class PinnedDNSAsyncTransport(httpx.AsyncBaseTransport):
-    """HTTPX transport that pins each request to the IPs validated for its URL."""
+    """HTTPX transport that pins each request to the IPs validated for its URL.
+
+    Ziggy-local (MIT-1405): ``loopback_origins`` lets an operator-configured
+    endpoint (an MCP server URL or its token URL) on a literal loopback host be
+    reached at exactly that scheme/host/port. Every other request through the
+    transport, including a redirect to another loopback port, keeps the full
+    SSRF policy. The process-wide loopback default is not consulted or changed.
+    """
 
     _resolver_lock = asyncio.Lock()
 
@@ -304,14 +334,21 @@ class PinnedDNSAsyncTransport(httpx.AsyncBaseTransport):
         self,
         *,
         allow_loopback: bool = False,
+        loopback_origins: Iterable[URLOrigin] = (),
         inner: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self._allow_loopback = allow_loopback
+        self._loopback_origins = frozenset(
+            origin for origin in loopback_origins if is_loopback_origin(origin)
+        )
         self._inner = inner or httpx.AsyncHTTPTransport()
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         url = str(request.url)
-        ok, error, resolved_ips = resolve_url_target(url, allow_loopback=self._allow_loopback)
+        allow_loopback = self._allow_loopback or (
+            bool(self._loopback_origins) and url_origin(url) in self._loopback_origins
+        )
+        ok, error, resolved_ips = resolve_url_target(url, allow_loopback=allow_loopback)
         if not ok:
             raise UnsafeURLRequestError(error, request=request)
         async with self._resolver_lock:
