@@ -142,6 +142,23 @@ def test_stale_metadata_layout_imports_cleanly_under_w_error(tmp_path) -> None:
     assert f"reports {_STALE_DIST_VERSION}" in proc.stderr
 
 
+def test_decoy_pyproject_in_snapshot_layout_falls_back_to_metadata(tmp_path) -> None:
+    # End-to-end form of the round-2 repro: nanobot/ copied next to another
+    # project's pyproject.toml (name=other-app, version=9.9.9 there) must
+    # report the dist metadata, never the decoy's version.
+    root = _build_snapshot_tree(
+        tmp_path / "decoy", project_name="other-app", tree_version="4.4.4"
+    )
+
+    proc = _import_report(root, "-W", "error")
+
+    assert proc.returncode == 0, proc.stderr
+    reported = json.loads(proc.stdout)
+    assert reported["dist"] == _STALE_DIST_VERSION
+    assert reported["version"] == _STALE_DIST_VERSION
+    assert "4.4.4" not in proc.stderr
+
+
 def test_executing_tree_wins_over_stale_dist_metadata(monkeypatch) -> None:
     # The deployed-runtime bug (MIT-1032/MIT-1011): dist metadata in the venv
     # described a different build than the package actually being imported.
