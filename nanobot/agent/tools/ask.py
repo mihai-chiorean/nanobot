@@ -133,7 +133,10 @@ def _parse_timestamp(value: Any) -> datetime | None:
         parsed = datetime.fromisoformat(value)
     except ValueError:
         return None
-    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+    # Session rows are written with naive local time (datetime.now().isoformat()),
+    # so a naive value is local time, not UTC. Reading it as UTC shrinks or grows
+    # the answer window by the host's UTC offset (about 7h on the PDT Spark).
+    return parsed if parsed.tzinfo is not None else parsed.astimezone()
 
 
 def ask_user_call_is_expired(

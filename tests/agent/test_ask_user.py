@@ -632,3 +632,16 @@ async def test_fresh_parked_ask_is_still_answered_after_aging_a_distractor(tmp_p
         and message.get("content") == "Skip"
         for message in seen_messages[-1]
     )
+
+
+def test_ask_user_expiry_reads_naive_timestamps_as_local_time():
+    """The session writer stores naive local timestamps; the age bound must not
+    reinterpret them as UTC (MIT-1029 review: 18h/23h-old questions expired on a
+    UTC-7 host)."""
+    from datetime import datetime, timedelta
+
+    now = datetime.now().astimezone()
+    parked_23h = (datetime.now() - timedelta(hours=23)).isoformat()  # naive, local, like the writer
+    parked_25h = (datetime.now() - timedelta(hours=25)).isoformat()
+    assert ask_user_call_is_expired(_parked_ask_history(timestamp=parked_23h), "call_1", now=now) is False
+    assert ask_user_call_is_expired(_parked_ask_history(timestamp=parked_25h), "call_1", now=now) is True
