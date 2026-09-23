@@ -682,9 +682,11 @@ class AgentLoop:
         # sweep would mark that live task interrupted. Startup calls
         # ``reconcile_work_store`` explicitly, before any channel accepts input.
         self.work_store = WorkStore(workspace, reconcile_on_open=False)
-        self.tools = ToolRegistry()
-        self._audit_logger = AuditLogger()
-        self.tools.set_audit_logger(self._audit_logger)
+        # MIT-1401: one audit log per workspace. The default (~/.nanobot/
+        # workspace/audit.jsonl) is the owner's workspace whenever tenants share
+        # a HOME, which put every tenant's audit rows in front of the owner.
+        # Attached to the effective registry below, after it is chosen.
+        self._audit_logger = AuditLogger(self.workspace / "audit.jsonl")
         # One file-read/write tracker per logical session. The tool registry is
         # shared by this loop, so tools resolve the active state via contextvars.
         self._file_state_store = FileStateStore(max_sessions=SESSION_CACHE_MAX_SIZE)
@@ -709,6 +711,9 @@ class AgentLoop:
                 self.memory_index = None
                 self._recall_indexer = None
         self.tools = tool_registry if tool_registry is not None else ToolRegistry()
+        # MIT-1401: attach here, not before the registry is chosen. Attaching to
+        # a throwaway registry left tool calls unaudited on 0.3.0.
+        self.tools.set_audit_logger(self._audit_logger)
         self._exec_session_manager = ExecSessionManager()
         self.runner = AgentRunner()
         self.subagents = SubagentManager(
