@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from contextvars import ContextVar, Token
-from typing import Literal
+from typing import Any, Literal
 
 SchedulingClass = Literal["foreground", "background"]
 
@@ -11,6 +12,21 @@ _current_scheduling_class: ContextVar[SchedulingClass] = ContextVar(
     "model_scheduling_class",
     default="foreground",
 )
+
+
+#: Work modes whose model calls are background load for the admission gateway.
+BACKGROUND_WORK_MODES = frozenset({"background", "scheduled"})
+
+
+def scheduling_class_for_turn(metadata: Mapping[str, Any] | None) -> SchedulingClass:
+    """Classify a turn from its inbound metadata.
+
+    A background or scheduled Work run is ``background``; everything else --
+    including a turn with no metadata -- is interactive ``foreground``.
+    """
+    if isinstance(metadata, Mapping) and metadata.get("work_mode") in BACKGROUND_WORK_MODES:
+        return "background"
+    return "foreground"
 
 
 def current_scheduling_class() -> SchedulingClass:

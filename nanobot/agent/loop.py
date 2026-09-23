@@ -89,6 +89,11 @@ from nanobot.llm_usage.context import source_from_request
 from nanobot.observability import observe_turn
 from nanobot.providers.base import LLMProvider, LLMUsage, ProviderConversationState
 from nanobot.providers.factory import ProviderSnapshot
+from nanobot.providers.request_context import (
+    reset_scheduling_class,
+    scheduling_class_for_turn,
+    set_scheduling_class,
+)
 from nanobot.runtime_context import (
     RUNTIME_CONTEXT_HISTORY_META,
     RUNTIME_CONTEXT_MESSAGE_META,
@@ -1467,6 +1472,12 @@ class AgentLoop:
             if publish_file_turn is not None
             else None
         )
+        # The admission gateway caps background concurrency by the
+        # ``X-Ziggy-Scheduling-Class`` header, which the provider reads from
+        # this contextvar. Bound per turn inside the turn's own task (so a
+        # concurrent interactive turn never sees it) and reset in ``finally``
+        # so a finished Work run cannot leave later turns marked background.
+        scheduling_token = set_scheduling_class(scheduling_class_for_turn(request_metadata))
         turn_scope_stack = ExitStack()
         # Compute lazily because create_goal may create goal metadata during this run.
         def _goal_continue() -> str | None:
@@ -1566,6 +1577,7 @@ class AgentLoop:
             reset_workspace_scope(workspace_token)
             reset_request_context(request_token)
             reset_file_states(file_state_token)
+            reset_scheduling_class(scheduling_token)
         if session is not None and not ephemeral:
             session.provider_state = result.provider_state
         if result.stop_reason == "max_iterations":

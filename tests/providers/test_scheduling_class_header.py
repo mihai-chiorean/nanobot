@@ -17,6 +17,7 @@ from nanobot.providers.openai_compat_provider import OpenAICompatProvider
 from nanobot.providers.registry import find_by_name
 from nanobot.providers.request_context import (
     reset_scheduling_class,
+    scheduling_class_for_turn,
     set_scheduling_class,
 )
 
@@ -111,3 +112,12 @@ def test_a_remote_qwen_endpoint_does_not_get_the_header() -> None:
         tool_choice=None,
     )
     assert HEADER not in kwargs.get("extra_headers", {})
+
+
+def test_turn_metadata_selects_the_class() -> None:
+    """The loop binds this per turn; Work runs are background, chat is not."""
+    assert scheduling_class_for_turn({"work_mode": "scheduled"}) == "background"
+    assert scheduling_class_for_turn({"work_mode": "background"}) == "background"
+    assert scheduling_class_for_turn({"work_mode": "interactive"}) == "foreground"
+    assert scheduling_class_for_turn({}) == "foreground"
+    assert scheduling_class_for_turn(None) == "foreground"
