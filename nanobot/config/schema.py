@@ -361,6 +361,22 @@ class GatewayConfig(Base):
     heartbeat: HeartbeatConfig = Field(default_factory=HeartbeatConfig)
 
 
+class OAuthClientCredentialsConfig(Base):
+    """Ziggy-local (MIT-1405): OAuth 2.0 client-credentials grant for an HTTP MCP server.
+
+    The secret is never stored in config: ``client_secret_file`` names a file
+    (typically a systemd ``LoadCredential`` path, often written as
+    ``${ZIGGY_MCP_CLIENT_SECRET_FILE}``) that is read at token-fetch time.
+    ``resource`` defaults to the server URL (RFC 8707).
+    """
+
+    token_url: str
+    client_id: str
+    client_secret_file: str
+    scopes: list[str] = Field(default_factory=list)
+    resource: str | None = None
+
+
 class MCPServerConfig(Base):
     """MCP server connection configuration (stdio or HTTP)."""
 
@@ -374,6 +390,26 @@ class MCPServerConfig(Base):
     headers: dict[str, str] = Field(default_factory=dict)  # HTTP/SSE: custom headers
     tool_timeout: int = 30  # seconds before a tool call is cancelled
     enabled_tools: list[str] = Field(default_factory=lambda: ["*"])  # Only register these tools; accepts raw MCP names or wrapped mcp_<server>_<tool> names; ["*"] = all capabilities (tools, resources, prompts); any restriction = only listed tools, no resources/prompts
+    # Ziggy-local (MIT-1405): non-interactive auth for tenant connectors.
+    oauth_client_credentials: OAuthClientCredentialsConfig | None = None
+    # Ziggy-local (MIT-1405): set only by the MCP provider for entries that
+    # came from ``tools.mcpServers`` in the operator's config file (never for
+    # workspace-plugin servers). A private attribute, so no config file, plugin
+    # manifest or model output can set it.
+    _operator_configured: bool = PrivateAttr(default=False)
+
+    @model_validator(mode="after")
+    def _reject_conflicting_mcp_auth(self) -> MCPServerConfig:
+        """Keep one source of truth for the Authorization header."""
+        if self.oauth_client_credentials is None:
+            return self
+        if any(name.lower() == "authorization" for name in self.headers):
+            raise ValueError(
+                "headers.Authorization cannot be configured with oauthClientCredentials"
+            )
+        if self.auth == "oauth":
+            raise ValueError("auth: oauth cannot be configured with oauthClientCredentials")
+        return self
 
 
 def _lazy_default(module_path: str, class_name: str) -> Any:

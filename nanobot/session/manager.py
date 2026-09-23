@@ -22,7 +22,11 @@ from weakref import WeakValueDictionary
 from filelock import FileLock
 from loguru import logger
 
-from nanobot.config.paths import get_legacy_sessions_dir, get_runtime_subdir
+from nanobot.config.paths import (
+    get_legacy_sessions_dir,
+    get_runtime_subdir,
+    is_default_workspace,
+)
 from nanobot.providers.base import ProviderConversationState
 from nanobot.runtime_context import (
     RUNTIME_CONTEXT_HISTORY_META,
@@ -1438,8 +1442,12 @@ class JsonlSessionStore:
             self.get_session_path(key),
             self.get_runtime_checkpoint_path(key),
             self.get_legacy_lossy_path(key),
-            self.get_legacy_session_path(key),
         ]
+        # MIT-1401: the legacy global dir (~/.nanobot/sessions) belongs to the
+        # default workspace. A tenant on its own workspace sharing that HOME
+        # must never unlink files there when it deletes one of its sessions.
+        if is_default_workspace(self.workspace):
+            paths.append(self.get_legacy_session_path(key))
         deleted = False
         for path in paths:
             if not path.exists():

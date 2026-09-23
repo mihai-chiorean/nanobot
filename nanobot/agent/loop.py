@@ -682,9 +682,11 @@ class AgentLoop:
         # sweep would mark that live task interrupted. Startup calls
         # ``reconcile_work_store`` explicitly, before any channel accepts input.
         self.work_store = WorkStore(workspace, reconcile_on_open=False)
-        self.tools = ToolRegistry()
-        self._audit_logger = AuditLogger()
-        self.tools.set_audit_logger(self._audit_logger)
+        # MIT-1401: one audit log per workspace. The default (~/.nanobot/
+        # workspace/audit.jsonl) is the owner's workspace whenever tenants share
+        # a HOME, which put every tenant's audit rows in front of the owner.
+        # Attached to the effective registry below, after it is chosen.
+        self._audit_logger = AuditLogger(self.workspace / "audit.jsonl")
         # One file-read/write tracker per logical session. The tool registry is
         # shared by this loop, so tools resolve the active state via contextvars.
         self._file_state_store = FileStateStore(max_sessions=SESSION_CACHE_MAX_SIZE)
@@ -709,6 +711,9 @@ class AgentLoop:
                 self.memory_index = None
                 self._recall_indexer = None
         self.tools = tool_registry if tool_registry is not None else ToolRegistry()
+        # MIT-1401: attach here, not before the registry is chosen. Attaching to
+        # a throwaway registry left tool calls unaudited on 0.3.0.
+        self.tools.set_audit_logger(self._audit_logger)
         self._exec_session_manager = ExecSessionManager()
         self.runner = AgentRunner()
         self.subagents = SubagentManager(
@@ -1690,6 +1695,13 @@ class AgentLoop:
         )
         active_session_key = session.key if session else request_ctx.session_key
         request_metadata = request_ctx.metadata
+        # MIT-1400: a shared-room session is never consolidated into the
+        # owner's memory (production feat/shared-rooms skips consolidation and
+        # raw-archiving for room turns). Either signal marks the turn a room.
+        shared_room_turn = transcript_input.shared_room or (
+            isinstance(request_metadata, dict)
+            and request_metadata.get("shared_room") is True
+        )
         effective_scope = self.workspace_scopes.for_turn(
             channel=request_ctx.channel,
             message_metadata=request_metadata,
@@ -1792,6 +1804,7 @@ class AgentLoop:
                     if initial_messages is not None
                     or session is None
                     or ephemeral
+                    or shared_room_turn
                     else partial(
                         self.consolidator.summarize_transcript,
                         runtime=runtime,
@@ -1804,6 +1817,7 @@ class AgentLoop:
                     if initial_messages is not None
                     or session is None
                     or ephemeral
+                    or shared_room_turn
                     else partial(
                         self.consolidator.summarize_provider_compaction,
                         runtime=runtime,
@@ -2556,6 +2570,11 @@ class AgentLoop:
 
     async def _dispatch_command(self, ctx: TurnContext) -> bool:
         if ctx.kind is TurnKind.SYSTEM or ctx.msg.channel == "system":
+            return False
+        # Slash commands are owner capabilities (MIT-1398). A shared-room turn
+        # is an ordinary room message even when it starts with "/", matching
+        # the priority and mid-turn injection guards in ``_run``.
+        if self._shared_room_turn(ctx.msg):
             return False
         session = ctx.require_session()
         raw = ctx.msg.content.strip()

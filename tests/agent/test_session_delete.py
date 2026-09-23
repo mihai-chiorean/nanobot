@@ -100,6 +100,8 @@ def test_delete_session_cleans_legacy_file(tmp_path: Path, monkeypatch) -> None:
         "nanobot.session.manager.get_legacy_sessions_dir",
         lambda: legacy,
     )
+    # The legacy global dir belongs to the default workspace (MIT-1401).
+    monkeypatch.setattr("nanobot.session.manager.is_default_workspace", lambda _: True)
     key = "telegram:only-legacy"
     legacy_path = _write_legacy_session(legacy, key, ["user", "assistant"])
     assert legacy_path.exists()
@@ -119,6 +121,8 @@ def test_delete_session_cleans_both_locations(tmp_path: Path, monkeypatch) -> No
         "nanobot.session.manager.get_legacy_sessions_dir",
         lambda: legacy,
     )
+    # The legacy global dir belongs to the default workspace (MIT-1401).
+    monkeypatch.setattr("nanobot.session.manager.is_default_workspace", lambda _: True)
     workspace = tmp_path / "workspace"
     key = "telegram:both-paths"
     _write_legacy_session(legacy, key, ["user", "assistant"])
@@ -144,6 +148,8 @@ def test_delete_session_prevents_legacy_revival(tmp_path: Path, monkeypatch) -> 
         "nanobot.session.manager.get_legacy_sessions_dir",
         lambda: legacy,
     )
+    # The legacy global dir belongs to the default workspace (MIT-1401).
+    monkeypatch.setattr("nanobot.session.manager.is_default_workspace", lambda _: True)
     workspace = tmp_path / "workspace"
     key = "telegram:no-revival"
     _write_legacy_session(legacy, key, ["user", "assistant"])

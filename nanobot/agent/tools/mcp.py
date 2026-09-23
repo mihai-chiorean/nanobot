@@ -22,6 +22,9 @@ from nanobot.agent.tools.base import Tool, ToolResult
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.security.network import (
     PinnedDNSAsyncTransport,
+    URLOrigin,
+    is_loopback_origin,
+    url_origin,
     env_proxy_applies_to_url,
     httpx_env_proxy_mounts,
     resolve_url_target,
@@ -238,7 +241,9 @@ def _is_session_terminated(exc: BaseException) -> bool:
     )
 
 
-async def _probe_http_url(url: str, timeout: float = 3.0) -> bool:
+async def _probe_http_url(
+    url: str, timeout: float = 3.0, *, allow_loopback: bool = False
+) -> bool:
     """Quick TCP probe to check if an HTTP MCP server is reachable.
 
     Avoids entering ``streamable_http_client`` / ``sse_client`` when the port is
@@ -251,7 +256,9 @@ async def _probe_http_url(url: str, timeout: float = 3.0) -> bool:
     port = parsed.port
     if not port:
         port = 443 if parsed.scheme == "https" else 80
-    ok, _, resolved_ips = resolve_url_target(url)
+    ok, _, resolved_ips = (
+        resolve_url_target(url, allow_loopback=True) if allow_loopback else resolve_url_target(url)
+    )
     if not ok:
         return False
     if env_proxy_applies_to_url(url):
@@ -290,22 +297,101 @@ def _redact_url(url: str) -> str:
         return "<redacted-url>"
 
 
-def _pinned_transport_kwargs() -> dict[str, Any]:
-    kwargs: dict[str, Any] = {"transport": PinnedDNSAsyncTransport()}
+def _operator_loopback_origins(cfg: MCPServerConfig) -> frozenset[URLOrigin]:
+    """Ziggy-local (MIT-1405): loopback endpoints named in operator config.
+
+    ``tools.mcpServers.<name>.url`` and its ``oauthClientCredentials.tokenUrl``
+    come from the operator's config file, never from the model; servers
+    contributed by workspace plugins are not trusted. When either is
+    on a literal loopback host (the tenant connector at
+    ``https://127.0.0.1:8790``), that exact scheme/host/port is reachable for
+    this server's MCP and token traffic only. Other tools, other ports and
+    redirects keep the full SSRF guard. Production (feat/shared-rooms) skipped
+    the guard for MCP entirely; this is deliberately narrower.
+    """
+    if not getattr(cfg, "_operator_configured", False):
+        return frozenset()
+    urls = [cfg.url]
+    if cfg.oauth_client_credentials is not None:
+        urls.append(cfg.oauth_client_credentials.token_url)
+    origins = (url_origin(url) for url in urls)
+    return frozenset(origin for origin in origins if origin and is_loopback_origin(origin))
+
+
+def _pinned_transport_kwargs(
+    loopback_origins: frozenset[URLOrigin] = frozenset(),
+) -> dict[str, Any]:
+    transport = (
+        PinnedDNSAsyncTransport(loopback_origins=loopback_origins)
+        if loopback_origins
+        else PinnedDNSAsyncTransport()
+    )
+    kwargs: dict[str, Any] = {"transport": transport}
     mounts = httpx_env_proxy_mounts()
     if mounts:
         kwargs["mounts"] = mounts
     return kwargs
 
 
+def _validate_operator_url(url: str, loopback_origins: frozenset[URLOrigin]) -> tuple[bool, str]:
+    if loopback_origins and url_origin(url) in loopback_origins:
+        return validate_url_target(url, allow_loopback=True)
+    return validate_url_target(url)
+
+
 async def _validate_mcp_request_url(request: httpx.Request) -> None:
     """Validate each outgoing MCP HTTP request, including redirect targets."""
-    ok, error = validate_url_target(str(request.url))
+    await _check_mcp_request_url(request, frozenset())
+
+
+async def _check_mcp_request_url(
+    request: httpx.Request, loopback_origins: frozenset[URLOrigin]
+) -> None:
+    ok, error = _validate_operator_url(str(request.url), loopback_origins)
     if not ok:
         raise httpx.RequestError(
             f"Blocked unsafe MCP URL {_redact_url(str(request.url))} ({error})",
             request=request,
         )
+
+
+def _mcp_request_validator(
+    loopback_origins: frozenset[URLOrigin] = frozenset(),
+) -> Callable[[httpx.Request], Awaitable[None]]:
+    """Request hook for one server; trusts only its operator loopback origins."""
+    if not loopback_origins:
+        return _validate_mcp_request_url
+
+    async def validate(request: httpx.Request) -> None:
+        await _check_mcp_request_url(request, loopback_origins)
+
+    return validate
+
+
+def _client_credentials_auth(cfg: MCPServerConfig) -> httpx.Auth:
+    """Ziggy-local (MIT-1405): build the client-credentials auth for one server.
+
+    The token request goes through the same pinned-DNS transport and SSRF
+    guard as the MCP traffic itself, and does not follow redirects.
+    """
+    from nanobot.agent.tools.mcp_client_credentials import OAuthClientCredentialsAuth
+
+    assert cfg.oauth_client_credentials is not None
+    loopback_origins = _operator_loopback_origins(cfg)
+
+    def token_client() -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            event_hooks={"request": [_mcp_request_validator(loopback_origins)]},
+            follow_redirects=False,
+            timeout=httpx.Timeout(10.0, connect=5.0),
+            **_pinned_transport_kwargs(loopback_origins),
+        )
+
+    return OAuthClientCredentialsAuth(
+        cfg.oauth_client_credentials,
+        cfg.url,
+        token_client_factory=token_client,
+    )
 
 
 def _windows_command_basename(command: str) -> str:
@@ -1032,8 +1118,14 @@ async def connect_mcp_servers(
                     logger.warning("MCP server '{}': no command or url configured, skipping", name)
                     return False
 
+            loopback_origins = _operator_loopback_origins(cfg)
+            probe_kwargs: dict[str, Any] = (
+                {"allow_loopback": True}
+                if url_origin(cfg.url) in loopback_origins
+                else {}
+            )
             if transport_type in {"sse", "streamableHttp"}:
-                ok, error = validate_url_target(cfg.url)
+                ok, error = _validate_operator_url(cfg.url, loopback_origins)
                 if not ok:
                     logger.warning(
                         "MCP server '{}': blocked unsafe URL {} ({})",
@@ -1065,6 +1157,15 @@ async def connect_mcp_servers(
                 except MCPAuthorizationRequiredError:
                     logger.info("MCP server '{}': waiting for browser authorization", name)
                     return False
+            elif cfg.oauth_client_credentials is not None:
+                if transport_type not in {"sse", "streamableHttp"}:
+                    logger.warning(
+                        "MCP server '{}': oauthClientCredentials requires an SSE or "
+                        "Streamable HTTP transport",
+                        name,
+                    )
+                    return False
+                oauth_auth = _client_credentials_auth(cfg)
 
             if transport_type == "stdio":
                 command, args, env = _normalize_windows_stdio_command(
@@ -1080,7 +1181,7 @@ async def connect_mcp_servers(
                 )
                 read, write = await server_stack.enter_async_context(stdio_client(params))
             elif transport_type == "sse":
-                if not await _probe_http_url(cfg.url):
+                if not await _probe_http_url(cfg.url, **probe_kwargs):
                     logger.warning("MCP server '{}': {} unreachable, skipping", name, _redact_url(cfg.url))
                     return False
 
@@ -1096,11 +1197,11 @@ async def connect_mcp_servers(
                     }
                     return httpx.AsyncClient(
                         headers=merged_headers or None,
-                        event_hooks={"request": [_validate_mcp_request_url]},
+                        event_hooks={"request": [_mcp_request_validator(loopback_origins)]},
                         follow_redirects=True,
                         timeout=timeout,
                         auth=auth,
-                        **_pinned_transport_kwargs(),
+                        **_pinned_transport_kwargs(loopback_origins),
                     )
 
                 sse_kwargs: dict[str, Any] = {
@@ -1112,16 +1213,16 @@ async def connect_mcp_servers(
                     sse_client(cfg.url, **sse_kwargs)
                 )
             elif transport_type == "streamableHttp":
-                if not await _probe_http_url(cfg.url):
+                if not await _probe_http_url(cfg.url, **probe_kwargs):
                     logger.warning("MCP server '{}': {} unreachable, skipping", name, _redact_url(cfg.url))
                     return False
 
                 http_client_kwargs: dict[str, Any] = {
                     "headers": cfg.headers or None,
-                    "event_hooks": {"request": [_validate_mcp_request_url]},
+                    "event_hooks": {"request": [_mcp_request_validator(loopback_origins)]},
                     "follow_redirects": True,
                     "timeout": httpx.Timeout(30.0, connect=10.0),
-                    **_pinned_transport_kwargs(),
+                    **_pinned_transport_kwargs(loopback_origins),
                 }
                 if oauth_auth is not None:
                     http_client_kwargs["auth"] = oauth_auth
@@ -1330,12 +1431,24 @@ def session_extra(metadata: Mapping[str, Any] | None) -> dict[str, Any]:
     return {"mcp_presets": mcp_presets} if isinstance(mcp_presets, list) and mcp_presets else {}
 
 
+def _mark_operator_configured(
+    servers: Mapping[str, MCPServerConfig],
+) -> dict[str, MCPServerConfig]:
+    """Ziggy-local (MIT-1405): copies of operator-config servers, marked as such."""
+    marked: dict[str, MCPServerConfig] = {}
+    for name, cfg in servers.items():
+        copy = cfg.model_copy()
+        copy._operator_configured = True
+        marked[name] = copy
+    return marked
+
+
 def _configured_servers(config: Config) -> dict[str, MCPServerConfig]:
     from nanobot.agent.plugins import agent_plugin_mcp_servers
 
     return agent_plugin_mcp_servers(
         config.workspace_path,
-        config.tools.mcp_servers,
+        _mark_operator_configured(config.tools.mcp_servers),
     )
 
 
@@ -1351,7 +1464,7 @@ def _load_current_servers(workspace: Path | None = None) -> dict[str, MCPServerC
     config = resolve_config_env_vars(load_config())
     return agent_plugin_mcp_servers(
         workspace if workspace is not None else config.workspace_path,
-        config.tools.mcp_servers,
+        _mark_operator_configured(config.tools.mcp_servers),
     )
 
 
