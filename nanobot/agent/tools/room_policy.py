@@ -54,14 +54,40 @@ class RoomPolicy(str, Enum):
 #     list_dir, write_file,          config and credentials; filesystem.py:130
 #     edit_file, apply_patch         allowlists memory/history.jsonl even under
 #                                    restrictToWorkspace
+#   notebook_edit                    ported MIT-1031.  A cell-level .ipynb editor
+#                                    (already denied by the allow-list default;
+#                                    listed so the decision is recorded); it rewrites the
+#                                    whole notebook JSON through ``_resolve_write``
+#                                    exactly like write_file, so it has the same
+#                                    arbitrary-file blast radius inside the
+#                                    workspace and inherits the read_file/
+#                                    edit_file denial above — being "a notebook
+#                                    tool" is not a safety property.  The
+#                                    0.2.x .ipynb refusal in EditFileTool was
+#                                    dropped on this branch (0.3.0 edits .ipynb
+#                                    as JSON), so notebook_edit must earn its
+#                                    own place here rather than ride an old
+#                                    tool's decision.
 #   message                          can address another channel/chat and attach
 #                                    arbitrary local files as media
 #   my, cron, schedule_work          mutate tenant runtime state
+#   briefing                         mutates owner briefing workflows through
+#                                    the control plane (its private-turn gate
+#                                    is defense in depth, not the boundary)
 #   create_goal, update_goal         durable sustained-goal state (the real
 #                                    tools; "long_task" was never a tool name)
 #   spawn                            a fresh turn one level down
 #   exec, exec_session, run_cli_app  arbitrary code execution
 #   generate_image                   spends the owner's provider quota
+#   ask_user                         pauses the turn for a reply. The resume gate
+#                                    (``AgentLoop._detect_ask_user_resume``) never
+#                                    lets a shared-room message answer it, so a
+#                                    question parked in a room could only ever be
+#                                    resolved by a *private* message on the same
+#                                    session -- reflecting a private reply back
+#                                    into the room and crossing the boundary the
+#                                    room model exists to hold. Denied outright;
+#                                    the owner keeps it on their own turns.
 #   every MCP tool                   a connector speaks for the owner's
 #                                    identity: gmail, linkedin, calendar
 ROOM_ALLOWED_TOOLS: dict[str, str] = {

@@ -74,6 +74,16 @@ from nanobot.webui.websocket_logging import websockets_server_logger
 if TYPE_CHECKING:
     from nanobot.bus.outbound_events import ProgressEvent
 
+
+def _append_buttons_as_text(text: str, buttons: list[list[str]]) -> str:
+    """Numbered fallback rendering so button rows stay readable in plain text."""
+    labels = [label for row in buttons for label in row if label]
+    if not labels:
+        return text
+    fallback = "\n".join(f"{index}. {label}" for index, label in enumerate(labels, 1))
+    return f"{text}\n\n{fallback}" if text else fallback
+
+
 # Plain HTTP WebUI routes also run through websockets.process_request.
 _WEBUI_HTTP_OPEN_TIMEOUT_S = 360.0
 _LISTENER_CHECK_INTERVAL_S = 0.5
@@ -1498,12 +1508,17 @@ class WebSocketChannel(BaseChannel):
         """Serialize one ordinary outbound message selected by the projector."""
         conns = list(self._subs.get(msg.chat_id, ()))
         text = msg.content
+        if msg.buttons:
+            text = _append_buttons_as_text(text, msg.buttons)
         wire_text = self._media.rewrite_local_markdown_images(text)
         payload: dict[str, Any] = {
             "event": "message",
             "chat_id": msg.chat_id,
             "text": wire_text,
         }
+        if msg.buttons:
+            payload["buttons"] = [list(row) for row in msg.buttons if row]
+            payload["button_prompt"] = msg.content
         turn_id = msg.metadata.get(WEBUI_TURN_METADATA_KEY)
         if isinstance(turn_id, str) and turn_id:
             payload["turn_id"] = turn_id

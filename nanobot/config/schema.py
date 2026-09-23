@@ -12,6 +12,7 @@ from nanobot.config_base import Base
 from nanobot.cron.types import CronSchedule
 
 if TYPE_CHECKING:
+    from nanobot.agent.tools.briefing import BriefingToolsConfig
     from nanobot.agent.tools.cli_apps import CliAppsToolConfig
     from nanobot.agent.tools.filesystem import FileToolsConfig
     from nanobot.agent.tools.image_generation import ImageGenerationToolConfig
@@ -405,6 +406,12 @@ class ToolsConfig(Base):
     image_generation: ImageGenerationToolConfig = Field(
         default_factory=lambda: _lazy_default("nanobot.agent.tools.image_generation", "ImageGenerationToolConfig"),
     )
+    # Ziggy-local (fork, MIT-1028): live in production. Every tenant config
+    # sets tools.briefing; the key must be modelled here, otherwise pydantic
+    # silently ignores it and the briefing tool never registers for anyone.
+    briefing: BriefingToolsConfig = Field(
+        default_factory=lambda: _lazy_default("nanobot.agent.tools.briefing", "BriefingToolsConfig"),
+    )
     max_session_messages_per_minute: int = Field(default=6, ge=1)
     restrict_to_workspace: bool = False  # policy intent: keep tool access inside workspace when possible
     webui_allow_local_service_access: bool = Field(
@@ -684,6 +691,7 @@ def _resolve_tool_config_refs() -> None:
     """
     import sys
 
+    from nanobot.agent.tools.briefing import BriefingToolsConfig
     from nanobot.agent.tools.cli_apps import CliAppsToolConfig
     from nanobot.agent.tools.filesystem import FileToolsConfig
     from nanobot.agent.tools.image_generation import ImageGenerationToolConfig
@@ -703,6 +711,7 @@ def _resolve_tool_config_refs() -> None:
     mod.MyToolConfig = MyToolConfig  # type: ignore[attr-defined]
     mod.ImageGenerationToolConfig = ImageGenerationToolConfig  # type: ignore[attr-defined]
     mod.MemoryToolConfig = MemoryToolConfig  # type: ignore[attr-defined]
+    mod.BriefingToolsConfig = BriefingToolsConfig  # type: ignore[attr-defined]
 
     ToolsConfig.model_rebuild()
     Config.model_rebuild()

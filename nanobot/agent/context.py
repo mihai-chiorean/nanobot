@@ -98,9 +98,25 @@ class ContextBuilder:
     BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md"]
     _SKIPPABLE_DEFAULTS = {"AGENTS.md", "USER.md"}
 
-    def __init__(self, workspace: Path, timezone: str | None = None, disabled_skills: list[str] | None = None):
+    def __init__(
+        self,
+        workspace: Path,
+        timezone: str | None = None,
+        disabled_skills: list[str] | None = None,
+        workflow_scheduling: bool = False,
+        cron_scheduling: bool = False,
+    ):
         self.workspace = workspace
         self.timezone = timezone
+        # Ziggy-local (fork, MIT-1028): the workflow-intake policy is only
+        # injected when this agent can actually schedule work (cron service or
+        # the enabled briefing tool).
+        self.workflow_scheduling = workflow_scheduling
+        # The intake policy's closing paragraph routes work to ``cron`` and
+        # ``schedule_work``; it may only appear when those tools registered,
+        # which (unlike briefing) requires a cron service. Derived separately so
+        # a briefing-only turn is not told to call tools it does not have.
+        self.cron_scheduling = cron_scheduling
         self.memory = MemoryStore(workspace)
         self.skills = SkillsLoader(workspace, disabled_skills=set(disabled_skills) if disabled_skills else None)
 
@@ -145,6 +161,9 @@ class ContextBuilder:
         bootstrap = self._load_bootstrap_files(root)
         if bootstrap:
             parts.append(bootstrap)
+
+        if self.workflow_scheduling:
+            parts.append(render_template("agent/workflow_intake.md", cron_scheduling=self.cron_scheduling))
 
         parts.append(render_template("agent/tool_contract.md"))
 
