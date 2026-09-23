@@ -308,6 +308,31 @@ async def _validate_mcp_request_url(request: httpx.Request) -> None:
         )
 
 
+def _client_credentials_auth(cfg: MCPServerConfig) -> httpx.Auth:
+    """Ziggy-local (MIT-1405): build the client-credentials auth for one server.
+
+    The token request goes through the same pinned-DNS transport and SSRF
+    guard as the MCP traffic itself, and does not follow redirects.
+    """
+    from nanobot.agent.tools.mcp_client_credentials import OAuthClientCredentialsAuth
+
+    assert cfg.oauth_client_credentials is not None
+
+    def token_client() -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            event_hooks={"request": [_validate_mcp_request_url]},
+            follow_redirects=False,
+            timeout=httpx.Timeout(10.0, connect=5.0),
+            **_pinned_transport_kwargs(),
+        )
+
+    return OAuthClientCredentialsAuth(
+        cfg.oauth_client_credentials,
+        cfg.url,
+        token_client_factory=token_client,
+    )
+
+
 def _windows_command_basename(command: str) -> str:
     """Return the lowercase basename for a Windows command or path."""
     return command.replace("\\", "/").rsplit("/", maxsplit=1)[-1].lower()
@@ -1065,6 +1090,15 @@ async def connect_mcp_servers(
                 except MCPAuthorizationRequiredError:
                     logger.info("MCP server '{}': waiting for browser authorization", name)
                     return False
+            elif cfg.oauth_client_credentials is not None:
+                if transport_type not in {"sse", "streamableHttp"}:
+                    logger.warning(
+                        "MCP server '{}': oauthClientCredentials requires an SSE or "
+                        "Streamable HTTP transport",
+                        name,
+                    )
+                    return False
+                oauth_auth = _client_credentials_auth(cfg)
 
             if transport_type == "stdio":
                 command, args, env = _normalize_windows_stdio_command(
