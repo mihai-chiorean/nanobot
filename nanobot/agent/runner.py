@@ -574,6 +574,12 @@ class AgentRunner:
                         context.final_content = final_content
                         context.stop_reason = stop_reason
                         if hook.wants_streaming():
+                            # ``on_stream_end(resuming=True)`` already closed the
+                            # tool-requesting stream at line 508; this second close
+                            # ends the *answer* stream that carried the question text.
+                            # Mirrors the reference (tip runner.py 370/437) and the
+                            # hook is idempotent, so a repeated close is a no-op, not
+                            # a dropped-delta bug.
                             await hook.on_stream_end(context, resuming=False)
                         await hook.after_iteration(context)
                         break
