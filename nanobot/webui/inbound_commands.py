@@ -600,6 +600,18 @@ class WebUICommandRouter:
                 **rejection_fields,
             )
             return
+        # A guest may not upload files (MIT-1399): they would land in the
+        # owner's media directory and in front of the owner's agent. Rejected
+        # before anything is decoded or stored, with production's wording.
+        if guest_credential is not None and envelope.get("media"):
+            await self._transport.webui_send_event(
+                connection,
+                "error",
+                detail="attachment_rejected",
+                message="Attachments are not available in shared rooms yet.",
+                **rejection_fields,
+            )
+            return
         # Owners post into their own rooms through the same intent path as
         # guests, so a discussion or proposal frame is recorded and broadcast
         # the same way whoever sent it. ``effective_room_credential`` resolves
