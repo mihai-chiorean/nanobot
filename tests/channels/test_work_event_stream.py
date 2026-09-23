@@ -432,6 +432,39 @@ async def test_a_terminal_task_refuses_messages_and_cancellation(
     assert bus.inbound == []
 
 
+@pytest.mark.asyncio
+async def test_cancel_is_recorded_as_cancelled_even_when_the_loop_wins_the_race(
+    hub: WorkStreamHub,
+    store: WorkStore,
+    bus: _Bus,
+) -> None:
+    """Regression (PR #58 review, P2-2): ``/stop`` closes the task out.
+
+    The loop's command short-circuit writes ``succeeded`` for any command,
+    ``/stop`` included.  If ``cancel_task`` signalled first and the loop got
+    there before the ``cancelled`` write, the terminal guard dropped the cancel
+    and the Work app showed a cancelled task as having succeeded.  The bus here
+    plays the loop and closes the row out the moment ``/stop`` is published.
+    """
+    connection = _Connection()
+    task_id = await _create(hub, connection)
+    bus.inbound.clear()
+
+    async def _loop_closes_out_on_stop(msg: Any) -> None:
+        bus.inbound.append(msg)
+        store.update_status(task_id, "succeeded", result_summary="stopped")
+
+    bus.publish_inbound = _loop_closes_out_on_stop  # type: ignore[method-assign]
+
+    task = store.get_task(task_id)
+    assert task is not None
+    assert await hub.cancel_task(task, sender_id="websocket") is None
+    assert [m.content for m in bus.inbound] == ["/stop"]
+    current = store.get_task(task_id)
+    assert current is not None
+    assert current["status"] == "cancelled"
+
+
 def test_work_event_fields_tolerates_a_plain_dict() -> None:
     """The loop hands the channel an already-projected dict over the bus."""
     projected = work_event_fields(

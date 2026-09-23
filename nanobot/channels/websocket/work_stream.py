@@ -497,11 +497,10 @@ class WorkStreamHub:
         if task.get("status") not in ACTIVE_STATUSES:
             return "terminal"
         task_id = str(task["task_id"])
-        try:
-            await self.publish_work_inbound(task, sender_id=sender_id, content="/stop")
-        except Exception:
-            logger.exception("failed to signal cancellation for Work task {}", task_id)
-            return "publish_failed"
+        # Write the terminal row before signalling the loop. "/stop" is a
+        # command, and the loop's command short-circuit closes the task out as
+        # ``succeeded``; if it got there first, the terminal guard would turn
+        # this ``cancelled`` write into a no-op and the cancel would be lost.
         event = await self._store.run_io(self._store.update_status, task_id, "cancelled")
         if event is None:
             # update_status returns None when the row did not move. Another
@@ -511,6 +510,13 @@ class WorkStreamHub:
                 return None
             return "terminal"
         await self.broadcast_event(event)
+        try:
+            await self.publish_work_inbound(task, sender_id=sender_id, content="/stop")
+        except Exception:
+            # The row already reads cancelled; the running turn will finish
+            # against a terminal row and its outcome write will no-op.
+            logger.exception("failed to signal cancellation for Work task {}", task_id)
+            return "publish_failed"
         return None
 
     def _envelope_media(self, raw_media: Any) -> tuple[list[str], str | None]:
