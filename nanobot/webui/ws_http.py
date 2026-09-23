@@ -1009,9 +1009,12 @@ class GatewayHTTPHandler:
         owner API token only, websocket (WebUI) sessions only, activity
         projected, server-only provenance stripped and raw media paths replaced
         by signed URLs. Room credentials are served by the shared-room router
-        (their own session only) before this route is reached.
+        (their own session only) before this route is reached. The owner API
+        token itself is required: the trusted-proxy shortcut in
+        ``check_api_token`` would also admit a proxied room guest whose room
+        token fell through as revoked or expired (as for ``/api/work``).
         """
-        if not self.check_api_token(request):
+        if not self.tokens.check_api_token(request):
             return _http_error(401, "Unauthorized")
         if self.session_manager is None:
             return _http_error(503, "session manager unavailable")

@@ -283,3 +283,41 @@ async def test_worker_reconcile_reads_owner_session_messages_after_final_stream_
     assert anonymous.status_code == 401
     assert wrong.status_code == 401
     assert other.status_code == 404  # only websocket sessions, as in production
+
+
+def test_session_messages_route_ignores_the_trusted_proxy_shortcut(tmp_path: Path) -> None:
+    """A proxied request is not an owner API token: a room guest whose room
+    token fell through (revoked or expired) must get 401, never the owner's
+    transcript. Mirrors the /api/work regression test."""
+    from nanobot.channels.websocket.tests.test_websocket_http_routes import _ch, _free_port
+    from nanobot.channels.websocket.transport import TransportRequest
+    from nanobot.session.manager import SessionManager
+
+    class _Headers(dict):
+        def get(self, key, default=None):  # case-insensitive like the transport
+            for k, v in self.items():
+                if k.lower() == key.lower():
+                    return v
+            return default
+
+    sessions = SessionManager(tmp_path / "workspace")
+    session = sessions.get_or_create("websocket:owner-chat")
+    session.add_message("assistant", "private owner reply")
+    sessions.save(session)
+    channel = _ch(MagicMock(), session_manager=sessions, port=_free_port())
+    http = channel.gateway.http
+    path = "/api/sessions/websocket:owner-chat/messages"
+
+    proxied = TransportRequest(method="GET", path=path, headers=_Headers(), body=b"", raw_path=path)
+    setattr(proxied, "_nanobot_trusted_proxy_authenticated", True)
+    assert http._handle_session_messages(proxied, "websocket:owner-chat").status_code == 401
+
+    token = channel.gateway.tokens.issue_api_token(60)
+    owner = TransportRequest(
+        method="GET",
+        path=path,
+        headers=_Headers({"Authorization": f"Bearer {token}"}),
+        body=b"",
+        raw_path=path,
+    )
+    assert http._handle_session_messages(owner, "websocket:owner-chat").status_code == 200
