@@ -32,6 +32,7 @@ from nanobot.session.manager import SessionManager
 from nanobot.session.webui_turns import (
     clear_websocket_turn_if_current,
     register_queued_websocket_turn_if_idle,
+    websocket_turn_wall_started_at,
 )
 
 
@@ -129,6 +130,9 @@ async def test_delete_with_active_turn_returns_409_and_keeps_the_session(
         assert response.content == b"conversation is active"
         assert path.is_file(), "the running turn's session must survive"
         assert webui_path.is_file(), "the running turn's transcript rows must survive"
+        assert websocket_turn_wall_started_at(chat_id) is not None, (
+            "the rejected delete must not cancel or drop the in-flight turn"
+        )
     finally:
         await channel.stop()
         await server_task
@@ -235,9 +239,7 @@ async def test_unauthenticated_delete_of_active_session_still_401(
     server_task = asyncio.create_task(channel.start())
     try:
         path = f"/api/sessions/{key}/delete"
-        anonymous = TransportRequest(
-            method="GET", path=path, headers={}, body=b"", raw_path=path
-        )
+        anonymous = TransportRequest(method="GET", path=path, headers={}, body=b"", raw_path=path)
         response = channel.gateway.http._handle_session_delete(anonymous, key)
 
         assert response.status_code == 401, response.body
