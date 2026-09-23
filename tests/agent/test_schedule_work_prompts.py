@@ -16,7 +16,7 @@ from pathlib import Path
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 from nanobot.agent.tools.loader import ToolLoader
-from nanobot.utils.helpers import load_bundled_template
+from nanobot.utils.helpers import load_bundled_template, sync_workspace_templates
 from nanobot.utils.prompt_templates import render_template
 
 # The tools the scheduling prompts are allowed to name (all registered on 0.3.0;
@@ -137,3 +137,96 @@ def test_scheduling_prompts_only_name_registered_tools() -> None:
             assert token in _STEERED_TOOLS, (
                 f"{name} tells the model to call unknown tool {token}()"
             )
+
+
+def _gateway_owner_prompt(tmp_path: Path) -> str:
+    """The owner system prompt exactly as a gateway turn builds it.
+
+    A freshly synced workspace (the bundled bootstrap files), with both
+    scheduling flags on -- ``AgentLoop._register_default_tools`` sets them that
+    way whenever the cron service registered ``cron``/``schedule_work``.
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    sync_workspace_templates(workspace, silent=True)
+    builder = ContextBuilder(workspace, workflow_scheduling=True, cron_scheduling=True)
+    return builder.build_system_prompt(channel="websocket")
+
+
+def _scheduling_sections(prompt: str) -> list[str]:
+    """Every prompt section that gives scheduling guidance.
+
+    Sections are split at markdown headings; a section is scheduling-related if
+    its heading mentions scheduling. The skills-summary line for the cron skill
+    is included too, since its description is what the model sees of the skill.
+    """
+    sections: list[str] = []
+    current: list[str] = []
+    for line in prompt.splitlines():
+        if line.startswith("#") and current:
+            sections.append("\n".join(current))
+            current = []
+        current.append(line)
+    if current:
+        sections.append("\n".join(current))
+    picked = [s for s in sections if "schedul" in s.splitlines()[0].lower()]
+    picked += [line for line in prompt.splitlines() if "**cron**" in line]
+    return picked
+
+
+def _sentences(text: str) -> list[str]:
+    return [s for s in re.split(r"(?<=[.;])\s+|\n\s*[-*]\s+", _normalized_lines(text)) if s]
+
+
+def _normalized_lines(text: str) -> str:
+    # Re-flow wrapped paragraphs but keep bullet boundaries.
+    return re.sub(r"(?<!\n)\n(?!\s*[-*#]|\n)", " ", text)
+
+
+def test_gateway_owner_prompt_steers_scheduling_to_schedule_work(tmp_path: Path) -> None:
+    """The real gateway owner prompt must not contradict the schedule_work steer.
+
+    ``agent/tool_contract.md`` renders on every owner turn; before this fix its
+    scheduling section told the model to use ``cron`` for recurring jobs and to
+    put heartbeat tasks in ``HEARTBEAT.md``, overriding the intake policy.
+    """
+    prompt = _gateway_owner_prompt(tmp_path)
+    sections = _scheduling_sections(prompt)
+    assert any("Workflow Scheduling" in s for s in sections), sections
+    assert any("Scheduling and Background Work" in s for s in sections), sections
+    scheduling_text = "\n".join(sections)
+
+    # (a) schedule_work is named for recurring/background work.
+    sentences = _sentences(scheduling_text)
+    assert any(
+        "`schedule_work`" in s and re.search(r"recurring|background", s) for s in sentences
+    ), sentences
+
+    # (b) nothing routes recurring work to cron or new tasks into HEARTBEAT.md.
+    for sentence in _sentences(prompt):
+        lowered = sentence.lower()
+        if "`cron`" in sentence and re.search(r"recurring|periodic|jobs|tasks", lowered):
+            assert "`schedule_work`" in sentence, f"routes recurring work to cron: {sentence!r}"
+        if "heartbeat.md" in lowered:
+            assert re.search(r"\bdo not\b|\bnever\b", lowered), (
+                f"tells the model to put work in HEARTBEAT.md: {sentence!r}"
+            )
+
+    # (c) every backticked tool identifier in those sections is a real tool.
+    registered = _registered_tool_names()
+    ident_re = re.compile(r"^([a-z][a-z0-9_]*)(\(.*\))?$")
+    for token in re.findall(r"`([^`\n]+)`", scheduling_text):
+        match = ident_re.match(token)
+        if match:
+            assert match.group(1) in registered, f"scheduling prompt names unknown tool `{token}`"
+
+
+def test_tool_contract_scheduling_lines_are_gated(tmp_path: Path) -> None:
+    """Without cron/schedule_work registered, the contract must not name them."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    builder = ContextBuilder(workspace, workflow_scheduling=True, cron_scheduling=False)
+    contract = builder.build_system_prompt().split("## Scheduling and Background Work", 1)[1]
+    contract = contract.split("\n#", 1)[0]
+    assert "`cron`" not in contract
+    assert "`schedule_work`" not in contract

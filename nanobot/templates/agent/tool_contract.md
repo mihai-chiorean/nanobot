@@ -72,6 +72,11 @@
 
 ## Scheduling and Background Work
 
-- Use `cron` for scheduled reminders or recurring jobs; do not run `nanobot cron` through `exec`.
-- For heartbeat tasks, update `HEARTBEAT.md`; the default gateway heartbeat cron job handles periodic checks when enabled.
+{% if cron_scheduling %}
+- Use `cron` only for simple reminder delivery; do not run `nanobot cron` through `exec`.
+- Use `schedule_work` for recurring or background work such as digests, monitoring, and reports, so each run and its results appear in the Work view.
+{% else %}
+- No scheduling tool is available in this session; say so instead of simulating a schedule.
+{% endif %}
+- Do not put new user workflows in `HEARTBEAT.md`.
 - Do not write reminders only to memory files when the user expects an actual notification.

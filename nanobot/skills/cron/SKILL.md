@@ -44,7 +44,7 @@ schedule_work(
   deliverable="markdown_digest",
   success_criteria="Every configured service is represented and failures have actionable evidence.",
   delivery="Publish the digest in the Work tab.",
-  tools_needed=["shell"],
+  tools_needed=["exec"],
   assumptions=[],
   open_questions=[],
   context_confidence=95,
