@@ -112,8 +112,9 @@ class ContextBuilder:
         # injected when this agent can actually schedule work (cron service or
         # the enabled briefing tool).
         self.workflow_scheduling = workflow_scheduling
-        # The intake policy's closing paragraph routes work to ``cron`` and
-        # ``schedule_work``; it may only appear when those tools registered,
+        # The intake policy's closing paragraph and the tool contract's
+        # scheduling section route work to ``cron`` and ``schedule_work``;
+        # they may only name them when those tools registered,
         # which (unlike briefing) requires a cron service. Derived separately so
         # a briefing-only turn is not told to call tools it does not have.
         self.cron_scheduling = cron_scheduling
@@ -165,7 +166,7 @@ class ContextBuilder:
         if self.workflow_scheduling:
             parts.append(render_template("agent/workflow_intake.md", cron_scheduling=self.cron_scheduling))
 
-        parts.append(render_template("agent/tool_contract.md"))
+        parts.append(render_template("agent/tool_contract.md", cron_scheduling=self.cron_scheduling))
 
         project_path = root.expanduser().resolve()
         if project_path != self.workspace.expanduser().resolve():
