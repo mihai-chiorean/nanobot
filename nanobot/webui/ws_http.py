@@ -99,6 +99,7 @@ from nanobot.webui.native_folder_picker import (
     native_folder_picker_available,
     pick_native_folder,
 )
+from nanobot.webui.session_access import WebuiSessionAccess
 from nanobot.webui.session_automations import (
     all_automations_payload,
     serialize_automation_jobs,
@@ -924,6 +925,81 @@ class GatewayHTTPHandler:
             cleaned.append(row)
         return {"sessions": cleaned}
 
+    async def _handle_conversation_search(self, request: WsRequest) -> Response:
+        """``GET /api/search/conversations?q=<text>&limit=<n>`` -- owner only.
+
+        Parity with the 0.2.x production route (feat/shared-rooms a6f0c196):
+        the owner API token is required and room credentials are refused, so a
+        shared-room guest can never read the owner's conversation history through
+        search. The trusted-proxy shortcut in ``check_api_token`` is deliberately
+        bypassed (as for ``/api/sessions/<key>/messages``, MIT-1404): a proxied
+        room guest whose room token fell through as revoked/expired must not be
+        admitted here. Backed by :class:`WebuiSessionAccess.search`; the wire
+        shape is prod's ``{"results": [...]}`` with one message-level entry per
+        match (``session_key``/``title``/``snippet``/``role``/``updated_at`` plus
+        optional ``message_index``/``timestamp``), so the iOS
+        ``ConversationSearchResult`` decodes unchanged.
+        """
+        if not self.tokens.check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        if self.session_manager is None:
+            return _http_error(503, "session manager unavailable")
+        query = _parse_query(request.path)
+        search_query = " ".join((_query_first(query, "q") or "").split())
+        if len(search_query) < 2 or len(search_query) > 256:
+            return _http_error(400, "q must contain between 2 and 256 characters")
+        try:
+            limit = int(_query_first(query, "limit") or 20)
+        except ValueError:
+            return _http_error(400, "limit must be an integer")
+        if limit < 1 or limit > 50:
+            return _http_error(400, "limit must be between 1 and 50")
+        results = await asyncio.to_thread(
+            self._conversation_search_results,
+            search_query,
+            limit,
+        )
+        return _http_json_response({"results": results})
+
+    def _conversation_search_results(self, query: str, limit: int) -> list[dict[str, Any]]:
+        assert self.session_manager is not None
+        matches = WebuiSessionAccess(self.session_manager).search(query, limit)
+        folded_query = query.casefold()
+        results: list[dict[str, Any]] = []
+        for match in matches:
+            session_key = match["session_key"]
+            title = match["title"]
+            updated_at = match["updated_at"]
+            message_matches = match["messages"]
+            if not message_matches:
+                # A title-ranked match carries no message bodies; surface the
+                # title itself as the snippet, as the 0.2.x title branch did.
+                results.append({
+                    "session_key": session_key,
+                    "title": title,
+                    "snippet": _conversation_search_snippet(title, folded_query),
+                    "role": "title",
+                    "updated_at": updated_at,
+                })
+                continue
+            for message in message_matches:
+                content = message["content"]
+                if not content:
+                    continue
+                entry: dict[str, Any] = {
+                    "session_key": session_key,
+                    "title": title,
+                    "snippet": _conversation_search_snippet(content, folded_query),
+                    "role": message["role"],
+                    "updated_at": updated_at,
+                    "message_index": message["message_index"],
+                }
+                timestamp = message["timestamp"]
+                if isinstance(timestamp, str) and timestamp:
+                    entry["timestamp"] = timestamp
+                results.append(entry)
+        return results[:limit]
+
     async def _handle_webui_thread_get_async(self, request: WsRequest, key: str) -> Response:
         diagnostics = _WebUIThreadDiagnostics()
         loop = asyncio.get_running_loop()
@@ -1626,6 +1702,10 @@ class GatewayHTTPHandler:
     ) -> Response | None:
         if got == "/api/sessions":
             return await self._handle_sessions_list(request)
+        if got == "/api/search/conversations":
+            if getattr(request, "method", "GET") != "GET":
+                return _http_error(405, "Method Not Allowed")
+            return await self._handle_conversation_search(request)
         if got == "/api/commands":
             return self._handle_commands(request)
         if got == "/api/workspaces/pick-folder":
@@ -2114,3 +2194,28 @@ def _strip_private_session_fields(payload: dict[str, Any]) -> None:
 
 def _is_websocket_channel_session_key(key: str) -> bool:
     return is_webui_session_key(key)
+
+
+def _conversation_search_snippet(text: str, folded_query: str, *, window: int = 240) -> str:
+    """Return a bounded snippet of *text* centred on the first ``folded_query`` hit.
+
+    Mirrors the 0.2.x production snippet windowing (feat/shared-rooms
+    a6f0c196): a ~240-char window with ``...`` markers where it was trimmed.
+    The result is at most ``window + 6`` characters.
+    """
+    if not text:
+        return ""
+    position = text.casefold().find(folded_query)
+    if position < 0:
+        start = 0
+    else:
+        start = max(0, position - window // 2)
+    end = min(len(text), start + window)
+    start = max(0, end - window)
+    snippet = text[start:end]
+    if start:
+        snippet = "..." + snippet.lstrip()
+    if end < len(text):
+        snippet = snippet.rstrip() + "..."
+    return snippet
+
