@@ -456,6 +456,11 @@ class WebSocketChannel(BaseChannel):
         self._outbound = WebUIOutboundProjector(self, self._session_projection)
 
         self._stream_text_buffers: dict[tuple[str, str], list[str]] = {}
+        # Ziggy-local (MIT-1404): the text of the last final (non-resuming)
+        # stream_end recorded per chat for a turn that asked for an explicit
+        # final message. That message repeats the streamed reply on the wire;
+        # recording it again would replay as a second assistant bubble.
+        self._explicit_final_stream_text: dict[str, str] = {}
         self._reasoning_text_buffers: dict[tuple[str, str], list[str]] = {}
 
         # -- Shared rooms (Ziggy-local, MIT-1010) ---------------------------
@@ -1500,6 +1505,24 @@ class WebSocketChannel(BaseChannel):
     async def send(self, msg: OutboundMessage) -> None:
         await self._outbound.send(msg)
 
+    def _is_recorded_explicit_final(
+        self,
+        msg: OutboundMessage,
+        payload: dict[str, Any],
+    ) -> bool:
+        """Ziggy-local (MIT-1404): whether this final repeats a recorded stream_end.
+
+        Only the explicit final ``message`` (no ``kind``) whose text matches the
+        stream_end already written for the turn is skipped; an error or
+        ask_user message carries different text and is still recorded.
+        """
+        if msg.metadata.get("explicit_final_message") is not True or "kind" in payload:
+            return False
+        streamed = self._explicit_final_stream_text.pop(msg.chat_id, None)
+        if streamed is None or msg.media or msg.buttons:
+            return False
+        return streamed.strip() == str(payload.get("text") or "").strip()
+
     async def send_projected_message(
         self,
         msg: OutboundMessage,
@@ -1549,14 +1572,15 @@ class WebSocketChannel(BaseChannel):
         elif progress_event:
             payload["kind"] = "progress"
         phase = "activity" if payload.get("kind") in ("tool_hint", "progress") else "answer"
-        self._persist_turn_transcript_event(
-            msg.chat_id,
-            payload,
-            metadata=msg.metadata,
-            phase=phase,
-            include_source=True,
-            transcript_overrides={"text": text},
-        )
+        if not self._is_recorded_explicit_final(msg, payload):
+            self._persist_turn_transcript_event(
+                msg.chat_id,
+                payload,
+                metadata=msg.metadata,
+                phase=phase,
+                include_source=True,
+                transcript_overrides={"text": text},
+            )
         raw = json.dumps(payload, ensure_ascii=False)
         if not conns:
             return
@@ -1699,6 +1723,11 @@ class WebSocketChannel(BaseChannel):
             # Ziggy-local (MIT-1404): always present so a client can tell a
             # final boundary (false) from a missing key.
             body["resuming"] = bool(resuming)
+            if meta.get("explicit_final_message") is True and not resuming and not merge_next:
+                if completed_text:
+                    self._explicit_final_stream_text[chat_id] = completed_text
+                else:
+                    self._explicit_final_stream_text.pop(chat_id, None)
         if stream_end and merge_next:
             body["merge_next"] = True
         self._persist_turn_stream_event(

@@ -350,8 +350,14 @@ async def test_messages_route_rejects_an_unauthenticated_read(
 ) -> None:
     await _create_room(router)
     path = f"/api/sessions/websocket:{ROOM_CHAT}/messages"
-    response = await router.dispatch(_Request(path, method="GET"), path)
-    assert response.status_code == 404
+    # No room token: not the room router's request. It falls through to the
+    # owner route, which requires the owner API token (401 otherwise).
+    assert await router.dispatch(_Request(path, method="GET"), path) is None
+    response = await router.dispatch(
+        _Request(path, method="GET", headers={"Authorization": "Bearer owner-api-token"}),
+        path,
+    )
+    assert response is None
 
 
 @pytest.mark.asyncio
@@ -370,7 +376,10 @@ async def test_revoked_credential_cannot_read(router: SharedRoomRouter) -> None:
         _Request(path, method="GET", headers={"Authorization": f"Bearer {token}"}),
         path,
     )
-    assert response.status_code == 404
+    # A revoked token is no longer a room credential; the room router does not
+    # serve it and the owner route rejects it (it is not an owner API token).
+    assert response is None
+    assert router.store.api_credential(token) is None
 
 
 @pytest.mark.asyncio

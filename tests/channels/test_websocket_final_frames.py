@@ -175,3 +175,111 @@ async def test_stream_end_always_carries_resuming(resuming: bool) -> None:
     assert stream_end["event"] == "stream_end"
     assert "resuming" in stream_end
     assert stream_end["resuming"] is resuming
+
+
+# -- transcript: one bubble for an explicit final (review F2) ---------------------
+
+
+@pytest.mark.asyncio
+async def test_explicit_final_replays_as_one_assistant_bubble() -> None:
+    from nanobot.webui.transcript import build_webui_thread_response, read_transcript_lines
+
+    frames = await _streamed_turn({"explicit_final_message": True})
+    assert [f["event"] for f in frames] == ["delta", "delta", "stream_end", "message"]
+
+    lines = read_transcript_lines("websocket:chat-1")
+    assert [line["event"] for line in lines] == ["stream_end"]
+    body = build_webui_thread_response("websocket:chat-1")
+    assert body is not None
+    assistant = [m for m in body["messages"] if m.get("role") == "assistant"]
+    assert [m["content"] for m in assistant] == ["Hello world"]
+
+
+@pytest.mark.asyncio
+async def test_explicit_final_with_different_text_is_still_recorded() -> None:
+    """An error reply after a streamed segment is new content, not a repeat."""
+    from nanobot.webui.transcript import read_transcript_lines
+
+    channel = _channel(MagicMock())
+    ws = AsyncMock()
+    channel._attach(ws, "chat-1")
+    meta = {"explicit_final_message": True}
+    await channel.send_delta("chat-1", "partial", meta, stream_id="sid")
+    await channel.send_delta("chat-1", "", meta, stream_id="sid", stream_end=True)
+    await ChannelManager._send_once(
+        channel,
+        OutboundMessage(
+            channel="websocket",
+            chat_id="chat-1",
+            content="Sorry, something went wrong.",
+            metadata=dict(meta),
+        ),
+    )
+
+    lines = read_transcript_lines("websocket:chat-1")
+    assert [line["event"] for line in lines] == ["stream_end", "message"]
+    assert lines[-1]["text"] == "Sorry, something went wrong."
+
+
+# -- worker reconciliation read (review F1) --------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_worker_reconcile_reads_owner_session_messages_after_final_stream_end(
+    tmp_path: Path,
+) -> None:
+    """The ziggy-worker flow: stream_end resuming:false starts a background
+    GET /api/sessions/websocket:<chat>/messages with the owner API token
+    (services/ziggy-worker/internal/control/client.go FinalMessage). It must be
+    200 JSON with ``messages`` carrying the final reply, not 404."""
+    import asyncio
+
+    from nanobot.channels.websocket.tests.test_websocket_http_routes import _ch, _free_port
+    from nanobot.channels.websocket.tests.ws_test_client import http_get
+    from nanobot.session.manager import SessionManager
+
+    sessions = SessionManager(tmp_path / "workspace")
+    chat_id = "worker-chat"
+    session = sessions.get_or_create(f"websocket:{chat_id}")
+    session.add_message("user", "what is on my calendar?")
+    session.add_message("assistant", "Two meetings today.")
+    sessions.save(session)
+
+    port = _free_port()
+    bus = MagicMock()
+    bus.publish_inbound = AsyncMock()
+    channel = _ch(bus, session_manager=sessions, port=port)
+    server = asyncio.create_task(channel.start())
+    try:
+        ws = AsyncMock()
+        channel._attach(ws, chat_id)
+        meta = {"explicit_final_message": True}
+        await channel.send_delta(chat_id, "Two meetings today.", meta, stream_id="sid")
+        await channel.send_delta(chat_id, "", meta, stream_id="sid", stream_end=True)
+        stream_end = _frames(ws)[-1]
+        assert stream_end["event"] == "stream_end"
+        assert stream_end["resuming"] is False  # the worker's reconcile trigger
+
+        token = channel.gateway.tokens.issue_api_token(300)
+        url = f"http://127.0.0.1:{port}/api/sessions/websocket:{chat_id}/messages"
+        owner = await http_get(url, headers={"Authorization": f"Bearer {token}"})
+        anonymous = await http_get(url)
+        wrong = await http_get(url, headers={"Authorization": "Bearer not-a-token"})
+        other = await http_get(
+            f"http://127.0.0.1:{port}/api/sessions/cli:direct/messages",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    finally:
+        await channel.stop()
+        await server
+
+    assert owner.status_code == 200
+    assert owner.headers["content-type"].startswith("application/json")
+    messages = owner.json()["messages"]
+    assert [(m["role"], m["content"]) for m in messages] == [
+        ("user", "what is on my calendar?"),
+        ("assistant", "Two meetings today."),
+    ]
+    assert anonymous.status_code == 401
+    assert wrong.status_code == 401
+    assert other.status_code == 404  # only websocket sessions, as in production
