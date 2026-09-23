@@ -106,7 +106,7 @@ from nanobot.webui.session_automations import (
     session_automations_payload,
 )
 from nanobot.webui.session_context import session_context_payload
-from nanobot.webui.session_identity import is_webui_session_key
+from nanobot.webui.session_identity import is_webui_session_key, webui_chat_id
 from nanobot.webui.session_list_index import (
     WEBUI_SESSION_INDEX_INTERNAL_FIELDS,
     indexed_workspace_scope,
@@ -1395,6 +1395,18 @@ class GatewayHTTPHandler:
             return _http_error(400, "invalid session key")
         if not _is_websocket_channel_session_key(decoded_key):
             return _http_error(404, "session not found")
+        # Ziggy-local (MIT-1416): 0.2.x parity -- production refuses the delete
+        # while a turn is still running in the conversation (feat/shared-rooms
+        # 5cdea416). The gateway's WebUI turn registry is this branch's single
+        # source of "turn in progress" for a key (same signal the sessions list
+        # and the messages route report as ``active_turn_*``); deleting
+        # underneath a running turn orphans the transcript rows it keeps
+        # writing.
+        from nanobot.session.webui_turns import websocket_turn_wall_started_at
+
+        chat_id = webui_chat_id(decoded_key)
+        if chat_id is not None and websocket_turn_wall_started_at(chat_id) is not None:
+            return _http_error(409, "conversation is active")
         query = _request_query(request)
         delete_automations = (_query_first(query, "delete_automations") or "").lower()
         automation_jobs = session_automation_jobs(
