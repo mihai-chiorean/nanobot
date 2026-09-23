@@ -55,6 +55,11 @@ from nanobot.agent.tools.context import RequestContext, bind_request_context, re
 from nanobot.agent.tools.exec_session import ExecSessionManager
 from nanobot.agent.tools.file_state import FileStateStore, bind_file_states, reset_file_states
 from nanobot.agent.tools.message import capture_message_deliveries
+from nanobot.agent.tools.publish_file import (
+    PublishFileTurn,
+    bind_publish_file_turn,
+    reset_publish_file_turn,
+)
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.runtime_control import AgentRuntimeControl
 
@@ -213,6 +218,10 @@ class TurnContext:
 
     input_persisted_early: bool = False
     save_skip: int = 0
+    # Server-owned publication capability for this turn (MIT-1030). ``None``
+    # means the conversation may not publish files at all; the binding is
+    # installed only around the runner call and released on every exit path.
+    publish_file_turn: PublishFileTurn | None = None
 
     outbound: OutboundMessage | None = None
     suppress_response: bool = False
@@ -1220,6 +1229,7 @@ class AgentLoop:
         tools: ToolRegistry | None = None,
         request_context: RequestContext | None = None,
         provider_state: ProviderConversationState | None = None,
+        publish_file_turn: PublishFileTurn | None = None,
         initial_messages: list[dict[str, Any]] | None = None,
     ) -> AgentRunResult:
         """Run the agent iteration loop.
@@ -1447,6 +1457,16 @@ class AgentLoop:
         file_state_token = bind_file_states(self._file_state_store.for_session(active_session_key))
         request_token = bind_request_context(request_ctx)
         workspace_token = bind_workspace_scope(effective_scope)
+        # The publication binding is task-scoped contextvars state: it is set
+        # here, inside the single task that executes this turn, and undone in
+        # the ``finally`` below so it can never leak past the run. A leaked
+        # binding would let the next turn publish into this conversation's
+        # slot (MIT-1030).
+        publication_token = (
+            bind_publish_file_turn(publish_file_turn)
+            if publish_file_turn is not None
+            else None
+        )
         turn_scope_stack = ExitStack()
         # Compute lazily because create_goal may create goal metadata during this run.
         def _goal_continue() -> str | None:
@@ -1537,6 +1557,11 @@ class AgentLoop:
                 events=events,
             ))
         finally:
+            # Every exit path — happy, error, and cancellation (CancelledError
+            # unwinds through ``finally``) — must release the publication
+            # binding before the other turn-scoped tokens.
+            if publication_token is not None:
+                reset_publish_file_turn(publication_token)
             turn_scope_stack.close()
             reset_workspace_scope(workspace_token)
             reset_request_context(request_token)
@@ -2402,12 +2427,34 @@ class AgentLoop:
         ctx.transcript_input = self._build_transcript_input(ctx)
 
 
+    def _publish_file_turn_for_turn(self, ctx: TurnContext) -> PublishFileTurn | None:
+        """Mint the server-owned publication capability for this turn, if any.
+
+        Publication links are a WebSocket-client capability. Background Work
+        may explicitly opt in (``work_mode`` metadata) so reports tied to its
+        own session can be handed back through the same authenticated route.
+        Shared-room turns never receive one: guests drive the agent, and a
+        private download must not be mintable from a guest prompt. ``None``
+        keeps the ``publish_file`` tool inert for this turn.
+        """
+        if ctx.ephemeral or self._shared_room_turn(ctx.msg):
+            return None
+        metadata = ctx.msg.metadata
+        enabled = ctx.msg.channel == "websocket" or metadata.get("work_mode") in {
+            "background",
+            "scheduled",
+        }
+        if not enabled:
+            return None
+        return PublishFileTurn(self.sessions, ctx.session_key)
+
     async def _run_turn(self, ctx: TurnContext) -> None:
         runtime = ctx.require_runtime()
         if ctx.visible_run_started_at is None:
             ctx.visible_run_started_at = time.time()
         await ctx.delivery.running(started_at=ctx.visible_run_started_at)
         assert ctx.transcript_input is not None
+        ctx.publish_file_turn = self._publish_file_turn_for_turn(ctx)
         with capture_message_deliveries() as message_sends:
             result = await self._run_agent_loop(
                 ctx.transcript_input,
@@ -2425,6 +2472,7 @@ class AgentLoop:
                 provider_state=ctx.provider_state,
                 initial_messages=ctx.initial_messages,
                 events=ctx.events,
+                publish_file_turn=ctx.publish_file_turn,
             )
         ctx.final_content = result.final_content
         ctx.all_messages = result.messages
@@ -2466,12 +2514,24 @@ class AgentLoop:
         ctx.turn_latency_ms = max(0, int((time.time() - latency_started_at) * 1000))
         if ctx.usage is not None and not ctx.ephemeral:
             session.metadata["_last_usage"] = ctx.usage.to_dict()
-        self._save_turn(
+        persisted = self._save_turn(
             session, ctx.all_messages, ctx.save_skip,
             turn_latency_ms=ctx.turn_latency_ms,
             summary_checkpoint=ctx.summary_checkpoint,
             input_persisted_early=ctx.input_persisted_early,
         )
+        if ctx.publish_file_turn is not None and not ctx.ephemeral:
+            # Grants attach only to publications whose canonical link was
+            # actually rendered in a final visible assistant message of *this*
+            # run. The run's messages are the entries ``_save_turn`` just
+            # appended, identified by object rather than by a transcript index
+            # captured at turn start: a summary checkpoint or compaction may
+            # rewrite the prefix mid-turn and shift any such index.
+            self.sessions.grant_published_files(
+                session,
+                ctx.publish_file_turn.publications,
+                messages=persisted,
+            )
         if (
             not ctx.ephemeral
             and ctx.provider_compaction_applied
@@ -2589,8 +2649,13 @@ class AgentLoop:
         turn_latency_ms: int | None = None,
         summary_checkpoint: SessionSummaryCheckpoint | None = None,
         input_persisted_early: bool = False,
-    ) -> None:
-        """Commit new-turn messages and an optional summary boundary."""
+    ) -> list[dict[str, Any]]:
+        """Commit new-turn messages and an optional summary boundary.
+
+        Returns the entries appended to ``session.messages`` by this call, in
+        order. They are the live transcript objects, so callers can annotate
+        them without locating them by index.
+        """
         declared_tool_call_ids = {
             str(tc["id"])
             for m in session.messages
@@ -2607,6 +2672,7 @@ class AgentLoop:
         }
         last_assistant_idx: int | None = None
         saved_followup_ids: set[str] = set()
+        persisted: list[dict[str, Any]] = []
         checkpoint_boundary = self._validated_checkpoint_boundary(
             summary_checkpoint,
             skip=skip,
@@ -2692,6 +2758,7 @@ class AgentLoop:
                     entry[RUNTIME_CONTEXT_HISTORY_META] = runtime_context_meta
             entry.setdefault("timestamp", datetime.now().isoformat())
             session.messages.append(entry)
+            persisted.append(entry)
             if role == "user":
                 saved_followup_ids.update(followup_id for followup_id in followup_ids if followup_id)
             if role == "assistant":
@@ -2713,6 +2780,7 @@ class AgentLoop:
         if saved_followup_ids:
             acknowledge_pending_followups(session, saved_followup_ids)
         session.updated_at = datetime.now()
+        return persisted
 
     def _persist_subagent_followup(self, session: Session, msg: InboundMessage) -> bool:
         """Persist subagent follow-ups before prompt assembly so history stays durable.
