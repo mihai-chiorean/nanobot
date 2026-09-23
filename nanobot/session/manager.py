@@ -1688,13 +1688,13 @@ class SessionManager:
         # runtime-owned, stable location holds immutable bytes that have
         # already been published. Its deterministic name lets a new process
         # serve grants persisted in JSONL after restart (MIT-1030, ported
-        # from the 0.2.x lineage).
+        # from the 0.2.x lineage). Created lazily by the first
+        # ``store_published_snapshot`` so managers that never publish (CLI,
+        # API, tests, non-websocket channels) leave the sessions root alone.
         store_key = hashlib.sha256(str(workspace.resolve()).encode("utf-8")).hexdigest()
-        self.published_files_dir = ensure_dir(
+        self.published_files_dir = (
             self.sessions_dir.parent / ".nanobot-published-files" / store_key
         )
-        with suppress(OSError):
-            os.chmod(self.published_files_dir, 0o700)
         # Ziggy-local (fork, MIT-1013): the recall index is fed from the durable
         # save path, so ingestion cannot depend on the model asking for it.
         self._indexer: SessionIndexer | None = None
@@ -2174,6 +2174,11 @@ class SessionManager:
             raise ValueError("invalid published file payload")
         if not isinstance(filename, str) or not filename.endswith(".md"):
             raise ValueError("invalid published filename")
+        # Owner-only on both levels: the shared parent and this store.
+        for directory in (self.published_files_dir.parent, self.published_files_dir):
+            ensure_dir(directory)
+            with suppress(OSError):
+                os.chmod(directory, 0o700)
         directory_fd = os.open(
             self.published_files_dir,
             os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,

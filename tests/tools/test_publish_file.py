@@ -20,7 +20,7 @@ from nanobot.agent.tools.publish_file import (
     current_publish_file_turn,
     reset_publish_file_turn,
 )
-from nanobot.session.manager import Session, SessionManager
+from nanobot.session.manager import JsonlSessionStore, Session, SessionManager
 
 
 @pytest.mark.asyncio
@@ -193,3 +193,57 @@ def test_publication_store_lives_outside_the_workspace(tmp_path: Path) -> None:
     assert workspace not in manager.published_files_dir.parents
     assert (manager.published_files_dir / file_id).read_bytes() == b"snapshot"
     assert oct(os.stat(manager.published_files_dir).st_mode)[-3:] == "700"
+
+
+def test_publication_store_is_created_lazily_on_first_snapshot(tmp_path: Path) -> None:
+    """Constructing a manager must not touch the shared sessions root."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    sessions_root = tmp_path / "sessions"
+    manager = SessionManager(workspace, sessions_root=sessions_root)
+    store_parent = sessions_root / ".nanobot-published-files"
+    assert manager.published_files_dir.parent == store_parent
+    assert not store_parent.exists()
+
+    # Reads and grant checks against a store that does not exist yet are
+    # plain misses, and do not create it either.
+    assert manager.read_published_file("websocket:chat", "a" * 32) is None
+    assert manager._snapshot_bytes("a" * 32) is None
+    assert not store_parent.exists()
+
+    file_id = manager.store_published_snapshot("report.md", b"snapshot")
+    assert manager._snapshot_bytes(file_id) == b"snapshot"
+    assert oct(os.stat(store_parent).st_mode)[-3:] == "700"
+    assert oct(os.stat(manager.published_files_dir).st_mode)[-3:] == "700"
+
+
+def test_publication_dotdir_does_not_disturb_sessions_root_consumers(
+    tmp_path: Path,
+) -> None:
+    """The sessions root is shared by every workspace namespace; the store's
+    dotdir must not be mistaken for one by namespace discovery or listing."""
+    sessions_root = tmp_path / "sessions"
+    first_ws = tmp_path / "first"
+    first_ws.mkdir()
+    first = SessionManager(first_ws, sessions_root=sessions_root)
+    first.store_published_snapshot("report.md", b"snapshot")
+    session = first.get_or_create("websocket:chat")
+    session.add_message("user", "hi")
+    first.save(session)
+
+    # A second workspace, and a restart of the first, both resolve their own
+    # namespace next to the dotdir without error.
+    second_ws = tmp_path / "second"
+    second_ws.mkdir()
+    second = SessionManager(second_ws, sessions_root=sessions_root)
+    assert second.workspace_id != first.workspace_id
+    restarted = SessionManager(first_ws, sessions_root=sessions_root)
+    assert restarted.workspace_id == first.workspace_id
+    assert [row["key"] for row in restarted.list_sessions()] == ["websocket:chat"]
+    assert second.list_sessions() == []
+
+    # Namespace recovery scans the root; it must skip the dotdir.
+    assert (
+        JsonlSessionStore._find_workspace_namespace(first_ws.resolve(), sessions_root.resolve())
+        == first.workspace_id
+    )
