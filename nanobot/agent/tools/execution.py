@@ -10,7 +10,9 @@ from typing import Any, cast
 from loguru import logger
 
 from nanobot.agent.hook import AgentHook, AgentHookContext
+from nanobot.agent.tools.ask import AskUserInterrupt
 from nanobot.agent.tools.registry import ToolRegistry, is_tool_error_result
+
 # Ziggy-local (fork, MIT-202/MIT-211): Langfuse tool span (no-op without Langfuse).
 from nanobot.observability import observe_tool
 from nanobot.providers.base import ToolCallRequest
@@ -77,9 +79,14 @@ async def execute_tool_calls(
     workspace_violation_counts: dict[str, int],
     hook: AgentHook,
     context: AgentHookContext,
-) -> tuple[list[Any], list[dict[str, str]]]:
-    """Execute one model response's tool calls in stable result order."""
-    tool_results: list[tuple[Any, dict[str, str]]] = []
+) -> tuple[list[Any], list[dict[str, str]], BaseException | None]:
+    """Execute one model response's tool calls in stable result order.
+
+    Returns ``(results, events, fatal_error)``. A fatal error is the first
+    turn-aborting signal seen (today only :class:`AskUserInterrupt`); later
+    batches are skipped once one is observed so nothing runs past the pause.
+    """
+    tool_results: list[tuple[Any, dict[str, str], BaseException | None]] = []
     for batch in _partition_tool_batches(tools, tool_calls, concurrent=concurrent):
         if concurrent and len(batch) > 1:
             batch_results = await asyncio.gather(*(
@@ -95,6 +102,7 @@ async def execute_tool_calls(
             ))
             tool_results.extend(batch_results)
         else:
+            batch_results: list[tuple[Any, dict[str, str], BaseException | None]] = []
             for tool_call in batch:
                 result = await _execute_tool_call(
                     tools,
@@ -105,10 +113,19 @@ async def execute_tool_calls(
                     context,
                 )
                 tool_results.append(result)
+                batch_results.append(result)
+                if isinstance(result[2], AskUserInterrupt):
+                    break
+        if any(isinstance(error, AskUserInterrupt) for _, _, error in batch_results):
+            break
 
-    results = [result for result, _event in tool_results]
-    events = [event for _result, event in tool_results]
-    return results, events
+    results = [result for result, _event, _error in tool_results]
+    events = [event for _result, event, _error in tool_results]
+    fatal_error: BaseException | None = None
+    for _result, _event, error in tool_results:
+        if error is not None and fatal_error is None:
+            fatal_error = error
+    return results, events, fatal_error
 
 
 async def _execute_tool_call(
@@ -118,7 +135,7 @@ async def _execute_tool_call(
     workspace_violation_counts: dict[str, int],
     hook: AgentHook,
     context: AgentHookContext,
-) -> tuple[Any, dict[str, str]]:
+) -> tuple[Any, dict[str, str], BaseException | None]:
     lookup_error = repeated_external_lookup_error(
         tool_call.name,
         tool_call.arguments,
@@ -130,7 +147,7 @@ async def _execute_tool_call(
             "status": "error",
             "detail": "repeated external lookup blocked",
         }
-        return _with_retry_hint(lookup_error), event
+        return _with_retry_hint(lookup_error), event, None
 
     prepare_call = cast(
         Callable[[str, Any], object] | None,
@@ -158,8 +175,8 @@ async def _execute_tool_call(
             workspace_violation_counts=workspace_violation_counts,
         )
         if handled is not None:
-            return handled
-        return payload, event
+            return handled + (None,)
+        return payload, event, None
 
     await hook.before_execute_tool(context, tool_call, tool, params)
     try:
@@ -175,6 +192,13 @@ async def _execute_tool_call(
                 result = await tools.execute(tool_call.name, params)
     except asyncio.CancelledError:
         raise
+    except AskUserInterrupt as interrupt:
+        event = {
+            "name": tool_call.name,
+            "status": "waiting",
+            "detail": interrupt.question.replace("\n", " ").strip()[:120],
+        }
+        return "", event, interrupt
     except Exception as exc:
         await hook.on_execute_tool_error(context, tool_call, tool, params, exc)
         event = {
@@ -191,8 +215,8 @@ async def _execute_tool_call(
             workspace_violation_counts=workspace_violation_counts,
         )
         if handled is not None:
-            return handled
-        return payload, event
+            return handled + (None,)
+        return payload, event, None
 
     if is_tool_error_result(result):
         await hook.on_execute_tool_error(context, tool_call, tool, params, result)
@@ -210,8 +234,8 @@ async def _execute_tool_call(
             workspace_violation_counts=workspace_violation_counts,
         )
         if handled is not None:
-            return handled
-        return payload, event
+            return handled + (None,)
+        return payload, event, None
 
     await hook.after_execute_tool(context, tool_call, tool, params, result)
 
@@ -221,7 +245,7 @@ async def _execute_tool_call(
         detail = "(empty)"
     elif len(detail) > 120:
         detail = detail[:120] + "..."
-    return result, {"name": tool_call.name, "status": "ok", "detail": detail}
+    return result, {"name": tool_call.name, "status": "ok", "detail": detail}, None
 
 
 def is_unresolvable_host(text: str) -> bool:

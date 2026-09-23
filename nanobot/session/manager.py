@@ -554,6 +554,7 @@ class SessionStore(Protocol):
         updates: dict[str, Any],
         *,
         fsync: bool = False,
+        touch_updated_at: bool = False,
     ) -> bool: ...
 
     def list_sessions(self) -> list[SessionInfo]: ...
@@ -1381,8 +1382,16 @@ class JsonlSessionStore:
         updates: dict[str, Any],
         *,
         fsync: bool = False,
+        touch_updated_at: bool = False,
     ) -> bool:
-        """Atomically replace only a session file's metadata record."""
+        """Atomically replace only a session file's metadata record.
+
+        ``touch_updated_at`` refreshes the top-level ``updated_at`` stamp so a
+        metadata-only mutation (e.g. tool activity, which never rewrites the
+        transcript) is observable by readers that cache on it — the WebUI thread
+        ETag derives a cache variant from it, so without the bump a poller
+        could keep getting ``304`` and miss a newly recoverable Activity row.
+        """
         with self._session_files_lock:
             path = self.get_session_path(key)
             if not path.exists():
@@ -1402,6 +1411,8 @@ class JsonlSessionStore:
                     )
                     metadata.update(deepcopy(updates))
                     data["metadata"] = metadata
+                    if touch_updated_at:
+                        data["updated_at"] = datetime.now().isoformat()
                     with open(tmp_path, "x", encoding="utf-8") as target:
                         target.write(json.dumps(data, ensure_ascii=False) + "\n")
                         shutil.copyfileobj(source, target)
@@ -2344,9 +2355,15 @@ class SessionManager:
         updates: dict[str, Any],
         *,
         fsync: bool = False,
+        touch_updated_at: bool = False,
     ) -> bool:
         """Atomically update metadata without replacing session history."""
-        updated = self._store.update_metadata(key, updates, fsync=fsync)
+        updated = self._store.update_metadata(
+            key,
+            updates,
+            fsync=fsync,
+            touch_updated_at=touch_updated_at,
+        )
         if updated and (session := self.get_cached(key)) is not None:
             session.metadata.update(deepcopy(updates))
         return updated
