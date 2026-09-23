@@ -9,6 +9,11 @@ from typing import TYPE_CHECKING, Any, cast
 
 from loguru import logger
 
+from nanobot.agent.tools.ask import (
+    ASK_USER_TOOL_NAME,
+    ask_user_unanswerable,
+    ask_user_unavailable_message,
+)
 from nanobot.agent.tools.base import Tool, ToolResult
 from nanobot.agent.tools.context import ContextAware, current_request_context
 # Ziggy-local (MIT-1010): shared-room tool authorization.  Upstream 6e9ae5bd
@@ -235,6 +240,14 @@ class ToolRegistry:
                 for schema in self._cached_definitions
                 if room_policy_for(self._schema_name(schema)) is RoomPolicy.ALLOWED
             ]
+        # Ziggy-local: a scheduled / cron turn has nobody to answer ask_user,
+        # so it is not offered there (prepare_call refuses it as well).
+        if ctx is not None and ask_user_unanswerable(ctx.metadata, ctx.session_key):
+            return [
+                schema
+                for schema in self._cached_definitions
+                if self._schema_name(schema) != ASK_USER_TOOL_NAME
+            ]
         return self._cached_definitions
 
     def prepare_call(
@@ -261,6 +274,12 @@ class ToolRegistry:
             and room_policy_for(tool.name) is RoomPolicy.DENIED
         ):
             return tool, params, ToolResult.error(room_denial_message(tool.name))
+        if (
+            ctx is not None
+            and tool.name == ASK_USER_TOOL_NAME
+            and ask_user_unanswerable(ctx.metadata, ctx.session_key)
+        ):
+            return tool, params, ToolResult.error(ask_user_unavailable_message())
         # Compatibility for external tools that still implement the legacy
         # setter protocol. Built-ins read the authoritative ContextVar
         # directly and never copy routing state.

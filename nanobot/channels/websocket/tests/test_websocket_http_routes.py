@@ -4185,3 +4185,365 @@ def test_bootstrap_secret_also_enforced_on_localhost(bus: MagicMock) -> None:
     channel = _ch(bus, host="0.0.0.0", tokenIssueSecret="s3cret")
     resp = channel.gateway.http._handle_bootstrap(_LOCAL, _NO_HEADERS)
     assert resp.status_code == 401
+
+
+def _activity_record(call_id: str = "call-a") -> dict[str, Any]:
+    return {
+        "call_id": call_id,
+        "started_at": "2026-09-21T12:00:00+00:00",
+        "completed_at": "2026-09-21T12:00:01+00:00",
+        "before_message_count": 1,
+        "name": "exec",
+        "summary": "Running a command",
+        "status": "completed",
+        "text": '{"arguments": {"command": "ls"}, "error": null}',
+    }
+
+
+def _tool_hint_frame(call_id: str = "call-a") -> dict[str, Any]:
+    return {
+        "version": 1,
+        "phase": "end",
+        "call_id": call_id,
+        "name": "exec",
+        "arguments": {"command": "ls"},
+        "result": "notes.md",
+        "error": None,
+        "files": [],
+        "embeds": [],
+    }
+
+
+async def _get_thread(port: int, token: str, chat_id: str, query: str = "") -> Any:
+    return await _http_get(
+        f"http://127.0.0.1:{port}/api/sessions/{chat_id}/webui-thread{query}",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_webui_thread_recovers_activity_rows_the_journal_missed(
+    bus: MagicMock, tmp_path: Path
+) -> None:
+    """A turn whose tool never journaled still shows its Activity row."""
+    from nanobot.webui.transcript import append_transcript_object
+
+    key = "websocket:activity-recovery"
+    sm = SessionManager(tmp_path / "workspace")
+    session = Session(key=key)
+    session.add_message("user", "list the files")
+    session.add_message("assistant", "one file: notes.md")
+    session.metadata["activity_v1"] = [_activity_record()]
+    sm.save(session)
+
+    append_transcript_object(
+        key, {"event": "user", "chat_id": "activity-recovery", "text": "list the files"},
+    )
+    append_transcript_object(
+        key, {"event": "message", "chat_id": "activity-recovery", "text": "one file: notes.md"},
+    )
+
+    port = _free_port()
+    channel = _ch(bus, session_manager=sm, port=port)
+    server_task = asyncio.create_task(channel.start())
+    try:
+        token = channel.gateway.tokens.issue_api_token(300)
+        response = await _get_thread(port, token, "websocket%3Aactivity-recovery")
+        assert response.status_code == 200
+        rows = response.json()["messages"]
+        activity_index = next(
+            index for index, row in enumerate(rows) if row.get("id") == "tool-call-a"
+        )
+        assert rows[activity_index - 1]["role"] == "user"
+        assert rows[activity_index + 1]["content"] == "one file: notes.md"
+        activity = rows[activity_index]
+        assert activity["role"] == "tool"
+        assert activity["kind"] == "trace"
+        assert activity["content"] == "Running a command"
+        assert activity["traces"] == ["Running a command"]
+        (tool_event,) = activity["toolEvents"]
+        assert tool_event["call_id"] == "call-a"
+        assert tool_event["phase"] == "end"
+        assert tool_event["arguments"] == {"command": "ls"}
+        assert "activity_v1" not in json.dumps(response.json())
+    finally:
+        await channel.stop()
+        await server_task
+
+
+@pytest.mark.asyncio
+async def test_webui_thread_does_not_duplicate_journaled_activity(
+    bus: MagicMock, tmp_path: Path
+) -> None:
+    """The same call id the journal already rendered must not appear twice."""
+    from nanobot.webui.transcript import append_transcript_object
+
+    key = "websocket:activity-dedup"
+    sm = SessionManager(tmp_path / "workspace")
+    session = Session(key=key)
+    session.add_message("user", "list the files")
+    session.add_message("assistant", "one file: notes.md")
+    session.metadata["activity_v1"] = [_activity_record()]
+    sm.save(session)
+
+    append_transcript_object(
+        key, {"event": "user", "chat_id": "activity-dedup", "text": "list the files"},
+    )
+    append_transcript_object(
+        key,
+        {
+            "event": "message",
+            "chat_id": "activity-dedup",
+            "text": "exec(ls)",
+            "kind": "tool_hint",
+            "tool_events": [_tool_hint_frame()],
+        },
+    )
+    append_transcript_object(
+        key, {"event": "message", "chat_id": "activity-dedup", "text": "one file: notes.md"},
+    )
+
+    port = _free_port()
+    channel = _ch(bus, session_manager=sm, port=port)
+    server_task = asyncio.create_task(channel.start())
+    try:
+        token = channel.gateway.tokens.issue_api_token(300)
+        response = await _get_thread(port, token, "websocket%3Aactivity-dedup")
+        assert response.status_code == 200
+        coverages = [
+            row for row in response.json()["messages"]
+            if any(event.get("call_id") == "call-a" for event in row.get("toolEvents") or [])
+        ]
+        assert len(coverages) == 1
+        assert coverages[0]["id"] != "tool-call-a"
+    finally:
+        await channel.stop()
+        await server_task
+
+
+@pytest.mark.asyncio
+async def test_webui_thread_paginated_reads_do_not_resynthesize_journaled_calls(
+    bus: MagicMock, tmp_path: Path
+) -> None:
+    """A call journaled on an older page must never reappear on another page."""
+    from datetime import datetime, timedelta, timezone
+
+    from nanobot.webui.transcript import append_transcript_object
+
+    key = "websocket:activity-pages"
+    chat = "activity-pages"
+    sm = SessionManager(tmp_path / "workspace")
+    session = Session(key=key)
+    for idx in (1, 2, 3, 4):
+        session.add_message("user", f"question {idx}")
+        session.add_message("assistant", f"answer {idx}")
+    recent = _activity_record("call-a")
+    started = datetime.now(timezone.utc) + timedelta(seconds=60)
+    recent["started_at"] = started.isoformat()
+    recent["completed_at"] = started.isoformat()
+    # Recent enough to survive the stale-record gate: only whole-journal
+    # coverage can keep this journaled call off the other pages.
+    session.metadata["activity_v1"] = [recent]
+    sm.save(session)
+
+    append_transcript_object(key, {"event": "user", "chat_id": chat, "text": "question 1"})
+    append_transcript_object(
+        key,
+        {
+            "event": "message",
+            "chat_id": chat,
+            "text": "exec(ls)",
+            "kind": "tool_hint",
+            "tool_events": [_tool_hint_frame("call-a")],
+        },
+    )
+    append_transcript_object(key, {"event": "turn_end", "chat_id": chat})
+    for idx in (2, 3, 4):
+        append_transcript_object(key, {"event": "user", "chat_id": chat, "text": f"question {idx}"})
+        append_transcript_object(key, {"event": "message", "chat_id": chat, "text": f"answer {idx}"})
+        append_transcript_object(key, {"event": "turn_end", "chat_id": chat})
+
+    port = _free_port()
+    channel = _ch(bus, session_manager=sm, port=port)
+    server_task = asyncio.create_task(channel.start())
+    encoded = "websocket%3Aactivity-pages"
+    try:
+        token = channel.gateway.tokens.issue_api_token(300)
+        seen_ids: list[Any] = []
+        response = await _get_thread(port, token, encoded, "?limit=1&direction=latest")
+        assert response.status_code == 200
+        body = response.json()
+        seen_ids += [row.get("id") for row in body["messages"]]
+        for _ in range(8):
+            cursor = (body.get("page") or {}).get("before_cursor")
+            if not cursor or not (body.get("page") or {}).get("has_more_before"):
+                break
+            response = await _get_thread(port, token, encoded, f"?limit=2&before={cursor}")
+            body = response.json()
+            seen_ids += [row.get("id") for row in body["messages"]]
+        assert "tool-call-a" not in seen_ids
+
+        response = await _get_thread(port, token, encoded)
+        coverages = [
+            row
+            for row in response.json()["messages"]
+            if any(event.get("call_id") == "call-a" for event in row.get("toolEvents") or [])
+        ]
+        assert len(coverages) == 1
+        assert coverages[0]["id"] != "tool-call-a"
+    finally:
+        await channel.stop()
+        await server_task
+
+
+@pytest.mark.asyncio
+async def test_webui_thread_crashed_turn_activity_renders_under_its_own_turn(
+    bus: MagicMock, tmp_path: Path
+) -> None:
+    """The unjournaled call of the open turn lands right after that turn's user row."""
+    from datetime import datetime, timedelta, timezone
+
+    from nanobot.webui.transcript import append_transcript_object
+
+    key = "websocket:activity-crash"
+    chat = "activity-crash"
+    sm = SessionManager(tmp_path / "workspace")
+    session = Session(key=key)
+    session.add_message("user", "question 1")
+    session.add_message("assistant", "answer 1")
+    session.add_message("user", "question 2")
+    started = datetime.now(timezone.utc) + timedelta(seconds=60)
+    session.metadata["activity_v1"] = [
+        {
+            "call_id": "call-crash",
+            "started_at": started.isoformat(),
+            "before_message_count": 3,
+            "name": "exec",
+            "summary": "Running a command",
+            "status": "running",
+            "text": '{"arguments": {"command": "ls"}, "error": null}',
+        }
+    ]
+    sm.save(session)
+
+    append_transcript_object(key, {"event": "user", "chat_id": chat, "text": "question 1"})
+    append_transcript_object(key, {"event": "message", "chat_id": chat, "text": "answer 1"})
+    append_transcript_object(key, {"event": "turn_end", "chat_id": chat})
+    # The crashed turn journaled its user row and nothing else.
+    append_transcript_object(key, {"event": "user", "chat_id": chat, "text": "question 2"})
+
+    port = _free_port()
+    channel = _ch(bus, session_manager=sm, port=port)
+    server_task = asyncio.create_task(channel.start())
+    encoded = "websocket%3Aactivity-crash"
+    try:
+        token = channel.gateway.tokens.issue_api_token(300)
+        response = await _get_thread(port, token, encoded)
+        assert response.status_code == 200
+        rows = response.json()["messages"]
+        assert rows[3]["id"] == "tool-call-crash"
+        assert [row.get("role") for row in rows] == ["user", "assistant", "user", "tool"]
+        ((tool_event,),) = [row["toolEvents"] for row in rows if "toolEvents" in row]
+        assert tool_event["call_id"] == "call-crash"
+        assert tool_event["status"] == "interrupted"
+
+        latest = await _get_thread(port, token, encoded, "?limit=1&direction=latest")
+        latest_rows = latest.json()["messages"]
+        assert [row.get("id") == "tool-call-crash" for row in latest_rows] == [False, True]
+        assert latest_rows[0]["role"] == "user"
+        cursor = (latest.json().get("page") or {}).get("before_cursor")
+        assert cursor
+        older = await _get_thread(port, token, encoded, f"?limit=2&before={cursor}")
+        older_rows = older.json()["messages"]
+        assert all(row.get("id") != "tool-call-crash" for row in older_rows)
+    finally:
+        await channel.stop()
+        await server_task
+
+
+@pytest.mark.asyncio
+async def test_webui_thread_recovered_call_survives_a_later_completed_turn(
+    bus: MagicMock, tmp_path: Path
+) -> None:
+    """A crashed turn's unjournaled call is not lost once a later turn completes.
+
+    The tail after the last journaled ``turn_end`` holds two turns: the crashed
+    one (whose tool never journaled) and a newer one that has since journaled
+    its own ``turn_end``. The recovered call must anchor under the crashed
+    turn's user row (by its start timestamp) and read ``interrupted`` — the
+    round-1 code dropped it entirely once the newer turn journaled a turn_end.
+    """
+    from nanobot.webui.transcript import append_transcript_object
+
+    key = "websocket:activity-two-turns"
+    chat = "activity-two-turns"
+    sm = SessionManager(tmp_path / "workspace")
+    session = Session(key=key)
+    session.add_message("user", "q1")
+    session.add_message("assistant", "a1")
+    session.add_message("user", "q2")
+    session.add_message("user", "q3")
+    # started_at (t=2500ms) is inside q2's window and before q3 (t=3000ms), and
+    # the newer turn's turn_end (t=4000ms) is *after* it — the exact shape the
+    # old ``started_at > last_turn_end`` gate discarded.
+    session.metadata["activity_v1"] = [
+        {
+            "call_id": "call-x",
+            "started_at": "1970-01-01T00:00:02.500000+00:00",
+            "before_message_count": 3,
+            "name": "exec",
+            "summary": "Running a command",
+            "status": "running",
+            "text": '{"arguments": {"command": "ls"}, "error": null}',
+        }
+    ]
+    sm.save(session)
+
+    append_transcript_object(
+        key, {"event": "user", "chat_id": chat, "text": "q1", "created_at_ms": 1_000}
+    )
+    append_transcript_object(
+        key, {"event": "message", "chat_id": chat, "text": "a1", "created_at_ms": 1_100}
+    )
+    append_transcript_object(
+        key, {"event": "turn_end", "chat_id": chat, "created_at_ms": 1_200}
+    )
+    # Crashed turn: journaled its user row, the tool call never reached the journal.
+    append_transcript_object(
+        key, {"event": "user", "chat_id": chat, "text": "q2", "created_at_ms": 2_000}
+    )
+    # A later turn completed and journaled its own turn_end.
+    append_transcript_object(
+        key, {"event": "user", "chat_id": chat, "text": "q3", "created_at_ms": 3_000}
+    )
+    append_transcript_object(
+        key, {"event": "message", "chat_id": chat, "text": "a3", "created_at_ms": 3_100}
+    )
+    append_transcript_object(
+        key, {"event": "turn_end", "chat_id": chat, "created_at_ms": 4_000}
+    )
+
+    port = _free_port()
+    channel = _ch(bus, session_manager=sm, port=port)
+    server_task = asyncio.create_task(channel.start())
+    encoded = "websocket%3Aactivity-two-turns"
+    try:
+        token = channel.gateway.tokens.issue_api_token(300)
+        response = await _get_thread(port, token, encoded)
+        assert response.status_code == 200
+        rows = response.json()["messages"]
+        activity_index = next(
+            index for index, row in enumerate(rows) if row.get("id") == "tool-call-x"
+        )
+        # Anchored under q2 (the crashed turn's user row), not under q3.
+        assert rows[activity_index - 1].get("content") == "q2"
+        assert rows[activity_index - 1].get("role") == "user"
+        after = rows[activity_index + 1]
+        assert after.get("role") == "user"
+        assert after.get("content") == "q3"
+        ((tool_event,),) = [row["toolEvents"] for row in rows if "toolEvents" in row]
+        assert tool_event["call_id"] == "call-x"
+        assert tool_event["status"] == "interrupted"
+    finally:
+        await channel.stop()
+        await server_task

@@ -15,7 +15,8 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Collection, Generator, Protocol, TypedDict, cast
+from typing import Any, Callable, Collection, Generator, Iterable, Protocol, TypedDict, cast
+from urllib.parse import quote
 from weakref import WeakValueDictionary
 
 from filelock import FileLock
@@ -74,6 +75,11 @@ _WORKSPACE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _SESSION_MIGRATION_LOCK_TIMEOUT_SECONDS = 30
 _SESSION_FILES_LOCK_FILENAME = ".session-files.lock"
 _COPY_CHUNK_SIZE = 1024 * 1024
+_PUBLISHED_FILE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+_PUBLISHED_GRANTS_KEY = "published_file_grants"
+_PUBLISHED_PROVENANCE_KEY = "published_file_provenance"
+_PUBLISHED_MESSAGE_ID_KEY = "_published_message_id"
+_MAX_PUBLISHED_FILE_BYTES = 2 * 1024 * 1024
 
 
 def _json_object(value: object) -> dict[str, Any]:
@@ -548,6 +554,7 @@ class SessionStore(Protocol):
         updates: dict[str, Any],
         *,
         fsync: bool = False,
+        touch_updated_at: bool = False,
     ) -> bool: ...
 
     def list_sessions(self) -> list[SessionInfo]: ...
@@ -1375,8 +1382,16 @@ class JsonlSessionStore:
         updates: dict[str, Any],
         *,
         fsync: bool = False,
+        touch_updated_at: bool = False,
     ) -> bool:
-        """Atomically replace only a session file's metadata record."""
+        """Atomically replace only a session file's metadata record.
+
+        ``touch_updated_at`` refreshes the top-level ``updated_at`` stamp so a
+        metadata-only mutation (e.g. tool activity, which never rewrites the
+        transcript) is observable by readers that cache on it — the WebUI thread
+        ETag derives a cache variant from it, so without the bump a poller
+        could keep getting ``304`` and miss a newly recoverable Activity row.
+        """
         with self._session_files_lock:
             path = self.get_session_path(key)
             if not path.exists():
@@ -1396,6 +1411,8 @@ class JsonlSessionStore:
                     )
                     metadata.update(deepcopy(updates))
                     data["metadata"] = metadata
+                    if touch_updated_at:
+                        data["updated_at"] = datetime.now().isoformat()
                     with open(tmp_path, "x", encoding="utf-8") as target:
                         target.write(json.dumps(data, ensure_ascii=False) + "\n")
                         shutil.copyfileobj(source, target)
@@ -1666,6 +1683,18 @@ class SessionManager:
         self.sessions_dir = self._jsonl_store.sessions_dir
         self.workspace_id = self._jsonl_store.workspace_id
         self.legacy_sessions_dir = self._jsonl_store.legacy_sessions_dir
+        # Publication snapshots deliberately do not live below the agent
+        # workspace. The workspace is where an agent writes reports; this
+        # runtime-owned, stable location holds immutable bytes that have
+        # already been published. Its deterministic name lets a new process
+        # serve grants persisted in JSONL after restart (MIT-1030, ported
+        # from the 0.2.x lineage). Created lazily by the first
+        # ``store_published_snapshot`` so managers that never publish (CLI,
+        # API, tests, non-websocket channels) leave the sessions root alone.
+        store_key = hashlib.sha256(str(workspace.resolve()).encode("utf-8")).hexdigest()
+        self.published_files_dir = (
+            self.sessions_dir.parent / ".nanobot-published-files" / store_key
+        )
         # Ziggy-local (fork, MIT-1013): the recall index is fed from the durable
         # save path, so ingestion cannot depend on the model asking for it.
         self._indexer: SessionIndexer | None = None
@@ -2120,6 +2149,208 @@ class SessionManager:
         """Read a session without populating the cache."""
         return cast(dict[str, Any] | None, self._store.read(key))
 
+    # -- Private Markdown publications (MIT-1030, ported from 0.2.x) --------
+
+    @staticmethod
+    def published_file_url(session_key: str, file_id: str) -> str:
+        """Return the one canonical relative route emitted by ``publish_file``."""
+        if _PUBLISHED_FILE_ID_RE.fullmatch(file_id) is None:
+            raise ValueError("invalid published file id")
+        return f"/api/sessions/{quote(session_key, safe='')}/files/{file_id}"
+
+    @staticmethod
+    def _has_published_markdown_link(content: str, url: str) -> bool:
+        """Recognize the exact Markdown-link URL shape emitted by the tool."""
+        return f"]({url})" in content
+
+    def store_published_snapshot(self, filename: object, payload: object) -> str:
+        """Atomically persist immutable publication bytes in the server store.
+
+        Both parameters are validated rather than trusted: the caller chain
+        reaches back into model-influenced data, so the type checks here are
+        the last gate before bytes hit the runtime-owned store.
+        """
+        if not isinstance(payload, bytes) or len(payload) > _MAX_PUBLISHED_FILE_BYTES:
+            raise ValueError("invalid published file payload")
+        if not isinstance(filename, str) or not filename.endswith(".md"):
+            raise ValueError("invalid published filename")
+        # Owner-only on both levels: the shared parent and this store.
+        for directory in (self.published_files_dir.parent, self.published_files_dir):
+            ensure_dir(directory)
+            with suppress(OSError):
+                os.chmod(directory, 0o700)
+        directory_fd = os.open(
+            self.published_files_dir,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
+        try:
+            for _ in range(8):
+                file_id = secrets.token_hex(16)
+                temp_name = f".{file_id}.tmp"
+                try:
+                    fd = os.open(
+                        temp_name,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+                        0o600,
+                        dir_fd=directory_fd,
+                    )
+                except FileExistsError:
+                    continue
+                try:
+                    with os.fdopen(fd, "wb") as handle:
+                        handle.write(payload)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    # link(2), unlike replace, never overwrites an existing
+                    # id. Both names are resolved from the trusted directory
+                    # descriptor, so a path race cannot redirect storage.
+                    try:
+                        os.link(
+                            temp_name,
+                            file_id,
+                            src_dir_fd=directory_fd,
+                            dst_dir_fd=directory_fd,
+                            follow_symlinks=False,
+                        )
+                    except FileExistsError:
+                        continue
+                    os.unlink(temp_name, dir_fd=directory_fd)
+                    os.fsync(directory_fd)
+                    return file_id
+                finally:
+                    with suppress(FileNotFoundError):
+                        os.unlink(temp_name, dir_fd=directory_fd)
+        finally:
+            os.close(directory_fd)
+        raise OSError("could not allocate a publication id")
+
+    def _snapshot_bytes(self, file_id: str) -> bytes | None:
+        if _PUBLISHED_FILE_ID_RE.fullmatch(file_id) is None:
+            return None
+        directory_fd = -1
+        try:
+            directory_fd = os.open(
+                self.published_files_dir,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+            fd = os.open(
+                file_id,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+                dir_fd=directory_fd,
+            )
+            try:
+                info = os.fstat(fd)
+                if not stat.S_ISREG(info.st_mode) or info.st_size > _MAX_PUBLISHED_FILE_BYTES:
+                    return None
+                chunks: list[bytes] = []
+                remaining = _MAX_PUBLISHED_FILE_BYTES + 1
+                while remaining:
+                    chunk = os.read(fd, min(64 * 1024, remaining))
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    remaining -= len(chunk)
+                data = b"".join(chunks)
+                return data if len(data) <= _MAX_PUBLISHED_FILE_BYTES else None
+            finally:
+                os.close(fd)
+        except OSError:
+            return None
+        finally:
+            if directory_fd >= 0:
+                os.close(directory_fd)
+
+    def read_published_file(self, session_key: str, file_id: str) -> tuple[str, bytes] | None:
+        """Return a granted snapshot only; ids are never global capabilities."""
+        if _PUBLISHED_FILE_ID_RE.fullmatch(file_id) is None:
+            return None
+        raw_record = self.read_session_file(session_key)
+        if not isinstance(raw_record, dict):
+            return None
+        if raw_record.get("key") != session_key:
+            return None
+        raw_metadata = raw_record.get("metadata")
+        if not isinstance(raw_metadata, dict):
+            return None
+        metadata = cast(dict[str, Any], raw_metadata)
+        raw_grants = metadata.get(_PUBLISHED_GRANTS_KEY)
+        if not isinstance(raw_grants, dict):
+            return None
+        grants = cast(dict[str, Any], raw_grants)
+        raw_grant = grants.get(file_id)
+        if not isinstance(raw_grant, dict):
+            return None
+        grant = cast(dict[str, Any], raw_grant)
+        filename = grant.get("filename")
+        if not isinstance(filename, str) or not filename.endswith(".md"):
+            return None
+        data = self._snapshot_bytes(file_id)
+        return (filename, data) if data is not None else None
+
+    def grant_published_files(
+        self,
+        session: Session,
+        publications: dict[str, str],
+        *,
+        messages: Iterable[dict[str, Any]],
+    ) -> None:
+        """Grant only tool publications rendered in a final visible answer.
+
+        *messages* are this run's persisted transcript entries (the objects
+        returned by ``AgentLoop._save_turn``), not an index into
+        ``session.messages``: the transcript prefix may be rewritten during a
+        turn, so a start index captured before the run is not a stable boundary.
+
+        The full assistant-message digest is durable provenance.  Room cloning
+        later requires that digest as well as the exact canonical URL, so a
+        pasted or invented id cannot become a room grant.
+        """
+        if not publications:
+            return
+        raw_grants = session.metadata.setdefault(_PUBLISHED_GRANTS_KEY, {})
+        raw_provenance = session.metadata.setdefault(_PUBLISHED_PROVENANCE_KEY, {})
+        if not isinstance(raw_grants, dict) or not isinstance(raw_provenance, dict):
+            return
+        grants = cast(dict[str, Any], raw_grants)
+        provenance = cast(dict[str, Any], raw_provenance)
+        for message in messages:
+            if message.get("role") != "assistant" or message.get("tool_calls"):
+                continue
+            content = message.get("content")
+            if not isinstance(content, str):
+                continue
+            digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            timestamp = message.get("timestamp")
+            for file_id, filename in publications.items():
+                if (
+                    _PUBLISHED_FILE_ID_RE.fullmatch(file_id) is None
+                    or not filename.endswith(".md")
+                    or not self._has_published_markdown_link(
+                        content, self.published_file_url(session.key, file_id)
+                    )
+                    or self._snapshot_bytes(file_id) is None
+                ):
+                    continue
+                message_id = message.get(_PUBLISHED_MESSAGE_ID_KEY)
+                if (
+                    not isinstance(message_id, str)
+                    or _PUBLISHED_FILE_ID_RE.fullmatch(message_id) is None
+                ):
+                    message_id = secrets.token_hex(16)
+                    message[_PUBLISHED_MESSAGE_ID_KEY] = message_id
+                grants[file_id] = {"filename": filename}
+                raw_records = provenance.setdefault(file_id, [])
+                if not isinstance(raw_records, list):
+                    continue
+                records = cast(list[Any], raw_records)
+                record = {
+                    "message_sha256": digest,
+                    "timestamp": timestamp,
+                    "message_id": message_id,
+                }
+                if record not in records:
+                    records.append(record)
+
     def read_session_snapshot(self, key: str) -> Session | None:
         """Load a detached session snapshot without populating the runtime cache."""
         return self._store.load(key)
@@ -2134,9 +2365,15 @@ class SessionManager:
         updates: dict[str, Any],
         *,
         fsync: bool = False,
+        touch_updated_at: bool = False,
     ) -> bool:
         """Atomically update metadata without replacing session history."""
-        updated = self._store.update_metadata(key, updates, fsync=fsync)
+        updated = self._store.update_metadata(
+            key,
+            updates,
+            fsync=fsync,
+            touch_updated_at=touch_updated_at,
+        )
         if updated and (session := self.get_cached(key)) is not None:
             session.metadata.update(deepcopy(updates))
         return updated

@@ -5,9 +5,9 @@
 from __future__ import annotations
 
 import asyncio
-import re
 import dataclasses
 import os
+import re
 import time
 import weakref
 from collections.abc import Coroutine, Iterable, Mapping
@@ -43,13 +43,26 @@ from nanobot.agent.runner import (
     AgentRunSpec,
 )
 from nanobot.agent.subagent import SubagentManager
+from nanobot.agent.tools.ask import (
+    ask_user_call_is_expired,
+    ask_user_options_from_messages,
+    ask_user_outbound,
+    ask_user_tool_result_messages,
+    pending_ask_user_id,
+)
+from nanobot.agent.tools.audit import AuditLogger
 from nanobot.agent.tools.context import RequestContext, bind_request_context, reset_request_context
 from nanobot.agent.tools.exec_session import ExecSessionManager
-from nanobot.agent.tools.audit import AuditLogger
 from nanobot.agent.tools.file_state import FileStateStore, bind_file_states, reset_file_states
 from nanobot.agent.tools.message import capture_message_deliveries
+from nanobot.agent.tools.publish_file import (
+    PublishFileTurn,
+    bind_publish_file_turn,
+    reset_publish_file_turn,
+)
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.runtime_control import AgentRuntimeControl
+
 # Ziggy-local (fork, MIT-1014): marker for the trusted user `!<command>` path.
 from nanobot.agent.tools.shell import USER_SHELL_COMMAND_ATTR
 from nanobot.agent.turn_delivery import (
@@ -60,6 +73,7 @@ from nanobot.agent.turn_delivery import TurnRoute as TurnRoute
 from nanobot.agent.turn_hooks import AgentTurnHookSpec, build_agent_turn_hook
 from nanobot.bus.events import INBOUND_META_USER_SHELL, InboundMessage, OutboundMessage
 from nanobot.bus.outbound_events import (
+    ProgressEvent,
     StreamDeltaEvent,
     StreamedResponseEvent,
     StreamEndEvent,
@@ -70,10 +84,16 @@ from nanobot.command.router import normalize_command_text
 from nanobot.config.schema import AgentDefaults, ModelPresetConfig
 from nanobot.events import NO_EVENTS, AgentEvent, EventSink
 from nanobot.llm_usage.context import source_from_request
-from nanobot.providers.base import LLMProvider, LLMUsage, ProviderConversationState
+
 # Ziggy-local (fork, MIT-202): Langfuse turn span.
 from nanobot.observability import observe_turn
+from nanobot.providers.base import LLMProvider, LLMUsage, ProviderConversationState
 from nanobot.providers.factory import ProviderSnapshot
+from nanobot.providers.request_context import (
+    reset_scheduling_class,
+    scheduling_class_for_turn,
+    set_scheduling_class,
+)
 from nanobot.runtime_context import (
     RUNTIME_CONTEXT_HISTORY_META,
     RUNTIME_CONTEXT_MESSAGE_META,
@@ -112,6 +132,8 @@ from nanobot.session.summary import (
     SessionSummaryCheckpoint,
 )
 from nanobot.triggers.local_turns import LocalTriggerTurnCoordinator
+from nanobot.utils.activity_history import KEY as ACTIVITY_HISTORY_KEY
+from nanobot.utils.activity_history import record_tool_activity
 from nanobot.utils.cancellation import task_is_cancelling
 from nanobot.utils.document import reference_non_image_attachments
 from nanobot.utils.helpers import image_placeholder_text
@@ -183,6 +205,11 @@ class TurnContext:
 
     history: list[dict[str, Any]] = field(default_factory=list)
     transcript_input: TranscriptInput | None = None
+    # Set when this user turn answers a parked ``ask_user`` question: the id
+    # of the pending tool call plus the transcript that injects the answer as
+    # its tool result instead of a fresh user message.
+    ask_user_resume_id: str | None = None
+    initial_messages: list[dict[str, Any]] | None = field(default=None, repr=False)
     provider_state: ProviderConversationState | None = field(default=None, repr=False)
     request_context: RequestContext | None = None
     runtime_context_blocks: list[RuntimeContextBlock] = field(default_factory=list)
@@ -196,6 +223,10 @@ class TurnContext:
 
     input_persisted_early: bool = False
     save_skip: int = 0
+    # Server-owned publication capability for this turn (MIT-1030). ``None``
+    # means the conversation may not publish files at all; the binding is
+    # installed only around the runner call and released on every exit path.
+    publish_file_turn: PublishFileTurn | None = None
 
     outbound: OutboundMessage | None = None
     suppress_response: bool = False
@@ -521,7 +552,15 @@ class AgentLoop:
             lambda turn: _ZiggyTurnHook(self, turn)
         )
 
-        self.context = ContextBuilder(workspace, timezone=timezone, disabled_skills=disabled_skills)
+        # Ziggy-local (MIT-1028): the workflow-intake policy is switched on
+        # below in _register_default_tools, after the tool loader has decided
+        # what actually registered -- an enabled-but-misconfigured briefing
+        # registers nothing, and its policy must not reach those tenants.
+        self.context = ContextBuilder(
+            workspace,
+            timezone=timezone,
+            disabled_skills=disabled_skills,
+        )
         self.sessions = session_manager or SessionManager(workspace)
         # Ziggy-local (MIT-1010): durable Work store for report_progress /
         # publish_artifact / schedule_work and the ``work_task`` cron kind.
@@ -811,6 +850,23 @@ class AgentLoop:
         loader = ToolLoader()
         registered = loader.load(ctx, self.tools)
 
+        # Ziggy-local (MIT-1028): the intake policy names the scheduling tools,
+        # so it may only reach turns whose tool set can act on them. The loader
+        # deliberately swallows create() failures (a misconfigured-but-enabled
+        # briefing never registers), so derive the flags from what actually
+        # registered -- never from the config alone. ``cron``/``schedule_work``
+        # need a cron service (always present on gateway builds, but a headless
+        # build may omit it), while briefing can stand alone; the policy's closing
+        # paragraph therefore only routes to cron/schedule_work when those tools
+        # are really available, not merely when the briefing tool turned the
+        # policy on.
+        self.context.workflow_scheduling = (
+            self.cron_service is not None or self.tools.get("briefing") is not None
+        )
+        self.context.cron_scheduling = (
+            self.tools.get("cron") is not None or self.tools.get("schedule_work") is not None
+        )
+
         logger.info("Registered {} tools: {}", len(registered), registered)
 
     def register_runtime_context_provider(
@@ -900,6 +956,37 @@ class AgentLoop:
         """
         metadata = msg.metadata
         return isinstance(metadata, dict) and metadata.get("shared_room") is True
+
+    def _detect_ask_user_resume(self, ctx: TurnContext) -> str | None:
+        """Return the parked ``ask_user`` call id this user turn should answer.
+
+        Only a plain private-channel user message may consume a parked
+        question: shared-room chatter, system deliveries, internal goal
+        continuations and ephemeral runs keep the question parked.
+        """
+        if (
+            ctx.kind is not TurnKind.USER
+            or ctx.ephemeral
+            or ctx.session is None
+            or not ctx.session.policy.persist
+            or self._shared_room_turn(ctx.msg)
+            or turn_continuation.internal_continuation_inbound(ctx.msg.metadata)
+        ):
+            return None
+        if not ctx.msg.content.strip():
+            return None
+        parked_id = pending_ask_user_id(ctx.history)
+        if parked_id is None:
+            return None
+        assert ctx.session is not None
+        # Bound the resume to a freshly parked question. An unanswered
+        # ``ask_user`` from an abandoned turn must not be consumed by an
+        # unrelated message that happens to arrive much later (MIT-1029,
+        # "what happens when the user never answers"): such a message starts a
+        # fresh turn and the stale question ages out through compaction.
+        if ask_user_call_is_expired(ctx.session.messages, parked_id):
+            return None
+        return parked_id
 
     def _build_transcript_input(self, ctx: TurnContext) -> TranscriptInput:
         """Capture the persisted history and fresh input as separate transcript parts."""
@@ -1147,6 +1234,8 @@ class AgentLoop:
         tools: ToolRegistry | None = None,
         request_context: RequestContext | None = None,
         provider_state: ProviderConversationState | None = None,
+        publish_file_turn: PublishFileTurn | None = None,
+        initial_messages: list[dict[str, Any]] | None = None,
     ) -> AgentRunResult:
         """Run the agent iteration loop.
 
@@ -1155,9 +1244,56 @@ class AgentLoop:
         ``resuming=True`` means the active turn continues. ``merge_next=True`` means
         the next text segment belongs to the same user-visible assistant message.
 
+        When *initial_messages* is given it replaces the built transcript
+        outright (used to resume a turn parked on ``ask_user``); *transcript_input*
+        is then only kept for save-boundary bookkeeping.
+
         Returns the complete result produced by ``AgentRunner``.
         """
         self._sync_subagent_runtime_limits()
+
+        if (
+            events.publish is not None
+            and session is not None
+            and not ephemeral
+            and session.policy.persist
+        ):
+            # Tool activity must survive a mid-turn crash: an interrupted turn
+            # still needs its Activity rows, and they can only be rebuilt from
+            # what reached the session file. Record at publish time so every
+            # lifecycle phase (start / end / error) is durable as it happens,
+            # mirroring the 0.2.x progress-callback seam.
+            _publish_events = events.publish
+
+            async def _record_tool_activity(event: AgentEvent) -> None:
+                if isinstance(event, ProgressEvent) and event.tool_events:
+                    # Copy first: the payload is frozen for everything else that
+                    # consumes it (websocket wire, transcript journal).
+                    record_tool_activity(
+                        session,
+                        [dict(tool_event) for tool_event in event.tool_events],
+                    )
+                    # Metadata-only atomic write (manager.py update_metadata).
+                    # A full save would rewrite and fsync the whole transcript
+                    # on every tool start/end, which is exactly the cost
+                    # save_runtime_checkpoint/update_session_metadata exist to
+                    # avoid. Fall back to a full save only when the file is not
+                    # there yet (e.g. the first turn raced its turn-start save).
+                    records = list(session.metadata.get(ACTIVITY_HISTORY_KEY, []))
+                    if not self.sessions.update_session_metadata(
+                        session.key,
+                        {ACTIVITY_HISTORY_KEY: records},
+                        fsync=True,
+                        # A metadata-only write leaves ``updated_at`` untouched,
+                        # which would freeze the webui-thread ETag variant (it
+                        # hashes ``session_updated_at``) and let a poller sit on
+                        # 304s and miss the freshly recoverable row. Bump it.
+                        touch_updated_at=True,
+                    ):
+                        self.sessions.save(session, fsync=True)
+                await _publish_events(event)
+
+            events = EventSink(_record_tool_activity, events.accepts)
 
         async def _checkpoint(payload: dict[str, Any]) -> None:
             if session is None:
@@ -1326,6 +1462,22 @@ class AgentLoop:
         file_state_token = bind_file_states(self._file_state_store.for_session(active_session_key))
         request_token = bind_request_context(request_ctx)
         workspace_token = bind_workspace_scope(effective_scope)
+        # The publication binding is task-scoped contextvars state: it is set
+        # here, inside the single task that executes this turn, and undone in
+        # the ``finally`` below so it can never leak past the run. A leaked
+        # binding would let the next turn publish into this conversation's
+        # slot (MIT-1030).
+        publication_token = (
+            bind_publish_file_turn(publish_file_turn)
+            if publish_file_turn is not None
+            else None
+        )
+        # The admission gateway caps background concurrency by the
+        # ``X-Ziggy-Scheduling-Class`` header, which the provider reads from
+        # this contextvar. Bound per turn inside the turn's own task (so a
+        # concurrent interactive turn never sees it) and reset in ``finally``
+        # so a finished Work run cannot leave later turns marked background.
+        scheduling_token = set_scheduling_class(scheduling_class_for_turn(request_metadata))
         turn_scope_stack = ExitStack()
         # Compute lazily because create_goal may create goal metadata during this run.
         def _goal_continue() -> str | None:
@@ -1362,12 +1514,12 @@ class AgentLoop:
                 run_extra_hooks_for_ephemeral=run_extra_hooks_for_ephemeral,
             ))
             result = await self.runner.run(AgentRunSpec(
-                initial_messages=None,
+                initial_messages=initial_messages,
                 tools=effective_tools,
                 runtime=runtime,
                 max_iterations=self.max_iterations,
                 max_tool_result_chars=self.max_tool_result_chars,
-                transcript_input=transcript_input,
+                transcript_input=None if initial_messages is not None else transcript_input,
                 transcript_builder=transcript_builder,
                 hook=hook,
                 concurrent_tools=True,
@@ -1376,24 +1528,28 @@ class AgentLoop:
                 provider_retry_mode=self.provider_retry_mode,
                 checkpoint_callback=_checkpoint,
                 consolidate_history=(
-                    partial(
+                    None
+                    if initial_messages is not None
+                    or session is None
+                    or ephemeral
+                    else partial(
                         self.consolidator.summarize_transcript,
                         runtime=runtime,
                         session_key=session.key,
                         tools=effective_tools.get_definitions(),
                     )
-                    if session is not None and not ephemeral
-                    else None
                 ),
                 consolidate_provider_compaction=(
-                    partial(
+                    None
+                    if initial_messages is not None
+                    or session is None
+                    or ephemeral
+                    else partial(
                         self.consolidator.summarize_provider_compaction,
                         runtime=runtime,
                         session_key=session.key,
                         tools=effective_tools.get_definitions(),
                     )
-                    if session is not None and not ephemeral
-                    else None
                 ),
                 injection_callback=_drain_pending,
                 terminal_injection_callback=_wait_for_pending,
@@ -1412,10 +1568,16 @@ class AgentLoop:
                 events=events,
             ))
         finally:
+            # Every exit path — happy, error, and cancellation (CancelledError
+            # unwinds through ``finally``) — must release the publication
+            # binding before the other turn-scoped tokens.
+            if publication_token is not None:
+                reset_publish_file_turn(publication_token)
             turn_scope_stack.close()
             reset_workspace_scope(workspace_token)
             reset_request_context(request_token)
             reset_file_states(file_state_token)
+            reset_scheduling_class(scheduling_token)
         if session is not None and not ephemeral:
             session.provider_state = result.provider_state
         if result.stop_reason == "max_iterations":
@@ -2001,6 +2163,7 @@ class AgentLoop:
         *,
         log_content: bool = True,
         turn_latency_ms: int | None = None,
+        buttons: list[list[str]] | None = None,
     ) -> OutboundMessage | None:
         """Assemble the final outbound message from turn results."""
         if log_content:
@@ -2011,7 +2174,9 @@ class AgentLoop:
 
         event = None
         meta = dict(msg.metadata or {})
-        if streamed_content and stop_reason not in {"error", "tool_error"}:
+        # ``ask_user`` closes its stream without delivering the question in it;
+        # the question must therefore travel as this fresh payload below.
+        if streamed_content and stop_reason not in {"error", "tool_error", "ask_user"}:
             event = StreamedResponseEvent()
         if turn_latency_ms is not None:
             meta["latency_ms"] = int(turn_latency_ms)
@@ -2022,6 +2187,7 @@ class AgentLoop:
             content=final_content,
             event=event,
             metadata=meta,
+            buttons=list(buttons or []),
         )
 
     async def _restore_turn(self, ctx: TurnContext) -> None:
@@ -2164,6 +2330,7 @@ class AgentLoop:
         is_subagent = ctx.kind is TurnKind.SYSTEM and ctx.msg.sender_id == "subagent"
 
         ctx.history = session.get_history(extend_to_user=is_subagent)
+        ctx.ask_user_resume_id = self._detect_ask_user_resume(ctx)
         stored_state = session.provider_state
         subagent_followup_persisted = False
         if is_subagent:
@@ -2190,9 +2357,15 @@ class AgentLoop:
         if ctx.kind is TurnKind.USER:
             ctx.runtime_context_blocks = await self._resolve_runtime_context_for_turn(ctx)
         staged_provider_state = False
-        if stored_state is not None and runtime.provider.can_resume_conversation_state(
-            stored_state,
-            runtime.model,
+        if (
+            stored_state is not None
+            # A parked ``ask_user`` answer is delivered as a tool result below;
+            # staging it as provider input would double-send it.
+            and ctx.ask_user_resume_id is None
+            and runtime.provider.can_resume_conversation_state(
+                stored_state,
+                runtime.model,
+            )
         ):
             current_provider_message = self.context.build_current_message(
                 ctx.msg.content,
@@ -2236,19 +2409,56 @@ class AgentLoop:
         elif stored_state is not None:
             session.provider_state = None
         if ctx.kind is TurnKind.USER:
-            ctx.input_persisted_early = self._persist_user_message_early(
-                ctx.msg,
-                session,
-                runtime_context_blocks=ctx.runtime_context_blocks,
-            )
-            if staged_provider_state and not ctx.input_persisted_early:
-                session.provider_state = stored_state
+            if ctx.ask_user_resume_id is None:
+                ctx.input_persisted_early = self._persist_user_message_early(
+                    ctx.msg,
+                    session,
+                    runtime_context_blocks=ctx.runtime_context_blocks,
+                )
+                if staged_provider_state and not ctx.input_persisted_early:
+                    session.provider_state = stored_state
+            # else: the answer becomes the parked call's tool result and is
+            # persisted by the save stage, never as a raw user message.
         elif subagent_followup_persisted and staged_provider_state:
             # Upgrade the replay-safe baseline to the resumable state before
             # prompt assembly and the first model checkpoint.
             self.sessions.save(session)
+        if ctx.ask_user_resume_id is not None:
+            assert ctx.request_context is not None
+            ctx.initial_messages = ask_user_tool_result_messages(
+                self.context.build_system_prompt(
+                    channel=ctx.request_context.channel,
+                    session_summary=ctx.pending_summary,
+                    workspace=ctx.request_context.workspace,
+                    include_memory=session.policy.persist,
+                ),
+                ctx.history,
+                ctx.ask_user_resume_id,
+                ctx.msg.content,
+            )
         ctx.transcript_input = self._build_transcript_input(ctx)
 
+
+    def _publish_file_turn_for_turn(self, ctx: TurnContext) -> PublishFileTurn | None:
+        """Mint the server-owned publication capability for this turn, if any.
+
+        Publication links are a WebSocket-client capability. Background Work
+        may explicitly opt in (``work_mode`` metadata) so reports tied to its
+        own session can be handed back through the same authenticated route.
+        Shared-room turns never receive one: guests drive the agent, and a
+        private download must not be mintable from a guest prompt. ``None``
+        keeps the ``publish_file`` tool inert for this turn.
+        """
+        if ctx.ephemeral or self._shared_room_turn(ctx.msg):
+            return None
+        metadata = ctx.msg.metadata
+        enabled = ctx.msg.channel == "websocket" or metadata.get("work_mode") in {
+            "background",
+            "scheduled",
+        }
+        if not enabled:
+            return None
+        return PublishFileTurn(self.sessions, ctx.session_key)
 
     async def _run_turn(self, ctx: TurnContext) -> None:
         runtime = ctx.require_runtime()
@@ -2256,6 +2466,7 @@ class AgentLoop:
             ctx.visible_run_started_at = time.time()
         await ctx.delivery.running(started_at=ctx.visible_run_started_at)
         assert ctx.transcript_input is not None
+        ctx.publish_file_turn = self._publish_file_turn_for_turn(ctx)
         with capture_message_deliveries() as message_sends:
             result = await self._run_agent_loop(
                 ctx.transcript_input,
@@ -2271,7 +2482,9 @@ class AgentLoop:
                 tools=ctx.tools,
                 request_context=ctx.request_context,
                 provider_state=ctx.provider_state,
+                initial_messages=ctx.initial_messages,
                 events=ctx.events,
+                publish_file_turn=ctx.publish_file_turn,
             )
         ctx.final_content = result.final_content
         ctx.all_messages = result.messages
@@ -2313,12 +2526,24 @@ class AgentLoop:
         ctx.turn_latency_ms = max(0, int((time.time() - latency_started_at) * 1000))
         if ctx.usage is not None and not ctx.ephemeral:
             session.metadata["_last_usage"] = ctx.usage.to_dict()
-        self._save_turn(
+        persisted = self._save_turn(
             session, ctx.all_messages, ctx.save_skip,
             turn_latency_ms=ctx.turn_latency_ms,
             summary_checkpoint=ctx.summary_checkpoint,
             input_persisted_early=ctx.input_persisted_early,
         )
+        if ctx.publish_file_turn is not None and not ctx.ephemeral:
+            # Grants attach only to publications whose canonical link was
+            # actually rendered in a final visible assistant message of *this*
+            # run. The run's messages are the entries ``_save_turn`` just
+            # appended, identified by object rather than by a transcript index
+            # captured at turn start: a summary checkpoint or compaction may
+            # rewrite the prefix mid-turn and shift any such index.
+            self.sessions.grant_published_files(
+                session,
+                ctx.publish_file_turn.publications,
+                messages=persisted,
+            )
         if (
             not ctx.ephemeral
             and ctx.provider_compaction_applied
@@ -2355,13 +2580,24 @@ class AgentLoop:
                 latency_ms=ctx.turn_latency_ms,
             )
             return
+        ask_options = (
+            ask_user_options_from_messages(ctx.all_messages)
+            if ctx.stop_reason == "ask_user"
+            else []
+        )
+        final_content, ask_buttons = ask_user_outbound(
+            cast(str, ctx.final_content),
+            ask_options,
+            ctx.msg.channel,
+        )
         ctx.outbound = self._assemble_outbound(
             ctx.delivery.delivery_message,
-            cast(str, ctx.final_content),
+            cast(str, final_content),
             ctx.stop_reason,
             ctx.streamed_content,
             log_content=ctx.require_session().policy.log_content,
             turn_latency_ms=ctx.turn_latency_ms,
+            buttons=ask_buttons,
         )
         if ctx.ephemeral and ctx.outbound is not None:
             ctx.outbound.metadata["_stop_reason"] = ctx.stop_reason
@@ -2425,8 +2661,13 @@ class AgentLoop:
         turn_latency_ms: int | None = None,
         summary_checkpoint: SessionSummaryCheckpoint | None = None,
         input_persisted_early: bool = False,
-    ) -> None:
-        """Commit new-turn messages and an optional summary boundary."""
+    ) -> list[dict[str, Any]]:
+        """Commit new-turn messages and an optional summary boundary.
+
+        Returns the entries appended to ``session.messages`` by this call, in
+        order. They are the live transcript objects, so callers can annotate
+        them without locating them by index.
+        """
         declared_tool_call_ids = {
             str(tc["id"])
             for m in session.messages
@@ -2443,6 +2684,7 @@ class AgentLoop:
         }
         last_assistant_idx: int | None = None
         saved_followup_ids: set[str] = set()
+        persisted: list[dict[str, Any]] = []
         checkpoint_boundary = self._validated_checkpoint_boundary(
             summary_checkpoint,
             skip=skip,
@@ -2528,6 +2770,7 @@ class AgentLoop:
                     entry[RUNTIME_CONTEXT_HISTORY_META] = runtime_context_meta
             entry.setdefault("timestamp", datetime.now().isoformat())
             session.messages.append(entry)
+            persisted.append(entry)
             if role == "user":
                 saved_followup_ids.update(followup_id for followup_id in followup_ids if followup_id)
             if role == "assistant":
@@ -2549,6 +2792,7 @@ class AgentLoop:
         if saved_followup_ids:
             acknowledge_pending_followups(session, saved_followup_ids)
         session.updated_at = datetime.now()
+        return persisted
 
     def _persist_subagent_followup(self, session: Session, msg: InboundMessage) -> bool:
         """Persist subagent follow-ups before prompt assembly so history stays durable.
