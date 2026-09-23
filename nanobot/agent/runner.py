@@ -24,6 +24,7 @@ from nanobot.agent.context_governance import (
     TranscriptBuilder,
 )
 from nanobot.agent.hook import AgentHook, AgentHookContext, AgentRunHookContext
+from nanobot.agent.tools.ask import AskUserInterrupt
 from nanobot.agent.tools.execution import execute_tool_calls
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.events import NO_EVENTS, EventSink
@@ -33,6 +34,10 @@ from nanobot.llm_usage.context import (
     reset_llm_usage_source,
     source_from_session_key,
 )
+
+# Ziggy-local (fork, MIT-202/210/211): Langfuse span helpers. Both are
+# no-ops when Langfuse is not configured.
+from nanobot.observability import observe_llm_iteration
 from nanobot.providers.base import (
     LLMProvider,
     LLMResponse,
@@ -41,9 +46,6 @@ from nanobot.providers.base import (
 )
 from nanobot.providers.conversation_state import ProviderConversationStateController
 from nanobot.session.summary import SessionSummaryCheckpoint
-# Ziggy-local (fork, MIT-202/210/211): Langfuse span helpers. Both are
-# no-ops when Langfuse is not configured.
-from nanobot.observability import observe_llm_iteration
 from nanobot.utils.helpers import (
     build_assistant_message,
     estimate_message_tokens,
@@ -495,13 +497,19 @@ class AgentRunner:
                     context.streamed_reasoning = True
 
                 if response.should_execute_tools:
-                    context.tool_calls = list(response.tool_calls)
+                    tool_calls = list(response.tool_calls)
+                    # ``ask_user`` pauses the turn: drop anything requested after
+                    # it so the model cannot schedule work past the question.
+                    ask_index = next((i for i, tc in enumerate(tool_calls) if tc.name == "ask_user"), None)
+                    if ask_index is not None:
+                        tool_calls = tool_calls[: ask_index + 1]
+                    context.tool_calls = list(tool_calls)
                     if hook.wants_streaming():
                         await hook.on_stream_end(context, resuming=True)
 
                     assistant_message = build_assistant_message(
                         response.content or "",
-                        tool_calls=[tc.to_openai_tool_call() for tc in response.tool_calls],
+                        tool_calls=[tc.to_openai_tool_call() for tc in tool_calls],
                         reasoning_content=response.reasoning_content,
                         thinking_blocks=response.thinking_blocks,
                     )
@@ -518,15 +526,15 @@ class AgentRunner:
                             "model": spec.runtime.model,
                             "assistant_message": assistant_message,
                             "completed_tool_results": [],
-                            "pending_tool_calls": [tc.to_openai_tool_call() for tc in response.tool_calls],
+                            "pending_tool_calls": [tc.to_openai_tool_call() for tc in tool_calls],
                         },
                     )
 
                     await hook.before_execute_tools(context)
 
-                    results, new_events = await execute_tool_calls(
+                    results, new_events, fatal_error = await execute_tool_calls(
                         spec.tools,
-                        response.tool_calls,
+                        tool_calls,
                         concurrent=spec.concurrent_tools,
                         external_lookup_counts=external_lookup_counts,
                         workspace_violation_counts=workspace_violation_counts,
@@ -536,13 +544,17 @@ class AgentRunner:
                     tool_events.extend(new_events)
                     tools_used.extend(
                         tool_call.name
-                        for tool_call, event in zip(response.tool_calls, new_events)
-                        if event.get("status") == "ok"
+                        for tool_call, event in zip(tool_calls, new_events)
+                        if event.get("status") in {"ok", "waiting"}
                     )
                     context.tool_results = list(results)
                     context.tool_events = list(new_events)
                     completed_tool_results: list[dict[str, Any]] = []
-                    for tool_call, result in zip(response.tool_calls, results):
+                    for tool_call, result in zip(tool_calls, results):
+                        if isinstance(fatal_error, AskUserInterrupt) and tool_call.name == "ask_user":
+                            # The parked turn is resumed by turning the user's
+                            # next message into this call's tool result.
+                            continue
                         tool_message = {
                             "role": "tool",
                             "tool_call_id": tool_call.id,
@@ -556,6 +568,26 @@ class AgentRunner:
                         }
                         messages.append(tool_message)
                         completed_tool_results.append(tool_message)
+                    if isinstance(fatal_error, AskUserInterrupt):
+                        final_content = fatal_error.question
+                        stop_reason = "ask_user"
+                        context.final_content = final_content
+                        context.stop_reason = stop_reason
+                        if hook.wants_streaming():
+                            # Second stream close for this iteration: the
+                            # tool-request branch above already closed the
+                            # delta stream with resuming=True once; the ask
+                            # path closes it again with resuming=False to mark
+                            # the question as delivered. This mirrors the
+                            # reference's ask-handling flow (the review thread
+                            # noted the reference does "the same"). We do NOT
+                            # claim the downstream consumer is idempotent --
+                            # it emits a second StreamEndEvent, and whether the
+                            # consumer treats the two closes as one turn is
+                            # not verified here.
+                            await hook.on_stream_end(context, resuming=False)
+                        await hook.after_iteration(context)
+                        break
                     checkpoint_model_messages = (
                         self.context_governor.prepare_messages_for_model(
                             governance_config,

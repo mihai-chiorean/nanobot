@@ -79,6 +79,15 @@ class RoomPolicy(str, Enum):
 #   spawn                            a fresh turn one level down
 #   exec, exec_session, run_cli_app  arbitrary code execution
 #   generate_image                   spends the owner's provider quota
+#   ask_user                         pauses the turn for a reply. The resume gate
+#                                    (``AgentLoop._detect_ask_user_resume``) never
+#                                    lets a shared-room message answer it, so a
+#                                    question parked in a room could only ever be
+#                                    resolved by a *private* message on the same
+#                                    session -- reflecting a private reply back
+#                                    into the room and crossing the boundary the
+#                                    room model exists to hold. Denied outright;
+#                                    the owner keeps it on their own turns.
 #   every MCP tool                   a connector speaks for the owner's
 #                                    identity: gmail, linkedin, calendar
 ROOM_ALLOWED_TOOLS: dict[str, str] = {

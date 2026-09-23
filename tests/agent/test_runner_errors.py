@@ -64,7 +64,7 @@ async def test_tool_execution_does_not_duplicate_existing_retry_hint():
         execute=AsyncMock(return_value=ToolResult.error("Error: boom" + retry_hint)),
     )
 
-    results, events = await execute_tool_calls(
+    results, events, fatal_error = await execute_tool_calls(
         tools,
         [ToolCallRequest(id="call_1", name="list_dir", arguments={})],
         concurrent=False,
