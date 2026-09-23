@@ -1412,10 +1412,11 @@ class GatewayHTTPHandler:
             {"deleted": bool(draft_deleted or session_deleted or transcript_deleted)}
         )
 
-    def _handle_session_title(self, request: WsRequest, key: str) -> Response:
+    def _handle_session_title(self, request: WsRequest, raw_key: str) -> Response:
         """Ziggy-local (MIT-1413): owner rename of a conversation, as production serves it.
 
-        Consumer: the iOS app (``ZiggyRESTClient.renameSession`` ->
+        Consumer: the iOS app (``AppModel.renameConversation`` ->
+        ``ZiggyRESTClient.updateConversationTitle`` ->
         ``POST /api/sessions/<key>/title``), whose rename 404s against 0.3.0
         while this route is absent. The new title arrives in the JSON body,
         is persisted through ``SessionManager.set_session_title`` (which
@@ -1424,19 +1425,34 @@ class GatewayHTTPHandler:
         production's ``{"session_key", "title"}`` shape. Shared-room sessions
         stay under the control plane's revision-mirrored title: the manager
         refuses a plain owner rename (``shared``) and the route answers 409,
-        the same split-brain guard the room routes enforce. Room credentials
-        are not owner credentials: they live in the shared-room credential
-        store, never in this gateway's API-token pool, so the shared token
-        check refuses them here exactly as it refuses an anonymous probe.
+        the same split-brain guard the room routes enforce.
+
+        Auth is the owner API bearer only (``tokens.check_api_token``), as for
+        ``/api/work`` and ``/api/sessions/<key>/messages``: the trusted-proxy
+        shortcut in ``check_api_token`` would also admit a proxied request
+        that carries no owner token (a room guest whose room token fell
+        through). Room credentials live in the shared-room store, never in
+        this pool.
+
+        The key gate mirrors production: a key that does not decode to a
+        legal session id, a non-canonical spelling (a literal colon rather
+        than ``%3A``, or lower-case escapes), or an original
+        request target that differs from the canonical path all answer the
+        same ``404 session not found``, so URL normalization never turns an
+        alias into a valid session identifier.
         """
-        if not self.check_api_token(request):
+        if not self.tokens.check_api_token(request):
             return _http_error(401, "Unauthorized")
         if self.session_manager is None:
             return _http_error(503, "session manager unavailable")
-        decoded_key = _decode_api_key(key)
-        if decoded_key is None:
-            return _http_error(400, "invalid session key")
-        if not _is_websocket_channel_session_key(decoded_key):
+        decoded_key = _decode_api_key(raw_key)
+        target = getattr(request, "raw_path", None) or request.path
+        if (
+            decoded_key is None
+            or quote(decoded_key, safe="") != raw_key
+            or target != f"/api/sessions/{raw_key}/title"
+            or not _is_websocket_channel_session_key(decoded_key)
+        ):
             return _http_error(404, "session not found")
         body = request_json(request)
         if body is None or not _valid_session_title(body.get("title")):

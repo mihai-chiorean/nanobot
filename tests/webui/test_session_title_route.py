@@ -2,10 +2,12 @@
 
 Production (``feat/shared-rooms`` @ 83028651) lets the owner rename a
 conversation through the WebUI; on the 0.3.0 line the route went missing, so
-the iOS rename (``ZiggyRESTClient.renameSession`` -> ``AppModel``
-``syncSessionTitle``) 404s.  Pins the restored contract: the owner API token
-is required (room credentials live in a separate pool and must not pass),
-unknown keys 404, blank/oversized/control-character titles 400, the rename
+the iOS rename (``AppModel.renameConversation`` ->
+``ZiggyRESTClient.updateConversationTitle``) 404s.  Pins the restored
+contract: the owner API bearer is required (room credentials live in a
+separate pool and the trusted-proxy marker is not accepted), unknown,
+undecodable and non-canonical keys 404, blank/oversized/control-character
+titles 400, the rename
 persists into the session file so the ``/api/sessions`` list index picks it
 up, and shared-room sessions stay under the control plane's revision protocol
 (409), never an owner split-brain write.
@@ -120,10 +122,9 @@ def _request(
 
 
 def _title_path(key: str) -> str:
-    # The browser client and the control proxy both send the session key
-    # percent-encoded (``encodeURIComponent`` in webui/src/api/client.ts; the
-    # control plane's route builder quotes the id); the route decodes it via
-    # ``_decode_api_key`` in the handler.
+    # The canonical spelling: the session key percent-encoded with no safe
+    # characters, as production's gate demands (the control plane's route
+    # builder quotes the id). The handler 404s any other spelling.
     return f"/api/sessions/{quote(key, safe='')}/title"
 
 
@@ -152,7 +153,7 @@ def _text(response: Any) -> str:
 @pytest.mark.asyncio
 async def test_owner_rename_round_trips_and_persists_to_list(env: Any) -> None:
     """Acceptance (1): owner POSTs {"title": "Trip plan"} -> 200; the
-    session list shows the new title (webui rename flow end-to-end)."""
+    session list shows the new title (rename flow end-to-end)."""
     channel, sessions, token = env
     key = f"websocket:{OWNER_CHAT}"
 
@@ -425,3 +426,163 @@ async def test_renaming_one_session_leaves_the_other_untouched(env: Any) -> None
     assert rows[target]["title"] == "Renamed"
     assert rows[sibling]["title"] == ""
     assert rows[sibling]["preview"] == "unrelated note"
+
+
+# ---------------------------------------------------------------------------
+# Trusted-proxy marker is not an owner credential (PR #76 review, blocking)
+# ---------------------------------------------------------------------------
+
+PROXY_ASSERTION_HEADER = "X-Ziggy-Proxy-Assertion"
+
+
+@pytest.fixture
+def proxied_env(tmp_path: Path) -> Any:
+    """The gateway fronted by a trusted proxy (as ziggy-control fronts it).
+
+    ``dispatch`` stamps ``_nanobot_trusted_proxy_authenticated`` from the
+    peer address plus a non-empty assertion header alone, so a proxied room
+    guest (or anything else the proxy forwards) carries the mark without ever
+    presenting the owner API token.
+    """
+    sessions = SessionManager(tmp_path)
+    session = sessions.get_or_create(f"websocket:{OWNER_CHAT}")
+    session.add_message("user", "where should we go?")
+    sessions.save(session, fsync=True)
+
+    config = WebSocketConfig.model_validate(
+        {
+            **_config().model_dump(by_alias=True),
+            "trustedProxyAuth": {
+                "trustedPeerCidrs": ["127.0.0.1/32"],
+                "assertionHeader": PROXY_ASSERTION_HEADER,
+            },
+        }
+    )
+    bus = MessageBus()
+    gateway = build_gateway_services(
+        config=config,
+        bus=bus,
+        session_manager=sessions,
+        static_dist_path=None,
+        workspace_path=tmp_path,
+        default_restrict_to_workspace=False,
+        runtime_model_name=None,
+        runtime_surface="browser",
+        runtime_capabilities_overrides=None,
+    )
+    channel = WebSocketChannel(config, bus, gateway=gateway)
+    token = channel.gateway.http.tokens.issue_api_token(60)
+    return channel, sessions, token
+
+
+@pytest.mark.asyncio
+async def test_a_trusted_proxy_request_is_not_an_owner_credential_for_rename(
+    proxied_env: Any,
+) -> None:
+    """Regression (PR #76 review, blocking).
+
+    ``WebUIHTTPRouter.check_api_token`` returns True for any request the
+    trusted proxy vouched for. The rename route must demand the owner API
+    token itself (``tokens.check_api_token``), as ``/api/work`` and
+    ``/api/sessions/<key>/messages`` do, or a proxied request with no bearer
+    can rename any owner conversation.
+    """
+    channel, sessions, token = proxied_env
+    key = f"websocket:{OWNER_CHAT}"
+
+    proxied = _request(_title_path(key), body={"title": "Proxy hijack"})
+    proxied.headers[PROXY_ASSERTION_HEADER] = "room-guest"
+    response = await channel._dispatch_http(_Connection(), proxied)
+    # Non-vacuity: dispatch really stamped the proxy mark on this request.
+    assert getattr(proxied, "_nanobot_trusted_proxy_authenticated", False) is True
+    assert response.status_code == 401
+    assert _text(response) == "Unauthorized"
+    persisted = sessions.read_session_file(key)
+    assert persisted is not None
+    assert "title" not in (persisted.get("metadata") or {})
+
+    # Non-vacuity: the owner bearer still renames through the same proxy.
+    owner = _request(_title_path(key), body={"title": "Owner rename"}, token=token)
+    owner.headers[PROXY_ASSERTION_HEADER] = "owner"
+    response = await channel._dispatch_http(_Connection(), owner)
+    assert response.status_code == 200
+    assert _body(response) == {"session_key": key, "title": "Owner rename"}
+
+
+# ---------------------------------------------------------------------------
+# Key gate parity with production: malformed / non-canonical keys -> 404
+# ---------------------------------------------------------------------------
+
+
+async def _post_raw(
+    channel: WebSocketChannel,
+    path: str,
+    token: str,
+    *,
+    raw_path: str | None = None,
+) -> Any:
+    request = _request(path, body={"title": "Aliased"}, token=token)
+    request.raw_path = raw_path if raw_path is not None else path
+    return await channel._dispatch_http(_Connection(), request)
+
+
+def _owner_title_untouched(sessions: SessionManager) -> bool:
+    persisted = sessions.read_session_file(f"websocket:{OWNER_CHAT}")
+    return persisted is not None and "title" not in (persisted.get("metadata") or {})
+
+
+@pytest.mark.asyncio
+async def test_undecodable_key_returns_404_like_production(env: Any) -> None:
+    """A key that does not decode to a legal session id is 'session not found'
+    (production folds it into the one 404), never a distinguishable 400."""
+    channel, sessions, token = env
+    for raw_key in ("bad%20key", "%ZZ", "a%2Fb", "x" * 129):
+        response = await _post_raw(channel, f"/api/sessions/{raw_key}/title", token)
+        assert response.status_code == 404, raw_key
+        assert _text(response) == "session not found"
+    assert _owner_title_untouched(sessions)
+
+
+@pytest.mark.asyncio
+async def test_non_canonical_key_spelling_returns_404(env: Any) -> None:
+    """``websocket:chat`` unencoded is an alias of the canonical
+    ``websocket%3Achat``; production refuses it so URL normalization never
+    turns an alternate spelling into a valid session identifier."""
+    channel, sessions, token = env
+    literal = f"/api/sessions/websocket:{OWNER_CHAT}/title"
+    response = await _post_raw(channel, literal, token)
+    assert response.status_code == 404
+    assert _text(response) == "session not found"
+    # Lower-case percent escape: decodes to the same key, still not canonical.
+    lower = f"/api/sessions/websocket%3a{OWNER_CHAT}/title"
+    response = await _post_raw(channel, lower, token)
+    assert response.status_code == 404
+    assert _owner_title_untouched(sessions)
+
+
+@pytest.mark.asyncio
+async def test_raw_target_must_match_the_canonical_path(env: Any) -> None:
+    """The routed path can be canonical while the original request target is
+    not (a trailing slash or query the parser dropped); production compares
+    the raw target too."""
+    channel, sessions, token = env
+    canonical = _title_path(f"websocket:{OWNER_CHAT}")
+    for raw_path in (canonical + "/", canonical + "?x=1"):
+        response = await _post_raw(channel, canonical, token, raw_path=raw_path)
+        assert response.status_code == 404, raw_path
+    assert _owner_title_untouched(sessions)
+
+
+@pytest.mark.asyncio
+async def test_canonical_encoded_key_is_still_renamed(env: Any) -> None:
+    """Positive control for the gate: ``websocket%3A<chat>`` renames (200)."""
+    channel, sessions, token = env
+    key = f"websocket:{OWNER_CHAT}"
+    canonical = f"/api/sessions/websocket%3A{OWNER_CHAT}/title"
+    assert canonical == _title_path(key)
+    response = await _post_raw(channel, canonical, token)
+    assert response.status_code == 200
+    assert _body(response) == {"session_key": key, "title": "Aliased"}
+    persisted = sessions.read_session_file(key)
+    assert persisted is not None
+    assert persisted["metadata"]["title"] == "Aliased"
