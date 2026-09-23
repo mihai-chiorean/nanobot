@@ -1377,6 +1377,13 @@ export type InboundEvent =
       reply_to?: string;
       media?: string[];
       media_urls?: Array<{ url: string; name?: string }>;
+      /** Structured quick-reply button rows (ask_user, message tool). Each row
+       * is a list of labels; a capable client renders them as tappable buttons. */
+      buttons?: string[][];
+      /** The prompt text that the ``buttons`` options answer. Present alongside
+       * ``buttons``; ``text`` already carries a numbered fallback of the same
+       * options for clients that ignore the structured field. */
+      button_prompt?: string;
       tool_events?: ToolProgressEvent[];
       /** Present when the frame is an agent breadcrumb (e.g. tool hint,
        * generic progress line) rather than a conversational reply. */
