@@ -6,6 +6,8 @@
 .env
 .web
 .orion
+# MIT-1422: sqlite dirs leaked by tests that mock SessionManager
+MagicMock/
 
 # Claude / AI assistant artifacts
 docs/superpowers/

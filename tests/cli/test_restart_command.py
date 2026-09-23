@@ -31,7 +31,15 @@ def _make_loop():
          patch("nanobot.agent.loop.SessionManager"), \
          patch("nanobot.agent.loop.SubagentManager") as mock_sub_mgr:
         mock_sub_mgr.return_value.close = AsyncMock()
-        loop = AgentLoop(bus=bus, provider=provider, workspace=workspace)
+        # MIT-1422: SessionManager is a MagicMock here; with the index on,
+        # AgentLoop would build MemoryIndex from the mock's string form and
+        # leak sqlite files into the cwd.
+        loop = AgentLoop(
+            bus=bus,
+            provider=provider,
+            workspace=workspace,
+            memory_index_enabled=False,
+        )
     return loop, bus
 
 
