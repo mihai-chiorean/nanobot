@@ -396,8 +396,8 @@ async def test_loop_max_iterations_message_stays_stable(tmp_path):
     )
 
     assert result.final_content == (
-        "I reached the maximum number of tool call iterations (2) "
-        "without completing the task. You can try breaking the task into smaller steps."
+        "This run reached its limit of 2 tool iterations without completing the task. "
+        "The limit resets for each new request or scheduled run; it is not a lifetime quota."
     )
 
 
@@ -428,8 +428,8 @@ async def test_loop_goal_turn_uses_standard_iteration_budget(tmp_path):
     assert loop.provider.chat_stream_with_retry.await_count == 3
     assert loop.provider.chat_stream_with_retry.await_args_list[-1].kwargs["tools"] is None
     assert result.final_content == (
-        "I reached the maximum number of tool call iterations (2) "
-        "without completing the task. You can try breaking the task into smaller steps."
+        "This run reached its limit of 2 tool iterations without completing the task. "
+        "The limit resets for each new request or scheduled run; it is not a lifetime quota."
     )
 
 

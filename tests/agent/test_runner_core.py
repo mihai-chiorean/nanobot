@@ -597,8 +597,8 @@ async def test_runner_returns_max_iterations_fallback():
 
     assert result.stop_reason == "max_iterations"
     assert result.final_content == (
-        "I reached the maximum number of tool call iterations (2) "
-        "without completing the task. You can try breaking the task into smaller steps."
+        "This run reached its limit of 2 tool iterations without completing the task. "
+        "The limit resets for each new request or scheduled run; it is not a lifetime quota."
     )
     assert result.messages[-1]["role"] == "assistant"
     assert result.messages[-1]["content"] == result.final_content

@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
+import json
+import re
 import time
 from collections.abc import Awaitable, Callable, Iterable
 from copy import deepcopy
@@ -43,6 +46,7 @@ from nanobot.providers.base import (
     LLMResponse,
     LLMUsage,
     ProviderConversationState,
+    ToolCallRequest,
 )
 from nanobot.providers.conversation_state import ProviderConversationStateController
 from nanobot.session.summary import SessionSummaryCheckpoint
@@ -75,6 +79,22 @@ _ARREARAGE_ERROR_MESSAGE = (
 _PERSISTED_MODEL_ERROR_PLACEHOLDER = "[Assistant reply unavailable due to model error.]"
 _MAX_EMPTY_RETRIES = 2
 _MAX_LENGTH_RECOVERIES = 3
+_MAX_INCOMPLETE_RECOVERIES = 2
+_REPEATED_EXEC_RECOVERY_THRESHOLD = 3
+_REPEATED_EXEC_STOP_THRESHOLD = 6
+_INCOMPLETE_FINAL_RECOVERY_PROMPT = (
+    "Your last response ended with an unfinished introduction or only a promise to act. "
+    "Complete the answer now, including any questions you intended to ask. "
+    "If authorized work is needed, use the available tools and verify the result. "
+    "Do not bypass approvals or safety controls. If blocked, explain the blocker. "
+    "Do not claim completion without evidence."
+)
+_REPEATED_EXEC_STOP_MESSAGE = (
+    "This run stopped after the same shell command returned "
+    "identical output six times, despite recovery prompts. "
+    "Review the saved work and continue with a different approach. "
+    "This is a repeated-command failure, not a lifetime tool quota."
+)
 _MAX_INJECTIONS_PER_TURN = 3
 _MAX_INJECTION_CYCLES = 5
 
@@ -88,6 +108,60 @@ def _restore_outer_whitespace(content: str, original: str | None) -> str:
     leading = original[:leading_size]
     trailing = original[-trailing_size:] if trailing_size else ""
     return f"{leading}{content}{trailing}"
+
+
+def _repeated_exec_hint(count: int) -> str:
+    """Hint appended to an exec result the model has already seen verbatim."""
+    return (
+        "\n\n[The same shell command has returned identical output "
+        f"{count} times consecutively. Reassess before calling "
+        "it again: check whether the proposed change changes anything, "
+        "inspect the saved result with another tool, then proceed to "
+        "validation/publication if it is already correct. If waiting "
+        "for external work, use its status/poll tool instead. "
+        "Do not repeat this command unchanged.]"
+    )
+
+
+def _incomplete_final(text: str | None) -> bool:
+    """Conservative guard for dangling introductions, not a success judge."""
+    text = (text or "").strip()
+    if text.endswith(":") and not text.endswith("```"):
+        return True
+    return len(text) < 400 and bool(re.fullmatch(
+        r"(?:Let me|I'll|I’ll|I will) (?:check|look|search|build|implement|create|start|inspect|test|verify) [^\n!?]+[.!]?",
+        text, flags=re.IGNORECASE,
+    ))
+
+
+@dataclass
+class _ExecProgress:
+    """Track consecutive identical successful exec responses within one run."""
+
+    fingerprint: str | None = None
+    count: int = 0
+
+    def observe(
+        self,
+        calls: list[ToolCallRequest],
+        results: list[Any],
+        events: list[dict[str, Any]],
+    ) -> int:
+        if (
+            len(calls) != 1
+            or calls[0].name != "exec"
+            or len(results) != 1
+            or len(events) != 1
+            or events[0].get("status") != "ok"
+            or not isinstance(results[0], str)
+        ):
+            self.fingerprint, self.count = None, 0
+            return 0
+        payload = json.dumps([calls[0].arguments, results[0]], sort_keys=True, default=str)
+        fingerprint = hashlib.sha256(payload.encode()).hexdigest()
+        self.count = self.count + 1 if fingerprint == self.fingerprint else 1
+        self.fingerprint = fingerprint
+        return self.count
 
 
 @dataclass(slots=True)
@@ -407,6 +481,8 @@ class AgentRunner:
         # Per-turn throttle for repeated attempts against the same outside target.
         workspace_violation_counts: dict[str, int] = {}
         empty_content_retries = 0
+        incomplete_recovery_count = 0
+        exec_progress = _ExecProgress()
         # Segments from one uninterrupted length-recovery chain. Tool work or
         # injected user input starts a new logical answer and clears the chain.
         length_recovery_parts: list[str] = []
@@ -541,6 +617,9 @@ class AgentRunner:
                         hook=hook,
                         context=context,
                     )
+                    repeated_exec = exec_progress.observe(tool_calls, results, new_events)
+                    if repeated_exec >= _REPEATED_EXEC_RECOVERY_THRESHOLD:
+                        results[0] += _repeated_exec_hint(repeated_exec)
                     tool_events.extend(new_events)
                     tools_used.extend(
                         tool_call.name
@@ -613,6 +692,17 @@ class AgentRunner:
                     )
                     empty_content_retries = 0
                     length_recovery_parts.clear()
+                    if repeated_exec >= _REPEATED_EXEC_STOP_THRESHOLD:
+                        # Three recovery opportunities preceded this stop. Preserve
+                        # checkpoints and never report unfinished work as successful.
+                        final_content = _REPEATED_EXEC_STOP_MESSAGE
+                        error = final_content
+                        stop_reason = "incomplete_response"
+                        self._append_final_message(messages, final_content)
+                        context.final_content, context.error = final_content, error
+                        context.stop_reason = stop_reason
+                        await hook.after_iteration(context)
+                        break
                     # Checkpoint 1: drain injections after tools, before next LLM call
                     _drained, injection_cycles = await self._try_drain_injections(
                         spec, messages, None, injection_cycles,
@@ -699,6 +789,30 @@ class AgentRunner:
                         messages.append(build_length_recovery_message(clean or ""))
                         await hook.after_iteration(context)
                         continue
+
+                if response.finish_reason == "stop" and _incomplete_final(clean):
+                    incomplete_recovery_count += 1
+                    if incomplete_recovery_count <= _MAX_INCOMPLETE_RECOVERIES:
+                        logger.warning(
+                            "Incomplete final response; retrying ({}/{})",
+                            incomplete_recovery_count,
+                            _MAX_INCOMPLETE_RECOVERIES,
+                        )
+                        # Do not save the stub as a completed assistant reply.
+                        messages.append({
+                            "role": "system",
+                            "content": _INCOMPLETE_FINAL_RECOVERY_PROMPT,
+                        })
+                        if hook.wants_streaming():
+                            await hook.on_stream_end(context, resuming=True)
+                        await hook.after_iteration(context)
+                        continue
+                    clean = (
+                        "I couldn't finish this response after two automatic retries. "
+                        "The task is not confirmed complete. Please retry; any required "
+                        "approvals still apply."
+                    )
+                    stop_reason = "incomplete_response"
 
                 # Some streaming providers recover with a complete response but no
                 # content deltas. When an earlier length segment is already visible,

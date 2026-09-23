@@ -120,7 +120,7 @@ class MyTool(Tool):
     })
 
     RESTRICTED: dict[str, dict[str, Any]] = {
-        "max_iterations":        {"type": int, "min": 1,   "max": 100},
+        "max_iterations":        {"type": int, "min": 1,   "max": 1000},
         "context_window_tokens": {"type": int, "min": 4096, "max": 1_000_000},
         "model":                 {"type": str, "min_len": 1},
     }
@@ -158,6 +158,8 @@ class MyTool(Tool):
             "(e.g. 'web_config.enable').\n"
             "- set (key, value): change config or store notes in your scratchpad. "
             "Scratchpad keys persist across turns but not restarts.\n"
+            "The iteration budget applies to one run, not the conversation's lifetime. "
+            "Each new request or scheduled run starts a fresh budget.\n"
             "Current routing metadata is available read-only via request.channel, "
             "request.chat_id, and request.sender_id.\n"
             "Use model_preset for session-scoped model or context changes; direct "

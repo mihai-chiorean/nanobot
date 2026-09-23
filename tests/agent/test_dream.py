@@ -685,6 +685,9 @@ class TestEphemeralHooks:
         spy.wants_streaming.return_value = False
         spy.before_iteration = AsyncMock()
         spy.after_iteration = AsyncMock()
+        # Match AgentHook's identity default so the spy never replaces the
+        # real content traveling through the runner's finalize chain.
+        spy.finalize_content.side_effect = lambda context, content: content
 
         with (
             patch("nanobot.agent.loop.SessionManager"),
