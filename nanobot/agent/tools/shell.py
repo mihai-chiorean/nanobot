@@ -115,6 +115,39 @@ _UNRESOLVABLE_HOST_NOTE = (
     "reach it and ask for the correct URL."
 )
 
+# MIT-1397: a whole-word `..` (delimited by start/end, whitespace or a shell
+# separator/redirection/quote) is a path component, not a name: `cd ..` and
+# `cat <>..` resolve exactly like `cd ../`. A dot pair glued to a word
+# character on either side (`a..b`, `v1..v2`, `...`) is not, so those keep
+# passing; `../` and `..\` stay covered by the literal substring checks.
+_BARE_PARENT_WORD_RE = re.compile(r"(?:^|[ \t\r\n;|&(<>\"'])\.\.(?:$|[ \t\r\n;|&)<>\"'])")
+
+
+def _param_expansion_has_path(command: str) -> bool:
+    """True when a ``${...}`` body in *command* contains a slash.
+
+    The guard cannot resolve what an expansion expands to, so a body that
+    carries a path (``${X:-/etc}``, ``${X#/etc}``) is rejected fail-closed
+    before any literal extraction runs. Braces are tracked by depth so a
+    nested ``${a:-${b}}`` is measured against its own closing brace, and an
+    unterminated ``${`` is treated as reaching the end of the command.
+    """
+    start = command.find("${")
+    while start >= 0:
+        depth = 1
+        pos = start + 2
+        while pos < len(command) and depth:
+            if command[pos] == "{":
+                depth += 1
+            elif command[pos] == "}":
+                depth -= 1
+            pos += 1
+        body = command[start + 2 : pos - 1] if depth == 0 else command[start + 2 :]
+        if "/" in body:
+            return True
+        start = command.find("${", start + 2)
+    return False
+
 
 class ExecToolConfig(Base):
     """Shell exec tool configuration."""
@@ -1042,6 +1075,31 @@ class ExecTool(Tool):
             if "..\\" in cmd or "../" in cmd:
                 return ToolResult.error(
                     "Error: Command blocked by safety guard (path traversal detected)"
+                    + _WORKSPACE_BOUNDARY_NOTE
+                )
+
+            # The traversal scan above only sees `../` / `..\`, so a bare `..`
+            # followed by a delimiter (`cd ..; cd ..; cat etc/passwd`) walked
+            # the tenant up one level per pair with no slash for the scan to
+            # find. The shell resolves such a word against the cwd exactly
+            # like `../`, so it is rejected as a whole word; names that merely
+            # contain dots (`a..b`, `...`, `foo..txt`) are not whole words and
+            # keep passing.
+            if _BARE_PARENT_WORD_RE.search(cmd):
+                return ToolResult.error(
+                    "Error: Command blocked by safety guard (path traversal detected)"
+                    + _WORKSPACE_BOUNDARY_NOTE
+                )
+
+            # A `${...}` expansion whose body carries a slash (`${X:-/etc}`,
+            # `${X#/etc}`) materialises a path only at run time, so no literal
+            # ever reaches the checks above and the word is otherwise opaque.
+            # Fail closed on the shape instead of trusting the value; bodies
+            # without a slash (`${path}`, `${#ref}`) stay allowed, and text
+            # *after* the closing brace is not body material.
+            if _param_expansion_has_path(cmd):
+                return ToolResult.error(
+                    "Error: Command blocked by safety guard (path outside working dir)"
                     + _WORKSPACE_BOUNDARY_NOTE
                 )
 
