@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
+import threading
 from functools import partial
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any
 
 import pytest
+from loguru import logger
 from mcp.shared.auth import OAuthToken
 
 from nanobot.agent.plugins import AGENT_PLUGIN_MCP_SCHEMA, AGENT_PLUGIN_SCHEMA
@@ -760,3 +765,355 @@ def test_normalize_mcp_mentions_uses_explicit_gateway_config(
     )
 
     assert payload == [{"name": "gateway-docs", "display_name": "Gateway docs"}]
+
+
+# -- MIT-1423: "test connection" against the operator-configured loopback connector ----
+#
+# The tenant Gmail connector (provision_tenant.py, mirrored by _server_dict in
+# tests/tools/test_mcp_oauth_client_credentials.py) is provisioned into
+# ``tools.mcpServers`` with a loopback MCP URL plus a loopback OAuth token URL.
+# PR #73 (MIT-1405) made the runtime accept those entries by marking them via
+# ``_mark_operator_configured``; the WebUI "test connection" check copies the
+# config and must carry the same marker, or the SSRF guard blocks the
+# operator's own connector and the page reports "blocked" while the runtime
+# connects fine. These tests drive the real connect path (SSRF guard, pinned
+# DNS transport, and the client-credentials token exchange) against a live
+# listener on 127.0.0.1 -- no transport mocks.
+
+
+_GMAIL_CLIENT_ID = "rt_0123456789abcdef"
+_GMAIL_CLIENT_SECRET = "s3cr3t-value-that-must-never-be-logged"
+
+
+def _gmail_server_dict(port: int, secret_file: Path) -> dict[str, Any]:
+    """The ``tools.mcpServers`` shape provision_tenant.py writes for Gmail."""
+    base = f"http://127.0.0.1:{port}"
+    return {
+        "type": "streamableHttp",
+        "url": f"{base}/mcp",
+        "oauthClientCredentials": {
+            "tokenUrl": f"{base}/token",
+            "clientId": _GMAIL_CLIENT_ID,
+            "clientSecretFile": str(secret_file),
+            "scopes": ["gmail.read", "gmail.search"],
+        },
+        "enabledTools": ["gmail_search"],
+        "toolTimeout": 240,
+    }
+
+
+def _write_gmail_operator_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, port: int
+) -> Path:
+    """Materialize the provisioned tenant config and point the loader at it."""
+    secret_file = tmp_path / "mcp-client-secret"
+    secret_file.write_text(_GMAIL_CLIENT_SECRET + "\n", encoding="utf-8")
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "agents": {"defaults": {"workspace": str(tmp_path / "workspace")}},
+                "tools": {"mcpServers": {"gmail": _gmail_server_dict(port, secret_file)}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("nanobot.config.loader._current_config_path", config_path)
+    return config_path
+
+
+class _MCPProbeHandler(BaseHTTPRequestHandler):
+    """A real MCP streamable-HTTP endpoint plus an OAuth client-credentials token endpoint.
+
+    Requests the SSRF guard blocks never reach this listener, so recording
+    every request that does arrive is what distinguishes "guard allowed it"
+    from "guard blocked it". The handler keeps no logs and never echoes the
+    client secret back in any response body.
+    """
+
+    def log_message(self, *_args: object) -> None:
+        pass
+
+    def _read_body(self) -> bytes:
+        length = int(self.headers.get("Content-Length") or 0)
+        return self.rfile.read(length) if length else b""
+
+    def _reply(self, status: int, payload: dict[str, Any] | None) -> None:
+        body = b"" if payload is None else json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
+
+    def do_GET(self) -> None:  # noqa: N802
+        self.server.recorded.append(("GET", self.path, None))
+        self._reply(405, None)
+
+    def do_POST(self) -> None:  # noqa: N802
+        raw = self._read_body()
+        auth = self.headers.get("Authorization")
+        self.server.recorded.append((self.command, self.path, auth))
+        if self.path == "/token":
+            self._handle_token(raw, auth)
+            return
+        if self.path != "/mcp":
+            self._reply(404, None)
+            return
+        self._handle_mcp(raw)
+
+    def _handle_token(self, raw: bytes, auth: str | None) -> None:
+        # Accept only the HTTP Basic client authentication the real flow
+        # produces (RFC 9707); a wrong or missing credential gets the 401 the
+        # runtime expects -- the secret itself never appears in any response.
+        if not auth or not auth.startswith("Basic "):
+            self._reply(401, {"error": "invalid_client"})
+            return
+        try:
+            identity = base64.b64decode(auth.removeprefix("Basic ").encode("ascii")).decode("utf-8")
+            client_id, secret = identity.split(":", 1)
+        except (ValueError, UnicodeDecodeError):
+            self._reply(401, {"error": "invalid_client"})
+            return
+        if client_id != _GMAIL_CLIENT_ID or secret != _GMAIL_CLIENT_SECRET:
+            self._reply(401, {"error": "invalid_client"})
+            return
+        self._reply(
+            200,
+            {
+                "access_token": "mit-1423-token",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+            },
+        )
+
+    def _handle_mcp(self, raw: bytes) -> None:
+        try:
+            msg = json.loads(raw or b"{}")
+        except ValueError:
+            msg = {}
+        method = msg.get("method")
+        msg_id = msg.get("id")
+        if method == "initialize":
+            params = msg.get("params") or {}
+            self.server.protocols.append(str(params.get("protocolVersion", "")))
+            self._reply(
+                200,
+                {
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "result": {
+                        "protocolVersion": params.get("protocolVersion", "2025-03-26"),
+                        "capabilities": {},
+                        "serverInfo": {"name": "mit-1423-probe", "version": "0"},
+                    },
+                },
+            )
+            return
+        if method == "notifications/initialized":
+            self._reply(202, None)
+            return
+        if method == "tools/list":
+            self._reply(
+                200,
+                {
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "result": {
+                        "tools": [
+                            {
+                                "name": "probe_tool",
+                                "description": "Probe tool served by the live test listener",
+                                "inputSchema": {"type": "object", "properties": {}},
+                            }
+                        ]
+                    },
+                },
+            )
+            return
+        if method == "tools/call":
+            self._reply(
+                200,
+                {
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "result": {"content": [{"type": "text", "text": "ok"}], "isError": False},
+                },
+            )
+            return
+        if method == "resources/list":
+            self._reply(200, {"jsonrpc": "2.0", "id": msg_id, "result": {"resources": []}})
+            return
+        if method == "prompts/list":
+            self._reply(200, {"jsonrpc": "2.0", "id": msg_id, "result": {"prompts": []}})
+            return
+        if msg_id is not None:
+            self._reply(
+                200,
+                {
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "error": {"code": -32601, "message": f"unsupported method: {method}"},
+                },
+            )
+        else:
+            self._reply(202, None)
+
+
+class _MCPProbeServer:
+    """A real loopback HTTP server: records every request that reaches it."""
+
+    def __init__(self) -> None:
+        self.recorded: list[tuple[str, str, str | None]] = []
+        self.protocols: list[str] = []
+        owner = self
+
+        class Handler(_MCPProbeHandler):
+            server_owner = owner
+
+        self._httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._httpd.daemon_threads = True
+        # The per-request handler reaches the recording lists through the
+        # server instance that ThreadingHTTPServer hands it.
+        self._httpd.recorded = self.recorded
+        self._httpd.protocols = self.protocols
+        self.port = self._httpd.server_address[1]
+        self.base_url = f"http://127.0.0.1:{self.port}"
+        self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
+        self._thread.start()
+
+    def requests_for(self, method: str, path: str) -> list[tuple[str, str, str | None]]:
+        return [item for item in self.recorded if item[0] == method and item[1] == path]
+
+    def stop(self) -> None:
+        self._httpd.shutdown()
+        self._httpd.server_close()
+        self._thread.join(timeout=5)
+
+
+@pytest.fixture
+def gmail_probe_server() -> Any:
+    server = _MCPProbeServer()
+    try:
+        yield server
+    finally:
+        server.stop()
+
+
+def _capture_mcp_logs() -> tuple[list[str], int]:
+    lines: list[str] = []
+    sink_id = logger.add(lambda message: lines.append(str(message)), level="TRACE")
+    return lines, sink_id
+
+
+def test_connection_test_reports_operator_configured_loopback_server_reachable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, gmail_probe_server: _MCPProbeServer
+) -> None:
+    # Acceptance 1: the operator-configured loopback connector the runtime
+    # reaches fine must not be reported as blocked. Before the fix the copied
+    # config lost the marker, the guard refused the URL before any socket was
+    # opened, and this assertion fails with ok=False.
+    config_path = _write_gmail_operator_config(tmp_path, monkeypatch, gmail_probe_server.port)
+    lines, sink_id = _capture_mcp_logs()
+    try:
+        payload = asyncio.run(mcp_presets_test_action({"name": ["gmail"]}, config_path=config_path))
+    finally:
+        logger.remove(sink_id)
+
+    last = payload["last_action"]
+    assert last["ok"] is True, last
+    assert last["tool_count"] == 1
+    assert any(name.endswith("probe_tool") for name in last["tool_names"])
+
+    # The handshake was a real MCP conversation, and the token endpoint was
+    # hit with the client credentials the config named -- proof the flow used
+    # the operator-configured URL rather than a mocked transport.
+    assert gmail_probe_server.protocols, "initialize never reached the test listener"
+    token_requests = gmail_probe_server.requests_for("POST", "/token")
+    assert token_requests, "token endpoint never reached the test listener"
+    authorization = token_requests[0][2]
+    assert authorization is not None and authorization.startswith("Basic "), token_requests[0]
+    decoded = base64.b64decode(authorization.removeprefix("Basic ").encode("ascii")).decode("utf-8")
+    assert decoded == f"{_GMAIL_CLIENT_ID}:{_GMAIL_CLIENT_SECRET}"
+    mcp_requests = gmail_probe_server.requests_for("POST", "/mcp")
+    assert mcp_requests, "MCP endpoint never reached the test listener"
+    bearer = next(item for item in mcp_requests if item[2] and item[2].startswith("Bearer "))
+    assert bearer[2] == "Bearer mit-1423-token"
+
+    # Acceptance 3 (this run): the client secret stays in the Authorization
+    # header the listener observed and never reaches a log line or payload.
+    joined = "\n".join(lines)
+    assert _GMAIL_CLIENT_SECRET not in joined
+    assert _GMAIL_CLIENT_SECRET not in json.dumps(payload, default=str)
+
+
+def test_connection_test_blocks_unconfigured_preset_but_operator_entry_reaches_listener(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, gmail_probe_server: _MCPProbeServer
+) -> None:
+    # Acceptance 2: the same loopback URL submitted as a new, unconfigured
+    # preset (nothing in ``tools.mcpServers``) still reports blocked. An
+    # unconfigured name must never reach the connect path at all -- the
+    # action refuses it before any socket is opened, and the listener stays
+    # silent to prove it. Pre-fix this behaves the same as post-fix; it is
+    # the regression face of the marker change, so it must keep holding.
+    _use_config(tmp_path, monkeypatch)
+    with pytest.raises(McpPresetError) as excinfo:
+        asyncio.run(mcp_presets_test_action({"name": ["gmail"]}, config_path=None))
+    assert excinfo.value.status == 404
+    assert "not enabled" in str(excinfo.value).lower()
+    assert gmail_probe_server.recorded == [], "unconfigured preset reached the listener"
+
+    # Negative control in the same run: a server object that never went
+    # through the operator code path -- exactly what a plugin or model-
+    # influenced edit produces -- must still be refused, even though the
+    # identical URL was allowlisted seconds earlier in the sibling test.
+    # Trust is granted only by the operator marker, so sharing the URL
+    # cannot widen the guard.
+    from nanobot.agent.tools.mcp import connect_mcp_servers
+    from nanobot.agent.tools.registry import ToolRegistry
+    from nanobot.config.schema import MCPServerConfig
+
+    secret_file = tmp_path / "mcp-client-secret"
+    secret_file.write_text(_GMAIL_CLIENT_SECRET + "\n", encoding="utf-8")
+    unmarked = MCPServerConfig.model_validate(
+        _gmail_server_dict(gmail_probe_server.port, secret_file)
+    )
+    try:
+        stacks = asyncio.run(connect_mcp_servers({"gmail": unmarked}, ToolRegistry()))
+    except Exception as exc:  # a refused connect before any socket is equally fine
+        print(f"unmarked connect raised as expected: {type(exc).__name__}")
+        stacks = {}
+    assert stacks == {} or stacks.get("gmail") is None, "unmarked config was not refused"
+    assert gmail_probe_server.recorded == [], "unmarked config reached the listener"
+
+
+def test_connection_test_never_logs_the_client_secret(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, gmail_probe_server: _MCPProbeServer
+) -> None:
+    # Acceptance 3, run independently of the reachable-path check above:
+    # the config file holds a real client secret and the token exchange runs
+    # over it, so any log record or error payload emitted by the tested code
+    # path must not contain it -- in either the raw or the base64 form the
+    # Authorization header would carry.
+    config_path = _write_gmail_operator_config(tmp_path, monkeypatch, gmail_probe_server.port)
+    lines, sink_id = _capture_mcp_logs()
+    try:
+        payload = asyncio.run(mcp_presets_test_action({"name": ["gmail"]}, config_path=config_path))
+    finally:
+        logger.remove(sink_id)
+
+    assert payload["last_action"]["ok"] is True, payload["last_action"]
+    assert any(
+        item[2] and item[2].startswith("Basic ")
+        for item in gmail_probe_server.requests_for("POST", "/token")
+    ), "token endpoint never saw the Basic credentials, so the scan below is vacuous"
+
+    encoded = base64.b64encode(
+        f"{_GMAIL_CLIENT_ID}:{_GMAIL_CLIENT_SECRET}".encode("utf-8")
+    ).decode("ascii")
+    joined = "\n".join(lines)
+    assert joined, "the tested path logged nothing at all"
+    assert _GMAIL_CLIENT_SECRET not in joined
+    assert encoded not in joined
+    assert _GMAIL_CLIENT_SECRET not in json.dumps(payload, default=str)

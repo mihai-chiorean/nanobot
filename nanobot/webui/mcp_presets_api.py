@@ -1106,7 +1106,7 @@ async def mcp_presets_test_action(
     config_path: Path | None = None,
 ) -> dict[str, Any]:
     """Connect to an enabled MCP preset and report its complete tool surface."""
-    from nanobot.agent.tools.mcp import connect_mcp_servers
+    from nanobot.agent.tools.mcp import _mark_operator_configured, connect_mcp_servers
 
     name = (_query_first(query, "name") or "").strip()
     if not name:
@@ -1165,7 +1165,18 @@ async def mcp_presets_test_action(
 
     registry = ToolRegistry()
     stacks: dict[str, Any] = {}
-    inspection_cfg = cfg.model_copy(update={"enabled_tools": ["*"]})
+    # Ziggy-local (MIT-1423): the entry under test was read back from the
+    # operator's ``tools.mcpServers`` config file, which is exactly what the
+    # runtime marks via ``_mark_operator_configured`` before connecting
+    # (``_load_current_servers``). Copying the config without that marker made
+    # the SSRF guard reject the very loopback endpoints the operator named
+    # themselves (the tenant Gmail connector on 127.0.0.1), so this page
+    # reported "blocked" while the live runtime connected fine. Reuse the
+    # runtime's marking code path; servers from any other source are not in
+    # ``config.tools.mcp_servers`` and keep facing the full guard.
+    inspection_cfg = _mark_operator_configured({name: cfg})[name].model_copy(
+        update={"enabled_tools": ["*"]}
+    )
     try:
         stacks = await asyncio.wait_for(
             connect_mcp_servers({name: inspection_cfg}, registry),
