@@ -708,12 +708,7 @@ async def test_runner_replaces_empty_tool_result_with_marker():
 
 @pytest.mark.asyncio
 async def test_runner_retries_empty_final_response_with_summary_prompt():
-    """Empty final answers are re-prompted with the completion instruction.
-
-    MIT-1408: two incomplete-final recoveries (tools still available) precede
-    the silent-retry/finalization fallback, so the real answer lands on the
-    third request.
-    """
+    """Empty responses get 2 silent retries before finalization kicks in."""
     from nanobot.agent.runner import AgentRunner
 
     provider = MagicMock(spec=LLMProvider)
@@ -747,12 +742,11 @@ async def test_runner_retries_empty_final_response_with_summary_prompt():
     ))
 
     assert result.final_content == "final answer"
-    # Incomplete-final recoveries re-prompt with the tool surface kept
-    # available; the real answer arrives on the third request.
+    # 2 silent retries (iterations 0,1) + finalization on iteration 1
     assert len(calls) == 3
     assert calls[0]["tools"] is not None
     assert calls[1]["tools"] is not None
-    assert calls[2]["tools"] is not None
+    assert calls[2]["tools"] is None
     assert result.usage is not None
     assert result.usage.input_tokens == 13
     assert result.usage.output_tokens == 9
@@ -875,11 +869,6 @@ async def test_empty_finalization_retry_discards_candidate_provider_state():
     provider = MagicMock(spec=LLMProvider)
     provider.can_resume_conversation_state.return_value = True
     provider.chat_stream_with_retry = AsyncMock(side_effect=[
-        # The first two empties feed the incomplete-final recoveries; the
-        # next two exhaust the silent-retry budget so the finalization pass
-        # (the fifth request) returns the candidate-state response.
-        LLMResponse(content=None, tool_calls=[], usage=None),
-        LLMResponse(content=None, tool_calls=[], usage=None),
         LLMResponse(content=None, tool_calls=[], usage=None),
         LLMResponse(content=None, tool_calls=[], usage=None),
         LLMResponse(

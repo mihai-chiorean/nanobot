@@ -809,9 +809,7 @@ async def test_runner_fits_empty_response_finalization_before_dispatch(monkeypat
 
     async def chat_stream_with_retry(*, messages, tools=None, **_kwargs):
         calls.append({"messages": [dict(message) for message in messages], "tools": tools})
-        # The first four empties feed the two incomplete-final recoveries and
-        # the silent retry; the fifth request is the no-tools finalization.
-        if len(calls) < 5:
+        if len(calls) < 3:
             return LLMResponse(
                 content=None,
                 usage=LLMUsage.reported(input_tokens=100, output_tokens=1),
@@ -850,7 +848,7 @@ async def test_runner_fits_empty_response_finalization_before_dispatch(monkeypat
         max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
     ))
 
-    assert len(calls) == 5
+    assert len(calls) == 3
     assert calls[-1]["tools"] is None
     assert all(message.get("content") != "do task" for message in calls[-1]["messages"])
     assert result.final_content == "finalized"
