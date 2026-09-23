@@ -186,6 +186,12 @@ def _model_thinking_style(model_name: str) -> str:
     return _MODEL_THINKING_STYLES.get(_model_slug(model_name), "")
 
 
+def _supports_qwen_preserve_thinking(model_name: str) -> bool:
+    """Return whether the model chat template supports historical thinking."""
+    normalized = model_name.lower().replace("_", ".").replace("-", ".")
+    return "qwen3.6" in normalized
+
+
 def _thinking_styles_for(spec: ProviderSpec | None, model_name: str) -> list[str]:
     styles: list[str] = []
     if spec and spec.thinking_style:
@@ -953,6 +959,16 @@ class OpenAICompatProvider(LLMProvider):
     ) -> dict[str, Any]:
         model_name = model or self.default_model
         spec = self._spec
+        # A locally served Qwen on the Spark's vLLM exposes thinking through
+        # the chat template (chat_template_kwargs), not the OpenAI wire
+        # fields; it needs the per-request profile applied below, and the
+        # scheduling-header branch at the end of this function recognises the
+        # same deployment.
+        local_qwen = (
+            "qwen" in model_name.lower()
+            and bool(spec and spec.name == "custom")
+            and _is_local_endpoint(spec, self.api_base)
+        )
 
         if spec and spec.supports_prompt_caching:
             model_name = model or self.default_model
@@ -1050,7 +1066,11 @@ class OpenAICompatProvider(LLMProvider):
 
         if strip_effort:
             wire_effort = None
-        elif wire_effort and semantic_effort != "none":
+        elif wire_effort and semantic_effort != "none" and not local_qwen:
+            # The local Qwen deployment does not implement the OpenAI wire
+            # reasoning_effort field; its thinking mode travels in the chat
+            # template kwargs set by the profile below, so sending the wire
+            # field here would put an unknown key on the request body.
             kwargs["reasoning_effort"] = wire_effort
 
         # Only send thinking controls when reasoning_effort is explicit so
@@ -1113,6 +1133,38 @@ class OpenAICompatProvider(LLMProvider):
         # otherwise lets extra_body.tools replace nanobot's generated functions.
         if self._extra_body:
             kwargs = _merge_chat_extra_body(kwargs, self._extra_body)
+
+        if local_qwen:
+            # The complete local-Qwen profile, ported from the 0.2.x line with
+            # its exact numbers: the template switch follows the resolved
+            # effort (off only when explicitly disabled), the sampling is
+            # Qwen's recommended per-mode values, and earlier assistant
+            # reasoning stays in context. These values deliberately win over
+            # any conflicting static sampling settings the merge above
+            # carried, so the copied containers keep the configured dict
+            # untouched at its source.
+            thinking_enabled = semantic_effort not in (None, "none", "minimal")
+            precise_coding = semantic_effort in {"max", "xhigh"}
+            kwargs["temperature"] = 0.6 if precise_coding else (1.0 if thinking_enabled else 0.7)
+            kwargs["top_p"] = 0.95 if thinking_enabled else 0.8
+            kwargs["presence_penalty"] = 0.0 if precise_coding else 1.5
+            existing_extra = kwargs.get("extra_body") or {}
+            extra_body = dict(existing_extra)
+            existing_ctk = existing_extra.get("chat_template_kwargs")
+            chat_template_kwargs = (
+                dict(existing_ctk) if isinstance(existing_ctk, dict) else {}
+            )
+            chat_template_kwargs["enable_thinking"] = thinking_enabled
+            if _supports_qwen_preserve_thinking(model_name):
+                # Qwen3.6 was explicitly trained to consume reasoning_content
+                # from earlier assistant turns. Keep a configured False value
+                # as an operational escape hatch for canaries and regressions.
+                chat_template_kwargs.setdefault("preserve_thinking", True)
+            extra_body["top_k"] = 20
+            extra_body["min_p"] = 0
+            extra_body["repetition_penalty"] = 1.0
+            extra_body["chat_template_kwargs"] = chat_template_kwargs
+            kwargs["extra_body"] = extra_body
 
         # Ziggy: the admission gateway in front of the local vLLM caps
         # background concurrency separately from foreground chat. It reads the
