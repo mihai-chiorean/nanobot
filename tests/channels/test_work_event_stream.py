@@ -801,6 +801,119 @@ async def test_a_trusted_proxy_request_is_not_an_api_token_for_the_work_routes(
     assert response.status_code == 200
 
 
+def _issue_channel(tmp_path: Path) -> WebSocketChannel:
+    config = _config(tokenIssuePath="/auth/token")
+    bus = MessageBus()
+    gateway = build_gateway_services(
+        config=config,
+        bus=bus,
+        session_manager=SessionManager(tmp_path),
+        static_dist_path=None,
+        workspace_path=tmp_path,
+        default_restrict_to_workspace=False,
+        runtime_model_name=None,
+        runtime_surface="browser",
+        runtime_capabilities_overrides=None,
+    )
+    return WebSocketChannel(config, bus, gateway=gateway)
+
+
+async def _get(channel: WebSocketChannel, path: str, token: str | None) -> Any:
+    headers = _Headers()
+    if token is not None:
+        headers["Authorization"] = f"Bearer {token}"
+    request = TransportRequest(
+        method="GET", path=path, headers=headers, body=b"", raw_path=path
+    )
+    response = await channel.gateway.http.dispatch(_GuestConnection(), request)
+    assert response is not None
+    return response
+
+
+@pytest.mark.asyncio
+async def test_the_reconciler_token_from_auth_token_reaches_the_work_routes(
+    tmp_path: Path,
+) -> None:
+    """Regression (PR #58 review, High).
+
+    ziggy-work's reconciler (``executor.go`` ``token`` + ``reconcile.go``) calls
+    ``GET /auth/token`` with the tenant issue secret and sends the returned
+    ``token`` as the Bearer for ``/api/work``, ``/api/work/<id>/events`` and
+    artifact downloads.  The 0.2.x runtime wrote that value into both the
+    WebSocket and API pools; 0.3.0 must too, or every reconcile is a 401.
+    """
+    channel = _issue_channel(tmp_path)
+    issued = await _get(channel, "/auth/token", SECRET)
+    assert issued.status_code == 200
+    token = _body(issued)["token"]
+
+    listed = await _get(channel, "/api/work", token)
+    assert listed.status_code == 200
+    # Reusable for the whole reconcile pass, not single-use like the WS copy.
+    assert (await _get(channel, "/api/work", token)).status_code == 200
+
+    # The WS copy is still there and still single-use.
+    tokens = channel.gateway.http.tokens
+    assert tokens.take_issued_token_audience(token) == "client"
+    assert tokens.take_issued_token_audience(token) is None
+    assert (await _get(channel, "/api/work", token)).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_unknown_or_expired_tokens_are_refused_on_the_work_routes(
+    tmp_path: Path,
+) -> None:
+    channel = _issue_channel(tmp_path)
+    assert (await _get(channel, "/api/work", "nbwt_unknown")).status_code == 401
+
+    token = _body(await _get(channel, "/auth/token", SECRET))["token"]
+    tokens = channel.gateway.http.tokens
+    tokens.api_tokens[token] = 0.0  # monotonic clock is long past zero
+    assert (await _get(channel, "/api/work", token)).status_code == 401
+    assert token not in tokens.api_tokens
+
+
+@pytest.mark.asyncio
+async def test_auth_token_still_requires_the_issue_secret(tmp_path: Path) -> None:
+    channel = _issue_channel(tmp_path)
+    response = await _get(channel, "/auth/token", "wrong-secret")
+    status = response[0] if isinstance(response, tuple) else response.status_code
+    assert status == 401
+    assert not channel.gateway.http.tokens.api_tokens
+
+
+@pytest.mark.asyncio
+async def test_auth_token_refuses_when_the_api_pool_is_full(tmp_path: Path) -> None:
+    """Same cap as 0.2.x: 429 when either pool holds the maximum."""
+    channel = _issue_channel(tmp_path)
+    tokens = channel.gateway.http.tokens
+    tokens.max_tokens = 2
+    tokens.issue_api_token(60)
+    tokens.issue_api_token(60)
+    response = await _get(channel, "/auth/token", SECRET)
+    assert response.status_code == 429
+    assert not tokens.issued_tokens
+
+
+@pytest.mark.asyncio
+async def test_a_proxied_request_without_a_token_is_refused_on_the_work_routes(
+    tmp_path: Path,
+) -> None:
+    """d4219f57 stays: the trusted-proxy shortcut does not open /api/work,
+    even once /auth/token feeds the API pool."""
+    channel = _issue_channel(tmp_path)
+    await _get(channel, "/auth/token", SECRET)
+    request = TransportRequest(
+        method="GET", path="/api/work", headers=_Headers(), body=b"", raw_path="/api/work"
+    )
+    setattr(request, "_nanobot_trusted_proxy_authenticated", True)
+    work = channel.gateway.http.work
+    assert work is not None
+    response = await work.dispatch(request, "/api/work")
+    assert response is not None
+    assert response.status_code == 401
+
+
 @pytest.mark.asyncio
 async def test_the_owner_socket_still_reaches_the_work_stream(
     channel: WebSocketChannel,
