@@ -3,12 +3,22 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from typing import Any, cast
 
 from nanobot.agent.tools.base import Tool, tool_parameters
 from nanobot.agent.tools.schema import ArraySchema, StringSchema, tool_parameters_schema
 
 STRUCTURED_BUTTON_CHANNELS = frozenset({"telegram", "websocket"})
+
+# A parked ``ask_user`` is only answerable while it is the live tail of the
+# conversation. MIT-1029 asks "what happens when the user never answers": an
+# abandoned question must not be silently resolved by whichever unrelated
+# message happens to arrive days later -- that message is a fresh request, and
+# the stale question is left for the history/compaction path to expire. A
+# question parked longer than this is treated as abandoned and the next plain
+# message starts a new turn instead of becoming the tool result.
+ASK_USER_ANSWER_MAX_AGE_S = 24 * 60 * 60
 
 
 class AskUserInterrupt(BaseException):
@@ -114,6 +124,45 @@ def pending_ask_user_id(history: list[dict[str, Any]]) -> str | None:
         if name == "ask_user":
             return tool_call_id
     return None
+
+
+def _parse_timestamp(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+
+
+def ask_user_call_is_expired(
+    history: list[dict[str, Any]],
+    tool_call_id: str,
+    *,
+    max_age_s: float = ASK_USER_ANSWER_MAX_AGE_S,
+    now: datetime | None = None,
+) -> bool:
+    """Whether the assistant row parking ``tool_call_id`` is older than ``max_age_s``.
+
+    Reads the persisted ``timestamp`` the session writer stamps on every row
+    (``Session.add_message``). A missing or unparseable timestamp returns
+    ``False`` so a data glitch never orphans a resumable question; the caller
+    still gates on :func:`pending_ask_user_id`, which is what makes the call
+    resumable in the first place.
+    """
+    for message in reversed(history):
+        if message.get("role") != "assistant":
+            continue
+        for tool_call in _assistant_tool_calls(message):
+            if tool_call.get("id") != tool_call_id or _tool_call_name(tool_call) != "ask_user":
+                continue
+            timestamp = _parse_timestamp(message.get("timestamp"))
+            if timestamp is None:
+                return False
+            base = now if now is not None else datetime.now(timezone.utc)
+            return (base - timestamp).total_seconds() > max_age_s
+    return False
 
 
 def ask_user_tool_result_messages(

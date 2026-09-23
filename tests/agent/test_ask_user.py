@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -11,8 +12,10 @@ from agent.runner_helpers import make_run_spec
 from nanobot.agent.loop import AgentLoop
 from nanobot.agent.runner import AgentRunner
 from nanobot.agent.tools.ask import (
+    ASK_USER_ANSWER_MAX_AGE_S,
     AskUserInterrupt,
     AskUserTool,
+    ask_user_call_is_expired,
     ask_user_options_from_messages,
     ask_user_outbound,
     pending_ask_user_id,
@@ -461,3 +464,171 @@ def test_pending_ask_user_id_requires_unanswered_call():
             ],
         }
     ]) is None
+
+
+def _parked_ask_history(*, timestamp: str | None) -> list[dict]:
+    row: dict = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "ask_user", "arguments": '{"question": "Proceed?"}'},
+            }
+        ],
+    }
+    if timestamp is not None:
+        row["timestamp"] = timestamp
+    return [
+        {"role": "user", "content": "set it up"},
+        row,
+    ]
+
+
+def test_ask_user_call_is_expired_bounds_the_resume():
+    now = datetime.now(timezone.utc)
+    old = (now - timedelta(seconds=ASK_USER_ANSWER_MAX_AGE_S + 60)).isoformat()
+    fresh = (now - timedelta(seconds=60)).isoformat()
+
+    # A freshly parked question is still answerable (positive control, using a
+    # phrasing the bound was not designed around: a near-bound recent stamp).
+    assert ask_user_call_is_expired(_parked_ask_history(timestamp=fresh), "call_1", now=now) is False
+    # The just-inside boundary is not expired; one second past it is.
+    inside = (now - timedelta(seconds=ASK_USER_ANSWER_MAX_AGE_S - 1)).isoformat()
+    outside = (now - timedelta(seconds=ASK_USER_ANSWER_MAX_AGE_S + 1)).isoformat()
+    assert ask_user_call_is_expired(_parked_ask_history(timestamp=inside), "call_1", now=now) is False
+    assert ask_user_call_is_expired(_parked_ask_history(timestamp=outside), "call_1", now=now) is True
+    assert ask_user_call_is_expired(_parked_ask_history(timestamp=old), "call_1", now=now) is True
+
+    # An unrelated old message must not be resolved against the parked call: the
+    # helper keys on the assistant row that actually holds the call, so a stale
+    # tail elsewhere in history is irrelevant (negative control).
+    unrelated_old_user = {"role": "user", "content": "unrelated", "timestamp": old}
+    assert ask_user_call_is_expired(
+        [unrelated_old_user, *_parked_ask_history(timestamp=fresh)], "call_1", now=now
+    ) is False
+
+    # Missing / unparseable timestamps fail open (the caller still requires an
+    # unanswered call, so this never orphans a resumable question).
+    assert ask_user_call_is_expired(_parked_ask_history(timestamp=None), "call_1", now=now) is False
+    assert ask_user_call_is_expired(
+        _parked_ask_history(timestamp="not-a-timestamp"), "call_1", now=now
+    ) is False
+    # An id that is not a parked ask_user is never expirable.
+    assert ask_user_call_is_expired(_parked_ask_history(timestamp=old), "call_zzz", now=now) is False
+
+
+@pytest.mark.asyncio
+async def test_stale_parked_ask_is_not_answered_by_a_later_message(tmp_path):
+    """An abandoned question is not resolved by a much-later unrelated message."""
+    seen_messages: list[list[dict]] = []
+    responses = iter(
+        [
+            _ask_response("call_ask", "Install the optional package?", ["Install", "Skip"]),
+            LLMResponse(content="New request handled.", finish_reason="stop"),
+        ]
+    )
+
+    async def chat_with_retry(**kwargs):
+        seen_messages.append([dict(message) for message in kwargs["messages"]])
+        return next(responses)
+
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    provider.generation = GenerationSettings()
+    provider.chat_stream_with_retry = chat_with_retry
+
+    loop = _make_loop(tmp_path, provider)
+
+    first = await loop._process_message(
+        InboundMessage(channel="cli", sender_id="user", chat_id="direct", content="set it up")
+    )
+    assert first is not None
+    assert first.content == "Install the optional package?\n\n1. Install\n2. Skip"
+
+    # Age the parked question beyond the resume window, exactly as a real
+    # abandoned turn would be aged by wall-clock time passing.
+    session = loop.sessions.get_or_create("cli:direct")
+    stale = (datetime.now(timezone.utc) - timedelta(seconds=ASK_USER_ANSWER_MAX_AGE_S + 3600)).isoformat()
+    parked_rows = [
+        message
+        for message in session.messages
+        if message.get("role") == "assistant"
+        and any(
+            (call.get("function") or {}).get("name") == "ask_user"
+            for call in message.get("tool_calls") or []
+        )
+    ]
+    assert parked_rows, "expected a parked ask_user row to age"
+    for message in parked_rows:
+        message["timestamp"] = stale
+    loop.sessions.save(session)
+
+    # The next plain message is a fresh request, not a belated answer: it is
+    # delivered as a user row, never as the parked call's tool result.
+    second = await loop._process_message(
+        InboundMessage(channel="cli", sender_id="user", chat_id="direct", content="what is the weather")
+    )
+    assert second is not None
+    assert second.content == "New request handled."
+    assert not any(
+        message.get("role") == "tool"
+        and message.get("name") == "ask_user"
+        and message.get("content") == "what is the weather"
+        for message in seen_messages[-1]
+    )
+    assert any(
+        message.get("role") == "user" and "what is the weather" in str(message.get("content"))
+        for message in seen_messages[-1]
+    )
+
+
+@pytest.mark.asyncio
+async def test_fresh_parked_ask_is_still_answered_after_aging_a_distractor(tmp_path):
+    """Negative control for the bound: aging a *distractor* row must not block
+    the real answer, whose own parked row stays fresh."""
+    seen_messages: list[list[dict]] = []
+    responses = iter(
+        [
+            _ask_response("call_ask", "Install the optional package?", ["Install", "Skip"]),
+            LLMResponse(content="Skipped install.", finish_reason="stop"),
+        ]
+    )
+
+    async def chat_with_retry(**kwargs):
+        seen_messages.append([dict(message) for message in kwargs["messages"]])
+        return next(responses)
+
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    provider.generation = GenerationSettings()
+    provider.chat_stream_with_retry = chat_with_retry
+
+    loop = _make_loop(tmp_path, provider)
+
+    await loop._process_message(
+        InboundMessage(channel="cli", sender_id="user", chat_id="direct", content="set it up")
+    )
+
+    # Age only the user prompt row; the parked ask_user row keeps its fresh
+    # timestamp, so the resume must still succeed.
+    session = loop.sessions.get_or_create("cli:direct")
+    stale = (datetime.now(timezone.utc) - timedelta(seconds=ASK_USER_ANSWER_MAX_AGE_S + 3600)).isoformat()
+    user_rows = [m for m in session.messages if m.get("role") == "user"]
+    assert user_rows
+    for message in user_rows:
+        message["timestamp"] = stale
+    loop.sessions.save(session)
+
+    second = await loop._process_message(
+        InboundMessage(channel="cli", sender_id="user", chat_id="direct", content="Skip")
+    )
+    assert second is not None
+    assert second.content == "Skipped install."
+    assert any(
+        message.get("role") == "tool"
+        and message.get("name") == "ask_user"
+        and message.get("content") == "Skip"
+        for message in seen_messages[-1]
+    )

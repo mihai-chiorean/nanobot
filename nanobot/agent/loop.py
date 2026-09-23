@@ -44,6 +44,7 @@ from nanobot.agent.runner import (
 )
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.ask import (
+    ask_user_call_is_expired,
     ask_user_options_from_messages,
     ask_user_outbound,
     ask_user_tool_result_messages,
@@ -932,7 +933,18 @@ class AgentLoop:
             return None
         if not ctx.msg.content.strip():
             return None
-        return pending_ask_user_id(ctx.history)
+        parked_id = pending_ask_user_id(ctx.history)
+        if parked_id is None:
+            return None
+        assert ctx.session is not None
+        # Bound the resume to a freshly parked question. An unanswered
+        # ``ask_user`` from an abandoned turn must not be consumed by an
+        # unrelated message that happens to arrive much later (MIT-1029,
+        # "what happens when the user never answers"): such a message starts a
+        # fresh turn and the stale question ages out through compaction.
+        if ask_user_call_is_expired(ctx.session.messages, parked_id):
+            return None
+        return parked_id
 
     def _build_transcript_input(self, ctx: TurnContext) -> TranscriptInput:
         """Capture the persisted history and fresh input as separate transcript parts."""
