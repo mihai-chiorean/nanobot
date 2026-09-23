@@ -132,8 +132,11 @@ async def test_publication_route_rejects_non_canonical_forms(
         )
         assert upper.status_code == 404
 
+        # A trailing slash is not the canonical path: the raw request target
+        # must equal the canonical route exactly.
+        assert (await _http_get(base + "/", headers=auth)).status_code == 404
+
         # Over-long / structurally bogus ids never reach the store.
-        assert (await _http_get(base + "/", headers=auth)).status_code in {200, 404}
         assert (
             await _http_get(
                 f"http://127.0.0.1:29951/api/sessions/{key.replace(':', '%3A')}/files/{'a' * 33}",
