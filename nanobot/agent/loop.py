@@ -2549,6 +2549,11 @@ class AgentLoop:
     async def _dispatch_command(self, ctx: TurnContext) -> bool:
         if ctx.kind is TurnKind.SYSTEM or ctx.msg.channel == "system":
             return False
+        # Slash commands are owner capabilities (MIT-1398). A shared-room turn
+        # is an ordinary room message even when it starts with "/", matching
+        # the priority and mid-turn injection guards in ``_run``.
+        if self._shared_room_turn(ctx.msg):
+            return False
         session = ctx.require_session()
         raw = ctx.msg.content.strip()
         _, automation_metadata = automation_history_overrides(ctx.msg.metadata)
