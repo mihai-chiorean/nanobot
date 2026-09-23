@@ -80,6 +80,9 @@ class _Transport:
     def store_work_attachments(self, media: list[Any]) -> tuple[list[str], str | None]:
         return self.attachment_result
 
+    def room_turn_metadata(self, connection: Any, chat_id: str) -> dict[str, Any]:
+        return {}
+
     # -- assertions helpers -------------------------------------------------
 
     def frames(self, connection: Any | None = None) -> list[dict[str, Any]]:

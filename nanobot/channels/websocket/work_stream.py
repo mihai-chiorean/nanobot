@@ -209,6 +209,28 @@ class WorkStreamHub:
     async def _error(self, connection: Any, detail: str, **fields: Any) -> None:
         await self._transport.webui_send_event(connection, "error", detail=detail, **fields)
 
+    async def _reject_room_media(
+        self,
+        connection: Any,
+        chat_id: str,
+        raw_media: Any,
+    ) -> bool:
+        """Refuse attachments bound for a shared room (MIT-1399).
+
+        Same rule and wording as ``_dispatch_message``: a file sent into a room
+        is served to every guest. ``room_turn_metadata`` is non-empty for any
+        room chat, revoked or expired ones included, so this fails closed.
+        """
+        if not raw_media or not self._transport.room_turn_metadata(connection, chat_id):
+            return False
+        await self._error(
+            connection,
+            "attachment_rejected",
+            message="Attachments are not available in shared rooms yet.",
+            chat_id=chat_id,
+        )
+        return True
+
     # -- inbound envelopes -------------------------------------------------
 
     async def dispatch(
@@ -252,6 +274,8 @@ class WorkStreamHub:
             not isinstance(request_id, str) or WORK_ID_RE.fullmatch(request_id) is None
         ):
             await self._error(connection, "invalid idempotency key")
+            return
+        if await self._reject_room_media(connection, str(chat_id), envelope.get("media")):
             return
         media_paths, media_error = self._envelope_media(envelope.get("media"))
         if media_error is not None:
@@ -383,6 +407,10 @@ class WorkStreamHub:
             return
         if not is_valid_webui_chat_id(task.get("chat_id")):
             await self._error(connection, "invalid task chat")
+            return
+        if await self._reject_room_media(
+            connection, str(task.get("chat_id")), envelope.get("media"),
+        ):
             return
         self.attach(connection, task_id)
         if command_id is not None:
