@@ -2044,25 +2044,122 @@ class SessionManager:
         owner = (owner_display_name or "").strip()[:64] or "Owner"
         shareable: list[dict[str, Any]] = []
         for message in messages:
-            if not isinstance(message, dict):
-                continue
-            if message.get("role") not in {"user", "assistant"}:
-                continue
-            if is_hidden_history_message(message):
-                continue
-            visible = {
-                key: deepcopy(value)
-                for key, value in message.items()
-                if key in cls.SHAREABLE_MESSAGE_FIELDS
-            }
-            content = visible.get("content")
-            if not isinstance(content, str) or not content.strip():
-                continue
-            if visible.get("role") == "user":
-                visible.setdefault("participant_id", "owner")
-                visible.setdefault("participant_display_name", owner)
-            shareable.append(visible)
+            visible = cls._shareable_view(message, owner)
+            if visible is not None:
+                shareable.append(visible)
         return shareable
+
+    @classmethod
+    def _shareable_view(cls, message: Any, owner: str) -> dict[str, Any] | None:
+        """Project one transcript entry, or ``None`` when it is not shareable.
+
+        *owner* is the display name already clamped the way
+        :meth:`shareable_messages` clamps it, so every projection path agrees
+        on what an owner-credited message looks like.
+        """
+        if not isinstance(message, dict):
+            return None
+        if message.get("role") not in {"user", "assistant"}:
+            return None
+        if is_hidden_history_message(message):
+            return None
+        visible = {
+            key: deepcopy(value)
+            for key, value in message.items()
+            if key in cls.SHAREABLE_MESSAGE_FIELDS
+        }
+        content = visible.get("content")
+        if not isinstance(content, str) or not content.strip():
+            return None
+        if visible.get("role") == "user":
+            visible.setdefault("participant_id", "owner")
+            visible.setdefault("participant_display_name", owner)
+        return visible
+
+    def _shareable_room_messages(
+        self,
+        messages: list[dict[str, Any]],
+        owner_display_name: str,
+        *,
+        source_key: str,
+        source_metadata: dict[str, Any],
+        destination_key: str,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
+        """Project *messages* for a room clone and carry over vetted publications.
+
+        A publication grant is copied only when the server-side provenance
+        record still matches the very message that links it: the same
+        full-content digest, the same timestamp and the same server-minted
+        ``_published_message_id`` marker stamped by
+        :meth:`grant_published_files`. The link is then rewritten to the
+        destination key, so a guest can resolve it through the room session
+        alone. A pasted or invented link has no record and is never granted.
+
+        Returns ``(messages, grants, provenance)``; the caller owns merging
+        the latter two into the clone metadata.
+        """
+        owner = (owner_display_name or "").strip()[:64] or "Owner"
+        raw_grants = source_metadata.get(_PUBLISHED_GRANTS_KEY)
+        raw_provenance = source_metadata.get(_PUBLISHED_PROVENANCE_KEY)
+        grants = raw_grants if isinstance(raw_grants, dict) else {}
+        provenance = raw_provenance if isinstance(raw_provenance, dict) else {}
+        shareable: list[dict[str, Any]] = []
+        copied_grants: dict[str, Any] = {}
+        copied_provenance: dict[str, Any] = {}
+        for message in messages:
+            visible = self._shareable_view(message, owner)
+            if visible is None:
+                continue
+            assert isinstance(message, dict)
+            if visible.get("role") == "assistant":
+                content = cast(str, visible["content"])
+                digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+                timestamp = message.get("timestamp")
+                message_id = message.get(_PUBLISHED_MESSAGE_ID_KEY)
+                copied: list[tuple[str, str]] = []
+                for file_id, grant in grants.items():
+                    records = provenance.get(file_id)
+                    filename = grant.get("filename") if isinstance(grant, dict) else None
+                    if (
+                        not isinstance(file_id, str)
+                        or _PUBLISHED_FILE_ID_RE.fullmatch(file_id) is None
+                        or not isinstance(filename, str)
+                        or not isinstance(records, list)
+                        or not any(
+                            isinstance(record, dict)
+                            and record.get("message_sha256") == digest
+                            and record.get("timestamp") == timestamp
+                            and record.get("message_id") == message_id
+                            for record in records
+                        )
+                    ):
+                        continue
+                    source_url = self.published_file_url(source_key, file_id)
+                    if self._has_published_markdown_link(content, source_url):
+                        copied.append((file_id, filename))
+                        content = content.replace(
+                            source_url,
+                            self.published_file_url(destination_key, file_id),
+                        )
+                if copied:
+                    visible["content"] = content
+                    destination_message_id = secrets.token_hex(16)
+                    # Persisted internally so a room copied again has stable
+                    # server-recorded identity even after history compaction.
+                    # Output paths strip it; it is never client-supplied.
+                    visible[_PUBLISHED_MESSAGE_ID_KEY] = destination_message_id
+                    rewritten_digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+                    for file_id, filename in copied:
+                        copied_grants[file_id] = {"filename": filename}
+                        copied_provenance.setdefault(file_id, []).append(
+                            {
+                                "message_sha256": rewritten_digest,
+                                "timestamp": timestamp,
+                                "message_id": destination_message_id,
+                            }
+                        )
+            shareable.append(visible)
+        return shareable, copied_grants, copied_provenance
 
     def clone_session_for_shared_room(
         self,
@@ -2101,12 +2198,28 @@ class SessionManager:
             if not isinstance(snapshot_sha256, str) or digest != snapshot_sha256:
                 raise ValueError("The preview changed; review it again")
         now = datetime.now()
+        messages, file_grants, file_provenance = self._shareable_room_messages(
+            messages,
+            owner_display_name,
+            source_key=source.key,
+            source_metadata=source.metadata,
+            destination_key=destination_key,
+        )
+        clone_metadata = deepcopy(metadata)
+        # Grants are the room's own, never a copy of the source's: only the
+        # publications whose provenance survived sanitization ride along, and
+        # the transcript links were rewritten to the destination key above.
+        clone_metadata.pop(_PUBLISHED_GRANTS_KEY, None)
+        clone_metadata.pop(_PUBLISHED_PROVENANCE_KEY, None)
+        if file_grants:
+            clone_metadata[_PUBLISHED_GRANTS_KEY] = file_grants
+            clone_metadata[_PUBLISHED_PROVENANCE_KEY] = file_provenance
         clone = Session(
             key=destination_key,
-            messages=self.shareable_messages(messages, owner_display_name),
+            messages=messages,
             created_at=now,
             updated_at=now,
-            metadata=deepcopy(metadata),
+            metadata=clone_metadata,
             last_consolidated=0,
         )
         self.save(clone, fsync=True)

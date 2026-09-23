@@ -16,6 +16,11 @@ Two authorization families, deliberately kept apart:
   for room credentials **only**: an ``nbrt_`` bearer reads exactly its own
   room session, projected through ``shareable_messages``.  Owner and
   API tokens are not accepted; those callers migrate to ``/webui-thread``.
+* ``/api/sessions/<key>/files/<id>`` -- the **guest download**.  The room twin
+  of the owner publication route in ``ws_http.py`` (MIT-1030): an ``nbrt_``
+  bearer serves one granted snapshot, but only from the credential's own room
+  session -- other keys, including the owner's private conversation, answer
+  the same 404 as a missing publication (MIT-1407).
 """
 
 from __future__ import annotations
@@ -26,6 +31,7 @@ import json
 import re
 from contextlib import suppress
 from typing import Any
+from urllib.parse import quote, unquote
 
 from loguru import logger
 from websockets.http11 import Request as WsRequest
@@ -44,6 +50,7 @@ from nanobot.webui.http_utils import (
     bearer_token,
     http_error,
     http_json_response,
+    http_response,
     issue_route_secret_matches,
 )
 from nanobot.webui.session_identity import (
@@ -59,6 +66,12 @@ MAX_SELECTED_RESULTS = 10
 MAX_SELECTED_RESULT_BYTES = 16_000
 
 SESSION_KEY_RE = re.compile(r"^[A-Za-z0-9_:.@+-]{1,512}$")
+
+# Same grammar as the owner route's publication ids (``ws_http`` MIT-1030 and
+# ``SessionManager._PUBLISHED_FILE_ID_RE``): a server-minted lowercase hex id.
+# The room route re-checks the literal request path against this shape so an
+# un-decoded ``%2F`` can never smuggle a different target into the lookup.
+_PUBLISHED_FILE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
 ROOM_EDITORIAL_ACTIONS = frozenset(
     {"preview", "upgrade", "state", "prepare", "approve", "publish", "decline"}
@@ -141,6 +154,12 @@ class SharedRoomRouter:
             if method != "GET":
                 return http_error(405, "Method Not Allowed")
             return self.room_session_messages(request, match.group(1))
+
+        match = re.fullmatch(r"/api/sessions/([^/]+)/files/([^/]+)$", path)
+        if match:
+            if method != "GET":
+                return http_error(405, "Method Not Allowed")
+            return await self.room_published_file(request, match.group(1), match.group(2))
         return None
 
     # -- shared helpers -----------------------------------------------------
@@ -498,6 +517,94 @@ class SharedRoomRouter:
                     owner,
                 ),
             }
+        )
+
+    async def room_published_file(
+        self,
+        request: WsRequest,
+        raw_key: str,
+        raw_file_id: str,
+    ) -> Response | None:
+        """Room-credential twin of the owner publication route (MIT-1407).
+
+        ``ziggy-control`` forwards guest ``/api/sessions/<key>/files/<id>``
+        requests to this origin (``shared_rooms.go`` allow-lists the exact
+        shape), and production answers them from its single
+        ``_handle_published_file`` by accepting a room credential beside the
+        owner token (``feat/shared-rooms`` @ 83028651).  This fork splits the
+        handlers, so the same rule lives here: the request must carry a live
+        REST room credential whose own room session *is* ``key`` -- checked
+        against ``credential.session_key``, never against the raw target, so
+        percent-encoding cannot make a different session look authorized.
+        A wrong, revoked or foreign credential, a non-canonical path and a
+        missing grant all answer the same 404 as a missing publication: the
+        route never discloses which room exists or which id was ever granted.
+
+        A request with no room credential at all is not answered here -- it
+        falls through to the owner route in ``ws_http``, exactly as the
+        reinstated ``/messages`` read above does.
+        """
+        credential = self.store.api_credential(bearer_token(request.headers))
+        if credential is None:
+            return None
+        if self.sessions is None:
+            return http_error(503, "session manager unavailable")
+        # Owner-route parity (``ws_http._handle_published_file``): the route
+        # is exact, so the original request target -- not the decoded routing
+        # path -- is what must agree with the re-canonicalised address; a
+        # already-decoded value arriving back at the route would be a
+        # re-encoded spelling of the same target and stays forbidden.
+        request_target = getattr(request, "raw_path", None) or getattr(request, "path", "")
+        if request_target != f"/api/sessions/{raw_key}/files/{raw_file_id}":
+            return http_error(404, "Not Found")
+        key = unquote(raw_key)
+        file_id = unquote(raw_file_id)
+        # The dispatch regexes exclude raw '/' and control bytes from each
+        # segment, so an encoded slash here is a smuggled second segment: it
+        # must address a different session or file, never this route's pair.
+        if "/" in raw_key or "/" in raw_file_id:
+            return http_error(404, "Not Found")
+        # One canonical spelling per target: re-encoding the decoded segment
+        # must reproduce the raw target exactly, so an equivalently-decoding
+        # but un-canonical key cannot reach a store lookup -- and the
+        # credential comparison below compares decoded values.
+        if quote(key, safe="") != raw_key or quote(file_id, safe="") != raw_file_id:
+            return http_error(404, "Not Found")
+        if not self.store.authorizes_session(credential, key):
+            return http_error(404, "Not Found")
+        published = await asyncio.to_thread(
+            self.sessions.read_published_file,
+            key,
+            file_id,
+        )
+        if published is None:
+            return http_error(404, "Not Found")
+        filename, payload = published
+        # The response is the owner route's: only server-minted names reach a
+        # client, the id and filename come from the validated grant rather
+        # than the request, and the stored filename was already bounded by
+        # ``grant_published_files`` (``.md``-terminated, no control bytes) --
+        # asserted rather than trusted, with the id pattern as the backstop.
+        assert "\r" not in filename and "\n" not in filename
+        assert _PUBLISHED_FILE_ID_RE.fullmatch(file_id) is not None
+        clean_name = "".join(ch for ch in filename if ord(ch) >= 32 and ch != "\x7f")
+        ascii_name = "".join(
+            ch if ord(ch) < 127 and ch not in {'"', '\\'} else "_" for ch in clean_name
+        )
+        if not ascii_name or not ascii_name.endswith(".md"):
+            ascii_name = "download.md"
+        utf8_name = quote(clean_name or "download.md", safe="")
+        return http_response(
+            payload,
+            content_type="text/markdown; charset=utf-8",
+            extra_headers=[
+                ("Cache-Control", "private, no-store"),
+                ("X-Content-Type-Options", "nosniff"),
+                (
+                    "Content-Disposition",
+                    f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{utf8_name}",
+                ),
+            ],
         )
 
     @staticmethod
