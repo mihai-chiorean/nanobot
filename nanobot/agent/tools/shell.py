@@ -102,6 +102,23 @@ class ExecTool(Tool):
     _MAX_TIMEOUT = 600
     _MAX_OUTPUT = 10_000
 
+    # Kernel device files that are not filesystem escapes (#3599). The deployed
+    # editorial-20260910 runtime skipped exactly these from the workspace path
+    # boundary; dropping them when e9daa2a0 replaced the skip-list with a
+    # redirect-only regex regressed non-redirect reads (MIT-1032 review).
+    _BENIGN_DEVICE_PATHS: frozenset[str] = frozenset({
+        "/dev/null",
+        "/dev/zero",
+        "/dev/full",
+        "/dev/random",
+        "/dev/urandom",
+        "/dev/stdin",
+        "/dev/stdout",
+        "/dev/stderr",
+        "/dev/tty",
+    })
+    _BENIGN_FD_PATH = re.compile(r"/dev/fd/\d+\Z")
+
     @property
     def description(self) -> str:
         return (
@@ -480,8 +497,16 @@ class ExecTool(Tool):
             for raw in self._extract_absolute_paths(path_command):
                 try:
                     expanded = os.path.expandvars(raw.strip())
+                    # Match the un-resolved path first: on Linux /dev/stderr is
+                    # a symlink into /proc/self/fd/ and resolve() would mask
+                    # the device-file intent (#3599).
+                    if self._is_benign_device_path(expanded):
+                        continue
                     p = Path(expanded).expanduser().resolve()
                 except Exception:
+                    continue
+
+                if self._is_benign_device_path(str(p)):
                     continue
 
                 media_path = get_media_dir().resolve()
@@ -498,6 +523,13 @@ class ExecTool(Tool):
                     )
 
         return None
+
+    @classmethod
+    def _is_benign_device_path(cls, path: str) -> bool:
+        """Return True for kernel device files that should never be workspace-blocked."""
+        if path in cls._BENIGN_DEVICE_PATHS:
+            return True
+        return cls._BENIGN_FD_PATH.fullmatch(path) is not None
 
     @staticmethod
     def _extract_absolute_paths(command: str) -> list[str]:
