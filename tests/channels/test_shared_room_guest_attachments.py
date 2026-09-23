@@ -1,10 +1,12 @@
-"""A shared-room guest must not upload attachments (MIT-1399).
+"""No attachments in a shared room, from a guest or the owner (MIT-1399).
 
 Production (``feat/shared-rooms``, ``nanobot/channels/websocket.py`` ~2762)
 rejects any room message carrying ``media`` with ``attachment_rejected`` and
 "Attachments are not available in shared rooms yet." On 0.3.0 the message path
 in ``nanobot/webui/inbound_commands.py`` stored guest files in the owner's
-media directory and fed them to the room turn.
+media directory and fed them to the room turn. Production also rejected the
+owner's own media inside a room (``room = scoped_room or owner credential``),
+since an owner file is served to every guest as a signed media URL.
 """
 
 from __future__ import annotations
@@ -228,3 +230,97 @@ async def test_an_owner_attachment_is_still_stored_and_delivered(
     msg = await channel.bus.consume_inbound()
     assert "shared_room" not in msg.metadata
     assert [Path(p).resolve() for p in msg.media] == [stored[0].resolve()]
+
+
+async def _create_room(channel: WebSocketChannel) -> None:
+    await channel._dispatch_http(
+        _Connection(),
+        _request(
+            "/auth/shared-rooms",
+            {
+                "source_session_key": f"websocket:{OWNER_CHAT}",
+                "chat_id": ROOM_CHAT,
+                "room_id": ROOM_ID,
+                "title": "Shared conversation",
+                "owner_display_name": "Mihai",
+            },
+        ),
+    )
+    assert channel.rooms is not None
+    assert channel.rooms.is_shared_room(ROOM_CHAT)
+
+
+async def _owner_room_message_with_media(channel: WebSocketChannel) -> list[dict[str, Any]]:
+    sent = _capture(channel)
+    await channel._commands.dispatch(
+        _Connection(),
+        "client-1",
+        {
+            "type": "message",
+            "chat_id": ROOM_CHAT,
+            "content": "look at this",
+            "media": _media(),
+        },
+    )
+    return sent
+
+
+def _assert_rejected(sent: list[dict[str, Any]], channel: WebSocketChannel, root: Path) -> None:
+    errors = [e for e in sent if e["event"] == "error"]
+    assert len(errors) == 1, sent
+    assert errors[0]["detail"] == "attachment_rejected"
+    assert errors[0]["message"] == REJECTION_TEXT
+    assert errors[0]["chat_id"] == ROOM_CHAT
+    assert _stored_files(root) == []
+    assert channel.bus.inbound_size == 0
+
+
+@pytest.mark.asyncio
+async def test_an_owner_attachment_inside_a_room_is_rejected(
+    channel: WebSocketChannel,
+    media_root: Path,
+) -> None:
+    await _create_room(channel)
+
+    sent = await _owner_room_message_with_media(channel)
+
+    _assert_rejected(sent, channel, media_root)
+
+
+@pytest.mark.asyncio
+async def test_an_owner_attachment_in_a_revoked_room_is_rejected(
+    channel: WebSocketChannel,
+    media_root: Path,
+) -> None:
+    """Fail closed: a revoked room is still a room, not the owner's chat."""
+    await _create_room(channel)
+    assert channel.rooms is not None
+    channel.rooms.revoke(room_id=ROOM_ID, chat_id=ROOM_CHAT)
+
+    sent = await _owner_room_message_with_media(channel)
+
+    _assert_rejected(sent, channel, media_root)
+
+
+@pytest.mark.asyncio
+async def test_an_owner_attachment_outside_the_room_still_works_once_a_room_exists(
+    channel: WebSocketChannel,
+    media_root: Path,
+) -> None:
+    await _create_room(channel)
+    sent = _capture(channel)
+
+    await channel._commands.dispatch(
+        _Connection(),
+        "client-1",
+        {
+            "type": "message",
+            "chat_id": OWNER_CHAT,
+            "content": "look at this",
+            "media": _media(),
+        },
+    )
+
+    assert not [e for e in sent if e["event"] == "error"], sent
+    assert len(_stored_files(media_root)) == 1
+    assert channel.bus.inbound_size == 1

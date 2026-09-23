@@ -600,10 +600,22 @@ class WebUICommandRouter:
                 **rejection_fields,
             )
             return
-        # A guest may not upload files (MIT-1399): they would land in the
-        # owner's media directory and in front of the owner's agent. Rejected
-        # before anything is decoded or stored, with production's wording.
-        if guest_credential is not None and envelope.get("media"):
+        # Owners post into their own rooms through the same intent path as
+        # guests, so a discussion or proposal frame is recorded and broadcast
+        # the same way whoever sent it. ``effective_room_credential`` resolves
+        # the guest credential when there is one and the owner's implicit
+        # credential otherwise; it is ``None`` outside a room.
+        room_credential = self._transport.effective_room_credential(connection, chat_id)
+        # No attachments in a shared room (MIT-1399), from a guest or from the
+        # owner, matching production. A guest file would land in the owner's
+        # media dir and in front of the owner's agent; an owner file would be
+        # served to every guest as a signed media URL. ``room_turn_metadata``
+        # is non-empty for any room chat, including a revoked or expired one,
+        # so this fails closed. Rejected before anything is decoded or stored.
+        if envelope.get("media") and (
+            room_credential is not None
+            or self._transport.room_turn_metadata(connection, chat_id)
+        ):
             await self._transport.webui_send_event(
                 connection,
                 "error",
@@ -612,12 +624,6 @@ class WebUICommandRouter:
                 **rejection_fields,
             )
             return
-        # Owners post into their own rooms through the same intent path as
-        # guests, so a discussion or proposal frame is recorded and broadcast
-        # the same way whoever sent it. ``effective_room_credential`` resolves
-        # the guest credential when there is one and the owner's implicit
-        # credential otherwise; it is ``None`` outside a room.
-        room_credential = self._transport.effective_room_credential(connection, chat_id)
         if room_credential is not None:
             from nanobot.channels.websocket.room_editorial import handle_room_intent
 
