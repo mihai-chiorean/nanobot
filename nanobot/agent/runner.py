@@ -934,15 +934,15 @@ class AgentRunner:
                 "status": "error",
                 "detail": prep_error.split(": ", 1)[-1][:120],
             }
-            if self._is_workspace_violation(prep_error):
-                logger.warning(
-                    "Tool {} blocked by workspace/safety guard during preparation; aborting turn: {}",
-                    tool_call.name,
-                    prep_error.replace("\n", " ").strip()[:200],
-                )
-                event["detail"] = ("workspace_violation: "
-                                   + prep_error.replace("\n", " ").strip())[:160]
-                return prep_error, event, RuntimeError(prep_error)
+            handled = self._classify_guard_rejection(
+                raw_text=prep_error,
+                payload=prep_error + hint,
+                event=event,
+                tool_call=tool_call,
+                counts=external_lookup_counts,
+            )
+            if handled is not None:
+                return handled[0], handled[1], None
             return prep_error + hint, event, RuntimeError(prep_error) if spec.fail_on_tool_error else None
         try:
             # MIT-202: nest tool dispatch under the active llm-iteration
@@ -965,15 +965,15 @@ class AgentRunner:
             if isinstance(exc, AskUserInterrupt):
                 event["status"] = "waiting"
                 return "", event, exc
-            if self._is_workspace_violation(str(exc)):
-                logger.warning(
-                    "Tool {} blocked by workspace/safety guard; aborting turn: {}",
-                    tool_call.name,
-                    str(exc).replace("\n", " ").strip()[:200],
-                )
-                event["detail"] = ("workspace_violation: "
-                                   + str(exc).replace("\n", " ").strip())[:160]
-                return f"Error: {type(exc).__name__}: {exc}", event, exc
+            handled = self._classify_guard_rejection(
+                raw_text=str(exc),
+                payload=f"Error: {type(exc).__name__}: {exc}" + hint,
+                event=event,
+                tool_call=tool_call,
+                counts=external_lookup_counts,
+            )
+            if handled is not None:
+                return handled[0], handled[1], None
             if spec.fail_on_tool_error:
                 return f"Error: {type(exc).__name__}: {exc}", event, exc
             return f"Error: {type(exc).__name__}: {exc}", event, None
@@ -986,15 +986,15 @@ class AgentRunner:
             }
 
             # check the outside workspace error and break loop
-            if self._is_workspace_violation(result):
-                logger.warning(
-                    "Tool {} blocked by workspace/safety guard; aborting turn: {}",
-                    tool_call.name,
-                    result.replace("\n", " ").strip()[:200],
-                )
-                event["detail"] = ("workspace_violation: "
-                                   + result.replace("\n", " ").strip())[:160]
-                return result, event, RuntimeError(result)
+            handled = self._classify_guard_rejection(
+                raw_text=result,
+                payload=result + hint,
+                event=event,
+                tool_call=tool_call,
+                counts=external_lookup_counts,
+            )
+            if handled is not None:
+                return handled[0], handled[1], None
             if spec.fail_on_tool_error:
                 return result + hint, event, RuntimeError(result)
             return result + hint, event, None
@@ -1006,6 +1006,128 @@ class AgentRunner:
         elif len(detail) > 120:
             detail = detail[:120] + "..."
         return result, {"name": tool_call.name, "status": "ok", "detail": detail}, None
+
+    # MIT-1011: guard rejections are observations for the model, never fatal.
+    # Previously each of these returned a non-None exception, which
+    # _execute_tools turns into `fatal_error` -- aborting the turn and
+    # surfacing the raw RuntimeError to the user as the assistant reply.
+    _SSRF_MARKERS: tuple[str, ...] = (
+        "internal/private url detected",
+        "private/internal address",
+        "private address",
+    )
+    _SSRF_BOUNDARY_NOTE = (
+        "\n\nThis is a non-bypassable security boundary. Stop trying to reach "
+        "private/internal URLs. Do not retry with curl, wget, encoded IPs, "
+        "alternate DNS, redirects, proxies, or another tool. Ask the user for "
+        "local files, logs, or an explicit safe public URL instead."
+    )
+    _UNRESOLVABLE_MARKER = "(unresolvable hostname)"
+    _MAX_REPEAT_UNRESOLVABLE = 2
+    # Aggregate budget across *distinct* dead hostnames in one turn.
+    # Without it the per-host cap is near-useless: a model that guesses
+    # URLs guesses a new one each time, restarting the per-host counter.
+    _MAX_TOTAL_UNRESOLVABLE = 3
+    _UNRESOLVABLE_TOTAL_KEY = "unresolvable:*"
+    # Per-turn budgets for the other two guard categories. Removing the
+    # turn-abort also removed the only circuit breaker, so bound the
+    # number of times a refusal is restated before saying "stop".
+    _MAX_TOTAL_SSRF_BLOCKS = 3
+    _SSRF_TOTAL_KEY = "ssrf:*"
+    _MAX_TOTAL_WORKSPACE_BLOCKS = 4
+    _WORKSPACE_TOTAL_KEY = "wsviol:*"
+
+    @classmethod
+    def _is_ssrf_violation(cls, text: str) -> bool:
+        if not text:
+            return False
+        lowered = text.lower()
+        return any(marker in lowered for marker in cls._SSRF_MARKERS)
+
+    @classmethod
+    def _classify_guard_rejection(
+        cls,
+        *,
+        raw_text: str,
+        payload: str,
+        event: dict[str, str],
+        tool_call: Any,
+        counts: dict[str, int],
+    ) -> tuple[Any, dict[str, str]] | None:
+        """Return (payload, event) for a guard rejection, or None if not one.
+
+        The caller must pass None as the error element so the turn continues.
+        """
+        flat = raw_text.replace("\n", " ").strip()
+
+        if cls._UNRESOLVABLE_MARKER in flat.lower():
+            # Recoverable: the name does not exist. Capped so a model that
+            # keeps inventing hostnames stops burning the turn on DNS misses.
+            match = re.search(r"cannot resolve hostname:\s*([^\s,;)]+)", flat, re.IGNORECASE)
+            key = "unresolvable:" + (match.group(1).lower() if match else "unknown")
+            count = counts.get(key, 0) + 1
+            counts[key] = count
+            total = counts.get(cls._UNRESOLVABLE_TOTAL_KEY, 0) + 1
+            counts[cls._UNRESOLVABLE_TOTAL_KEY] = total
+            event["detail"] = ("unresolvable_host: " + flat)[:160]
+            if (count > cls._MAX_REPEAT_UNRESOLVABLE
+                    or total > cls._MAX_TOTAL_UNRESOLVABLE):
+                logger.warning(
+                    "Tool {} hit unresolvable hostnames (same={}, total={}); escalating",
+                    tool_call.name, count, total,
+                )
+                event["detail"] = ("unresolvable_host_escalated: " + flat)[:160]
+                return (
+                    "Error: repeated lookups of hostnames that do not resolve.\n"
+                    + flat
+                    + "\n\nStop guessing URLs. Use a documented endpoint, a "
+                      "configured search tool, or tell the user you could not "
+                      "reach the service and ask for the correct address."
+                ), event
+            return payload, event
+
+        if cls._is_ssrf_violation(flat):
+            total = counts.get(cls._SSRF_TOTAL_KEY, 0) + 1
+            counts[cls._SSRF_TOTAL_KEY] = total
+            logger.warning(
+                "Tool {} blocked by SSRF guard ({} this turn; turn continues): {}",
+                tool_call.name, total, flat[:200],
+            )
+            event["detail"] = ("ssrf_violation: " + flat)[:160]
+            if total > cls._MAX_TOTAL_SSRF_BLOCKS:
+                event["detail"] = ("ssrf_violation_escalated: " + flat)[:160]
+                return (
+                    "Error: refusing repeated attempts to reach private/internal addresses.\n"
+                    + flat
+                    + "\n\nYou have been blocked %d times in this turn. Stop. Trying "
+                      "another host, encoding, port, redirect, or tool will not change "
+                      "the answer. Tell the user what you could not reach and ask how "
+                      "they want to proceed." % total
+                ), event
+            return (raw_text.strip() or "Error: blocked by SSRF guard") + cls._SSRF_BOUNDARY_NOTE, event
+
+        if cls._is_workspace_violation(flat):
+            total = counts.get(cls._WORKSPACE_TOTAL_KEY, 0) + 1
+            counts[cls._WORKSPACE_TOTAL_KEY] = total
+            logger.warning(
+                "Tool {} hit a workspace boundary ({} this turn; turn continues): {}",
+                tool_call.name, total, flat[:200],
+            )
+            event["detail"] = ("workspace_violation: " + flat)[:160]
+            if total > cls._MAX_TOTAL_WORKSPACE_BLOCKS:
+                event["detail"] = ("workspace_violation_escalated: " + flat)[:160]
+                return (
+                    "Error: refusing repeated workspace-bypass attempts.\n"
+                    + flat
+                    + "\n\nYou have hit this boundary %d times in this turn. This is a "
+                      "hard policy boundary -- switching tools, shell tricks, working_dir "
+                      "overrides, symlinks, or base64 piping will NOT change the answer. "
+                      "Stop retrying. Tell the user you cannot access it and ask how they "
+                      "want to proceed." % total
+                ), event
+            return payload, event
+
+        return None
 
     # Markers identifying tool results that represent a workspace / safety boundary rejection.
     _WORKSPACE_BLOCK_MARKERS: tuple[str, ...] = (

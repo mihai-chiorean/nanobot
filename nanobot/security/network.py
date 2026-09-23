@@ -31,6 +31,9 @@ _LOOPBACK_NETWORKS = [
 ]
 
 _URL_RE = re.compile(r"https?://[^\s\"'`;|<>]+", re.IGNORECASE)
+# MIT-1011: reason prefix used when a hostname does not resolve. The exec
+# guard keys off it to tell an unreachable name apart from a private target.
+_UNRESOLVABLE_REASON_PREFIX = "Cannot resolve hostname:"
 
 _allowed_networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
 # Module-level default for ``allow_loopback``. Ziggy's config flips this to
@@ -108,7 +111,7 @@ def validate_url_target(url: str, *, allow_loopback: bool | None = None) -> tupl
     try:
         infos = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
     except socket.gaierror:
-        return False, f"Cannot resolve hostname: {hostname}"
+        return False, f"{_UNRESOLVABLE_REASON_PREFIX} {hostname}"
 
     for info in infos:
         try:
@@ -154,6 +157,36 @@ def validate_resolved_url(url: str, *, allow_loopback: bool | None = None) -> tu
     return True, ""
 
 
+def find_internal_url(
+    command: str,
+    *,
+    allow_loopback: bool | None = None,
+) -> tuple[str, str] | None:
+    """MIT-1011: return ``(url, reason)`` for the first URL that fails validation.
+
+    A bare boolean forced the guard to emit a generic message, so the model
+    could not tell which URL of a compound command was refused, or why.
+    """
+    for m in _URL_RE.finditer(command):
+        url = m.group(0)
+        ok, error = validate_url_target(url, allow_loopback=allow_loopback)
+        if not ok:
+            return url, error
+    return None
+
+
+def is_unresolvable_reason(reason: str) -> bool:
+    """MIT-1011: whether a rejection reason is "the name does not resolve".
+
+    Such a host is still refused (the guard stays fail-closed, which is what
+    defeats split-horizon and rebinding tricks) but it is not evidence of an
+    attempt to reach a private network -- usually it is a typo or an invented
+    domain. Reporting it as SSRF tells the model to stop trying entirely,
+    when the useful advice is "that host does not exist, use a real one".
+    """
+    return reason.strip().lower().startswith(_UNRESOLVABLE_REASON_PREFIX.lower())
+
+
 def contains_internal_url(command: str, *, allow_loopback: bool | None = None) -> bool:
     """Return True if the command string contains a URL targeting an internal/private address.
 
@@ -161,9 +194,4 @@ def contains_internal_url(command: str, *, allow_loopback: bool | None = None) -
     docstring for the scope-reduction contract. Cloud-metadata, RFC1918,
     and CGNAT addresses stay blocked regardless.
     """
-    for m in _URL_RE.finditer(command):
-        url = m.group(0)
-        ok, _ = validate_url_target(url, allow_loopback=allow_loopback)
-        if not ok:
-            return True
-    return False
+    return find_internal_url(command, allow_loopback=allow_loopback) is not None

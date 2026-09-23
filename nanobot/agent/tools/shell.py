@@ -13,6 +13,8 @@ from typing import Any
 from loguru import logger
 
 from nanobot.agent.tools.base import Tool, tool_parameters
+# Ziggy-local (fork, MIT-1014): mid-conversation environment-build refusal.
+from nanobot.agent.tools.env_guard import detect_environment_build, install_refusal
 from nanobot.agent.tools.sandbox import wrap_command
 from nanobot.agent.tools.schema import IntegerSchema, StringSchema, tool_parameters_schema
 from nanobot.config.paths import get_media_dir
@@ -86,6 +88,12 @@ class ExecTool(Tool):
         self.restrict_to_workspace = restrict_to_workspace
         self.path_append = path_append
         self.allowed_env_keys = allowed_env_keys or []
+        # Ziggy-local (fork, MIT-1014): interactive-turn install guard state.
+        self._turn_channel = ""
+        self._turn_session_key = ""
+        self._turn_metadata: dict[str, Any] = {}
+        self._turn_key: tuple[str, str, str | None] | None = None
+        self._install_attempts = 0
 
     @property
     def name(self) -> str:
@@ -93,6 +101,25 @@ class ExecTool(Tool):
 
     _MAX_TIMEOUT = 600
     _MAX_OUTPUT = 10_000
+
+    # Kernel device files that are not filesystem escapes (#3599). The deployed
+    # editorial-20260910 runtime skipped exactly these from the workspace path
+    # boundary; dropping them when e9daa2a0 replaced the skip-list with a
+    # redirect-only regex regressed non-redirect reads (MIT-1032 review).
+    _BENIGN_DEVICE_PATHS: frozenset[str] = frozenset({
+        "/dev/null",
+        "/dev/zero",
+        "/dev/full",
+        "/dev/random",
+        "/dev/urandom",
+        "/dev/stdin",
+        "/dev/stdout",
+        "/dev/stderr",
+        "/dev/tty",
+    })
+    # Only the standard streams: the deployed snapshot blocked higher fds, and
+    # anything a command opens onto fd 3+ is path-checked where it is opened.
+    _BENIGN_FD_PATH = re.compile(r"/dev/fd/[0-2]\Z")
 
     @property
     def description(self) -> str:
@@ -108,10 +135,95 @@ class ExecTool(Tool):
     def exclusive(self) -> bool:
         return True
 
+    # --- Ziggy-local (fork, MIT-1014): interactive-turn install guard -------
+    #
+    # ``exec`` is an unrestricted shell, so when a web lookup dead-ends the
+    # model escalates into building an environment (pip install playwright,
+    # python -m venv, playwright install chromium) instead of concluding --
+    # minutes of a live conversation spent on setup the user never asked for.
+    # The guard refuses that *as information*, never as a turn-fatal error.
+    #
+    # Scope: AgentLoop._set_tool_context hands every routing-aware tool the
+    # channel, session key and message metadata for the turn, so we gate on
+    # that rather than guessing. Only the interactive app websocket is
+    # restricted. Left alone: the CLI and API channels, subagents (channel
+    # "system"), cron and heartbeat runs -- which reuse the originating
+    # channel but carry their own session-key namespace -- background and
+    # scheduled Work tasks, which the websocket channel marks in metadata,
+    # and any ExecTool nobody has given a context to (embedders, tests).
+
+    #: Channels that carry a live human conversation.
+    _INTERACTIVE_CHANNELS = frozenset({"websocket"})
+    #: Session-key namespaces that reuse a chat channel for unattended runs.
+    _UNATTENDED_SESSION_PREFIXES = ("cron:", "heartbeat")
+
+    def set_context(
+        self,
+        channel: str,
+        chat_id: str,
+        message_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        session_key: str | None = None,
+    ) -> None:
+        """Record which turn the next exec call belongs to."""
+        self._turn_channel = channel or ""
+        self._turn_session_key = session_key or f"{channel}:{chat_id}"
+        self._turn_metadata = metadata or {}
+        # The websocket channel identifies a user turn with client_message_id;
+        # other channels use message_id. Either way a change means a new turn,
+        # which is a second, independent reset path alongside start_turn().
+        token = (
+            self._turn_metadata.get("client_message_id")
+            or self._turn_metadata.get("message_id")
+            or message_id
+        )
+        turn_key = (self._turn_channel, self._turn_session_key, token)
+        if turn_key != self._turn_key:
+            self._turn_key = turn_key
+            self._install_attempts = 0
+
+    def start_turn(self) -> None:
+        """Reset the per-turn install budget. Called once per inbound turn."""
+        self._turn_key = None
+        self._install_attempts = 0
+
+    def _is_interactive_turn(self) -> bool:
+        if self._turn_channel not in self._INTERACTIVE_CHANNELS:
+            return False
+        # A background or scheduled Work task is dispatched over the same
+        # websocket channel as chat and is marked in metadata instead.
+        if self._turn_metadata.get("work_mode") or self._turn_metadata.get("work_task_id"):
+            return False
+        return not self._turn_session_key.startswith(self._UNATTENDED_SESSION_PREFIXES)
+
+    def _install_guard(self, command: str) -> str | None:
+        """Refuse package installs / env construction inside a chat turn."""
+        if not self._is_interactive_turn():
+            return None
+        detected = detect_environment_build(command)
+        if detected is None:
+            return None
+        self._install_attempts += 1
+        logger.warning(
+            "exec refused an environment build in a chat turn ({}): {}",
+            detected,
+            command.strip().replace("\n", " ")[:200],
+        )
+        return install_refusal(command, detected, self._install_attempts)
+
     async def execute(
         self, command: str, working_dir: str | None = None,
         timeout: int | None = None, **kwargs: Any,
     ) -> str:
+        # Ziggy-local (fork, MIT-1014). Deliberately NOT prefixed with
+        # "Error": AgentRunner._run_tool decorates an "Error"-prefixed result
+        # with "[Analyze the error above and try a different approach.]", and
+        # can raise under fail_on_tool_error. Both are exactly the behaviour
+        # this guard exists to stop, so the refusal is an ordinary result.
+        refusal = self._install_guard(command)
+        if refusal is not None:
+            return refusal
+
         cwd = working_dir or self.working_dir or os.getcwd()
 
         # Prevent an LLM-supplied working_dir from escaping the configured
@@ -347,9 +459,29 @@ class ExecTool(Tool):
             if not any(re.search(p, lower) for p in self.allow_patterns):
                 return "Error: Command blocked by safety guard (not in allowlist)"
 
-        from nanobot.security.network import contains_internal_url
-        if contains_internal_url(cmd, allow_loopback=self.allow_loopback):
-            return "Error: Command blocked by safety guard (internal/private URL detected)"
+        from nanobot.security.network import find_internal_url, is_unresolvable_reason
+        offending_url = find_internal_url(cmd, allow_loopback=self.allow_loopback)
+        if offending_url is not None:
+            url, reason = offending_url
+            # MIT-1011: a name that does not resolve is refused too, but it is
+            # not a private-network target. Labelling it "internal/private"
+            # escalated a plain typo to the non-bypassable SSRF boundary and
+            # dead-ended the turn instead of letting the model fix the URL.
+            if is_unresolvable_reason(reason):
+                return (
+                    "Error: Command blocked by safety guard (unresolvable hostname)"
+                    f": {url} - {reason}"
+                    "\n\nNote: this hostname does not exist in DNS - it is not a "
+                    "blocked internal address. Do not retry the same hostname. "
+                    "Check for a typo, use a documented endpoint for the service, "
+                    "or tell the user you could not reach it and ask for the URL."
+                )
+            # Name the URL and reason after the parenthesised code so callers
+            # and tests that match on the code are unaffected (cf. 797a7bfc).
+            return (
+                "Error: Command blocked by safety guard (internal/private URL detected)"
+                f": {url} - {reason}"
+            )
 
         if self.restrict_to_workspace:
             if "..\\" in cmd or "../" in cmd:
@@ -367,8 +499,16 @@ class ExecTool(Tool):
             for raw in self._extract_absolute_paths(path_command):
                 try:
                     expanded = os.path.expandvars(raw.strip())
+                    # Match the un-resolved path first: on Linux /dev/stderr is
+                    # a symlink into /proc/self/fd/ and resolve() would mask
+                    # the device-file intent (#3599).
+                    if self._is_benign_device_path(expanded):
+                        continue
                     p = Path(expanded).expanduser().resolve()
                 except Exception:
+                    continue
+
+                if self._is_benign_device_path(str(p)):
                     continue
 
                 media_path = get_media_dir().resolve()
@@ -378,15 +518,26 @@ class ExecTool(Tool):
                     and media_path not in p.parents
                     and p != media_path
                 ):
-                    return "Error: Command blocked by safety guard (path outside working dir)"
+                    return (
+                        "Error: Command blocked by safety guard "
+                        f"(path outside working dir: {p}). Only paths under "
+                        f"{cwd_path} are allowed; rerun without that path."
+                    )
 
         return None
+
+    @classmethod
+    def _is_benign_device_path(cls, path: str) -> bool:
+        """Return True for kernel device files that should never be workspace-blocked."""
+        if path in cls._BENIGN_DEVICE_PATHS:
+            return True
+        return cls._BENIGN_FD_PATH.fullmatch(path) is not None
 
     @staticmethod
     def _extract_absolute_paths(command: str) -> list[str]:
         # Windows: match drive-root paths like `C:\` as well as `C:\path\to\file`
         # NOTE: `*` is required so `C:\` (nothing after the slash) is still extracted.
         win_paths = re.findall(r"[A-Za-z]:\\[^\s\"'|><;]*", command)
-        posix_paths = re.findall(r"(?:^|[\s|>'\"])(/[^\s\"'>;|<]+)", command) # POSIX: /absolute only
-        home_paths = re.findall(r"(?:^|[\s|>'\"])(~[^\s\"'>;|<]*)", command) # POSIX/Windows home shortcut: ~
+        posix_paths = re.findall(r"(?:^|[\s|>'\"(])(/[^\s\"'>;|<()&]+)", command) # POSIX: /absolute only
+        home_paths = re.findall(r"(?:^|[\s|>'\"(])(~[^\s\"'>;|<()&]*)", command) # POSIX/Windows home shortcut: ~
         return win_paths + posix_paths + home_paths
