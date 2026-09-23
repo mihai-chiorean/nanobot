@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
-from typing import Any, cast
+from typing import Any, Mapping, cast
 
 from nanobot.agent.tools.base import Tool, tool_parameters
 from nanobot.agent.tools.schema import ArraySchema, StringSchema, tool_parameters_schema
@@ -19,6 +19,41 @@ STRUCTURED_BUTTON_CHANNELS = frozenset({"telegram", "websocket"})
 # question parked longer than this is treated as abandoned and the next plain
 # message starts a new turn instead of becoming the tool result.
 ASK_USER_ANSWER_MAX_AGE_S = 24 * 60 * 60
+
+
+ASK_USER_TOOL_NAME = "ask_user"
+
+# Metadata key a session-bound cron run carries (``nanobot.cron.session_turns``);
+# spelled here rather than imported so this leaf module stays import-light.
+_CRON_TRIGGER_META = "_cron_trigger"
+
+
+def ask_user_unanswerable(
+    metadata: Mapping[str, Any] | None,
+    session_key: str | None = None,
+) -> bool:
+    """True when nobody can answer an ``ask_user`` raised by this turn.
+
+    A scheduled (cron) Work run executes in a dedicated ``cron:<job>`` session
+    that no person ever writes to, so a question parked there waits forever
+    while the cron work runner records the task ``succeeded``. A session-bound
+    cron turn is unattended by definition too. Background (non-scheduled) Work
+    is deliberately *not* included: its ``waiting -> message -> running`` flow
+    delivers the owner's reply back into the parked turn.
+    """
+    if isinstance(metadata, Mapping):
+        if metadata.get("work_mode") == "scheduled":
+            return True
+        if metadata.get(_CRON_TRIGGER_META):
+            return True
+    return bool(session_key) and str(session_key).startswith("cron:")
+
+
+def ask_user_unavailable_message() -> str:
+    return (
+        "Error: Tool 'ask_user' is unavailable in a scheduled run: nobody is present "
+        "to answer. Make a reasonable assumption, state it, and continue."
+    )
 
 
 class AskUserInterrupt(BaseException):
@@ -47,7 +82,7 @@ class AskUserTool(Tool):
 
     @property
     def name(self) -> str:
-        return "ask_user"
+        return ASK_USER_TOOL_NAME
 
     @property
     def description(self) -> str:
