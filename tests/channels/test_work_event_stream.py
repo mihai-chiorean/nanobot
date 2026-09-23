@@ -761,6 +761,47 @@ async def test_a_room_bearer_is_not_an_api_token_for_the_work_routes(
 
 
 @pytest.mark.asyncio
+async def test_a_trusted_proxy_request_is_not_an_api_token_for_the_work_routes(
+    channel: WebSocketChannel,
+) -> None:
+    """Regression (PR #58 review, P2-3).
+
+    ``WebUIHTTPRouter.check_api_token`` returns True for any request a trusted
+    proxy vouched for, and ``dispatch`` stamps that flag from the peer address
+    and an assertion header alone.  Once ziggy-control fronts the tenant with
+    ``trustedProxyAuth``, a room guest arrives exactly that way, so the Work
+    routes must demand the owner API token itself.
+    """
+    work = channel.gateway.http.work
+    assert work is not None
+
+    proxied = TransportRequest(
+        method="GET",
+        path="/api/work",
+        headers=_Headers(),
+        body=b"",
+        raw_path="/api/work",
+    )
+    setattr(proxied, "_nanobot_trusted_proxy_authenticated", True)
+    response = await work.dispatch(proxied, "/api/work")
+    assert response is not None
+    assert response.status_code == 401
+
+    # Non-vacuity: a real owner API token still reaches the route.
+    token = channel.gateway.http.tokens.issue_api_token(60)
+    owner = TransportRequest(
+        method="GET",
+        path="/api/work",
+        headers=_Headers({"Authorization": f"Bearer {token}"}),
+        body=b"",
+        raw_path="/api/work",
+    )
+    response = await work.dispatch(owner, "/api/work")
+    assert response is not None
+    assert response.status_code == 200
+
+
+@pytest.mark.asyncio
 async def test_the_owner_socket_still_reaches_the_work_stream(
     channel: WebSocketChannel,
 ) -> None:

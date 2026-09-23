@@ -475,7 +475,12 @@ class WebSocketChannel(BaseChannel):
             )
             gateway.http.work = WorkRouter(
                 hub=self.work,
-                check_api_token=gateway.http.check_api_token,
+                # Owner API token only -- deliberately not
+                # ``gateway.http.check_api_token``, which also accepts any
+                # trusted-proxy request. A room guest proxied through
+                # ziggy-control would satisfy that shortcut, and Work rows span
+                # sessions, so it would be a cross-session read channel.
+                check_api_token=gateway.http.tokens.check_api_token,
             )
         if (
             self.config.shared_rooms_enabled
