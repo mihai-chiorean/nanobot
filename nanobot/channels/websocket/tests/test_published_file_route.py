@@ -66,7 +66,7 @@ def _seed_publication(workspace: Path, key: str = "websocket:private") -> tuple[
     file_id = sm.store_published_snapshot("report.md", b"# immutable report\n")
     url = sm.published_file_url(session.key, file_id)
     session.add_message("assistant", f"Download: [report.md]({url})")
-    sm.grant_published_files(session, {file_id: "report.md"}, message_start=0)
+    sm.grant_published_files(session, {file_id: "report.md"}, messages=session.messages)
     sm.save(session)
     return sm, key, file_id
 

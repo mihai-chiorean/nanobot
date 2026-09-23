@@ -328,3 +328,102 @@ async def test_invented_file_id_never_granted_from_model_copy(
     assert session.metadata.get("published_file_grants", {}) == {}
     assert loop.sessions.read_published_file(session.key, stolen) is None
     assert current_publish_file_turn() is None
+
+
+def _seed_history(loop: AgentLoop, key: str, pairs: int) -> None:
+    session = loop.sessions.get_or_create(key)
+    for index in range(pairs):
+        session.add_message("user", f"earlier question {index}")
+        session.add_message("assistant", f"earlier answer {index}")
+    loop.sessions.save(session)
+
+
+async def _publish_while_rewriting_prefix(
+    tmp_path: Path,
+    chat_id: str,
+    rewrite,
+) -> tuple[AgentLoop, str]:
+    """Run a publishing turn whose transcript prefix is rewritten mid-turn.
+
+    ``rewrite`` receives the live session after the tool call and before the
+    final answer, i.e. while the run is in flight.
+    """
+    (tmp_path / "report.md").write_text("# compacted turn\n", encoding="utf-8")
+    provider = _provider()
+    key = f"websocket:{chat_id}"
+    link: dict[str, str] = {}
+    loop = _make_loop(tmp_path, provider)
+    _seed_history(loop, key, pairs=4)
+
+    async def chat_stream_with_retry(**kwargs):
+        tool_result = next(
+            (m["content"] for m in kwargs["messages"] if m.get("name") == "publish_file"),
+            None,
+        )
+        if tool_result is None:
+            return _tool_call_response()
+        match = re.search(r"(\[report\.md\]\(/api/sessions/[^)]+\))", tool_result)
+        assert match is not None, tool_result
+        link["markdown"] = match.group(1)
+        rewrite(loop.sessions.get_or_create(key))
+        return LLMResponse(
+            content=f"Your report: {match.group(1)}",
+            tool_calls=[],
+            usage=LLMUsage.reported(input_tokens=1, output_tokens=1),
+        )
+
+    provider.chat_stream_with_retry = chat_stream_with_retry
+    result = await loop._process_message(_publish_turn_message(chat_id))
+    assert result is not None
+    assert link["markdown"] in (result.content or "")
+    return loop, key
+
+
+def _assert_single_grant(loop: AgentLoop, key: str) -> None:
+    session = loop.sessions.get_or_create(key)
+    grants = session.metadata.get("published_file_grants", {})
+    assert len(grants) == 1, session.messages
+    file_id = next(iter(grants))
+    assert loop.sessions.read_published_file(key, file_id) == (
+        "report.md",
+        b"# compacted turn\n",
+    )
+    # Provenance points at this run's final answer, not a prefix message.
+    [record] = session.metadata["published_file_provenance"][file_id]
+    stamped = [
+        m for m in session.messages if m.get("_published_message_id") == record["message_id"]
+    ]
+    assert len(stamped) == 1
+    assert stamped[0]["role"] == "assistant"
+    assert stamped[0]["content"].startswith("Your report: ")
+    assert current_publish_file_turn() is None
+
+
+@pytest.mark.asyncio
+async def test_grant_survives_prefix_compaction_during_publishing_turn(
+    tmp_path: Path,
+) -> None:
+    """Compaction that drops archived prefix messages mid-turn shrinks the
+    transcript below the index captured at turn start; the grant must still
+    attach to this run's final answer."""
+
+    def drop_prefix(session) -> None:
+        del session.messages[:6]
+        session.last_archived = 0
+
+    loop, key = await _publish_while_rewriting_prefix(tmp_path, "compacted", drop_prefix)
+    _assert_single_grant(loop, key)
+
+
+@pytest.mark.asyncio
+async def test_grant_survives_summary_checkpoint_inserted_before_turn(
+    tmp_path: Path,
+) -> None:
+    """A summary checkpoint committed into the prefix mid-turn shifts every
+    later index; the grant must still land exactly on this run's answer."""
+
+    def checkpoint(session) -> None:
+        session.commit_summary_checkpoint("summary of earlier turns", insert_at=4)
+
+    loop, key = await _publish_while_rewriting_prefix(tmp_path, "checkpointed", checkpoint)
+    _assert_single_grant(loop, key)

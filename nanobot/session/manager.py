@@ -15,7 +15,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Collection, Generator, Protocol, TypedDict, cast
+from typing import Any, Callable, Collection, Generator, Iterable, Protocol, TypedDict, cast
 from urllib.parse import quote
 from weakref import WeakValueDictionary
 
@@ -2292,9 +2292,14 @@ class SessionManager:
         session: Session,
         publications: dict[str, str],
         *,
-        message_start: int,
+        messages: Iterable[dict[str, Any]],
     ) -> None:
         """Grant only tool publications rendered in a final visible answer.
+
+        *messages* are this run's persisted transcript entries (the objects
+        returned by ``AgentLoop._save_turn``), not an index into
+        ``session.messages``: the transcript prefix may be rewritten during a
+        turn, so a start index captured before the run is not a stable boundary.
 
         The full assistant-message digest is durable provenance.  Room cloning
         later requires that digest as well as the exact canonical URL, so a
@@ -2308,7 +2313,7 @@ class SessionManager:
             return
         grants = cast(dict[str, Any], raw_grants)
         provenance = cast(dict[str, Any], raw_provenance)
-        for message in session.messages[message_start:]:
+        for message in messages:
             if message.get("role") != "assistant" or message.get("tool_calls"):
                 continue
             content = message.get("content")

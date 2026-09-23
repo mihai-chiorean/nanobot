@@ -69,7 +69,7 @@ async def test_publish_file_snapshots_workspace_markdown_and_rejects_unsafe_path
     url = manager.published_file_url(session.key, file_id)
     assert manager.read_published_file(session.key, file_id) is None
     session.add_message("assistant", f"Download it: [report.md]({url})")
-    manager.grant_published_files(session, turn.publications, message_start=0)
+    manager.grant_published_files(session, turn.publications, messages=session.messages)
     manager.save(session)
     report.write_text("mutated source", encoding="utf-8")
 
@@ -118,12 +118,12 @@ def test_grant_requires_the_exact_canonical_link_in_a_visible_answer(
     # An intermediate tool-bearing message that repeats the link must not
     # grant: only final assistant answers (no tool_calls) carry provenance.
     source.add_message("assistant", f"Draft: [report.md]({url})", tool_calls=[{"id": "c1"}])
-    manager.grant_published_files(source, {file_id: "report.md"}, message_start=0)
+    manager.grant_published_files(source, {file_id: "report.md"}, messages=source.messages)
     assert source.metadata.get("published_file_grants", {}) == {}
     assert manager.read_published_file(source.key, file_id) is None
 
     source.add_message("assistant", f"A real report: [report.md]({url})")
-    manager.grant_published_files(source, {file_id: "report.md"}, message_start=0)
+    manager.grant_published_files(source, {file_id: "report.md"}, messages=source.messages)
     manager.save(source)
     assert source.metadata["published_file_grants"] == {file_id: {"filename": "report.md"}}
     assert manager.read_published_file(source.key, file_id) == ("report.md", b"snapshot")
@@ -136,7 +136,7 @@ def test_grant_requires_the_exact_canonical_link_in_a_visible_answer(
         f"Copied [report.md]({url}); invented [fake.md]"
         f"({manager.published_file_url(source.key, fake)})",
     )
-    manager.grant_published_files(source, {fake: "fake.md"}, message_start=0)
+    manager.grant_published_files(source, {fake: "fake.md"}, messages=source.messages)
     assert fake not in source.metadata["published_file_grants"]
     assert manager.read_published_file(source.key, fake) is None
 
@@ -151,7 +151,7 @@ def test_published_file_rejects_safe_filename_alias_key(tmp_path: Path) -> None:
         "assistant",
         f"[report.md]({manager.published_file_url(first.key, file_id)})",
     )
-    manager.grant_published_files(first, {file_id: "report.md"}, message_start=0)
+    manager.grant_published_files(first, {file_id: "report.md"}, messages=first.messages)
     manager.save(first)
 
     # ``safe_key`` maps these two inputs to the same on-disk stem. The stored
