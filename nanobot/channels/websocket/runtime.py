@@ -30,12 +30,13 @@ from nanobot.bus.events import (
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 
-# Ziggy-local (MIT-1010): shared rooms.
+# Ziggy-local (MIT-1010): shared rooms and the Work event stream.
 from nanobot.channels.websocket.rooms import (
     RoomCredential,
     SharedRoomStore,
     room_scope_metadata,
 )
+from nanobot.channels.websocket.work_stream import WorkStreamHub
 from nanobot.config.schema import Base
 from nanobot.session.webui_turns import (
     clear_websocket_turn_if_current,
@@ -464,6 +465,38 @@ class WebSocketChannel(BaseChannel):
         # without them keeps exactly upstream's route table and handshake.
         self.rooms: SharedRoomStore | None = None
         self.connected_room_executor: Any | None = None
+
+        # -- Work event stream (Ziggy-local, MIT-1010) -----------------------
+        # The hub owns the task->subscriber table and the work.* frames; the
+        # router owns /api/work*. Both sit on the WorkStore the agent loop
+        # already writes, so nothing here duplicates task state.
+        # The store is the same SQLite file the agent loop writes; it is opened
+        # here rather than threaded through GatewayServices, matching how
+        # ``room_work_store`` resolves its own store from the workspace.
+        self.work: WorkStreamHub | None = None
+        if gateway.session_manager is not None:
+            from nanobot.webui.work_http import WorkRouter
+            from nanobot.work.store import WorkStore
+
+            self.work = WorkStreamHub(
+                transport=self,
+                # The agent loop's store owns the restart sweep; this one is a
+                # reader of the same file and must not run it.
+                store=WorkStore(
+                    gateway.session_manager.workspace,
+                    reconcile_on_open=False,
+                ),
+                bus=bus,
+            )
+            gateway.http.work = WorkRouter(
+                hub=self.work,
+                # Owner API token only -- deliberately not
+                # ``gateway.http.check_api_token``, which also accepts any
+                # trusted-proxy request. A room guest proxied through
+                # ziggy-control would satisfy that shortcut, and Work rows span
+                # sessions, so it would be a cross-session read channel.
+                check_api_token=gateway.http.tokens.check_api_token,
+            )
         if (
             self.config.shared_rooms_enabled
             or self.config.shared_room_collaboration_enabled
@@ -616,6 +649,8 @@ class WebSocketChannel(BaseChannel):
                         # The roster must shrink when a participant leaves.
                         with suppress(Exception):
                             await broadcast_room_presence(self, chat_id)
+            if self.work is not None:
+                self.work.detach_connection(connection)
             self.gateway.endpoint.discard_connection(connection)
             if self._connection_outbound.get(connection) is state:
                 self._connection_outbound.pop(connection, None)
@@ -700,6 +735,24 @@ class WebSocketChannel(BaseChannel):
         if not secret:
             return False
         return _issue_route_secret_matches(getattr(request, "headers", {}), secret)
+
+    # -- Work event stream (Ziggy-local, MIT-1010) --------------------------
+
+    @property
+    def runtime_model_name(self) -> str:
+        """Model name stamped on a task the Work app creates over the socket."""
+        from nanobot.webui.ws_http import _resolve_bootstrap_model_name
+
+        return _resolve_bootstrap_model_name(self.gateway.http.runtime_model_name)
+
+    async def broadcast_work_event(self, event: Any) -> None:
+        """Fan a Work event out to its subscribers; a no-op without a store."""
+        if self.work is not None:
+            await self.work.broadcast_event(event)
+
+    def store_work_attachments(self, media: list[Any]) -> tuple[list[str], str | None]:
+        """Persist ``work.create`` attachments through the WebUI ingress path."""
+        return self._media.store_inbound_attachments(media)
 
     # -- Shared rooms -------------------------------------------------------
 
@@ -1192,6 +1245,8 @@ class WebSocketChannel(BaseChannel):
         self._subs.clear()
         self._conn_chats.clear()
         self._conn_default.clear()
+        if self.work is not None:
+            self.work.clear()
 
     @staticmethod
     async def _stop_connection_writer(state: _ConnectionOutbound) -> None:

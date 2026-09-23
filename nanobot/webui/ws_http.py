@@ -393,6 +393,9 @@ class GatewayHTTPHandler:
         # owns the credential store; ``None`` leaves every room route absent,
         # which is the correct posture for a runtime without shared rooms.
         self.shared_rooms: Any | None = None
+        # Ziggy-local (MIT-1010): /api/work*. Attached by the channel once it
+        # owns the Work store; ``None`` leaves every Work route absent.
+        self.work: Any | None = None
 
         from nanobot.webui.settings_api import runtime_capabilities as _rc
         from nanobot.webui.settings_routes import WebUISettingsRouter
@@ -586,6 +589,12 @@ class GatewayHTTPHandler:
             if response is not None:
                 return response
 
+        # Work routes (Ziggy-local, MIT-1010).
+        if self.work is not None:
+            response = await self.work.dispatch(request, got)
+            if response is not None:
+                return response
+
         # Settings routes (delegated)
         response = await self.settings_routes.dispatch(connection, request, got)
         if response is not None:
@@ -659,17 +668,21 @@ class GatewayHTTPHandler:
                 "token_issue_path is set but token_issue_secret is empty; "
                 "any client can obtain connection tokens — set token_issue_secret for production."
             )
-        if not self.tokens.can_issue():
+        if not self.tokens.can_issue(include_api_token=True):
             self._log.error(
-                "too many outstanding issued tokens ({}), rejecting issuance",
+                "too many outstanding tokens (issued={}, api={}), rejecting issuance",
                 len(self.tokens.issued_tokens),
+                len(self.tokens.api_tokens),
             )
             return _http_json_response(
                 {"error": "too many outstanding tokens"},
                 status=429,
                 extra_headers=_NO_STORE_HEADERS,
             )
-        token_value = self.tokens.issue_token(self.config.token_ttl_s)
+        # One value, both pools: the WebSocket handshake consumes its copy and
+        # REST callers (ziggy-work's reconciler on /api/work) reuse the same
+        # token as a Bearer until the shared TTL expires.
+        token_value = self.tokens.issue_client_token(self.config.token_ttl_s)
         return _http_json_response(
             token_response_payload(token_value, self.config.token_ttl_s),
             extra_headers=_NO_STORE_HEADERS,

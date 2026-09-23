@@ -65,6 +65,20 @@ class GatewayTokenStore:
         self.api_tokens[token_value] = expiry
         return token_value
 
+    def issue_client_token(self, ttl_s: int | float) -> str:
+        """Issue one ``/auth/token`` value into both pools with one TTL.
+
+        The WebSocket handshake consumes its copy; the API copy keeps
+        authorizing REST calls (``/api/work`` and friends) until the shared
+        expiry. This is the contract ziggy-work's reconciler relies on.
+        """
+        token_value = f"nbwt_{secrets.token_urlsafe(32)}"
+        expiry = time.monotonic() + float(ttl_s)
+        self.issued_tokens[token_value] = expiry
+        self.issued_token_audiences[token_value] = "client"
+        self.api_tokens[token_value] = expiry
+        return token_value
+
     def take_issued_token_audience(
         self,
         token_value: str | None,

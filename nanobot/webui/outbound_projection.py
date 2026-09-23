@@ -80,6 +80,8 @@ class WebUIOutboundTransport(Protocol):
         turn_owner: str | None = None,
     ) -> None: ...
 
+    async def broadcast_work_event(self, event: Any) -> None: ...
+
     async def send_goal_state(self, chat_id: str, blob: dict[str, Any]) -> None: ...
 
     async def send_goal_status(
@@ -135,6 +137,14 @@ class WebUIOutboundProjector:
             )
 
     async def send(self, msg: OutboundMessage) -> None:
+        # Ziggy-local (MIT-1010): the agent loop has no connection table, so a
+        # Work event rides the outbound bus and is demultiplexed here. It is
+        # addressed to Work subscribers by task, not to a chat, and its content
+        # is empty, so it must never reach the chat projection below.
+        work_event = msg.metadata.get("_work_event")
+        if work_event is not None:
+            await self._transport.broadcast_work_event(work_event)
+            return
         event = msg.event
         if isinstance(event, RetryWaitEvent):
             return

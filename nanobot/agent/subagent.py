@@ -40,6 +40,7 @@ from nanobot.security.workspace_access import (
 )
 from nanobot.utils.llm_runtime import LLMRuntime
 from nanobot.utils.prompt_templates import render_template
+from nanobot.work.context import reset_work_context, set_work_context
 
 
 def _inherited_room_scope() -> dict[str, Any] | None:
@@ -462,6 +463,16 @@ class SubagentManager:
                 ),
             ))
             token = bind_workspace_scope(workspace_scope) if workspace_scope is not None else None
+            # Ziggy-local (MIT-1010): a subagent coroutine is created with a
+            # *copy* of the spawning turn's context, so a spawn during a Work
+            # turn inherits that turn's Work store, task id and workspace. No
+            # Work tool is registered at subagent scope today, which is the only
+            # reason that is currently harmless -- and relying on a tool-scope
+            # table to keep a contextvar gate honest is exactly the mistake
+            # REBASE-SHARED-ROOMS.md §4 records for the room scope. Clear it
+            # here so the property holds by construction: subagent-originated
+            # progress can never be attributed to the parent's Work task.
+            work_tokens = set_work_context(store=None, task_id=None, workspace=None)
             try:
                 # Ziggy-local (fork, MIT-202/MIT-186): open the subagent root span
                 # as a child of the parent turn's trace. The llm-iteration and tool
@@ -493,6 +504,7 @@ class SubagentManager:
                         ),
                     ))
             finally:
+                reset_work_context(work_tokens)
                 if token is not None:
                     reset_workspace_scope(token)
                 reset_request_context(request_token)

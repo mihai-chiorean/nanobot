@@ -16,6 +16,7 @@ from loguru import logger
 from websockets.asyncio.server import ServerConnection
 
 from nanobot.bus.events import INBOUND_META_USER_SHELL
+from nanobot.channels.websocket.work_stream import WORK_ENVELOPE_TYPES
 from nanobot.command.builtin import USER_SHELL_COMMAND, builtin_command_starts_agent_turn
 from nanobot.runtime_context import (
     RUNTIME_CONTEXT_INPUT_META,
@@ -346,6 +347,23 @@ class WebUICommandRouter:
                     detail="room scope violation",
                 )
                 return
+
+        # -- Work event stream (Ziggy-local, MIT-1010) ----------------------
+        # Dispatched before the WebUI commands because these frames are not
+        # WebUI mutations: they are the contract services/ziggy-work's executor
+        # runs a task over. A guest never reaches here -- the allow-list above
+        # refuses every work.* type on a room connection.
+        if command_type in WORK_ENVELOPE_TYPES:
+            work = getattr(self._transport, "work", None)
+            if work is None:
+                await self._transport.webui_send_event(
+                    connection,
+                    "error",
+                    detail="work unavailable",
+                )
+                return
+            await work.dispatch(connection, client_id, envelope)
+            return
 
         if command_type == "webui_request":
             await self.start_webui_request(connection, envelope)
