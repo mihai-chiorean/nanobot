@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import inspect
 import json
+import re
 import time
 from collections.abc import Awaitable, Callable, Iterable
 from copy import deepcopy
@@ -94,12 +95,6 @@ _REPEATED_EXEC_STOP_MESSAGE = (
     "Review the saved work and continue with a different approach. "
     "This is a repeated-command failure, not a lifetime tool quota."
 )
-_INCOMPLETE_FINAL_EXCLUDED_FINISH_REASONS = frozenset({
-    "error",
-    "cancelled",
-    "refusal",
-    "content_filter",
-})
 _MAX_INJECTIONS_PER_TURN = 3
 _MAX_INJECTION_CYCLES = 5
 
@@ -128,19 +123,15 @@ def _repeated_exec_hint(count: int) -> str:
     )
 
 
-def _incomplete_final(response: LLMResponse) -> bool:
-    """True when the model ended a turn without producing a usable final answer.
-
-    Fires on an empty final answer, or a ``length``-truncated answer that
-    carries no recoverable content, when no tool calls were requested. A
-    truncation that still has content is owned by the length-recovery
-    mechanism, and provider policy/error terminals are never re-prompted.
-    """
-    if response.should_execute_tools or response.has_tool_calls:
-        return False
-    if response.finish_reason in _INCOMPLETE_FINAL_EXCLUDED_FINISH_REASONS:
-        return False
-    return is_blank_text(response.content)
+def _incomplete_final(text: str | None) -> bool:
+    """Conservative guard for dangling introductions, not a success judge."""
+    text = (text or "").strip()
+    if text.endswith(":") and not text.endswith("```"):
+        return True
+    return len(text) < 400 and bool(re.fullmatch(
+        r"(?:Let me|I'll|I’ll|I will) (?:check|look|search|build|implement|create|start|inspect|test|verify) [^\n!?]+[.!]?",
+        text, flags=re.IGNORECASE,
+    ))
 
 
 @dataclass
@@ -581,49 +572,6 @@ class AgentRunner:
                     await hook.emit_reasoning_end()
                     context.streamed_reasoning = True
 
-                # Incomplete-final recovery: when the model ends the turn with an
-                # empty or cut-off answer and no tool calls in flight, re-prompt it
-                # with an explicit completion instruction (production 83028651).
-                # The instruction rides on the request copy only; the abandoned
-                # attempt is never persisted into the transcript.
-                while (
-                    _incomplete_final(response)
-                    and incomplete_recovery_count < _MAX_INCOMPLETE_RECOVERIES
-                ):
-                    incomplete_recovery_count += 1
-                    logger.warning(
-                        "Incomplete final response; re-prompting ({}/{}) on turn {} for {}",
-                        incomplete_recovery_count,
-                        _MAX_INCOMPLETE_RECOVERIES,
-                        iteration,
-                        spec.session_key or "default",
-                    )
-                    response, raw_usage = await self._request_model(
-                        spec,
-                        self._incomplete_final_recovery_messages(messages_for_model),
-                        hook,
-                        context,
-                        request_state=request_state,
-                        transcript=messages,
-                    )
-                    conversation_state.observe_response(response, messages)
-                    context.response = response
-                    context.tool_calls = list(response.tool_calls)
-                    original_content = response.content
-                    reasoning_text, cleaned_content = extract_reasoning(
-                        response.reasoning_content,
-                        response.thinking_blocks,
-                        response.content,
-                    )
-                    response.content = cleaned_content
-                    round_usages.append(raw_usage)
-                    context.usage = raw_usage
-                    usage = self._merge_usage(usage, raw_usage)
-                    if reasoning_text and not context.streamed_reasoning:
-                        await hook.emit_reasoning(reasoning_text)
-                        await hook.emit_reasoning_end()
-                        context.streamed_reasoning = True
-
                 if response.should_execute_tools:
                     tool_calls = list(response.tool_calls)
                     # ``ask_user`` pauses the turn: drop anything requested after
@@ -841,6 +789,30 @@ class AgentRunner:
                         messages.append(build_length_recovery_message(clean or ""))
                         await hook.after_iteration(context)
                         continue
+
+                if response.finish_reason == "stop" and _incomplete_final(clean):
+                    incomplete_recovery_count += 1
+                    if incomplete_recovery_count <= _MAX_INCOMPLETE_RECOVERIES:
+                        logger.warning(
+                            "Incomplete final response; retrying ({}/{})",
+                            incomplete_recovery_count,
+                            _MAX_INCOMPLETE_RECOVERIES,
+                        )
+                        # Do not save the stub as a completed assistant reply.
+                        messages.append({
+                            "role": "system",
+                            "content": _INCOMPLETE_FINAL_RECOVERY_PROMPT,
+                        })
+                        if hook.wants_streaming():
+                            await hook.on_stream_end(context, resuming=True)
+                        await hook.after_iteration(context)
+                        continue
+                    clean = (
+                        "I couldn't finish this response after two automatic retries. "
+                        "The task is not confirmed complete. Please retry; any required "
+                        "approvals still apply."
+                    )
+                    stop_reason = "incomplete_response"
 
                 # Some streaming providers recover with a complete response but no
                 # content deltas. When an earlier length segment is already visible,
@@ -1345,19 +1317,6 @@ class AgentRunner:
     def _finalization_retry_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         retry_messages = list(messages)
         retry_messages.append(build_finalization_retry_message())
-        return retry_messages
-
-    @staticmethod
-    def _incomplete_final_recovery_messages(
-        messages: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        """Request copy that re-prompts an empty or cut-off final answer.
-
-        Built on a copy so the completion instruction never enters the
-        transcript, mirroring the finalization-retry candidate pattern.
-        """
-        retry_messages = list(messages)
-        retry_messages.append({"role": "user", "content": _INCOMPLETE_FINAL_RECOVERY_PROMPT})
         return retry_messages
 
     async def _try_finalize_after_max_iterations(
