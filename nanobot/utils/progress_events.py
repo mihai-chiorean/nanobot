@@ -14,6 +14,7 @@ from nanobot.bus.outbound_events import (
     StreamEndEvent,
 )
 from nanobot.events import NO_EVENTS, AgentEvent, EventSink
+from nanobot.utils.tool_hints import format_tool_hints
 
 
 def _on_progress_accepts(cb: Callable[..., Any], name: str) -> bool:
@@ -88,12 +89,29 @@ def _tool_event_arguments(tool_call: Any) -> dict[str, Any]:
     return cast(dict[str, Any], arguments) if isinstance(arguments, dict) else {}
 
 
+def _tool_event_summary(tool_call: Any) -> str:
+    """Human-readable one-line description of a single tool call.
+
+    Consumers (e.g. the iOS WebSocket client) render this in place of the raw
+    tool name, so it must never raise: a formatting failure falls back to the
+    bare tool name.
+    """
+    name = getattr(tool_call, "name", "")
+    name = name if isinstance(name, str) else ""
+    try:
+        summary = format_tool_hints([tool_call])
+    except Exception:
+        return name
+    return summary or name
+
+
 def build_tool_event_start_payload(tool_call: Any) -> dict[str, Any]:
     return {
         "version": 1,
         "phase": "start",
         "call_id": str(getattr(tool_call, "id", "") or ""),
         "name": getattr(tool_call, "name", ""),
+        "summary": _tool_event_summary(tool_call),
         "arguments": _tool_event_arguments(tool_call),
         "result": None,
         "error": None,
@@ -130,6 +148,7 @@ def build_tool_event_finish_payloads(context: AgentHookContext) -> list[dict[str
             "phase": phase,
             "call_id": str(getattr(tool_call, "id", "") or ""),
             "name": getattr(tool_call, "name", ""),
+            "summary": _tool_event_summary(tool_call),
             "arguments": _tool_event_arguments(tool_call),
             "result": result if phase == "end" else None,
             "error": None,
