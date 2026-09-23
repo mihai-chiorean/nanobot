@@ -606,6 +606,24 @@ class WebUICommandRouter:
         # the guest credential when there is one and the owner's implicit
         # credential otherwise; it is ``None`` outside a room.
         room_credential = self._transport.effective_room_credential(connection, chat_id)
+        # No attachments in a shared room (MIT-1399), from a guest or from the
+        # owner, matching production. A guest file would land in the owner's
+        # media dir and in front of the owner's agent; an owner file would be
+        # served to every guest as a signed media URL. ``room_turn_metadata``
+        # is non-empty for any room chat, including a revoked or expired one,
+        # so this fails closed. Rejected before anything is decoded or stored.
+        if envelope.get("media") and (
+            room_credential is not None
+            or self._transport.room_turn_metadata(connection, chat_id)
+        ):
+            await self._transport.webui_send_event(
+                connection,
+                "error",
+                detail="attachment_rejected",
+                message="Attachments are not available in shared rooms yet.",
+                **rejection_fields,
+            )
+            return
         if room_credential is not None:
             from nanobot.channels.websocket.room_editorial import handle_room_intent
 
