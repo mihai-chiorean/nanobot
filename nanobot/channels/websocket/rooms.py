@@ -109,6 +109,9 @@ class SharedRoomStore:
         self._ws_tokens: dict[str, RoomCredential] = {}
         self._api_tokens: dict[str, RoomCredential] = {}
         self._connections: dict[Any, RoomCredential] = {}
+        # Connections whose room was revoked while they were still open. Kept
+        # rather than dropped so that "revoked" never reads as "not a guest".
+        self._revoked_connections: set[Any] = set()
 
     # -- metadata and liveness ---------------------------------------------
 
@@ -236,10 +239,23 @@ class SharedRoomStore:
         return self._connections.get(connection)
 
     def forget_connection(self, connection: Any) -> None:
+        """Forget a connection entirely. Only correct once the socket is gone."""
         self._connections.pop(connection, None)
+        self._revoked_connections.discard(connection)
 
     def revoke(self, *, room_id: str, chat_id: str) -> tuple[int, list[Any]]:
-        """Drop every token and connection for one room. Returns (tokens, connections)."""
+        """Invalidate every token and connection for one room.
+
+        Returns ``(tokens_invalidated, connections)``.
+
+        Revoked connections are **marked**, not forgotten. Deleting the
+        credential made ``connection_credential()`` return ``None``, and a
+        ``None`` credential meant "not a guest" everywhere downstream: the guest
+        command allow-list was skipped and ``effective_room_credential`` fell
+        through to ``owner_credential``. Because the socket close is
+        asynchronous, revoking a guest briefly promoted them to owner. A revoked
+        credential stays resolvable and stays denied.
+        """
         invalidated = 0
         for pool in (self._ws_tokens, self._api_tokens):
             for token, credential in list(pool.items()):
@@ -252,8 +268,11 @@ class SharedRoomStore:
             if credential.room_id == room_id and credential.chat_id == chat_id
         ]
         for connection in connections:
-            self._connections.pop(connection, None)
+            self._revoked_connections.add(connection)
         return invalidated, connections
+
+    def is_revoked(self, connection: Any) -> bool:
+        return connection in self._revoked_connections
 
     def authorizes_session(self, credential: RoomCredential | None, session_key: str) -> bool:
         """A room credential authorizes exactly its own session. Nothing else."""

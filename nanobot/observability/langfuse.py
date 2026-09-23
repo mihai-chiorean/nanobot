@@ -19,8 +19,11 @@ Design goals
 Environment gate
 ----------------
 ``LANGFUSE_ENABLED`` is ``True`` iff the Langfuse client is importable AND
-env vars are configured (``LANGFUSE_SECRET_KEY`` is the canonical gate,
-matching the gate already present in ``providers/openai_compat_provider.py``).
+``LANGFUSE_SECRET_KEY`` is set AND ``LANGFUSE_HOST`` names a destination.
+The host is not optional: the SDK falls back to Langfuse Cloud when it is
+unset, so tracing fails closed instead — see
+:func:`langfuse_destination_is_pinned`. ``providers/openai_compat_provider.py``
+and ``webui/settings_capabilities.py`` gate on the same helper.
 The provider-level gate emits one ``generation`` per LLM call via the
 ``langfuse.openai`` drop-in wrapper; this module adds the span hierarchy
 (turn → llm-iteration → tool / subagent) that gives those generations
@@ -51,16 +54,40 @@ if TYPE_CHECKING:
 _INPUT_CHAR_LIMIT = 512
 
 
+def langfuse_destination_is_pinned() -> bool:
+    """True when ``LANGFUSE_HOST`` names an explicit ingest endpoint.
+
+    The Langfuse SDK silently falls back to its Cloud SaaS endpoint when
+    ``LANGFUSE_HOST`` is unset, and the provider layer traces through
+    ``langfuse.openai``, so an env file that loses the line — or an
+    ``EnvironmentFile=-`` that quietly does not exist — would ship every
+    prompt and completion to a third party with no log line to show for it.
+
+    Tracing therefore fails closed on an unset host. Langfuse Cloud is still
+    a legitimate target; it just has to be asked for by name.
+    """
+    if os.environ.get("LANGFUSE_HOST", "").strip():
+        return True
+    logger.warning(
+        "LANGFUSE_SECRET_KEY is set but LANGFUSE_HOST is empty; tracing is "
+        "disabled rather than defaulting to Langfuse Cloud. Set LANGFUSE_HOST "
+        "explicitly (a self-hosted URL, or https://cloud.langfuse.com if that "
+        "is really where prompts and completions should go)."
+    )
+    return False
+
+
 def _detect_enabled() -> bool:
     """Check gate conditions at module import time.
 
     Mirrors the ``openai_compat_provider.py`` gate so both layers agree on
-    whether Langfuse is wired.  ``LANGFUSE_SECRET_KEY`` is treated as the
-    canonical switch because it is the minimum required credential; the
-    default ``LANGFUSE_HOST`` points at the Langfuse Cloud SaaS endpoint
-    when unset, which is still a valid target.
+    whether Langfuse is wired.  ``LANGFUSE_SECRET_KEY`` is the minimum
+    required credential, and ``LANGFUSE_HOST`` must name the destination —
+    see :func:`langfuse_destination_is_pinned`.
     """
     if not os.environ.get("LANGFUSE_SECRET_KEY"):
+        return False
+    if not langfuse_destination_is_pinned():
         return False
     if importlib.util.find_spec("langfuse") is None:
         logger.warning(

@@ -414,6 +414,56 @@ async def test_reload_is_a_direct_provider_operation_without_an_agent_loop(
     assert closed == ["browserbase"]
 
 
+def test_has_pending_config_changes_compares_loaded_servers_with_live_set():
+    live = MCPServerConfig(type="stdio", command="browserbase-mcp")
+    configured: dict[str, MCPServerConfig] = {"browserbase": live.model_copy()}
+    provider = MCPProvider({"browserbase": live}, ToolRegistry(), server_loader=lambda: configured)
+
+    assert provider.has_pending_config_changes() is False
+
+    configured["browserbase"] = live.model_copy(update={"enabled_tools": ["navigate"]})
+    assert provider.has_pending_config_changes() is True
+
+    configured["browserbase"] = live.model_copy()
+    configured["linkedin"] = MCPServerConfig(type="stdio", command="linkedin-mcp")
+    assert provider.has_pending_config_changes() is True
+
+    configured = {}
+    assert provider.has_pending_config_changes() is True
+
+
+def test_from_config_loader_pins_the_live_workspace_for_plugin_servers(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr("nanobot.config.loader._current_config_path", tmp_path / "config.json")
+    config = load_config()
+    config.agents.defaults.workspace = str(tmp_path / "override-workspace")
+    seen: list[Any] = []
+
+    def _fake_plugin_servers(workspace, configured=None):
+        seen.append(workspace)
+        return dict(configured or {})
+
+    monkeypatch.setattr("nanobot.agent.plugins.agent_plugin_mcp_servers", _fake_plugin_servers)
+    provider = MCPProvider.from_config(config, ToolRegistry())
+
+    assert provider.has_pending_config_changes() is False
+    # Both the initial set and every re-read scan the gateway's (in-memory,
+    # --workspace) workspace, not whatever the on-disk config would resolve.
+    assert seen == [config.workspace_path, config.workspace_path]
+
+
+def test_has_pending_config_changes_propagates_loader_errors():
+    def _broken_loader() -> dict[str, MCPServerConfig]:
+        raise ValueError("config.json: expecting value")
+
+    provider = MCPProvider({}, ToolRegistry(), server_loader=_broken_loader)
+
+    with pytest.raises(ValueError, match="expecting value"):
+        provider.has_pending_config_changes()
+
+
 @pytest.mark.asyncio
 async def test_reload_timeout_marks_attempted_server_failed_and_allows_retry(
     monkeypatch: pytest.MonkeyPatch,
@@ -717,3 +767,235 @@ async def test_concurrent_mcp_reconnect_reuses_fresh_session(
     assert outputs == ["fresh:alpha", "fresh:beta"]
     assert connect_count == 2
     assert closed == ["remote"]
+
+
+# ---------------------------------------------------------------------------
+# A reload must not pull tools out from under a turn that is already running.
+#
+# `reload()` unregisters tools and closes transports for `removed` and
+# `changed` servers.  Turn execution takes no lock, so a turn that the model
+# has already been handed those tools for would hit either
+# "Error: Tool 'mcp_x_y' not found." from `ToolRegistry.prepare_call` or a
+# closed transport.  Every config writer is now a trigger for this, and
+# Ziggy's provisioning rewrites tenant config files.
+# ---------------------------------------------------------------------------
+
+
+def _reload_probe(monkeypatch):
+    """A provider whose connect/close are observable, plus its registry."""
+    closed: list[str] = []
+
+    async def _mark_closed(name: str) -> None:
+        closed.append(name)
+
+    async def _fake_connect(servers, registry):
+        stacks = {}
+        for name in servers:
+            registry.register(_FakeMcpTool(f"mcp_{name}_navigate"))
+            stack = AsyncExitStack()
+            await stack.__aenter__()
+            stack.push_async_callback(_mark_closed, name)
+            stacks[name] = stack
+        return stacks
+
+    monkeypatch.setattr("nanobot.agent.tools.mcp.connect_mcp_servers", _fake_connect)
+    return closed, _fake_connect
+
+
+@pytest.mark.asyncio
+async def test_reload_waits_for_an_in_flight_turn_before_swapping_tools(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A turn already holding a changed server's tool must finish with it."""
+    closed, _ = _reload_probe(monkeypatch)
+    browserbase = MCPServerConfig(type="stdio", command="browserbase-mcp")
+    configured: dict[str, MCPServerConfig] = {"browserbase": browserbase}
+    registry = ToolRegistry()
+    provider = MCPProvider({}, registry, server_loader=lambda: configured)
+
+    await provider.reload()
+    assert registry.has("mcp_browserbase_navigate")
+
+    # A turn starts and is handed the tool.
+    turn = await provider.begin_turn()
+    tool = registry.get("mcp_browserbase_navigate")
+    assert tool is not None
+
+    # The config changes underneath it.
+    configured = {"browserbase": MCPServerConfig(type="stdio", command="browserbase-mcp-v2")}
+    reload_task = asyncio.create_task(provider.reload(drain_timeout_s=5.0))
+    await asyncio.sleep(0.05)
+
+    assert not reload_task.done(), "reload swapped tools while a turn was in flight"
+    assert registry.get("mcp_browserbase_navigate") is tool, (
+        "the running turn's tool was unregistered mid-turn"
+    )
+    assert closed == [], "the running turn's transport was closed mid-turn"
+
+    # The turn finishes; the swap is then free to happen.
+    provider.end_turn(turn)
+    result = await asyncio.wait_for(reload_task, timeout=5.0)
+
+    assert result["ok"] is True
+    assert result["changed"] == ["browserbase"]
+    assert closed == ["browserbase"]
+    assert registry.has("mcp_browserbase_navigate")
+
+
+@pytest.mark.asyncio
+async def test_reload_proceeds_after_the_drain_wait_times_out(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A turn that never ends must not wedge config reload forever."""
+    closed, _ = _reload_probe(monkeypatch)
+    configured: dict[str, MCPServerConfig] = {
+        "browserbase": MCPServerConfig(type="stdio", command="browserbase-mcp")
+    }
+    registry = ToolRegistry()
+    provider = MCPProvider({}, registry, server_loader=lambda: configured)
+    await provider.reload()
+
+    stuck = await provider.begin_turn()  # never ends
+    configured = {"browserbase": MCPServerConfig(type="stdio", command="browserbase-mcp-v2")}
+
+    result = await asyncio.wait_for(provider.reload(drain_timeout_s=0.05), timeout=5.0)
+
+    assert result["ok"] is True
+    assert result["changed"] == ["browserbase"]
+    assert result["drained"] is False, "a timed-out drain must be reported, not hidden"
+    assert closed == ["browserbase"]
+    provider.end_turn(stuck)
+
+
+@pytest.mark.asyncio
+async def test_a_turn_starting_during_a_drain_waits_for_the_swap(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Otherwise the new turn grabs tools the drain is about to close."""
+    _reload_probe(monkeypatch)
+    configured: dict[str, MCPServerConfig] = {
+        "browserbase": MCPServerConfig(type="stdio", command="browserbase-mcp")
+    }
+    registry = ToolRegistry()
+    provider = MCPProvider({}, registry, server_loader=lambda: configured)
+    await provider.reload()
+
+    held = await provider.begin_turn()
+    configured = {"browserbase": MCPServerConfig(type="stdio", command="browserbase-mcp-v2")}
+    reload_task = asyncio.create_task(provider.reload(drain_timeout_s=5.0))
+    await asyncio.sleep(0.05)
+
+    late = asyncio.create_task(provider.begin_turn())
+    await asyncio.sleep(0.05)
+    assert not late.done(), "a turn started during a drain and could be swapped out"
+
+    provider.end_turn(held)
+    await asyncio.wait_for(reload_task, timeout=5.0)
+    provider.end_turn(await asyncio.wait_for(late, timeout=5.0))
+
+
+@pytest.mark.asyncio
+async def test_begin_turn_gives_up_waiting_rather_than_wedging_the_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A reload that never finishes must not park turns forever."""
+    _reload_probe(monkeypatch)
+    registry = ToolRegistry()
+    provider = MCPProvider({}, registry, server_loader=dict)
+
+    provider._reload_drain_depth = 1  # simulate a reload that died without cleanup
+    provider._reload_gate.clear()
+
+    token = await asyncio.wait_for(provider.begin_turn(gate_timeout_s=0.05), timeout=5.0)
+    provider.end_turn(token)
+
+
+@pytest.mark.asyncio
+async def test_overlapping_reloads_keep_the_turn_gate_closed(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The watcher and the WebUI settings route can both reload at once.
+
+    A boolean flag would let whichever reload finished first reopen the gate
+    while the other was still draining, reopening the very window the drain
+    exists to close.
+    """
+    _reload_probe(monkeypatch)
+    configured: dict[str, MCPServerConfig] = {
+        "browserbase": MCPServerConfig(type="stdio", command="browserbase-mcp")
+    }
+    registry = ToolRegistry()
+    provider = MCPProvider({}, registry, server_loader=lambda: configured)
+    await provider.reload()
+
+    held = await provider.begin_turn()
+    configured = {"browserbase": MCPServerConfig(type="stdio", command="v2")}
+
+    slow = asyncio.create_task(provider.reload(drain_timeout_s=5.0))
+    quick = asyncio.create_task(provider.reload(drain_timeout_s=0.05))
+    await asyncio.wait_for(quick, timeout=5.0)
+    await asyncio.sleep(0.05)
+
+    late = asyncio.create_task(provider.begin_turn())
+    await asyncio.sleep(0.05)
+    assert not late.done(), (
+        "the finished reload reopened the gate while another was still draining"
+    )
+
+    provider.end_turn(held)
+    await asyncio.wait_for(slow, timeout=5.0)
+    provider.end_turn(await asyncio.wait_for(late, timeout=5.0))
+
+
+@pytest.mark.asyncio
+async def test_an_add_only_reload_does_not_stall_on_a_running_turn(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Nothing is unregistered or closed, so there is nothing to protect.
+
+    Agent turns run for minutes. If every reload drained, one long turn would
+    make every config write burn the full drain timeout and park every new
+    turn behind the gate for it — on a gateway whose tenant config is
+    rewritten by provisioning. Pay that cost only when a server is actually
+    being removed or changed.
+    """
+    _reload_probe(monkeypatch)
+    configured: dict[str, MCPServerConfig] = {
+        "browserbase": MCPServerConfig(type="stdio", command="browserbase-mcp")
+    }
+    registry = ToolRegistry()
+    provider = MCPProvider({}, registry, server_loader=lambda: configured)
+    await provider.reload()
+
+    held = await provider.begin_turn()  # a long-running turn
+    configured = {
+        "browserbase": MCPServerConfig(type="stdio", command="browserbase-mcp"),
+        "linkedin": MCPServerConfig(type="stdio", command="linkedin-mcp"),
+    }
+
+    result = await asyncio.wait_for(provider.reload(drain_timeout_s=30.0), timeout=5.0)
+
+    assert result["added"] == ["linkedin"]
+    assert result["drained"] is True
+    assert registry.has("mcp_browserbase_navigate"), "the running turn lost its tool"
+    provider.end_turn(held)
+
+
+@pytest.mark.asyncio
+async def test_an_add_only_reload_does_not_close_the_turn_gate(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _reload_probe(monkeypatch)
+    configured: dict[str, MCPServerConfig] = {}
+    registry = ToolRegistry()
+    provider = MCPProvider({}, registry, server_loader=lambda: configured)
+
+    held = await provider.begin_turn()
+    configured = {"linkedin": MCPServerConfig(type="stdio", command="linkedin-mcp")}
+
+    reload_task = asyncio.create_task(provider.reload(drain_timeout_s=30.0))
+    late = await asyncio.wait_for(provider.begin_turn(), timeout=1.0)
+
+    await asyncio.wait_for(reload_task, timeout=5.0)
+    provider.end_turn(held)
+    provider.end_turn(late)

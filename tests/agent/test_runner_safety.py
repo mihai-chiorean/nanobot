@@ -240,3 +240,76 @@ async def test_runner_throttles_repeated_workspace_bypass_attempts():
         "expected at least one escalated workspace_violation event, got: "
         f"{result.tool_events}"
     )
+
+
+@pytest.mark.asyncio
+async def test_unresolvable_host_is_recoverable_and_capped():
+    """A hostname that does not resolve is a correctable error, not an SSRF wall.
+
+    The owner's trip-planning turn died because a made-up search endpoint was
+    reported as "internal/private URL detected" and escalated to the
+    non-bypassable SSRF boundary. It must instead come back as a recoverable
+    tool result the loop continues from -- with a cap so repeats stop.
+    """
+    from nanobot.agent.tools.execution import is_unresolvable_host
+
+    blocked = (
+        "Error: Command blocked by safety guard (unresolvable hostname): "
+        "https://serpapi.oss-accel.online-third-party-pages.com/search — "
+        "Cannot resolve hostname: serpapi.oss-accel.online-third-party-pages.com"
+    )
+    assert is_unresolvable_host(blocked) is True
+    assert is_ssrf_violation(blocked) is False, "must not inherit the SSRF dead end"
+
+    provider = MagicMock()
+    provider.chat_stream_with_retry = AsyncMock(side_effect=[
+        LLMResponse(
+            content="searching",
+            tool_calls=[ToolCallRequest(
+                id="c1", name="exec",
+                arguments={"command": "curl -s https://serpapi.oss-accel.online-third-party-pages.com/search"},
+            )],
+        ),
+        LLMResponse(content="That endpoint does not exist; here is the plan.", tool_calls=[]),
+    ])
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    tools.execute = AsyncMock(return_value=ToolResult.error(blocked))
+
+    runner = AgentRunner()
+    result = await runner.run(make_run_spec(provider,
+        initial_messages=[],
+        tools=tools,
+        model="test-model",
+        max_iterations=3,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+    ))
+
+    assert provider.chat_stream_with_retry.await_count == 2, "the turn must continue"
+    assert result.error is None
+    assert result.final_content == "That endpoint does not exist; here is the plan."
+    assert result.tool_events[0]["status"] == "error"
+    assert "unresolvable_host" in result.tool_events[0]["detail"]
+
+
+def test_unresolvable_host_escalates_after_repeats():
+    """The third attempt at the same dead hostname gets a stop-guessing hint."""
+    from nanobot.agent.tools.execution import _classify_violation
+
+    raw = (
+        "Error: Command blocked by safety guard (unresolvable hostname): "
+        "https://nope.example.invalid/ — Cannot resolve hostname: nope.example.invalid"
+    )
+    call = ToolCallRequest(id="c", name="exec", arguments={"command": "curl https://nope.example.invalid/"})
+    counts: dict[str, int] = {}
+    payloads = []
+    for _ in range(3):
+        handled = _classify_violation(
+            raw_text=raw, soft_payload=raw, event={"name": "exec", "status": "error", "detail": ""},
+            tool_call=call, workspace_violation_counts=counts,
+        )
+        assert handled is not None
+        payloads.append(handled[0])
+
+    assert payloads[0] == raw and payloads[1] == raw
+    assert "Stop guessing URLs" in payloads[2], "repeat cap must escalate"

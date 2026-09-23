@@ -16,6 +16,7 @@ from nanobot.audio.transcription_registry import (
     transcription_provider_names,
 )
 from nanobot.config.schema import Config
+from nanobot.observability.langfuse import langfuse_destination_is_pinned
 from nanobot.optional_features import (
     OptionalFeatureError,
     extra_installed,
@@ -196,12 +197,23 @@ def capability_settings_payload(
         },
         "observability": {
             "provider": "langfuse",
+            # Keys alone are not enough: tracing fails closed without an
+            # explicit LANGFUSE_HOST, so reporting "configured" on the keys
+            # would tell an operator prompts are being shipped when they are
+            # not — the same misreading, inverted, that the fail-closed gate
+            # exists to prevent. LANGFUSE_BASE_URL is read for backwards
+            # compatibility only; LANGFUSE_HOST is what the SDK and the
+            # runtime gate actually use.
             "configured": bool(
                 os.environ.get("LANGFUSE_SECRET_KEY")
                 and os.environ.get("LANGFUSE_PUBLIC_KEY")
+                and langfuse_destination_is_pinned()
             ),
-            "base_url": os.environ.get("LANGFUSE_BASE_URL")
-            or "https://cloud.langfuse.com",
+            "base_url": (
+                os.environ.get("LANGFUSE_HOST")
+                or os.environ.get("LANGFUSE_BASE_URL")
+                or ""
+            ),
         },
         "image_generation": {
             "enabled": image_config.enabled,

@@ -604,3 +604,204 @@ async def test_a_normal_connection_keeps_every_command(
     channel.webui_send_event = _capture  # type: ignore[assignment]
     await channel._commands.dispatch(_Connection(), "client-1", {"type": "new_chat"})
     assert [e["event"] for e in sent][:1] == ["attached"]
+
+
+# --------------------------------------------------------------------------
+# Revocation must not promote a guest to owner (PR review, C1)
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_revoking_a_guest_does_not_promote_it_to_owner(
+    channel: WebSocketChannel,
+) -> None:
+    """store.revoke() used to delete the credential while the socket close was
+    fire-and-forget. In that window room_credential() returned None, so the
+    guest allow-list was skipped and effective_room_credential fell through to
+    owner_credential with role="owner"."""
+    connection = await _room_guest(channel)
+    assert channel.room_credential(connection) is not None
+
+    assert channel.rooms is not None
+    channel.rooms.revoke(room_id=ROOM_ID, chat_id=ROOM_CHAT)
+
+    # Still resolvable as a guest, and explicitly marked revoked.
+    assert channel.rooms.is_revoked(connection) is True
+    assert channel.room_credential(connection) is not None
+
+    # The scope it now mints denies everything; it is not an owner scope.
+    metadata = channel.room_turn_metadata(connection, ROOM_CHAT)
+    scope = metadata["_room_scope"]
+    assert scope["role"] != "owner"
+    assert scope["chat_id"] == ""
+
+    # And the command allow-list still applies.
+    sent: list[dict[str, Any]] = []
+
+    async def _capture(conn: Any, event: str, **fields: Any) -> None:
+        sent.append({"event": event, **fields})
+
+    channel.webui_send_event = _capture  # type: ignore[assignment]
+    await channel._commands.dispatch(
+        connection,
+        "client-1",
+        {"type": "attach", "chat_id": f"websocket:{OWNER_CHAT}"},
+    )
+    assert sent and sent[0]["detail"] == "room scope violation"
+
+
+@pytest.mark.asyncio
+async def test_a_revoked_guest_cannot_even_attach_to_its_own_room(
+    channel: WebSocketChannel,
+) -> None:
+    connection = await _room_guest(channel)
+    assert channel.rooms is not None
+    channel.rooms.revoke(room_id=ROOM_ID, chat_id=ROOM_CHAT)
+
+    sent: list[dict[str, Any]] = []
+
+    async def _capture(conn: Any, event: str, **fields: Any) -> None:
+        sent.append({"event": event, **fields})
+
+    channel.webui_send_event = _capture  # type: ignore[assignment]
+    await channel._commands.dispatch(
+        connection,
+        "client-1",
+        {"type": "attach", "chat_id": ROOM_CHAT},
+    )
+    assert sent and sent[0]["detail"] == "room scope violation"
+
+
+@pytest.mark.asyncio
+async def test_the_revoke_route_awaits_the_socket_close(
+    channel: WebSocketChannel,
+) -> None:
+    """A fire-and-forget close leaves a window where the socket is open."""
+    closed: list[tuple[int, str]] = []
+
+    class _Closable(_Connection):
+        async def close(self, *, code: int = 1000, reason: str = "") -> None:
+            closed.append((code, reason))
+
+    connection = _Closable()
+    assert channel.rooms is not None
+    await channel._dispatch_http(
+        _Connection(),
+        _request(
+            "/auth/shared-rooms",
+            body={
+                "source_session_key": f"websocket:{OWNER_CHAT}",
+                "chat_id": ROOM_CHAT,
+                "room_id": ROOM_ID,
+                "title": "Shared conversation",
+                "owner_display_name": "Mihai",
+            },
+        ),
+    )
+    token, _ = channel.rooms.mint(
+        room_id=ROOM_ID,
+        chat_id=ROOM_CHAT,
+        participant_id="participant_" + "f" * 32,
+        display_name="Guest",
+        role="contributor",
+    )
+    channel.gateway.endpoint.authorize_websocket_handshake(
+        connection, {"token": [token]}, None
+    )
+
+    response = await channel._dispatch_http(
+        _Connection(),
+        _request(
+            "/auth/shared-room-revoke",
+            body={"room_id": ROOM_ID, "chat_id": ROOM_CHAT},
+        ),
+    )
+    assert response.status_code == 200
+    # Closed synchronously within the request, not on a detached task.
+    assert closed == [(1008, "shared room revoked")]
+
+
+# --------------------------------------------------------------------------
+# A spent room token must not fall through (PR review, N2)
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_spent_room_token_is_refused_not_fallen_through(
+    channel: WebSocketChannel,
+) -> None:
+    """Single-use means single-use. Replaying a consumed nbrt_ token must 401,
+    not reach the no-auth / trusted-proxy branches, which grant
+    owner-equivalent access via the effective_room_credential fallback."""
+    connection = await _room_guest(channel)
+    assert channel.room_credential(connection) is not None
+
+    # Replay the same token on a second socket.
+    assert channel.rooms is not None
+    token, _ = channel.rooms.mint(
+        room_id=ROOM_ID,
+        chat_id=ROOM_CHAT,
+        participant_id="participant_" + "a" * 32,
+        display_name="Guest2",
+        role="contributor",
+    )
+    first = _Connection()
+    assert channel.gateway.endpoint.authorize_websocket_handshake(
+        first, {"token": [token]}, None
+    ) is None
+    second = _Connection()
+    response = channel.gateway.endpoint.authorize_websocket_handshake(
+        second, {"token": [token]}, None
+    )
+    assert response is not None, "a spent room token must be refused"
+    assert channel.room_credential(second) is None
+    assert not channel.gateway.endpoint.is_webui_connection(second)
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_room_token_is_refused_without_auth_configured(
+    tmp_path: Path,
+) -> None:
+    """The no-auth branch is the one the reviewer flagged: with
+    websocketRequiresToken off and no static token, an nbrt_ token used to
+    fall through to an authorized connection."""
+    config = _config(websocketRequiresToken=False, tokenIssueSecret="")
+    bus = MessageBus()
+    gateway = build_gateway_services(
+        config=config,
+        bus=bus,
+        session_manager=SessionManager(tmp_path),
+        static_dist_path=None,
+        workspace_path=tmp_path,
+        default_restrict_to_workspace=False,
+        runtime_model_name=None,
+        runtime_surface="browser",
+        runtime_capabilities_overrides=None,
+    )
+    channel = WebSocketChannel(config, bus, gateway=gateway)
+    response = channel.gateway.endpoint.authorize_websocket_handshake(
+        _Connection(), {"token": ["nbrt_revoked_or_expired"]}, None
+    )
+    assert response is not None
+    assert channel is not None
+
+
+@pytest.mark.asyncio
+async def test_a_normal_token_is_unaffected_by_the_nbrt_check(tmp_path: Path) -> None:
+    config = _config(websocketRequiresToken=False, tokenIssueSecret="")
+    bus = MessageBus()
+    gateway = build_gateway_services(
+        config=config,
+        bus=bus,
+        session_manager=SessionManager(tmp_path),
+        static_dist_path=None,
+        workspace_path=tmp_path,
+        default_restrict_to_workspace=False,
+        runtime_model_name=None,
+        runtime_surface="browser",
+        runtime_capabilities_overrides=None,
+    )
+    channel = WebSocketChannel(config, bus, gateway=gateway)
+    assert channel.gateway.endpoint.authorize_websocket_handshake(
+        _Connection(), {"token": ["nbwt_ordinary"]}, None
+    ) is None

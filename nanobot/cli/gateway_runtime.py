@@ -5,7 +5,7 @@ import signal
 from collections.abc import Awaitable, Callable, Coroutine, Iterable
 from contextlib import suppress
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Protocol, cast
 
 import typer
 from loguru import logger
@@ -15,7 +15,7 @@ from nanobot import __logo__, __version__
 from nanobot.agent.hook import AgentHook, AgentRunHookContext
 from nanobot.agent.hooks import create_file_edit_activity_hook
 from nanobot.agent.loop import AgentLoop
-from nanobot.agent.tools.mcp import MCPProvider
+from nanobot.agent.tools.mcp import RELOAD_DRAIN_TIMEOUT_SECONDS, MCPProvider
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.cli import terminal as cli_terminal
 from nanobot.cli.runtime_config import _migrate_cron_store
@@ -37,6 +37,7 @@ from nanobot.config.schema import Config
 from nanobot.gateway.runtime import GatewayInstance
 from nanobot.security.network import is_loopback_host
 from nanobot.session.keys import UNIFIED_SESSION_KEY, last_channel_from_metadata
+from nanobot.utils.cancellation import task_is_cancelling
 from nanobot.utils.evaluator import evaluate_response, resolve_evaluator_prompt
 from nanobot.utils.helpers import sync_workspace_templates
 from nanobot.webui.build import BuildMode
@@ -49,14 +50,127 @@ console = Console()
 
 
 class _MCPReadinessHook(AgentHook):
-    """Retry application-owned MCP connections before the runner reads tools."""
+    """Retry MCP connections before a run, and keep its tools alive for it.
+
+    The hook instance is shared by every concurrent run, so the provider's
+    turn token is kept per ``AgentRunHookContext`` (one object per run, and
+    ``slots=True`` rules out stashing it on the context itself).  Registration
+    is what lets ``MCPProvider.reload()`` avoid closing a transport or
+    unregistering a tool under a run that is already using it; ``on_finally``
+    is the release point because the runner calls it in a ``finally``, so it
+    also covers the error and cancellation paths.
+    """
 
     def __init__(self, provider: MCPProvider) -> None:
         super().__init__()
         self._provider = provider
+        self._turn_tokens: dict[int, object] = {}
 
     async def before_run(self, context: AgentRunHookContext) -> None:
         await self._provider.connect()
+        # After connect(), so a reload that is draining holds the run here
+        # rather than letting it pick up tools the reload is about to close.
+        self._turn_tokens[id(context)] = await self._provider.begin_turn()
+
+    async def on_finally(self, context: AgentRunHookContext) -> None:
+        token = self._turn_tokens.pop(id(context), None)
+        if token is not None:
+            self._provider.end_turn(token)
+
+
+# Bound a watcher-driven reload the same way the WebUI settings route does:
+# ``reload()`` holds the provider lock the pre-turn readiness hook also takes,
+# so an unreachable server must not stall every turn until its transport gives up.
+# The budget covers both phases: draining turns that are already running
+# (``RELOAD_DRAIN_TIMEOUT_SECONDS``) and then reconnecting.  If the timeout
+# fired during the drain nothing would reload at all, so it has to be strictly
+# larger than the drain.
+_MCP_HOT_RELOAD_TIMEOUT_SECONDS = 15.0 + RELOAD_DRAIN_TIMEOUT_SECONDS
+
+
+class _RuntimeConfigInvalidator(Protocol):
+    def invalidate_runtime_config(self) -> None: ...
+
+
+async def _hot_reload_mcp_servers(
+    provider: MCPProvider,
+    *,
+    timeout_s: float = _MCP_HOT_RELOAD_TIMEOUT_SECONDS,
+) -> dict[str, Any] | None:
+    """Reconcile MCP connections after a config write, only when their config changed.
+
+    Returns the provider's reload result, or ``None`` when nothing was reloaded.
+    Servers whose config did not change are never touched.  ``reload()`` is not
+    transactional: it closes removed and changed servers before connecting the
+    new set, so a reload that raises or times out leaves those servers
+    disconnected and marked ``failed``; the readiness hook reconnects whatever
+    is configured but missing before the next turn.
+    """
+    try:
+        pending = provider.has_pending_config_changes()
+    except Exception as exc:
+        logger.warning(
+            "Config changed but the MCP server config could not be read; "
+            "keeping the current MCP tools: {}",
+            exc,
+        )
+        return None
+    if not pending:
+        return None
+    try:
+        result = await asyncio.wait_for(provider.reload(), timeout=timeout_s)
+    except asyncio.CancelledError:
+        if task_is_cancelling():
+            raise
+        # The MCP SDK can leak a cancel scope that is not this task's own
+        # cancellation; treat it like a failed connection attempt.
+        logger.warning(
+            "MCP hot reload was cancelled by an MCP server/SDK; "
+            "the readiness hook will retry missing servers"
+        )
+        return None
+    except TimeoutError:
+        logger.warning(
+            "MCP hot reload timed out after {}s; the readiness hook will retry missing servers",
+            timeout_s,
+        )
+        return None
+    except Exception:
+        logger.exception(
+            "MCP hot reload failed; the readiness hook will retry missing servers"
+        )
+        return None
+    if result.get("requires_restart"):
+        # Shutting down, or the config became unreadable between the two reads;
+        # the next config write re-evaluates it.
+        logger.info("MCP hot reload skipped: {}", result.get("message"))
+    elif not result.get("ok", False):
+        logger.warning("MCP hot reload did not fully apply: {}", result.get("message"))
+    return result
+
+
+def _config_change_handler(
+    agent: _RuntimeConfigInvalidator,
+    mcp_provider: MCPProvider,
+    config_path: Path,
+) -> Callable[[], Awaitable[None]]:
+    """Build the config-watcher callback: refresh the LLM runtime, then MCP tools."""
+
+    async def on_config_change() -> None:
+        agent.invalidate_runtime_config()
+        if not config_path.exists():
+            # ``load_config`` falls back to environment defaults for a missing
+            # file, which would read as "every server removed".  A delete +
+            # recreate that lands in one watch batch is seen with the file back.
+            logger.warning(
+                "{} is missing after a change event; keeping the current MCP tools "
+                "until it is written again",
+                config_path,
+            )
+            return
+        await _hot_reload_mcp_servers(mcp_provider)
+
+    return on_config_change
 
 
 def _http_endpoint_responding(url: str, *, timeout_s: float = 0.25) -> bool:
@@ -982,7 +1096,7 @@ def _run_gateway(
                 asyncio.create_task(
                     watch_config_file(
                         Path(config_path),
-                        lambda: agent.invalidate_runtime_config(),
+                        _config_change_handler(agent, mcp_provider, Path(config_path)),
                     ),
                     name="nanobot-config-watcher",
                 ),

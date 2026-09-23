@@ -23,8 +23,9 @@ import pytest
 from nanobot.agent.tools.base import Tool, ToolResult
 from nanobot.agent.tools.context import RequestContext, request_context
 from nanobot.agent.tools.registry import ToolRegistry
+from nanobot.agent.tools.loader import ToolLoader
 from nanobot.agent.tools.room_policy import (
-    ROOM_DENIED_TOOLS,
+    ROOM_ALLOWED_TOOLS,
     RoomPolicy,
     room_policy_for,
     room_scope,
@@ -132,18 +133,53 @@ class _StubTool(Tool):
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("name", sorted(ROOM_DENIED_TOOLS))
-def test_denied_tools_are_blocked_in_a_room(name: str) -> None:
+def _live_builtin_tool_names() -> list[str]:
+    """Every built-in tool the loader actually discovers, by its runtime name.
+
+    Deliberately not a hand-written list: asserting against the policy dict was
+    how ``long_task`` -- a name no tool has ever had -- sat in the policy for a
+    release while the real tools (``create_goal`` / ``update_goal``) were open.
+    """
+    names: list[str] = []
+    for cls in ToolLoader().discover():
+        attr = cls.__dict__.get("name")
+        if not isinstance(attr, property) or attr.fget is None:
+            continue
+        try:
+            value = attr.fget(cls.__new__(cls))
+        except Exception:
+            continue
+        if isinstance(value, str) and value:
+            names.append(value)
+    return sorted(set(names))
+
+
+def test_the_loader_actually_yields_tool_names() -> None:
+    """Guard the guard: if this returns nothing, every test below is vacuous."""
+    names = _live_builtin_tool_names()
+    assert len(names) >= 15
+    # Spot-check a few that must be present for the suite to mean anything.
+    for expected in ("read_session", "grep", "message", "spawn", "create_goal"):
+        assert expected in names, expected
+
+
+@pytest.mark.parametrize("name", _live_builtin_tool_names())
+def test_every_live_builtin_is_denied_unless_explicitly_allowed(name: str) -> None:
+    """The allow-list is the whole policy: unclassified means denied."""
     registry = ToolRegistry()
     registry.register(_StubTool(name))
     with request_context(guest_request_context()):
         _tool, _params, error = registry.prepare_call(name, {})
-    assert isinstance(error, ToolResult) and error.is_error
-    assert "shared room" in str(error)
+    if name in ROOM_ALLOWED_TOOLS:
+        assert error is None, f"{name} is allow-listed but was denied"
+    else:
+        assert isinstance(error, ToolResult) and error.is_error, (
+            f"{name} is not allow-listed but was ALLOWED in a room"
+        )
 
 
-@pytest.mark.parametrize("name", sorted(ROOM_DENIED_TOOLS))
-def test_denied_tools_still_work_outside_a_room(name: str) -> None:
+@pytest.mark.parametrize("name", _live_builtin_tool_names())
+def test_every_live_builtin_still_works_outside_a_room(name: str) -> None:
     registry = ToolRegistry()
     registry.register(_StubTool(name))
     ctx = RequestContext(channel="websocket", chat_id=OWNER_CHAT, metadata={})
@@ -152,35 +188,65 @@ def test_denied_tools_still_work_outside_a_room(name: str) -> None:
     assert error is None
 
 
-def test_unclassified_tools_remain_allowed_in_a_room() -> None:
-    """Default-allow matches 0.2.x, where a room turn can reach every tool."""
+@pytest.mark.parametrize(
+    "name",
+    [
+        # The owner's shipped connector surface. None of these is a built-in, so
+        # a deny-list could never have covered them.
+        "mcp_ziggy_gmail_gmail_search",
+        "mcp_ziggy_gmail_gmail_get_message",
+        "mcp_ziggy_gmail_gmail_send_message",
+        "mcp_ziggy_gmail_linkedin_read_page",
+        "mcp_ziggy_connectors_work_app_submit_feedback",
+        # And an arbitrary future tool.
+        "some_tool_that_does_not_exist_yet",
+    ],
+)
+def test_unclassified_and_mcp_tools_are_denied_in_a_room(name: str) -> None:
     registry = ToolRegistry()
-    registry.register(_StubTool("web_search"))
+    registry.register(_StubTool(name))
     with request_context(guest_request_context()):
-        _tool, _params, error = registry.prepare_call("web_search", {})
-    assert error is None
-    assert room_policy_for("web_search") is RoomPolicy.ALLOWED
+        _tool, _params, error = registry.prepare_call(name, {})
+    assert isinstance(error, ToolResult) and error.is_error
+    assert room_policy_for(name) is RoomPolicy.DENIED
 
 
-def test_every_cross_session_tool_shipped_by_030_is_classified() -> None:
-    """Guard against a new upstream cross-session tool arriving unclassified."""
-    for name in ("search_sessions", "read_session", "list_sessions", "send_session_message"):
+def test_the_allow_list_is_small_and_deliberate() -> None:
+    """A large allow-list is the same bug in a different shape."""
+    assert set(ROOM_ALLOWED_TOOLS) == {"web_search", "report_progress"}
+    assert all(reason.strip() for reason in ROOM_ALLOWED_TOOLS.values())
+
+
+def test_the_exploited_tools_from_review_are_denied() -> None:
+    """The three demonstrated exploits, pinned as regressions."""
+    for name in (
+        "mcp_ziggy_gmail_gmail_search",  # mailbox exfiltration
+        "message",  # cross-chat delivery with file media
+        "grep",  # workspace/memory/ read
+        "read_file",
+        "find_files",
+        "create_goal",  # the real tool "long_task" never was
+        "update_goal",
+    ):
         assert room_policy_for(name) is RoomPolicy.DENIED, name
 
 
 def test_a_half_populated_scope_denies_rather_than_falling_open() -> None:
     """A malformed scope is a minting bug; it must not read as 'no room'."""
     registry = ToolRegistry()
-    registry.register(_StubTool("read_session"))
+    registry.register(_StubTool("web_search"))
     ctx = RequestContext(
         channel="websocket",
         chat_id=ROOM_CHAT,
         metadata={INBOUND_META_ROOM_SCOPE: "not-a-mapping"},
     )
     with request_context(ctx):
-        _tool, _params, error = registry.prepare_call("read_session", {})
-    assert isinstance(error, ToolResult) and error.is_error
-    assert room_scope_session_key(room_scope(ctx.metadata)) is None
+        # Even an allow-listed tool is fine, but the scope must resolve to a
+        # session key nothing can match.
+        _tool, _params, error = registry.prepare_call("web_search", {})
+    assert error is None
+    assert room_scope(ctx.metadata) is not None
+    assert room_scope_session_key(room_scope(ctx.metadata)) == "\0"
 
 
 # --------------------------------------------------------------------------
@@ -336,7 +402,14 @@ def test_revocation_invalidates_tokens_and_connections(
     assert invalidated == 1  # the ws copy was already consumed
     assert connections == [conn]
     assert store.api_credential(token) is None
+    # The credential is MARKED, not dropped: a revoked guest must never read as
+    # "not a guest" while its socket is still closing, or it is promoted to
+    # owner downstream.
+    assert store.is_revoked(conn) is True
+    assert store.connection_credential(conn) is not None
+    store.forget_connection(conn)
     assert store.connection_credential(conn) is None
+    assert store.is_revoked(conn) is False
 
 
 def test_revoked_room_is_inactive(sessions: SessionManager, store: SharedRoomStore) -> None:
@@ -444,6 +517,12 @@ class _FakeChannel:
 
         return WebSocketChannel.room_turn_metadata(self, connection, chat_id)
 
+    _denied_room_metadata = staticmethod(
+        __import__(
+            "nanobot.channels.websocket.runtime", fromlist=["WebSocketChannel"]
+        ).WebSocketChannel._denied_room_metadata
+    )
+
 
 def test_room_metadata_is_minted_for_an_owner_turn(store: SharedRoomStore) -> None:
     channel = _FakeChannel(store)
@@ -488,7 +567,16 @@ def test_no_room_metadata_for_a_revoked_room(
     session.metadata["shared_room_revoked"] = True
     sessions.save(session, fsync=True)
     channel = _FakeChannel(store)
-    assert channel.room_turn_metadata(object(), ROOM_CHAT) == {}
+    metadata = channel.room_turn_metadata(object(), ROOM_CHAT)
+    # Fail closed, not open: a revoked room yields a deny-everything scope so
+    # prepare_call still gates the turn.
+    assert metadata["shared_room"] is True
+    assert metadata[INBOUND_META_ROOM_SCOPE] == {
+        "room_id": "",
+        "chat_id": "",
+        "participant_id": "",
+        "role": "guest",
+    }
 
 
 def test_a_guest_credential_cannot_mint_scope_for_another_chat(
@@ -505,7 +593,8 @@ def test_a_guest_credential_cannot_mint_scope_for_another_chat(
     store.consume_ws_token(conn, token)
     channel = _FakeChannel(store)
     channel.room_credential = store.connection_credential
-    assert channel.room_turn_metadata(conn, OWNER_CHAT) == {}
+    metadata = channel.room_turn_metadata(conn, OWNER_CHAT)
+    assert metadata[INBOUND_META_ROOM_SCOPE]["chat_id"] == ""
 
 
 # --------------------------------------------------------------------------
@@ -734,3 +823,119 @@ def test_fan_out_tools_are_denied_in_a_room() -> None:
         for name in ("spawn", "long_task"):
             _tool, _params, error = registry.prepare_call(name, {})
             assert isinstance(error, ToolResult) and error.is_error, name
+
+
+# --------------------------------------------------------------------------
+# The model must not be shown tools it cannot call
+# --------------------------------------------------------------------------
+
+
+def _registry_with(*names: str) -> ToolRegistry:
+    registry = ToolRegistry()
+    for name in names:
+        registry.register(_StubTool(name))
+    return registry
+
+
+def test_a_room_turn_is_only_shown_allow_listed_schemas() -> None:
+    """prepare_call is the gate; this stops the model burning iterations on
+    tools the room prompt already says it does not have."""
+    registry = _registry_with(
+        "web_search",
+        "read_session",
+        "grep",
+        "message",
+        "mcp_ziggy_gmail_gmail_search",
+    )
+    with request_context(guest_request_context()):
+        shown = {registry._schema_name(s) for s in registry.get_definitions()}
+    assert shown == {"web_search"}
+
+
+def test_a_normal_turn_is_shown_every_schema() -> None:
+    registry = _registry_with("web_search", "read_session", "grep", "message")
+    ctx = RequestContext(channel="websocket", chat_id=OWNER_CHAT, metadata={})
+    with request_context(ctx):
+        shown = {registry._schema_name(s) for s in registry.get_definitions()}
+    assert shown == {"web_search", "read_session", "grep", "message"}
+
+
+def test_schema_narrowing_does_not_poison_the_cache() -> None:
+    """A room turn must not leave the owner with a narrowed tool list."""
+    registry = _registry_with("web_search", "read_session")
+    with request_context(guest_request_context()):
+        assert len(registry.get_definitions()) == 1
+    ctx = RequestContext(channel="websocket", chat_id=OWNER_CHAT, metadata={})
+    with request_context(ctx):
+        assert len(registry.get_definitions()) == 2
+
+
+# --------------------------------------------------------------------------
+# web_fetch must stay denied whatever the SSRF knobs say (PR review, N1)
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def permissive_ssrf():
+    """Both global SSRF knobs at their most permissive, then restored.
+
+    ``tools.exec.allow_loopback: true`` (cutover memo C22 plans to enable this
+    for MCP on 127.0.0.1:8790) and the owner's real
+    ``ssrfWhitelist: ["192.168.68.0/24"]``.
+    """
+    from nanobot.security import network
+
+    previous_loopback = network._loopback_allowed_default
+    previous_networks = list(network._allowed_networks)
+    network.configure_loopback_exception(True)
+    network.configure_ssrf_whitelist(["192.168.68.0/24"])
+    try:
+        yield network
+    finally:
+        network.configure_loopback_exception(previous_loopback)
+        network._allowed_networks = previous_networks
+
+
+def test_the_knobs_really_would_open_loopback_and_the_lan(permissive_ssrf) -> None:
+    """Guard the guard: if these pass unconditionally the next test is vacuous."""
+    network = permissive_ssrf
+    ok_loopback, _ = network.validate_url_target("http://127.0.0.1:8790/mcp")
+    assert ok_loopback is True, "loopback should be reachable with allow_loopback on"
+    assert network._is_private(__import__("ipaddress").ip_address("192.168.68.10")) is False
+
+
+def test_web_fetch_is_denied_in_a_room_even_with_both_knobs_permissive(
+    permissive_ssrf,
+) -> None:
+    """A room guest must not reach loopback or the owner's LAN, and that must
+    not depend on two config knobs owned by unrelated subsystems."""
+    registry = ToolRegistry()
+    registry.register(_StubTool("web_fetch"))
+    with request_context(guest_request_context()):
+        _tool, _params, error = registry.prepare_call("web_fetch", {"url": "http://127.0.0.1:8790/"})
+        assert isinstance(error, ToolResult) and error.is_error
+        _tool, _params, error = registry.prepare_call(
+            "web_fetch", {"url": "http://192.168.68.10/"}
+        )
+        assert isinstance(error, ToolResult) and error.is_error
+        # And it is not advertised either.
+        shown = {registry._schema_name(sch) for sch in registry.get_definitions()}
+        assert shown == set()
+
+
+def test_the_owner_keeps_web_fetch(permissive_ssrf) -> None:
+    registry = ToolRegistry()
+    registry.register(_StubTool("web_fetch"))
+    ctx = RequestContext(channel="websocket", chat_id=OWNER_CHAT, metadata={})
+    with request_context(ctx):
+        _tool, _params, error = registry.prepare_call("web_fetch", {"url": "http://example.com"})
+    assert error is None
+
+
+def test_every_allow_listed_tool_is_url_independent() -> None:
+    """The invariant behind the allow-list: no entry may take a caller-chosen
+    host, or its safety becomes a function of the SSRF configuration."""
+    assert "web_fetch" not in ROOM_ALLOWED_TOOLS
+    assert "web_read" not in ROOM_ALLOWED_TOOLS
+    for name in ROOM_ALLOWED_TOOLS:
+        assert "fetch" not in name, name
