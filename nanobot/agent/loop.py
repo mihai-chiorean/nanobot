@@ -2481,7 +2481,15 @@ class AgentLoop:
         meta = dict(msg.metadata or {})
         # ``ask_user`` closes its stream without delivering the question in it;
         # the question must therefore travel as this fresh payload below.
-        if streamed_content and stop_reason not in {"error", "tool_error", "ask_user"}:
+        # Ziggy-local (MIT-1404): a websocket client that asks for an explicit
+        # final message (the ziggy-worker) completes its execution on that
+        # frame, so a streamed reply still ends with an ordinary ``message``.
+        explicit_final = msg.channel == "websocket" and meta.get("explicit_final_message") is True
+        if (
+            streamed_content
+            and not explicit_final
+            and stop_reason not in {"error", "tool_error", "ask_user"}
+        ):
             event = StreamedResponseEvent()
         if turn_latency_ms is not None:
             meta["latency_ms"] = int(turn_latency_ms)

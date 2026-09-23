@@ -455,16 +455,21 @@ class SharedRoomRouter:
 
     # -- guest read ---------------------------------------------------------
 
-    def room_session_messages(self, request: WsRequest, raw_key: str) -> Response:
-        """Reinstated ``/api/sessions/<key>/messages`` for room credentials only.
+    def room_session_messages(self, request: WsRequest, raw_key: str) -> Response | None:
+        """Reinstated ``/api/sessions/<key>/messages`` for room credentials.
 
-        Upstream removed this route (``cdb2a474``) and its own test now asserts
-        404.  It is restored here with a *narrower* contract than it had: the
-        only accepted credential is a room token, it authorizes exactly its own
-        session, and the body is the ``shareable_messages`` projection rather
-        than the raw session file.  Owner and API-token callers still get 404
-        and must use ``/api/sessions/<key>/webui-thread``.
+        Upstream removed this route (``cdb2a474``). For a room token it is
+        restored with a *narrower* contract than it had: the token authorizes
+        exactly its own session, and the body is the ``shareable_messages``
+        projection rather than the raw session file.
+
+        A request that carries no live room token falls through (``None``) to
+        the owner route in ``ws_http`` (MIT-1404), which requires the owner API
+        token and answers 401 otherwise, exactly as production does.
         """
+        credential = self.store.api_credential(bearer_token(request.headers))
+        if credential is None:
+            return None
         if self.sessions is None:
             return http_error(503, "session manager unavailable")
         from urllib.parse import unquote
@@ -472,7 +477,6 @@ class SharedRoomRouter:
         key = unquote(raw_key)
         if not valid_session_key(key):
             return http_error(400, "invalid session key")
-        credential = self.store.api_credential(bearer_token(request.headers))
         if not self.store.authorizes_session(credential, key):
             # Same response for an absent, wrong-session, expired or revoked
             # credential: a prober learns nothing about which rooms exist.
