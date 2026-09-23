@@ -406,11 +406,15 @@ class TestEphemeralDirect:
             patch("nanobot.agent.loop.Consolidator"),
         ):
             mock_sub.return_value.cancel_by_session = AsyncMock(return_value=0)
+            # MIT-1422: SessionManager is a MagicMock here; with the index on,
+            # AgentLoop would build MemoryIndex from the mock's string form and
+            # leak sqlite files into the cwd.
             loop = AgentLoop(
                 bus=bus,
                 provider=provider,
                 workspace=tmp_path,
                 context_window_tokens=32_000,
+                memory_index_enabled=False,
             )
 
         return loop, store
@@ -688,12 +692,16 @@ class TestEphemeralHooks:
             patch("nanobot.agent.loop.Consolidator"),
         ):
             mock_sub.return_value.cancel_by_session = AsyncMock(return_value=0)
+            # MIT-1422: SessionManager is a MagicMock here; with the index on,
+            # AgentLoop would build MemoryIndex from the mock's string form and
+            # leak sqlite files into the cwd.
             loop = AgentLoop(
                 bus=bus,
                 provider=provider,
                 workspace=tmp_path,
                 context_window_tokens=32_000,
                 hooks=[spy],
+                memory_index_enabled=False,
             )
 
         return loop, spy
