@@ -30,7 +30,9 @@ def test_null_redirect_does_not_exempt_host_access(tmp_path, command):
     "cat /dev/stdout",
     "cat /dev/stderr",
     "cat /dev/tty",
-    "cat /dev/fd/3",
+    "cat /dev/fd/0",
+    "cat /dev/fd/1",
+    "cat /dev/fd/2",
 ])
 def test_benign_device_reads_are_not_workspace_blocked(tmp_path, command):
     tool = ExecTool(working_dir=str(tmp_path), restrict_to_workspace=True)
@@ -40,12 +42,29 @@ def test_benign_device_reads_are_not_workspace_blocked(tmp_path, command):
 @pytest.mark.parametrize("command", [
     "cat /dev/sda",
     "cat /dev/null/file",
+    "cat /dev/fd/3",
+    "cat /dev/fd/987",
+    "cat /dev/fd/01",
     "cat /dev/fd/$FD",
     "cat /dev/fd/../../etc/passwd",
 ])
 def test_device_allowlist_does_not_become_path_bypass(tmp_path, command):
     tool = ExecTool(working_dir=str(tmp_path), restrict_to_workspace=True)
     assert tool._guard_command(command, str(tmp_path)) is not None
+
+
+@pytest.mark.parametrize(("path", "benign"), [
+    ("/dev/fd/0", True),
+    ("/dev/fd/1", True),
+    ("/dev/fd/2", True),
+    ("/dev/fd/3", False),
+    ("/dev/fd/12", False),
+    ("/dev/fd/01", False),
+])
+def test_only_standard_stream_fds_are_benign(path, benign):
+    # The deployed snapshot allowed only the standard streams; fd 3+ is left to
+    # the path boundary (after resolve()) rather than exempted by name.
+    assert ExecTool._is_benign_device_path(path) is benign
 
 
 def test_workspace_boundary_includes_sibling_of_working_directory(tmp_path):

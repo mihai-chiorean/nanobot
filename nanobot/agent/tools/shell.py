@@ -117,7 +117,9 @@ class ExecTool(Tool):
         "/dev/stderr",
         "/dev/tty",
     })
-    _BENIGN_FD_PATH = re.compile(r"/dev/fd/\d+\Z")
+    # Only the standard streams: the deployed snapshot blocked higher fds, and
+    # anything a command opens onto fd 3+ is path-checked where it is opened.
+    _BENIGN_FD_PATH = re.compile(r"/dev/fd/[0-2]\Z")
 
     @property
     def description(self) -> str:
