@@ -559,15 +559,11 @@ class SharedRoomRouter:
             return http_error(404, "Not Found")
         key = unquote(raw_key)
         file_id = unquote(raw_file_id)
-        # The dispatch regexes exclude raw '/' and control bytes from each
-        # segment, so an encoded slash here is a smuggled second segment: it
-        # must address a different session or file, never this route's pair.
-        if "/" in raw_key or "/" in raw_file_id:
-            return http_error(404, "Not Found")
         # One canonical spelling per target: re-encoding the decoded segment
         # must reproduce the raw target exactly, so an equivalently-decoding
-        # but un-canonical key cannot reach a store lookup -- and the
-        # credential comparison below compares decoded values.
+        # but un-canonical key cannot reach a store lookup -- and a smuggled
+        # encoded separator addresses a different session or file, which the
+        # credential comparison below (and the store's own id pattern) refuses.
         if quote(key, safe="") != raw_key or quote(file_id, safe="") != raw_file_id:
             return http_error(404, "Not Found")
         if not self.store.authorizes_session(credential, key):
@@ -581,12 +577,15 @@ class SharedRoomRouter:
             return http_error(404, "Not Found")
         filename, payload = published
         # The response is the owner route's: only server-minted names reach a
-        # client, the id and filename come from the validated grant rather
-        # than the request, and the stored filename was already bounded by
-        # ``grant_published_files`` (``.md``-terminated, no control bytes) --
-        # asserted rather than trusted, with the id pattern as the backstop.
-        assert "\r" not in filename and "\n" not in filename
-        assert _PUBLISHED_FILE_ID_RE.fullmatch(file_id) is not None
+        # client, the id and filename come from the validated grant rather than
+        # the request, and ``read_published_file`` already refused an id whose
+        # shape it did not mint -- so an id that reached here yet fails the
+        # pattern is a corrupt store, answered by revealing nothing (the same
+        # 404 as any other unresolvable id, never a 500).
+        if _PUBLISHED_FILE_ID_RE.fullmatch(file_id) is None:
+            return http_error(404, "Not Found")
+        # Never reflect a control byte into a header, even if a host filesystem
+        # permits one in a stored filename.
         clean_name = "".join(ch for ch in filename if ord(ch) >= 32 and ch != "\x7f")
         ascii_name = "".join(
             ch if ord(ch) < 127 and ch not in {'"', '\\'} else "_" for ch in clean_name

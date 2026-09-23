@@ -2110,7 +2110,6 @@ class SessionManager:
             visible = self._shareable_view(message, owner)
             if visible is None:
                 continue
-            assert isinstance(message, dict)
             if visible.get("role") == "assistant":
                 content = cast(str, visible["content"])
                 digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
