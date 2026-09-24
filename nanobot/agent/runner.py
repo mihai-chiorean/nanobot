@@ -193,8 +193,8 @@ class AgentRunSpec:
     provider_state: ProviderConversationState | None = None
     llm_usage_source: LLMUsageSource | None = None
     events: EventSink = NO_EVENTS
-    # MIT-1410 (production feat/shared-rooms cfccc2a2): the reasoning profile
-    # the loop resolved for this turn ("auto"/"fast"/"deep"/...).  The runner
+    # MIT-1410 (production feat/shared-rooms 1ff35d02): the reasoning profile
+    # the loop resolved for this turn ("auto"/"fast"/"think"/...).  The runner
     # never resolves it itself; it is carried here so the bounded auto
     # escalation below can consult the policy without re-reading turn metadata.
     # ``None`` (every non-chat path, and every profile-less chat turn) means
@@ -739,7 +739,7 @@ class AgentRunner:
                     not in {"error", "length", "refusal", "content_filter"}
                     and is_blank_text(clean)
                 ):
-                    # MIT-1410 (production cfccc2a2): an auto turn the policy
+                    # MIT-1410 (production 1ff35d02): an auto turn the policy
                     # resolved to fast re-tries a blank reply once at the next
                     # tier up.  The retry does not consume the empty-retry
                     # budget, and an explicit fast/deep turn never gets here
@@ -790,7 +790,7 @@ class AgentRunner:
                     clean = hook.finalize_content(context, response.content)
 
                 if response.finish_reason == "length":
-                    # MIT-1410 (production cfccc2a2): a truncated answer on an
+                    # MIT-1410 (production 1ff35d02): a truncated answer on an
                     # escalation-eligible auto turn -- blank or not, since a
                     # blank truncation lands here rather than in the empty
                     # retry above -- gets its continuation at the next tier
@@ -1330,7 +1330,7 @@ class AgentRunner:
         """Take the policy's one permitted escalation step, if there is one.
 
         Port of production's auto-escalation hook (feat/shared-rooms
-        cfccc2a2): an ``auto`` turn the policy resolved down to ``fast``
+        1ff35d02): an ``auto`` turn the policy resolved down to ``fast``
         re-tries a failed response once at the next tier up (``think``).
         The gate is the loop's ``allow_reasoning_escalation`` verdict —
         explicit ``fast``/``deep`` turns never have it, so they never get a

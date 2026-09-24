@@ -343,8 +343,8 @@ async def handle_chat_completions(request: web.Request) -> web.Response | web.St
     )
     session_lock = session_locks.setdefault(session_key, asyncio.Lock())
 
-    # MIT-1410: port of production (feat/shared-rooms 1ff35d02 / cfccc2a2):
-    # the chat body may carry ``reasoning_profile`` ("auto"/"fast"/"deep");
+    # MIT-1410: port of production (feat/shared-rooms 1ff35d02):
+    # the chat body may carry ``reasoning_profile`` (auto/fast/think/think-code/deep);
     # it rides the turn metadata to the loop, which binds it to the turn's
     # runtime.  Invalid or missing values leave the metadata untouched, so
     # the provider default applies.

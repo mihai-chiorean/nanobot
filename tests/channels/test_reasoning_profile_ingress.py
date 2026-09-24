@@ -1,6 +1,6 @@
 """MIT-1410: ``reasoning_profile`` ingress on the chat frame and REST chat API.
 
-Production parity (``feat/shared-rooms`` 1ff35d02 / cfccc2a2): the client's
+Production parity (``feat/shared-rooms`` 1ff35d02): the client's
 product profile choice (``auto``/``fast``/``deep``) rides the inbound
 websocket ``message`` frame and the REST chat body into the turn metadata,
 where the MIT-1409 loop binding resolves it; ``auto`` turns may take the
@@ -110,9 +110,9 @@ async def test_an_absent_profile_leaves_the_key_absent(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "wire_value",
-    ["turbo", "", "   ", "think", "think-code", "FAST;", 42, True, ["fast"], {"fast": True}],
+    ["turbo", "", "   ", "FAST;", "think_code", 42, True, ["fast"], {"fast": True}],
 )
-async def test_a_value_outside_the_chat_trio_is_dropped(tmp_path: Path, wire_value: Any) -> None:
+async def test_an_unknown_value_is_dropped(tmp_path: Path, wire_value: Any) -> None:
     channel = _owner_channel(tmp_path)
 
     await channel._dispatch_envelope(
@@ -336,7 +336,7 @@ async def test_a_rest_body_without_a_profile_keeps_metadata_empty(aiohttp_client
 
 @pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
 @pytest.mark.asyncio
-@pytest.mark.parametrize("wire_value", ["turbo", "think", "", 42, None])
+@pytest.mark.parametrize("wire_value", ["turbo", "deeper", "", 42, None])
 async def test_an_invalid_rest_profile_is_dropped_not_400(
     aiohttp_client, wire_value: Any
 ) -> None:
@@ -351,7 +351,7 @@ async def test_an_invalid_rest_profile_is_dropped_not_400(
 
 
 # ---------------------------------------------------------------------------
-# Runner: the bounded auto escalation hook (production cfccc2a2).
+# Runner: the bounded auto escalation hook (production 1ff35d02).
 # ---------------------------------------------------------------------------
 
 
@@ -493,3 +493,54 @@ async def test_an_explicit_fast_turn_does_not_escalate_on_truncation(tmp_path: P
     await harness.run_turn({"reasoning_profile": "fast"})
 
     assert [call.get("reasoning_effort") for call in harness.calls] == ["none", "none"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("wire_value", "expected"),
+    [
+        ("auto", "auto"),
+        ("fast", "fast"),
+        ("think", "think"),
+        ("think-code", "think-code"),
+        ("deep", "deep"),
+        (" Think ", "think"),
+    ],
+)
+async def test_every_client_profile_reaches_the_inbound_metadata(
+    tmp_path: Path, wire_value: str, expected: str
+) -> None:
+    """iOS and web send production's values (auto/fast/think/think-code)."""
+    channel = _owner_channel(tmp_path)
+
+    await channel._dispatch_envelope(
+        AsyncMock(), "client-1", _message_frame("abc123", reasoning_profile=wire_value)
+    )
+
+    assert _published(channel).metadata["reasoning_profile"] == expected
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wire_value", ["think", "think-code"])
+async def test_the_rest_body_accepts_the_think_profiles(aiohttp_client, wire_value: str) -> None:
+    agent = _make_mock_agent()
+    app = create_app(agent, model_name="test-model", api_key=API_KEY)
+    client = await aiohttp_client(app)
+
+    assert await _post_chat(client, {"reasoning_profile": wire_value}) == 200
+
+    _args, kwargs = agent.process_direct.await_args
+    assert kwargs["metadata"] == {"reasoning_profile": wire_value}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("profile", "effort"), [("think", "high"), ("think-code", "max")])
+async def test_an_explicit_think_turn_never_escalates(
+    tmp_path: Path, profile: str, effort: str
+) -> None:
+    harness = _LoopHarness(tmp_path, [_blank(), _blank(), _text("ok")])
+
+    await harness.run_turn({"reasoning_profile": profile})
+
+    assert {call.get("reasoning_effort") for call in harness.calls} == {effort}

@@ -822,10 +822,10 @@ class WebUICommandRouter:
                 # explicit request for help; discussion never gets this far.
                 metadata["room_intent"] = "ask_ziggy"
         # MIT-1410: owner-selected reasoning profile, ported from production
-        # (feat/shared-rooms 1ff35d02 / cfccc2a2).  The frame may carry
-        # ``reasoning_profile`` ("auto"/"fast"/"deep"); the loop binds it to
-        # the turn at entry.  Anything outside the chat trio is dropped, so a
-        # client can never select the internal Work tiers.  Room turns keep
+        # (feat/shared-rooms 1ff35d02).  The frame may carry
+        # ``reasoning_profile`` (auto/fast/think/think-code, plus deep); the
+        # loop binds it to the turn at entry.  Unknown values are dropped.
+        # Room turns keep
         # the default: the room metadata is non-empty for any shared-room chat
         # -- guests and the owner alike -- and guest frames must not be able
         # to steer the owner's model selection, so the field is ignored there.
