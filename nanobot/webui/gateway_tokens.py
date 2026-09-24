@@ -114,5 +114,18 @@ class GatewayTokenStore:
                 self.issued_token_audiences.pop(token_key, None)
 
 
-def token_response_payload(token: str, expires_in: Any) -> dict[str, Any]:
-    return {"token": token, "expires_in": expires_in}
+def token_response_payload(
+    token: str,
+    expires_in: Any,
+    *,
+    ws_path: str,
+    model_name: str | None,
+) -> dict[str, Any]:
+    # Same fields as production's transport token: web and ziggy-worker require
+    # ``ws_path``; iOS shows ``model_name`` (null when no model is configured).
+    return {
+        "token": token,
+        "ws_path": ws_path,
+        "expires_in": expires_in,
+        "model_name": model_name,
+    }

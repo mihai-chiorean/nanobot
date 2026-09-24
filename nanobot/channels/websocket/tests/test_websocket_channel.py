@@ -4098,6 +4098,38 @@ async def test_http_route_issues_token_then_websocket_requires_it(bus: MagicMock
 
 
 @pytest.mark.asyncio
+async def test_token_issue_returns_ws_path_and_model_name(bus: MagicMock) -> None:
+    """/auth/token matches production's payload: web and ziggy-worker need ws_path, iOS reads model_name."""
+    port = 29878
+    channel = _ch(
+        bus, port=port,
+        path="/chat",
+        tokenIssuePath="/auth/token",
+        tokenIssueSecret="route-secret",
+    )
+    channel.gateway.http.runtime_model_name = lambda: "openai/gpt-4.1"
+
+    server_task = asyncio.create_task(channel.start())
+    await asyncio.sleep(0.3)
+
+    try:
+        issue = await _http_get(
+            f"http://127.0.0.1:{port}/auth/token",
+            headers={"Authorization": "Bearer route-secret"},
+        )
+        assert issue.status_code == 200
+        body = issue.json()
+        assert set(body) == {"token", "ws_path", "expires_in", "model_name"}
+        assert body["token"].startswith("nbwt_")
+        assert body["ws_path"] == "/chat"
+        assert isinstance(body["expires_in"], int)
+        assert body["model_name"] == "openai/gpt-4.1"
+    finally:
+        await channel.stop()
+        await server_task
+
+
+@pytest.mark.asyncio
 async def test_settings_api_returns_safe_subset_and_updates_whitelist(
     bus: MagicMock,
     monkeypatch,
