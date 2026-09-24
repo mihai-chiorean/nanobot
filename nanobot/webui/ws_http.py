@@ -701,7 +701,16 @@ class GatewayHTTPHandler:
         # token as a Bearer until the shared TTL expires.
         token_value = self.tokens.issue_client_token(self.config.token_ttl_s)
         return _http_json_response(
-            token_response_payload(token_value, self.config.token_ttl_s),
+            token_response_payload(
+                token_value,
+                self.config.token_ttl_s,
+                ws_path=_normalize_config_path(self.config.path),
+                model_name=_resolve_bootstrap_model_name(
+                    self.runtime_model_name,
+                    self.settings.config.path,
+                )
+                or None,
+            ),
             extra_headers=_NO_STORE_HEADERS,
         )
 
