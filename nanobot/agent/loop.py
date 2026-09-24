@@ -1524,19 +1524,30 @@ class AgentLoop:
         Port of the production turn-entry binding (feat/shared-rooms
         1ff35d02 / cfccc2a2).  The profile arrives on the turn metadata;
         raw ``reasoning_effort`` / ``max_tokens`` metadata overrides win
-        over a profile, exactly as on production.  ``auto`` — and an
-        absent or unknown value, which is treated as ``auto`` — leaves
-        the admitted generation untouched: the provider decides effort
-        for itself, and the bounded escalation ladder is P13b runner
-        work.  Production mutated its (shared, mutable) provider around
-        the call and restored it afterwards; 0.3.0 generation lives on the
-        frozen ``LLMRuntime`` value, so the override is derived here and
-        carried by this turn's run spec alone — the shared runtime is
+        over a profile, exactly as on production.  An absent value leaves
+        the admitted generation untouched (the provider decides effort for
+        itself); a present-but-unknown value resolves as ``auto`` per the
+        MIT-1409 acceptance criteria — production rejects those at the
+        frame/REST edges and never lets one reach the loop, so the issue
+        text, not production, is the spec here.  The resolved ``auto``
+        generation is applied like any other profile, as production does;
+        the bounded escalation ladder behind ``allow_escalation`` is P13b
+        runner work.  Production mutated its (shared, mutable) provider
+        around the call and restored it afterwards; 0.3.0 generation lives
+        on the frozen ``LLMRuntime`` value, so the override is derived here
+        and carried by this turn's run spec alone — the shared runtime is
         never mutated and later turns need no restoration.
         """
         if not isinstance(request_metadata, Mapping) or not request_metadata:
             return runtime
-        requested_profile = parse_reasoning_profile(request_metadata.get("reasoning_profile"))
+        raw_profile = request_metadata.get("reasoning_profile")
+        requested_profile = parse_reasoning_profile(raw_profile)
+        if requested_profile is None and raw_profile is not None:
+            requested_profile = ReasoningProfile.AUTO
+            logger.debug(
+                "Unknown reasoning profile value {!r} on turn metadata; resolving as auto",
+                raw_profile,
+            )
         uses_raw_generation_controls = (
             "reasoning_effort" in request_metadata or "max_tokens" in request_metadata
         )
@@ -1553,8 +1564,6 @@ class AgentLoop:
                 decision.source,
                 decision.classifier_candidate,
             )
-            if decision.requested is ReasoningProfile.AUTO:
-                return runtime
             return runtime.with_generation_overrides(
                 temperature=decision.generation.temperature,
                 max_tokens=decision.generation.max_tokens,
@@ -1837,6 +1846,22 @@ class AgentLoop:
             if publish_file_turn is not None
             else None
         )
+        # MIT-1409: bind this turn's reasoning profile to the provider call,
+        # as production does at turn entry (feat/shared-rooms 1ff35d02 /
+        # cfccc2a2).  Computed BEFORE the turn's contextvars are bound below:
+        # the helper is pure (metadata + messages only), and a raise after
+        # ``set_scheduling_class``/``set_work_context`` would leak the class
+        # and Work context into the task, since their resets live in the
+        # ``try``'s ``finally`` that we would never enter.  The derived
+        # runtime carries the resolved generation for THIS turn's run only;
+        # the admitted runtime is a frozen value and is never touched, so
+        # the next turn starts from the base generation again.
+        turn_runtime = self._turn_runtime_for_reasoning_profile(
+            runtime,
+            request_metadata,
+            transcript_input,
+            initial_messages,
+        )
         # The admission gateway caps background concurrency by the
         # ``X-Ziggy-Scheduling-Class`` header, which the provider reads from
         # this contextvar. Bound per turn inside the turn's own task (so a
@@ -1854,17 +1879,6 @@ class AgentLoop:
             store=self.work_store if run_task_id else None,
             task_id=run_task_id,
             workspace=self.workspace if run_task_id else None,
-        )
-        # MIT-1409: bind this turn's reasoning profile to the provider call,
-        # as production does at turn entry (feat/shared-rooms 1ff35d02 /
-        # cfccc2a2).  The derived runtime carries the resolved generation for
-        # THIS turn's run only; the admitted runtime is a frozen value and is
-        # never touched, so the next turn starts from the base generation again.
-        turn_runtime = self._turn_runtime_for_reasoning_profile(
-            runtime,
-            request_metadata,
-            transcript_input,
-            initial_messages,
         )
         turn_scope_stack = ExitStack()
         # Compute lazily because create_goal may create goal metadata during this run.
