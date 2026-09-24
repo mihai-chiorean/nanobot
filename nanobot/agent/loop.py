@@ -36,6 +36,11 @@ from nanobot.agent.hook import (
 from nanobot.agent.memory import Consolidator
 from nanobot.agent.memory_index import MemoryIndex, SessionRecallIndexer
 from nanobot.agent.model_runtime import ModelRuntimeResolver
+from nanobot.agent.reasoning_policy import (
+    ReasoningProfile,
+    parse_reasoning_profile,
+    resolve_reasoning_profile,
+)
 from nanobot.agent.runner import (
     _MAX_INJECTIONS_PER_TURN,
     AgentRunner,
@@ -388,6 +393,43 @@ def work_task_id(metadata: Mapping[str, Any] | None) -> str | None:
         return None
     value = metadata.get("work_task_id")
     return value if isinstance(value, str) and value.startswith("work_") else None
+
+
+def _reasoning_profile_messages(
+    transcript_input: TranscriptInput | None,
+    initial_messages: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Messages the reasoning policy reads to resolve this turn's Auto choice.
+
+    The Auto rules only look at the latest user turn, so the caller-supplied
+    transcript is preferred when the caller has one (subagent runs and the
+    resume path carry a fully formed conversation); otherwise the current user
+    message is appended to the session history.  This is a cheap classification
+    view, not the model-bound transcript (the runner assembles that one).
+    """
+    if initial_messages is not None:
+        return initial_messages
+    if transcript_input is None:
+        return []
+    messages: list[dict[str, Any]] = [
+        message
+        for message in transcript_input.history
+        if isinstance(message, dict) and message.get("role") == "user"
+    ]
+    if transcript_input.current_message is not None:
+        content: str | list[dict[str, Any]] = transcript_input.current_message
+        if transcript_input.media:
+            content = [{"type": "text", "text": transcript_input.current_message}]
+            content.extend(
+                {"type": "image", "image_url": str(path)} for path in transcript_input.media
+            )
+        messages.append(
+            {
+                "role": transcript_input.current_role or "user",
+                "content": content,
+            }
+        )
+    return messages
 
 
 class _WorkHook(AgentHook):
@@ -1473,6 +1515,78 @@ class AgentLoop:
         if self._unified_session and session.key == UNIFIED_SESSION_KEY:
             remember_last_channel(session.metadata, msg.channel, msg.chat_id)
 
+    def _turn_runtime_for_reasoning_profile(
+        self,
+        runtime: LLMRuntime,
+        request_metadata: Mapping[str, Any] | None,
+        transcript_input: TranscriptInput | None,
+        initial_messages: list[dict[str, Any]] | None,
+    ) -> LLMRuntime:
+        """Bind this turn's reasoning profile to a freshly derived runtime.
+
+        Port of the production turn-entry binding (feat/shared-rooms
+        1ff35d02 / cfccc2a2).  The profile arrives on the turn metadata;
+        raw ``reasoning_effort`` / ``max_tokens`` metadata overrides win
+        over a profile, exactly as on production.  An absent value leaves
+        the admitted generation untouched (the provider decides effort for
+        itself); a present-but-unknown value resolves as ``auto`` per the
+        MIT-1409 acceptance criteria — production rejects those at the
+        frame/REST edges and never lets one reach the loop, so the issue
+        text, not production, is the spec here.  The resolved ``auto``
+        generation is applied like any other profile, as production does;
+        the bounded escalation ladder behind ``allow_escalation`` is P13b
+        runner work.  Production mutated its (shared, mutable) provider
+        around the call and restored it afterwards; 0.3.0 generation lives
+        on the frozen ``LLMRuntime`` value, so the override is derived here
+        and carried by this turn's run spec alone — the shared runtime is
+        never mutated and later turns need no restoration.
+        """
+        if not isinstance(request_metadata, Mapping) or not request_metadata:
+            return runtime
+        raw_profile = request_metadata.get("reasoning_profile")
+        requested_profile = parse_reasoning_profile(raw_profile)
+        if requested_profile is None and raw_profile is not None:
+            requested_profile = ReasoningProfile.AUTO
+            logger.debug(
+                "Unknown reasoning profile value {!r} on turn metadata; resolving as auto",
+                raw_profile,
+            )
+        uses_raw_generation_controls = (
+            "reasoning_effort" in request_metadata or "max_tokens" in request_metadata
+        )
+        if requested_profile is not None and not uses_raw_generation_controls:
+            decision = resolve_reasoning_profile(
+                requested_profile,
+                _reasoning_profile_messages(transcript_input, initial_messages),
+                background_work=scheduling_class_for_turn(request_metadata) == "background",
+            )
+            logger.info(
+                "Reasoning profile requested={} resolved={} source={} classifier_candidate={}",
+                decision.requested.value,
+                decision.generation.name.value,
+                decision.source,
+                decision.classifier_candidate,
+            )
+            return runtime.with_generation_overrides(
+                temperature=decision.generation.temperature,
+                max_tokens=decision.generation.max_tokens,
+                reasoning_effort=decision.generation.reasoning_effort,
+            )
+        candidate_effort = request_metadata.get("reasoning_effort")
+        run_reasoning_effort = candidate_effort if isinstance(candidate_effort, str) else None
+        candidate_max_tokens = request_metadata.get("max_tokens")
+        run_max_tokens = (
+            candidate_max_tokens
+            if isinstance(candidate_max_tokens, int) and not isinstance(candidate_max_tokens, bool)
+            else None
+        )
+        if run_reasoning_effort is None and run_max_tokens is None:
+            return runtime
+        return runtime.with_generation_overrides(
+            reasoning_effort=run_reasoning_effort,
+            max_tokens=run_max_tokens,
+        )
+
     async def _run_agent_loop(
         self,
         transcript_input: TranscriptInput,
@@ -1735,6 +1849,22 @@ class AgentLoop:
             if publish_file_turn is not None
             else None
         )
+        # MIT-1409: bind this turn's reasoning profile to the provider call,
+        # as production does at turn entry (feat/shared-rooms 1ff35d02 /
+        # cfccc2a2).  Computed BEFORE the turn's contextvars are bound below:
+        # the helper is pure (metadata + messages only), and a raise after
+        # ``set_scheduling_class``/``set_work_context`` would leak the class
+        # and Work context into the task, since their resets live in the
+        # ``try``'s ``finally`` that we would never enter.  The derived
+        # runtime carries the resolved generation for THIS turn's run only;
+        # the admitted runtime is a frozen value and is never touched, so
+        # the next turn starts from the base generation again.
+        turn_runtime = self._turn_runtime_for_reasoning_profile(
+            runtime,
+            request_metadata,
+            transcript_input,
+            initial_messages,
+        )
         # The admission gateway caps background concurrency by the
         # ``X-Ziggy-Scheduling-Class`` header, which the provider reads from
         # this contextvar. Bound per turn inside the turn's own task (so a
@@ -1791,7 +1921,7 @@ class AgentLoop:
             result = await self.runner.run(AgentRunSpec(
                 initial_messages=initial_messages,
                 tools=effective_tools,
-                runtime=runtime,
+                runtime=turn_runtime,
                 max_iterations=self.max_iterations,
                 max_tool_result_chars=self.max_tool_result_chars,
                 transcript_input=None if initial_messages is not None else transcript_input,
