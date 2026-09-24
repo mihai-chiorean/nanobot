@@ -3,19 +3,28 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import hashlib
 import json
 import re
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Protocol, cast
 
 from loguru import logger
 from websockets.asyncio.server import ServerConnection
 
-from nanobot.bus.events import INBOUND_META_USER_SHELL
+from nanobot.bus.events import INBOUND_META_USER_SHELL, InboundMessage
+from nanobot.channels.websocket.chat_inbox import ChatInboxStore
+from nanobot.channels.websocket.message_ack import (
+    AcceptedClientMessages,
+    discard_duplicate_media,
+    parse_client_message_id,
+)
+from nanobot.channels.websocket.rooms import RoomCredential
 from nanobot.channels.websocket.work_stream import WORK_ENVELOPE_TYPES
 from nanobot.command.builtin import USER_SHELL_COMMAND, builtin_command_starts_agent_turn
 from nanobot.runtime_context import (
@@ -124,6 +133,39 @@ class WebUICommandTransport(Protocol):
         *,
         scope: str | None = None,
     ) -> None: ...
+
+    # Ziggy-local (MIT-1402): owner-chat message.ack and id de-duplication.
+    @property
+    def chat_inbox(self) -> ChatInboxStore | None: ...
+
+    accepted_client_messages: AcceptedClientMessages
+
+    async def webui_prepare_message(
+        self,
+        *,
+        sender_id: str,
+        chat_id: str,
+        content: str,
+        media: list[str] | None,
+        metadata: dict[str, Any],
+        is_dm: bool,
+        session_key: str | None,
+        require_existing_session: bool,
+    ) -> InboundMessage | None: ...
+
+    async def webui_publish_message(self, msg: InboundMessage) -> None: ...
+
+    async def send_message_ack(
+        self,
+        connection: ServerConnection,
+        *,
+        chat_id: str,
+        client_message_id: str,
+        status: str,
+        detail: str | None = None,
+    ) -> None: ...
+
+    async def broadcast_room_event(self, chat_id: str, event: str, **fields: Any) -> None: ...
 
 
 # Ziggy-local (MIT-1010). The only commands a shared-room guest may send.
@@ -562,30 +604,55 @@ class WebUICommandRouter:
     ) -> None:
         chat_id = envelope.get("chat_id")
         content = envelope.get("content")
+        # Ziggy-local (MIT-1402), production parity: a frame carrying a
+        # ``client_message_id`` gets exactly one ``message.ack``. Every
+        # refusal below becomes ``status: "rejected"`` so the client's outbox
+        # stops resending; frames without an id keep their ``error`` events.
+        client_id_valid, client_message_id = parse_client_message_id(
+            envelope.get("client_message_id")
+        )
+        if not client_id_valid:
+            await self._transport.webui_send_event(
+                connection,
+                "error",
+                detail="invalid client_message_id",
+            )
+            return
+        rejection_fields: dict[str, Any] = {}
+
+        async def reject(detail: str, **fields: Any) -> None:
+            if client_message_id is None:
+                await self._transport.webui_send_event(
+                    connection,
+                    "error",
+                    detail=detail,
+                    **fields,
+                    **rejection_fields,
+                )
+                return
+            message = fields.get("message")
+            await self._transport.send_message_ack(
+                connection,
+                chat_id=chat_id if isinstance(chat_id, str) else "",
+                client_message_id=client_message_id,
+                status="rejected",
+                detail=message if isinstance(message, str) and message else detail,
+            )
+
         if not is_valid_webui_chat_id(chat_id):
-            await self._transport.webui_send_event(connection, "error", detail="invalid chat_id")
+            await reject("invalid chat_id")
             return
         raw_turn_id = envelope.get("turn_id")
         turn_id = raw_turn_id if isinstance(raw_turn_id, str) and raw_turn_id else None
-        rejection_fields = {
+        rejection_fields.update({
             "chat_id": chat_id,
             **({"turn_id": turn_id} if turn_id else {}),
-        }
+        })
         if not self._transport.is_allowed(client_id):
-            await self._transport.webui_send_event(
-                connection,
-                "error",
-                detail="access_denied",
-                **rejection_fields,
-            )
+            await reject("access_denied")
             return
         if not isinstance(content, str):
-            await self._transport.webui_send_event(
-                connection,
-                "error",
-                detail="missing content",
-                **rejection_fields,
-            )
+            await reject("missing content")
             return
 
         # -- Shared rooms (Ziggy-local, MIT-1010) ---------------------------
@@ -593,12 +660,7 @@ class WebUICommandRouter:
         # Checked before anything is stored, hydrated or dispatched.
         guest_credential = self._transport.room_credential(connection)
         if guest_credential is not None and guest_credential.chat_id != chat_id:
-            await self._transport.webui_send_event(
-                connection,
-                "error",
-                detail="access_denied",
-                **rejection_fields,
-            )
+            await reject("access_denied")
             return
         # Owners post into their own rooms through the same intent path as
         # guests, so a discussion or proposal frame is recorded and broadcast
@@ -616,12 +678,9 @@ class WebUICommandRouter:
             room_credential is not None
             or self._transport.room_turn_metadata(connection, chat_id)
         ):
-            await self._transport.webui_send_event(
-                connection,
-                "error",
-                detail="attachment_rejected",
+            await reject(
+                "attachment_rejected",
                 message="Attachments are not available in shared rooms yet.",
-                **rejection_fields,
             )
             return
         if room_credential is not None:
@@ -637,12 +696,9 @@ class WebUICommandRouter:
 
         message_rejection = self._ingress.validate_text(content)
         if message_rejection is not None:
-            await self._transport.webui_send_event(
-                connection,
-                "error",
-                detail="message_rejected",
+            await reject(
+                "message_rejected",
                 reason=message_rejection,
-                **rejection_fields,
             )
             return
 
@@ -653,12 +709,7 @@ class WebUICommandRouter:
                 content,
             )
         except TemporaryChatError as exc:
-            await self._transport.webui_send_event(
-                connection,
-                "error",
-                detail=exc.detail,
-                **rejection_fields,
-            )
+            await reject(exc.detail)
             return
 
         raw_media = envelope.get("media")
@@ -666,24 +717,18 @@ class WebUICommandRouter:
         media_names: list[str | None] = []
         if raw_media is not None:
             if not isinstance(raw_media, list):
-                await self._transport.webui_send_event(
-                    connection,
-                    "error",
-                    detail="attachment_rejected",
+                await reject(
+                    "attachment_rejected",
                     reason="malformed",
-                    **rejection_fields,
                 )
                 return
             media_paths, reason = self._media.store_inbound_attachments(
                 cast(list[Any], raw_media)
             )
             if reason is not None:
-                await self._transport.webui_send_event(
-                    connection,
-                    "error",
-                    detail="attachment_rejected",
+                await reject(
+                    "attachment_rejected",
                     reason=reason,
-                    **rejection_fields,
                 )
                 return
             for item in cast(list[Any], raw_media):
@@ -694,12 +739,7 @@ class WebUICommandRouter:
                 self._temporary_chats.register_media(connection, chat_id, media_paths)
 
         if not content.strip() and not media_paths:
-            await self._transport.webui_send_event(
-                connection,
-                "error",
-                detail="missing content",
-                **rejection_fields,
-            )
+            await reject("missing content")
             return
         self._transport.webui_attach(connection, chat_id)
         if temporary_policy is None or temporary_policy.hydrate_transcript:
@@ -725,12 +765,7 @@ class WebUICommandRouter:
             return
 
         if not self._transport.is_allowed(client_id):
-            await self._transport.webui_send_event(
-                connection,
-                "error",
-                detail="access_denied",
-                **rejection_fields,
-            )
+            await reject("access_denied")
             return
 
         metadata: dict[str, Any] = {
@@ -740,6 +775,8 @@ class WebUICommandRouter:
         # frame after a streamed reply; the agent loop reads this flag.
         if envelope.get("explicit_final_message") is True:
             metadata["explicit_final_message"] = True
+        if client_message_id is not None:
+            metadata["client_message_id"] = client_message_id
         if envelope.get("webui") is True:
             metadata["webui"] = True
             metadata.update(self._transcripts.client_turn_metadata(envelope.get("turn_id")))
@@ -783,6 +820,41 @@ class WebUICommandRouter:
                 # Anything reaching the agent from a collaborative room is an
                 # explicit request for help; discussion never gets this far.
                 metadata["room_intent"] = "ask_ziggy"
+        session_key_override = (
+            temporary_policy.session_key if temporary_policy is not None else None
+        )
+        require_existing_session = (
+            temporary_policy.require_existing_session
+            if temporary_policy is not None
+            else False
+        )
+        # MIT-1402: claim the id before anything is recorded or broadcast, so
+        # a resend of an accepted message is acknowledged and dropped here.
+        prepared: InboundMessage | None = None
+        if client_message_id is not None:
+            prepared = await self._transport.webui_prepare_message(
+                sender_id=client_id,
+                chat_id=chat_id,
+                content=dispatch_content,
+                media=media_paths or None,
+                metadata=metadata,
+                is_dm=False,
+                session_key=session_key_override,
+                require_existing_session=require_existing_session,
+            )
+            if prepared is None:
+                await reject("Message was not accepted.")
+                return
+            prepared = await self._claim_client_message(
+                connection,
+                prepared,
+                client_message_id,
+                reject,
+            )
+            if prepared is None:
+                return
+            media_paths = list(prepared.media)
+
         is_webui = metadata.get("webui") is True
         queued_owner = None
         if is_webui and not is_user_shell and builtin_command_starts_agent_turn(content):
@@ -821,27 +893,53 @@ class WebUICommandRouter:
                     context_blocks.append(session_context)
                 if context_blocks:
                     metadata[RUNTIME_CONTEXT_INPUT_META] = context_blocks
-            await self._transport.webui_dispatch_message(
-                sender_id=client_id,
-                chat_id=chat_id,
-                content=dispatch_content,
-                media=media_paths or None,
-                metadata=metadata,
-                is_dm=False,
-                session_key=(
-                    temporary_policy.session_key if temporary_policy is not None else None
-                ),
-                require_existing_session=(
-                    temporary_policy.require_existing_session
-                    if temporary_policy is not None
-                    else False
-                ),
-            )
+            if prepared is None:
+                await self._transport.webui_dispatch_message(
+                    sender_id=client_id,
+                    chat_id=chat_id,
+                    content=dispatch_content,
+                    media=media_paths or None,
+                    metadata=metadata,
+                    is_dm=False,
+                    session_key=session_key_override,
+                    require_existing_session=require_existing_session,
+                )
+            else:
+                # ``metadata`` may have gained turn-local keys since the
+                # claim; they ride along without changing the stored receipt.
+                await self._transport.webui_publish_message(
+                    dataclasses.replace(
+                        prepared,
+                        metadata={**prepared.metadata, **metadata},
+                    )
+                )
             self._workspaces.persist_scope(chat_id, scope)
             accepted = True
         finally:
             if not accepted and queued_owner is not None:
                 clear_websocket_turn_if_current(chat_id, queued_owner)
+            if not accepted and prepared is not None and client_message_id is not None:
+                await self._release_client_message(chat_id, client_message_id)
+
+        if client_message_id is not None:
+            await self._transport.send_message_ack(
+                connection,
+                chat_id=chat_id,
+                client_message_id=client_message_id,
+                status="accepted",
+            )
+            if room_credential is not None:
+                # Production parity: room participants see the asked message.
+                participant = cast(RoomCredential, room_credential)
+                await self._transport.broadcast_room_event(
+                    chat_id,
+                    "participant.message",
+                    client_message_id=client_message_id,
+                    participant_id=participant.participant_id,
+                    display_name=participant.display_name,
+                    content=content,
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                )
 
         if is_webui:
             await self.broadcast_user_message(
@@ -875,6 +973,67 @@ class WebUICommandRouter:
                     if active_turn_id is not None and started_at is not None
                     else {}
                 ),
+            )
+
+    async def _claim_client_message(
+        self,
+        connection: ServerConnection,
+        prepared: InboundMessage,
+        client_message_id: str,
+        reject: Callable[[str], Awaitable[None]],
+    ) -> InboundMessage | None:
+        """Claim ``client_message_id`` for dispatch, or acknowledge and stop.
+
+        Production parity (``websocket.py`` message path): the durable inbox
+        decides; the in-memory LRU is used only when there is no inbox.
+        Returns the message to publish, or ``None`` once a ``duplicate`` or
+        ``rejected`` ack has been sent.
+        """
+        chat_id = prepared.chat_id
+        inbox = self._transport.chat_inbox
+        if inbox is None:
+            accepted = self._transport.accepted_client_messages
+            if (chat_id, client_message_id) in accepted:
+                await self._transport.send_message_ack(
+                    connection,
+                    chat_id=chat_id,
+                    client_message_id=client_message_id,
+                    status="duplicate",
+                )
+                return None
+            accepted.remember(chat_id, client_message_id)
+            return prepared
+        disposition, record = await inbox.accept(prepared, client_message_id)
+        if disposition == "conflict":
+            discard_duplicate_media(prepared.media, record.message.media)
+            await reject("client_message_id was already used for different content")
+            return None
+        if disposition == "existing":
+            discard_duplicate_media(prepared.media, record.message.media)
+            prepared = dataclasses.replace(prepared, media=list(record.message.media))
+        if not await inbox.claim_for_enqueue(chat_id, client_message_id):
+            await self._transport.send_message_ack(
+                connection,
+                chat_id=chat_id,
+                client_message_id=client_message_id,
+                status="duplicate",
+            )
+            return None
+        return prepared
+
+    async def _release_client_message(self, chat_id: str, client_message_id: str) -> None:
+        """Undo a claim whose message never reached the bus, so a resend retries."""
+        inbox = self._transport.chat_inbox
+        if inbox is None:
+            self._transport.accepted_client_messages.forget(chat_id, client_message_id)
+            return
+        try:
+            await inbox.release_enqueue_claim(chat_id, client_message_id)
+        except Exception:
+            logger.exception(
+                "Failed to release chat inbox claim for {}:{}",
+                chat_id,
+                client_message_id,
             )
 
     async def start_webui_request(
