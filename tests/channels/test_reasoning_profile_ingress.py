@@ -469,3 +469,27 @@ async def test_a_profile_less_turn_never_escalates(tmp_path: Path) -> None:
     efforts = [call.get("reasoning_effort") for call in harness.calls]
     assert len(efforts) >= 2
     assert set(efforts) == {"low"}  # the admitted default, unescalated
+
+
+def _truncated(content: str | None) -> LLMResponse:
+    return LLMResponse(content=content, tool_calls=[], finish_reason="length")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("partial", ["the start of an answer", None])
+async def test_an_auto_turn_escalates_on_truncation(tmp_path: Path, partial: str | None) -> None:
+    harness = _LoopHarness(tmp_path, [_truncated(partial), _text("the rest")])
+
+    await harness.run_turn({"reasoning_profile": "auto"})
+
+    efforts = [call.get("reasoning_effort") for call in harness.calls]
+    assert efforts == ["none", "high"]
+
+
+@pytest.mark.asyncio
+async def test_an_explicit_fast_turn_does_not_escalate_on_truncation(tmp_path: Path) -> None:
+    harness = _LoopHarness(tmp_path, [_truncated("partial"), _text("the rest")])
+
+    await harness.run_turn({"reasoning_profile": "fast"})
+
+    assert [call.get("reasoning_effort") for call in harness.calls] == ["none", "none"]

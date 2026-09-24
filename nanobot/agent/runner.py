@@ -790,15 +790,15 @@ class AgentRunner:
                     clean = hook.finalize_content(context, response.content)
 
                 if response.finish_reason == "length":
-                    if not is_blank_text(clean):
-                        # MIT-1410 (production cfccc2a2): a truncated answer
-                        # on an escalated-eligible auto turn gets its
-                        # continuation at the next tier up.  The recovery loop
-                        # below stays intact; only the generation of the
-                        # upcoming requests changes.
-                        escalated = self._escalate_reasoning(spec, trigger="length")
-                        if escalated is not None:
-                            spec = escalated
+                    # MIT-1410 (production cfccc2a2): a truncated answer on an
+                    # escalation-eligible auto turn -- blank or not, since a
+                    # blank truncation lands here rather than in the empty
+                    # retry above -- gets its continuation at the next tier
+                    # up.  The recovery loop below stays intact; only the
+                    # generation of the upcoming requests changes.
+                    escalated = self._escalate_reasoning(spec, trigger="length")
+                    if escalated is not None:
+                        spec = escalated
                     if len(length_recovery_parts) < _MAX_LENGTH_RECOVERIES:
                         length_recovery_parts.append(
                             _restore_outer_whitespace(clean or "", original_content)
