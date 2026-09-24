@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Collection
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Callable, Coroutine
@@ -9,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Callable, Coroutine
 from loguru import logger
 
 from nanobot.events import NO_EVENTS, EventSink
+from nanobot.providers.request_context import reset_scheduling_class, set_scheduling_class
 from nanobot.session.manager import Session, SessionManager
 from nanobot.session.summary import (
     SessionSummary,
@@ -35,6 +37,8 @@ class AutoCompact:
         self._archiving: set[str] = set()
         self._summaries: dict[str, SessionSummary] = {}
         self._bind_events = bind_events
+        # MIT-1439: one idle archive in flight per runtime.
+        self._archive_slot = asyncio.Semaphore(1)
 
     def _is_expired(self, ts: datetime | str | None,
                     now: datetime | None = None) -> bool:
@@ -95,7 +99,36 @@ class AutoCompact:
                     # Invalid session selections remain recoverable through /model.
                     continue
                 self._archiving.add(key)
-                schedule_background(self._archive(key, runtime=runtime))
+                schedule_background(
+                    self._archive_if_still_idle(
+                        key, runtime=runtime, active_session_keys=active_session_keys,
+                    )
+                )
+
+    async def _archive_if_still_idle(
+        self,
+        key: str,
+        *,
+        runtime: LLMRuntime,
+        active_session_keys: Collection[str],
+    ) -> None:
+        """Queue one idle archive behind the others; skip it if the chat woke up.
+
+        MIT-1439: after a restart every idle session is due at once, so the
+        archives run one at a time as background load. The queue can be long,
+        so the session is re-checked once it reaches the front.
+        ``active_session_keys`` is the loop's live view of in-flight turns.
+        """
+        async with self._archive_slot:
+            session = self.sessions.get_or_create(key)
+            if key in active_session_keys or not self._is_expired(session.updated_at):
+                self._archiving.discard(key)
+                return
+            scheduling_token = set_scheduling_class("background")
+            try:
+                await self._archive(key, runtime=runtime)
+            finally:
+                reset_scheduling_class(scheduling_token)
 
     async def _archive(self, key: str, *, runtime: LLMRuntime) -> None:
         if self._is_internal_session(key):
@@ -113,6 +146,7 @@ class AutoCompact:
                 key,
                 runtime=runtime,
                 events=self._bind_events(key) if self._bind_events else NO_EVENTS,
+                defer_on_transient=True,
             )
             if summary:
                 session = self.sessions.get_or_create(key)

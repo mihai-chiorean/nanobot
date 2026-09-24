@@ -23,7 +23,7 @@ from loguru import logger
 
 from nanobot.events import NO_EVENTS, ContextCompactionEvent, EventSink
 from nanobot.llm_usage.context import llm_usage_source
-from nanobot.providers.base import ProviderCallContext, ProviderConversationState
+from nanobot.providers.base import LLMProvider, ProviderCallContext, ProviderConversationState
 from nanobot.runtime_context import public_history_messages
 from nanobot.session.manager import Session, SessionManager
 from nanobot.session.summary import is_summary_checkpoint, session_summary_from_metadata
@@ -861,8 +861,14 @@ class MemoryArchiver:
         input_token_budget: int | None = None,
         fallback_max_tokens: int | None = None,
         provider_state: ProviderConversationState | None = None,
+        defer_on_transient: bool = False,
     ) -> str | None:
-        """Append the archive prompt to H and persist its summary."""
+        """Append the archive prompt to H and persist its summary.
+
+        With ``defer_on_transient`` a retryable provider error (for example an
+        admission ``capacity_unavailable``) returns ``None`` without writing a
+        raw checkpoint, so the caller can leave the session for a later retry.
+        """
         if not source_messages:
             return None
 
@@ -943,6 +949,16 @@ class MemoryArchiver:
         except Exception:
             logger.warning("Memory archive provider call failed, raw-dumping to history")
             return raw_fallback()
+        if (
+            defer_on_transient
+            and response.finish_reason == "error"
+            and LLMProvider.is_transient_response(response)
+        ):
+            logger.warning(
+                "Memory archive for {} hit a retryable provider error; leaving it for a later retry",
+                session_key,
+            )
+            return None
         if response.finish_reason in {"error", "length"}:
             logger.warning(
                 "Memory archive provider did not complete ({}), raw-dumping to history",
@@ -971,6 +987,7 @@ class MemoryArchiver:
         archive_end: int,
         runtime: LLMRuntime,
         input_token_budget: int,
+        defer_on_transient: bool = False,
     ) -> str | None:
         """Archive a captured session prefix without mutating the session."""
         messages = [
@@ -1037,6 +1054,7 @@ class MemoryArchiver:
             request_tools=tools,
             previous_summary=previous_summary,
             input_token_budget=input_token_budget,
+            defer_on_transient=defer_on_transient,
         )
 
 
@@ -1181,6 +1199,7 @@ class Consolidator:
         *,
         archive_end: int,
         runtime: LLMRuntime,
+        defer_on_transient: bool = False,
     ) -> str | None:
         """Archive one captured session range through the shared Memory path."""
         return await self.archiver.archive_session(
@@ -1188,6 +1207,7 @@ class Consolidator:
             archive_end=archive_end,
             runtime=runtime,
             input_token_budget=self._input_token_budget(runtime),
+            defer_on_transient=defer_on_transient,
         )
 
     async def compact_idle_session(
@@ -1197,11 +1217,14 @@ class Consolidator:
         runtime: LLMRuntime,
         max_suffix: int = 0,
         events: EventSink = NO_EVENTS,
+        defer_on_transient: bool = False,
     ) -> str | None:
         """Replace archived history with a summary checkpoint.
 
         ``max_suffix`` is accepted for SDK compatibility and no longer retains
         archived messages. All compaction triggers share checkpoint replay.
+        ``defer_on_transient`` (the idle sweep) leaves the session untouched on
+        a retryable provider error instead of raw-archiving it.
         """
         lock = self.get_lock(session_key)
         async with lock:
@@ -1226,6 +1249,7 @@ class Consolidator:
             try:
                 summary = await self.archive_session(
                     session, archive_end=archive_end, runtime=runtime,
+                    defer_on_transient=defer_on_transient,
                 )
                 if summary:
                     # Concurrent appends remain after the captured boundary.
