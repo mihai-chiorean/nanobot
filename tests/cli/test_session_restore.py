@@ -25,7 +25,8 @@ def test_sessions_restore_workspace_command_prepares_downgrade(
 
     assert result.exit_code == 0, result.output
     assert "Restored 1 session file(s)" in result.output
-    restored = workspace / "sessions" / manager._get_session_path(session.key).name
+    # 0.2.x reads ``safe_key(key)`` names (MIT-1429).
+    restored = workspace / "sessions" / "cli_rollback.jsonl"
     assert restored.exists()
     assert "restore-me" in restored.read_text(encoding="utf-8")
     assert manager._get_session_path(session.key).exists()

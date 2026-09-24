@@ -293,7 +293,8 @@ def test_explicit_rollback_restore_copies_sessions_back_without_deleting_new_sto
     manager.save(session, fsync=True)
 
     result = manager.restore_sessions_to_workspace()
-    legacy_file = workspace / "sessions" / manager._get_session_path(session.key).name
+    # 0.2.x only reads ``safe_key(key)`` names (MIT-1429).
+    legacy_file = workspace / "sessions" / "telegram_rollback.jsonl"
 
     assert result.restored == 1
     assert result.unchanged == 0
