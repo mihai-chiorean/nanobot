@@ -1,8 +1,10 @@
 """MIT-1410: ``reasoning_profile`` ingress on the chat frame and REST chat API.
 
 Production parity (``feat/shared-rooms`` 1ff35d02): the client's
-product profile choice (``auto``/``fast``/``deep``) rides the inbound
-websocket ``message`` frame and the REST chat body into the turn metadata,
+product profile choice -- ``auto``/``fast``/``think``/``think-code`` (what iOS
+and web send), plus the ``deep`` alias ziggy-main defines (MIT-1409) -- rides
+the inbound websocket ``message`` frame and the REST chat body into the turn
+metadata,
 where the MIT-1409 loop binding resolves it; ``auto`` turns may take the
 policy's one bounded escalation step.  Room guests keep the default profile:
 their frames must not steer the owner's model selection, so the field is
