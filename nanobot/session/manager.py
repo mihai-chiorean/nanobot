@@ -925,61 +925,122 @@ class JsonlSessionStore:
         except OSError:
             return False
 
-    def _migrate_from_workspace(self, workspace: Path) -> None:
-        """Durably copy legacy sessions out of the workspace, then remove the source."""
-        old_dir = workspace / "sessions"
-        if old_dir.is_symlink() or not old_dir.is_dir():
-            if old_dir.is_symlink():
-                logger.warning("Skipping symlinked legacy sessions directory: {}", old_dir)
+    @staticmethod
+    def _stored_session_key(path: Path) -> str | None:
+        """Return the session key recorded in a file's leading metadata record."""
+        try:
+            with open(path, encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    data = _json_object(json.loads(line))
+                    if data.get("_type") != "metadata":
+                        return None
+                    key_value = cast(object, data.get("key"))
+                    return key_value if isinstance(key_value, str) and key_value else None
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError):
+            return None
+        return None
+
+    def _session_key_for_file(self, path: Path) -> str:
+        """Resolve the session key a stored file belongs to (MIT-1429).
+
+        0.2.x named files ``safe_key(key)`` (e.g. ``websocket_<uuid>.jsonl``);
+        0.3 names them ``storage_key(key)``. The key recorded in the metadata
+        row wins. A canonical name is trusted unless the stored key shows the
+        name is really a lossy legacy name that happens to decode as base64.
+        Without a stored key, fall back to the 0.2.x list heuristic.
+        """
+        stored = self._stored_session_key(path)
+        decoded = self.session_key_from_path(path)
+        if decoded is not None and (
+            stored is None or stored == decoded or self.safe_key(stored) != path.stem
+        ):
+            return decoded
+        if stored is not None:
+            return stored
+        return path.stem.replace("_", ":", 1)
+
+    def _migrate_session_file(self, src: Path, dst: Path) -> None:
+        """Durably move one session file to ``dst`` without losing either side.
+
+        Identical content is deduplicated; on a real conflict the older copy is
+        archived under ``.migration-conflicts`` before the source is removed.
+        """
+        source_snapshot = self._session_file_snapshot(src)
+        if source_snapshot is None:
+            logger.warning("Skipping invalid or changing legacy session file: {}", src)
             return
-        for src in old_dir.glob("*.jsonl"):
-            if src.is_symlink() or not src.is_file():
-                logger.warning("Skipping unsafe legacy session file: {}", src)
-                continue
-            dst = self.sessions_dir / src.name
-            source_snapshot = self._session_file_snapshot(src)
-            if source_snapshot is None:
-                logger.warning("Skipping invalid or changing legacy session file: {}", src)
-                continue
-            try:
-                destination_snapshot = self._session_file_snapshot(dst) if dst.exists() else None
-                if dst.exists() and destination_snapshot is None:
-                    logger.warning(
-                        "Keeping legacy session because destination is invalid: {}",
-                        dst,
-                    )
-                    continue
-
-                if destination_snapshot is None:
-                    self._install_snapshot(src, dst, source_snapshot)
-                elif destination_snapshot.digest == source_snapshot.digest:
-                    pass
-                elif source_snapshot.updated_at > destination_snapshot.updated_at:
-                    archived = self._archive_conflict(dst, destination_snapshot, "destination")
-                    self._install_snapshot(src, dst, source_snapshot)
-                    logger.warning("Archived older session migration conflict at {}", archived)
-                else:
-                    archived = self._archive_conflict(src, source_snapshot, "workspace")
-                    logger.warning("Archived older session migration conflict at {}", archived)
-
-                installed = self._session_file_snapshot(dst)
-                if installed is None:
-                    raise OSError(f"session migration destination is unreadable: {dst}")
-                selected_digest = (
-                    source_snapshot.digest
-                    if destination_snapshot is None
-                    or source_snapshot.updated_at > destination_snapshot.updated_at
-                    else destination_snapshot.digest
+        try:
+            destination_snapshot = self._session_file_snapshot(dst) if dst.exists() else None
+            if dst.exists() and destination_snapshot is None:
+                logger.warning(
+                    "Keeping legacy session because destination is invalid: {}",
+                    dst,
                 )
-                if installed.digest != selected_digest:
-                    raise OSError(f"session migration selected unexpected data: {dst}")
-                if not self._remove_migrated_source(src, source_snapshot):
-                    logger.warning(
-                        "Session migrated but legacy source changed or could not be removed: {}",
-                        src,
-                    )
-            except OSError as exc:
-                logger.warning("Failed to migrate session {}: {}", src, exc)
+                return
+
+            if destination_snapshot is None:
+                self._install_snapshot(src, dst, source_snapshot)
+            elif destination_snapshot.digest == source_snapshot.digest:
+                pass
+            elif source_snapshot.updated_at > destination_snapshot.updated_at:
+                archived = self._archive_conflict(dst, destination_snapshot, "destination")
+                self._install_snapshot(src, dst, source_snapshot)
+                logger.warning("Archived older session migration conflict at {}", archived)
+            else:
+                archived = self._archive_conflict(src, source_snapshot, "workspace")
+                logger.warning("Archived older session migration conflict at {}", archived)
+
+            installed = self._session_file_snapshot(dst)
+            if installed is None:
+                raise OSError(f"session migration destination is unreadable: {dst}")
+            selected_digest = (
+                source_snapshot.digest
+                if destination_snapshot is None
+                or source_snapshot.updated_at > destination_snapshot.updated_at
+                else destination_snapshot.digest
+            )
+            if installed.digest != selected_digest:
+                raise OSError(f"session migration selected unexpected data: {dst}")
+            if not self._remove_migrated_source(src, source_snapshot):
+                logger.warning(
+                    "Session migrated but legacy source changed or could not be removed: {}",
+                    src,
+                )
+        except OSError as exc:
+            logger.warning("Failed to migrate session {}: {}", src, exc)
+
+    def _migrate_from_workspace(self, workspace: Path) -> None:
+        """Durably copy legacy sessions out of the workspace, then remove the source.
+
+        Files land at their canonical ``get_session_path(key)`` name. Files a
+        previous build already moved into the store under a legacy name are
+        renamed in place too (MIT-1429). Both passes are idempotent.
+        """
+        old_dir = workspace / "sessions"
+        if old_dir.is_symlink():
+            logger.warning("Skipping symlinked legacy sessions directory: {}", old_dir)
+        elif old_dir.is_dir():
+            for src in sorted(old_dir.glob("*.jsonl")):
+                if src.is_symlink() or not src.is_file():
+                    logger.warning("Skipping unsafe legacy session file: {}", src)
+                    continue
+                dst = self.get_session_path(self._session_key_for_file(src))
+                self._migrate_session_file(src, dst)
+        self._repair_legacy_named_files()
+
+    def _repair_legacy_named_files(self) -> None:
+        """Rename legacy-named files already inside the store to canonical names."""
+        for src in sorted(self.sessions_dir.glob("*.jsonl")):
+            if src.is_symlink() or not src.is_file():
+                continue
+            dst = self.get_session_path(self._session_key_for_file(src))
+            if dst == src:
+                continue
+            logger.info("Renaming legacy-named session file {} -> {}", src.name, dst.name)
+            self._migrate_session_file(src, dst)
 
     def restore_to_workspace(self) -> SessionRestoreResult:
         """Copy canonical sessions back for an explicit downgrade or rollback."""
@@ -999,7 +1060,9 @@ class JsonlSessionStore:
                 if source_snapshot is None:
                     conflicts.append(src)
                     continue
-                dst = old_dir / src.name
+                # 0.2.x only reads ``safe_key(key)`` names, so restore under
+                # that name; 0.3 maps it back to canonical on next start.
+                dst = old_dir / f"{self.safe_key(self._session_key_for_file(src))}.jsonl"
                 if dst.exists():
                     destination_snapshot = self._session_file_snapshot(dst)
                     if (
