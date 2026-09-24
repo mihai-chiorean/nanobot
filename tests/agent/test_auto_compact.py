@@ -92,6 +92,7 @@ def _make_fake_compact(
         max_suffix: int = 8,
         trigger: str = "policy",
         events=NO_EVENTS,
+        defer_on_transient: bool = False,
     ) -> str:
         state["count"] += 1
         session = loop.sessions.get_or_create(key)

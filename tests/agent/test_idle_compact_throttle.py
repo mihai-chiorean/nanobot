@@ -126,3 +126,57 @@ async def test_capacity_rejection_leaves_the_session_for_retry(tmp_path):
     text = history.read_text(encoding="utf-8") if history.exists() else ""
     assert "[RAW]" not in text
     assert "session 3 user" not in text
+
+
+def _session_in(messages) -> int:
+    text = " ".join(str(m.get("content")) for m in messages)
+    return next(i for i in range(SESSIONS) if f"session {i} user" in text)
+
+
+@pytest.mark.asyncio
+async def test_queued_archive_skips_a_session_that_woke_up(tmp_path):
+    """A chat reopened while its archive waits in the queue is not archived."""
+    woken: dict[str, str] = {}
+    loop: AgentLoop
+
+    def respond(messages):
+        if not woken:
+            first = _session_in(messages)
+            others = [i for i in range(3) if i != first]
+            # One chat gets a new message; another has a turn in flight.
+            touched = f"cli:idle-{others[0]}"
+            loop.sessions.get_or_create(touched).updated_at = datetime.now()
+            busy = f"cli:idle-{others[1]}"
+            loop._pending_queues[busy] = asyncio.Queue()
+            woken.update(touched=touched, busy=busy)
+        return LLMResponse(content="Summary.")
+
+    stub = _RecordingProvider(respond)
+    loop = _make_loop(tmp_path, stub)
+    _seed_idle_sessions(loop, 3)
+
+    await _sweep(loop)
+
+    assert len(stub.classes) == 1
+    for key in woken.values():
+        assert loop.sessions.get_or_create(key).last_archived == 0
+        assert key not in loop.auto_compact._archiving
+
+
+@pytest.mark.asyncio
+async def test_manual_compact_still_raw_archives_on_capacity_rejection(tmp_path):
+    stub = _RecordingProvider(
+        lambda _messages: LLMResponse(
+            content="error: capacity_unavailable",
+            finish_reason="error",
+            error_status_code=503,
+            error_code="capacity_unavailable",
+        )
+    )
+    loop = _make_loop(tmp_path, stub)
+    (key,) = _seed_idle_sessions(loop, 1)
+
+    await loop.consolidator.compact_idle_session(key, runtime=loop.llm_runtime())
+
+    assert loop.sessions.get_or_create(key).last_archived > 0
+    assert "[RAW]" in loop.context.memory.history_file.read_text(encoding="utf-8")

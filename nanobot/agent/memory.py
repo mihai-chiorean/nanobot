@@ -1217,11 +1217,14 @@ class Consolidator:
         runtime: LLMRuntime,
         max_suffix: int = 0,
         events: EventSink = NO_EVENTS,
+        defer_on_transient: bool = False,
     ) -> str | None:
         """Replace archived history with a summary checkpoint.
 
         ``max_suffix`` is accepted for SDK compatibility and no longer retains
         archived messages. All compaction triggers share checkpoint replay.
+        ``defer_on_transient`` (the idle sweep) leaves the session untouched on
+        a retryable provider error instead of raw-archiving it.
         """
         lock = self.get_lock(session_key)
         async with lock:
@@ -1244,11 +1247,9 @@ class Consolidator:
             last_active = session.updated_at
             archive_end = archive_start + len(messages_to_archive)
             try:
-                # A retryable provider error leaves the session untouched; the
-                # next idle scan retries it (MIT-1439).
                 summary = await self.archive_session(
                     session, archive_end=archive_end, runtime=runtime,
-                    defer_on_transient=True,
+                    defer_on_transient=defer_on_transient,
                 )
                 if summary:
                     # Concurrent appends remain after the captured boundary.

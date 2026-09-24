@@ -251,6 +251,7 @@ class TestCheckExpired:
         old_dt = datetime.now() - timedelta(minutes=20)
         session = _make_session("cli:old", updated_at=old_dt)
         _add_turns(session, 5)
+        session.updated_at = old_dt  # still idle when its turn in the queue comes
         ac.sessions.list_sessions.return_value = [
             {"key": "cli:old", "updated_at": old_dt.isoformat()}
         ]
@@ -269,6 +270,7 @@ class TestCheckExpired:
             "cli:old",
             runtime=admitted,
             events=NO_EVENTS,
+            defer_on_transient=True,
         )
 
     @pytest.mark.parametrize("resolution_error", [KeyError, ValueError])
@@ -444,6 +446,7 @@ class TestArchiveDelegates:
             "cli:test",
             runtime=runtime,
             events=NO_EVENTS,
+            defer_on_transient=True,
         )
 
     @pytest.mark.asyncio
