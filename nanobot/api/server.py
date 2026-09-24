@@ -18,6 +18,7 @@ from aiohttp import web
 from loguru import logger
 
 from nanobot.agent.hook import AgentHook, AgentRunHookContext
+from nanobot.agent.reasoning_policy import chat_profile_from_wire
 from nanobot.config.paths import get_media_dir
 from nanobot.providers.base import LLMUsage
 from nanobot.utils.helpers import safe_filename
@@ -304,6 +305,9 @@ async def handle_chat_completions(request: web.Request) -> web.Response | web.St
     model_name: str = _app_value(request.app, _MODEL_NAME_KEY, "model_name", "nanobot")
 
     stream = False
+    # MIT-1410: REST-selected reasoning profile; only the JSON body carries
+    # it (multipart uploads stay on the default profile).
+    reasoning_profile: str | None = None
     try:
         if content_type.startswith("multipart/"):
             text, media_paths, session_id, requested_model = await _parse_multipart(request)
@@ -319,6 +323,7 @@ async def handle_chat_completions(request: web.Request) -> web.Response | web.St
             requested_model = body.get("model")
             text, media_paths = _parse_json_content(body)
             session_id = body.get("session_id")
+            reasoning_profile = chat_profile_from_wire(body.get("reasoning_profile"))
     except ValueError as e:
         return _error_json(400, str(e))
     except _FileSizeExceeded as e:
@@ -337,6 +342,15 @@ async def handle_chat_completions(request: web.Request) -> web.Response | web.St
         "session_locks",
     )
     session_lock = session_locks.setdefault(session_key, asyncio.Lock())
+
+    # MIT-1410: port of production (feat/shared-rooms 1ff35d02 / cfccc2a2):
+    # the chat body may carry ``reasoning_profile`` ("auto"/"fast"/"deep");
+    # it rides the turn metadata to the loop, which binds it to the turn's
+    # runtime.  Invalid or missing values leave the metadata untouched, so
+    # the provider default applies.
+    turn_metadata: dict[str, Any] = {}
+    if reasoning_profile is not None:
+        turn_metadata["reasoning_profile"] = reasoning_profile
 
     logger.info(
         "API request session_key={} media={} text={} stream={}",
@@ -381,6 +395,7 @@ async def handle_chat_completions(request: web.Request) -> web.Response | web.St
                             chat_id=API_CHAT_ID,
                             on_stream=_on_stream,
                             on_stream_end=_on_stream_end,
+                            metadata=turn_metadata,
                         )
                     if not emitted_content:
                         response_text = _response_text(response)
@@ -424,6 +439,7 @@ async def handle_chat_completions(request: web.Request) -> web.Response | web.St
                         channel="api",
                         chat_id=API_CHAT_ID,
                         hooks=[usage_capture],
+                        metadata=turn_metadata,
                     )
                 response_text = _response_text(response)
                 if not response_text or not response_text.strip():

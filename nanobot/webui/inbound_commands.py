@@ -17,6 +17,7 @@ from typing import Any, Protocol, cast
 from loguru import logger
 from websockets.asyncio.server import ServerConnection
 
+from nanobot.agent.reasoning_policy import chat_profile_from_wire
 from nanobot.bus.events import INBOUND_META_USER_SHELL, InboundMessage
 from nanobot.channels.websocket.chat_inbox import ChatInboxStore
 from nanobot.channels.websocket.message_ack import (
@@ -820,6 +821,18 @@ class WebUICommandRouter:
                 # Anything reaching the agent from a collaborative room is an
                 # explicit request for help; discussion never gets this far.
                 metadata["room_intent"] = "ask_ziggy"
+        # MIT-1410: owner-selected reasoning profile, ported from production
+        # (feat/shared-rooms 1ff35d02 / cfccc2a2).  The frame may carry
+        # ``reasoning_profile`` ("auto"/"fast"/"deep"); the loop binds it to
+        # the turn at entry.  Anything outside the chat trio is dropped, so a
+        # client can never select the internal Work tiers.  Room turns keep
+        # the default: the room metadata is non-empty for any shared-room chat
+        # -- guests and the owner alike -- and guest frames must not be able
+        # to steer the owner's model selection, so the field is ignored there.
+        if not room_metadata:
+            wire_profile = chat_profile_from_wire(envelope.get("reasoning_profile"))
+            if wire_profile is not None:
+                metadata["reasoning_profile"] = wire_profile
         session_key_override = (
             temporary_policy.session_key if temporary_policy is not None else None
         )
