@@ -377,6 +377,18 @@ async def test_loop_explicit_profile_is_never_rerouted_through_auto(tmp_path: Pa
     assert kwargs["reasoning_effort"] == "high"
     assert kwargs["max_tokens"] == 32_768
 
+    # A classifier-THINK text (no code markers): auto would resolve think
+    # (high).  An explicit fast must still bind none -- the fallback must not
+    # capture an unrelated valid value.
+    harness3 = _LoopHarness(tmp_path)
+    kwargs = await harness3.run_turn(
+        {"reasoning_profile": "fast"},
+        text="Analyze the tradeoff between plans and design a strategy",
+    )
+    assert kwargs["reasoning_effort"] == "none"
+    assert kwargs["temperature"] == 0.7
+    assert kwargs["max_tokens"] == 8_192
+
 
 @pytest.mark.asyncio
 async def test_loop_non_string_profile_falls_back_to_auto(tmp_path: Path) -> None:
