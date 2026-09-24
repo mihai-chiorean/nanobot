@@ -10,7 +10,7 @@ import re
 import time
 from collections.abc import Awaitable, Callable, Iterable
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -27,6 +27,7 @@ from nanobot.agent.context_governance import (
     TranscriptBuilder,
 )
 from nanobot.agent.hook import AgentHook, AgentHookContext, AgentRunHookContext
+from nanobot.agent.reasoning_policy import escalation_profile
 from nanobot.agent.tools.ask import AskUserInterrupt
 from nanobot.agent.tools.execution import execute_tool_calls
 from nanobot.agent.tools.registry import ToolRegistry
@@ -192,6 +193,18 @@ class AgentRunSpec:
     provider_state: ProviderConversationState | None = None
     llm_usage_source: LLMUsageSource | None = None
     events: EventSink = NO_EVENTS
+    # MIT-1410 (production feat/shared-rooms cfccc2a2): the reasoning profile
+    # the loop resolved for this turn ("auto"/"fast"/"deep"/...).  The runner
+    # never resolves it itself; it is carried here so the bounded auto
+    # escalation below can consult the policy without re-reading turn metadata.
+    # ``None`` (every non-chat path, and every profile-less chat turn) means
+    # "no policy": the hooks never fire and provider defaults stand.
+    reasoning_profile: str | None = None
+    # True only when the loop's policy decision said this turn may escalate
+    # exactly once (requested auto AND resolved fast).  Escalation is
+    # one-shot: the runner clears it on the first ladder step and the policy
+    # caps the ladder at one rung, so a turn can never climb past ``think``.
+    allow_reasoning_escalation: bool = False
 
 
 @dataclass(slots=True)
@@ -726,6 +739,19 @@ class AgentRunner:
                     not in {"error", "length", "refusal", "content_filter"}
                     and is_blank_text(clean)
                 ):
+                    # MIT-1410 (production cfccc2a2): an auto turn the policy
+                    # resolved to fast re-tries a blank reply once at the next
+                    # tier up.  The retry does not consume the empty-retry
+                    # budget, and an explicit fast/deep turn never gets here
+                    # with an escalation armed.
+                    escalated = self._escalate_reasoning(spec, trigger="empty")
+                    if escalated is not None:
+                        spec = escalated
+                        empty_content_retries = 0
+                        if hook.wants_streaming():
+                            await hook.on_stream_end(context, resuming=False)
+                        await hook.after_iteration(context)
+                        continue
                     empty_content_retries += 1
                     if empty_content_retries < _MAX_EMPTY_RETRIES:
                         logger.warning(
@@ -764,6 +790,15 @@ class AgentRunner:
                     clean = hook.finalize_content(context, response.content)
 
                 if response.finish_reason == "length":
+                    if not is_blank_text(clean):
+                        # MIT-1410 (production cfccc2a2): a truncated answer
+                        # on an escalated-eligible auto turn gets its
+                        # continuation at the next tier up.  The recovery loop
+                        # below stays intact; only the generation of the
+                        # upcoming requests changes.
+                        escalated = self._escalate_reasoning(spec, trigger="length")
+                        if escalated is not None:
+                            spec = escalated
                     if len(length_recovery_parts) < _MAX_LENGTH_RECOVERIES:
                         length_recovery_parts.append(
                             _restore_outer_whitespace(clean or "", original_content)
@@ -1290,6 +1325,41 @@ class AgentRunner:
             )
         retry_messages.append({"role": "user", "content": note})
         return retry_messages
+
+    def _escalate_reasoning(self, spec: AgentRunSpec, *, trigger: str) -> AgentRunSpec | None:
+        """Take the policy's one permitted escalation step, if there is one.
+
+        Port of production's auto-escalation hook (feat/shared-rooms
+        cfccc2a2): an ``auto`` turn the policy resolved down to ``fast``
+        re-tries a failed response once at the next tier up (``think``).
+        The gate is the loop's ``allow_reasoning_escalation`` verdict —
+        explicit ``fast``/``deep`` turns never have it, so they never get a
+        higher tier than the client asked for.  The step is one-shot: the
+        returned spec clears the flag, and the policy ladder itself ends at
+        ``think``, so nothing can climb further this run.
+        """
+        if not spec.allow_reasoning_escalation:
+            return None
+        stronger = escalation_profile(spec.reasoning_profile or "")
+        if stronger is None:
+            return None
+        logger.info(
+            "Reasoning escalation {} -> {} (trigger={}, session={})",
+            spec.reasoning_profile,
+            stronger.name.value,
+            trigger,
+            spec.session_key or "default",
+        )
+        return replace(
+            spec,
+            runtime=spec.runtime.with_generation_overrides(
+                temperature=stronger.temperature,
+                max_tokens=stronger.max_tokens,
+                reasoning_effort=stronger.reasoning_effort,
+            ),
+            reasoning_profile=stronger.name.value,
+            allow_reasoning_escalation=False,
+        )
 
     async def _request_finalization_retry(
         self,

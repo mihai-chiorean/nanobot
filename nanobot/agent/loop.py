@@ -1521,7 +1521,7 @@ class AgentLoop:
         request_metadata: Mapping[str, Any] | None,
         transcript_input: TranscriptInput | None,
         initial_messages: list[dict[str, Any]] | None,
-    ) -> LLMRuntime:
+    ) -> tuple[LLMRuntime, str | None, bool]:
         """Bind this turn's reasoning profile to a freshly derived runtime.
 
         Port of the production turn-entry binding (feat/shared-rooms
@@ -1534,15 +1534,19 @@ class AgentLoop:
         frame/REST edges and never lets one reach the loop, so the issue
         text, not production, is the spec here.  The resolved ``auto``
         generation is applied like any other profile, as production does;
-        the bounded escalation ladder behind ``allow_escalation`` is P13b
-        runner work.  Production mutated its (shared, mutable) provider
+        the bounded escalation ladder behind ``allow_escalation`` is owned
+        by the runner (MIT-1410): the resolved profile name and the policy's
+        one-shot escalation verdict are returned alongside the runtime and
+        ride the run spec, so a triggered auto turn re-tries at the next
+        tier and nothing else can escalate.  Production mutated its
+        (shared, mutable) provider
         around the call and restored it afterwards; 0.3.0 generation lives
         on the frozen ``LLMRuntime`` value, so the override is derived here
         and carried by this turn's run spec alone — the shared runtime is
         never mutated and later turns need no restoration.
         """
         if not isinstance(request_metadata, Mapping) or not request_metadata:
-            return runtime
+            return runtime, None, False
         raw_profile = request_metadata.get("reasoning_profile")
         requested_profile = parse_reasoning_profile(raw_profile)
         if requested_profile is None and raw_profile is not None:
@@ -1567,10 +1571,14 @@ class AgentLoop:
                 decision.source,
                 decision.classifier_candidate,
             )
-            return runtime.with_generation_overrides(
-                temperature=decision.generation.temperature,
-                max_tokens=decision.generation.max_tokens,
-                reasoning_effort=decision.generation.reasoning_effort,
+            return (
+                runtime.with_generation_overrides(
+                    temperature=decision.generation.temperature,
+                    max_tokens=decision.generation.max_tokens,
+                    reasoning_effort=decision.generation.reasoning_effort,
+                ),
+                decision.generation.name.value,
+                decision.allow_escalation,
             )
         candidate_effort = request_metadata.get("reasoning_effort")
         run_reasoning_effort = candidate_effort if isinstance(candidate_effort, str) else None
@@ -1581,10 +1589,14 @@ class AgentLoop:
             else None
         )
         if run_reasoning_effort is None and run_max_tokens is None:
-            return runtime
-        return runtime.with_generation_overrides(
-            reasoning_effort=run_reasoning_effort,
-            max_tokens=run_max_tokens,
+            return runtime, None, False
+        return (
+            runtime.with_generation_overrides(
+                reasoning_effort=run_reasoning_effort,
+                max_tokens=run_max_tokens,
+            ),
+            None,
+            False,
         )
 
     async def _run_agent_loop(
@@ -1858,12 +1870,17 @@ class AgentLoop:
         # ``try``'s ``finally`` that we would never enter.  The derived
         # runtime carries the resolved generation for THIS turn's run only;
         # the admitted runtime is a frozen value and is never touched, so
-        # the next turn starts from the base generation again.
-        turn_runtime = self._turn_runtime_for_reasoning_profile(
-            runtime,
-            request_metadata,
-            transcript_input,
-            initial_messages,
+        # the next turn starts from the base generation again.  Alongside the
+        # runtime, the helper returns the resolved profile name and the
+        # policy's one-shot escalation verdict; both ride the run spec below
+        # so the runner's bounded auto ladder (MIT-1410) can act on them.
+        turn_runtime, turn_reasoning_profile, turn_allow_escalation = (
+            self._turn_runtime_for_reasoning_profile(
+                runtime,
+                request_metadata,
+                transcript_input,
+                initial_messages,
+            )
         )
         # The admission gateway caps background concurrency by the
         # ``X-Ziggy-Scheduling-Class`` header, which the provider reads from
@@ -1922,6 +1939,8 @@ class AgentLoop:
                 initial_messages=initial_messages,
                 tools=effective_tools,
                 runtime=turn_runtime,
+                reasoning_profile=turn_reasoning_profile,
+                allow_reasoning_escalation=turn_allow_escalation,
                 max_iterations=self.max_iterations,
                 max_tool_result_chars=self.max_tool_result_chars,
                 transcript_input=None if initial_messages is not None else transcript_input,
