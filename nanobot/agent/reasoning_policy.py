@@ -127,6 +127,20 @@ def parse_reasoning_profile(value: Any) -> ReasoningProfile | None:
         return None
 
 
+def chat_profile_from_wire(value: Any) -> str | None:
+    """Validate a client-supplied chat profile; drop anything else.
+
+    Production (``feat/shared-rooms`` 1ff35d02) accepts every profile it
+    defines on the websocket ``message`` frame and the REST chat body:
+    ``auto``/``fast``/``think``/``think-code``, which is what iOS and web
+    send.  ziggy-main also defines ``deep`` (an alias of the ``think`` tier,
+    MIT-1409), so it is accepted too.  Missing, non-string and unknown
+    values degrade to ``None`` (the provider default), never to an error.
+    """
+    parsed = parse_reasoning_profile(value)
+    return parsed.value if parsed is not None else None
+
+
 def generation_profile(profile: ReasoningProfile | str) -> GenerationProfile:
     """Return concrete controls for a non-Auto profile."""
     parsed = profile if isinstance(profile, ReasoningProfile) else parse_reasoning_profile(profile)
