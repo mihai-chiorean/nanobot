@@ -25,10 +25,16 @@ from nanobot.agent.tools.room_policy import DENY_EVERYTHING_SCOPE
 from nanobot.bus.events import (
     INBOUND_META_ROOM_SCOPE,
     OUTBOUND_META_AGENT_UI,
+    InboundMessage,
     OutboundMessage,
 )
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
+from nanobot.channels.websocket.chat_inbox import ChatInboxStore
+from nanobot.channels.websocket.message_ack import (
+    AcceptedClientMessages,
+    message_ack_fields,
+)
 
 # Ziggy-local (MIT-1010): shared rooms and the Work event stream.
 from nanobot.channels.websocket.rooms import (
@@ -463,6 +469,13 @@ class WebSocketChannel(BaseChannel):
         self._explicit_final_stream_text: dict[str, str] = {}
         self._reasoning_text_buffers: dict[tuple[str, str], list[str]] = {}
 
+        # -- Owner-chat message.ack (Ziggy-local, MIT-1402) -----------------
+        # The durable inbox is the client_message_id dedupe boundary and
+        # survives a restart; the LRU stands in only without a workspace.
+        # Opened on first use so a channel that never sees an id touches no disk.
+        self._chat_inbox: ChatInboxStore | None = None
+        self.accepted_client_messages = AcceptedClientMessages()
+
         # -- Shared rooms (Ziggy-local, MIT-1010) ---------------------------
         # The store owns room credentials and liveness; the router owns the
         # /auth/shared-room* control plane and the room-scoped session read.
@@ -586,6 +599,60 @@ class WebSocketChannel(BaseChannel):
             is_dm=is_dm,
             session_key=session_key,
             require_existing_session=require_existing_session,
+        )
+
+    @property
+    def chat_inbox(self) -> ChatInboxStore | None:
+        """Durable ``client_message_id`` ledger; ``None`` without a workspace."""
+        if self._chat_inbox is None and self.gateway.session_manager is not None:
+            self._chat_inbox = ChatInboxStore(self.gateway.session_manager.workspace)
+        return self._chat_inbox
+
+    async def webui_prepare_message(
+        self,
+        *,
+        sender_id: str,
+        chat_id: str,
+        content: str,
+        media: list[str] | None,
+        metadata: dict[str, Any],
+        is_dm: bool,
+        session_key: str | None,
+        require_existing_session: bool,
+    ) -> InboundMessage | None:
+        """Authorize and sanitize like ``webui_dispatch_message``, unpublished."""
+        return await self._prepare_message(
+            sender_id=sender_id,
+            chat_id=chat_id,
+            content=content,
+            media=media,
+            metadata=metadata,
+            is_dm=is_dm,
+            session_key=session_key,
+            require_existing_session=require_existing_session,
+        )
+
+    async def webui_publish_message(self, msg: InboundMessage) -> None:
+        await self.bus.publish_inbound(msg)
+
+    async def send_message_ack(
+        self,
+        connection: ServerConnection,
+        *,
+        chat_id: str,
+        client_message_id: str,
+        status: str,
+        detail: str | None = None,
+    ) -> None:
+        await self._send_event(
+            connection,
+            "message.ack",
+            **message_ack_fields(
+                chat_id=chat_id,
+                client_message_id=client_message_id,
+                status=status,
+                detail=detail,
+            ),
         )
 
     def _attach(self, connection: ServerConnection, chat_id: str) -> None:

@@ -673,6 +673,9 @@ class AgentLoop:
             disabled_skills=disabled_skills,
         )
         self.sessions = session_manager or SessionManager(workspace)
+        # Ziggy-local (MIT-1402): opened on first use, see
+        # ``_mark_chat_message_processed``.
+        self._chat_inbox: Any | None = None
         # Ziggy-local (MIT-1010): durable Work store for report_progress /
         # publish_artifact / schedule_work and the ``work_task`` cron kind.
         # The restart sweep is *not* run on open. The schema comes up lazily
@@ -2101,6 +2104,7 @@ class AgentLoop:
                         "failed",
                         error="Work tasks cannot request changes to the agent's own system.",
                     )
+                await self._mark_chat_message_processed(msg)
                 return
 
         try:
@@ -2126,6 +2130,7 @@ class AgentLoop:
                         publish_completion=not continuing,
                     )
                     completion_published = not continuing
+                    await self._mark_chat_message_processed(msg)
                     for _, coordinator in self._automation_turn_coordinators:
                         coordinator.complete(msg, response=response)
                 except asyncio.CancelledError:
@@ -2228,6 +2233,39 @@ class AgentLoop:
             if pending is None:
                 await delivery.idle()
                 await self._publish_next_deferred_automation_turn(session_key)
+
+    async def _mark_chat_message_processed(self, msg: InboundMessage) -> None:
+        """Close the durable receipt of a WebSocket message whose turn completed.
+
+        Ziggy-local (MIT-1402), from production's ``AgentLoop``: the channel
+        stores ``client_message_id`` messages in ``ChatInboxStore`` before
+        publishing them; the receipt is marked processed once the turn is done.
+        Failures are logged, never raised: the turn has already been delivered.
+        """
+        if msg.channel != "websocket":
+            return
+        client_message_id = msg.metadata.get("client_message_id")
+        if not isinstance(client_message_id, str):
+            return
+        try:
+            inbox = getattr(self, "_chat_inbox", None)
+            if inbox is None:
+                from nanobot.channels.websocket.chat_inbox import ChatInboxStore
+
+                inbox = self._chat_inbox = ChatInboxStore(self.sessions.workspace)
+            await inbox.mark_processed(msg.chat_id, client_message_id)
+        except KeyError:
+            logger.debug(
+                "No durable chat receipt for {}:{}",
+                msg.chat_id,
+                client_message_id,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to mark durable chat receipt processed for {}:{}",
+                msg.chat_id,
+                client_message_id,
+            )
 
     async def aclose(self) -> None:
         """Stop active work, then close resources owned by the agent loop.

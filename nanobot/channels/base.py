@@ -282,6 +282,38 @@ class BaseChannel(ABC):
         can pass that entity as ``authorization_id`` without changing the
         sender's identity.  When omitted, authorization remains sender-based.
         """
+        msg = await self._prepare_message(
+            sender_id=sender_id,
+            chat_id=chat_id,
+            content=content,
+            media=media,
+            metadata=metadata,
+            session_key=session_key,
+            is_dm=is_dm,
+            authorization_id=authorization_id,
+            require_existing_session=require_existing_session,
+        )
+        if msg is None:
+            return
+        await self.bus.publish_inbound(msg)
+
+    async def _prepare_message(
+        self,
+        sender_id: str,
+        chat_id: str,
+        content: str,
+        media: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+        session_key: str | None = None,
+        is_dm: bool = False,
+        authorization_id: str | None = None,
+        require_existing_session: bool = False,
+    ) -> InboundMessage | None:
+        """Authorize and sanitize a message without publishing it.
+
+        ``None`` means the message was refused (and any user-visible feedback
+        has already been sent).
+        """
         permission_id = authorization_id if authorization_id is not None else sender_id
         if not self.is_allowed(permission_id):
             if is_dm:
@@ -293,7 +325,7 @@ class BaseChannel(ABC):
                     self.logger.warning(
                         "Pairing store unavailable; dropping DM from {}", sender_id
                     )
-                    return
+                    return None
                 await self.send(
                     OutboundMessage(
                         channel=self.name,
@@ -312,7 +344,7 @@ class BaseChannel(ABC):
                     "Add them to allowFrom list in config to grant access.",
                     sender_id,
                 )
-            return
+            return None
         
         # Sanitize input for prompt injection defense
         sanitized_content, was_injection = sanitize_input(content)
@@ -334,7 +366,7 @@ class BaseChannel(ABC):
                 )
             except Exception:
                 pass  # Best effort
-            return
+            return None
 
         meta = metadata or {}
         if self.supports_streaming:
@@ -350,8 +382,7 @@ class BaseChannel(ABC):
             session_key_override=session_key,
             require_existing_session=require_existing_session,
         )
-        
-        await self.bus.publish_inbound(msg)
+        return msg
 
     @classmethod
     def default_config(cls) -> dict[str, Any]:
