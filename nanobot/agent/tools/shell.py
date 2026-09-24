@@ -120,7 +120,44 @@ _UNRESOLVABLE_HOST_NOTE = (
 # `cat <>..` resolve exactly like `cd ../`. A dot pair glued to a word
 # character on either side (`a..b`, `v1..v2`, `...`) is not, so those keep
 # passing; `../` and `..\` stay covered by the literal substring checks.
-_BARE_PARENT_WORD_RE = re.compile(r"(?:^|[ \t\r\n;|&(<>\"'])\.\.(?:$|[ \t\r\n;|&)<>\"'])")
+#
+# PR #85 review round 2: the left-hand class also admits `=`, so an assignment
+# of a bare traversal (`D=..; cd $D`, verified reaching the parent with
+# `bash -c`) is caught on the raw text, where the `..` sits directly after the
+# `=`. The value side of an assignment is not a shell word boundary, which is
+# why this is a left-hand-only extension: adding `=` to the right-hand class
+# would flag `echo ..=foo` / `cat f..=g`, where a dotted word merely precedes
+# an `=` and bash performs no traversal at all.
+_BARE_PARENT_WORD_RE = re.compile(
+    r"(?:^|[ \t\r\n;|&(<>\"'=])\.\.(?:$|[ \t\r\n;|&)<>\"'])"
+)
+
+# Quotes/backslashes removed to build the guard's *second* look at the command,
+# so a traversal reassembled by the shell (`./x` -> `../x` after the shell drops
+# the quotes/backslashes) is visible to the whole-word scan above. This copy is
+# only ever an additional input -- the raw command is still scanned unchanged and
+# nothing is stripped from the value that is executed -- so over-stripping a
+# command that was never a traversal is harmless (it can only reveal a `..` the
+# raw scan would already have caught, never hide one).
+_QUOTE_OR_BACKSLASH_RE = re.compile(r"[\"'\\]")
+
+
+def _bare_parent_referred_to(command: str) -> bool:
+    """True when a whole-word ``..`` is present, on the raw or de-quoted text.
+
+    Two views are scanned: the command as written, and a copy with the quote and
+    escape characters removed, which is how bash reassembles ``./x`` once the
+    quotes are gone. The second view is what closes the quoting/escaping escapes
+    the raw scan can not see (``cd .''.;``, ``cd \\..``, ``D=..; cd $D``); it is
+    additive -- a command blocked here was already blockable on the raw text or
+    is a genuine reassembly, never a false positive on ordinary input.
+    """
+    if _BARE_PARENT_WORD_RE.search(command):
+        return True
+    dequoted = _QUOTE_OR_BACKSLASH_RE.sub("", command)
+    if dequoted != command and _BARE_PARENT_WORD_RE.search(dequoted):
+        return True
+    return False
 
 
 def _param_expansion_has_path(command: str) -> bool:
@@ -1084,8 +1121,11 @@ class ExecTool(Tool):
             # find. The shell resolves such a word against the cwd exactly
             # like `../`, so it is rejected as a whole word; names that merely
             # contain dots (`a..b`, `...`, `foo..txt`) are not whole words and
-            # keep passing.
-            if _BARE_PARENT_WORD_RE.search(cmd):
+            # keep passing. The scan runs on both the raw command and a copy
+            # with quotes/backslashes removed, so a traversal the shell only
+            # reassembles after de-quoting (`cd .''.;`, `cd \..`, `D=..; cd $D`)
+            # is caught too.
+            if _bare_parent_referred_to(cmd):
                 return ToolResult.error(
                     "Error: Command blocked by safety guard (path traversal detected)"
                     + _WORKSPACE_BOUNDARY_NOTE
