@@ -101,6 +101,42 @@ def _index_fixture(tmp_path):
     return manager, indexer
 
 
+def _short_fixture_messages() -> list[dict]:
+    """Thirty short messages; the needle phrase lives in exactly messages 14, 15
+    and 16. Every message renders to the same 30 characters, which makes the
+    windower cut the first chunk at exactly message 24 -- the review's
+    "one chunk spans messages 0-24" signature case, reproduced deterministically.
+    The dots are tokenizer-neutral separators, so no filler word can ever match
+    a query term and the needle's window stays unique."""
+    messages: list[dict] = []
+    for index in range(30):
+        if index in (14, 15, 16):
+            base = f"{NEEDLE} log {index}"
+        else:
+            base = f"note {index} of the depot"
+        content = base + "." * (24 - len(base))  # uniform rendered length
+        messages.append(
+            {
+                "role": "user",
+                "content": content,
+                "timestamp": f"{DAY}T09:{index % 60:02d}:00",
+            }
+        )
+    return messages
+
+
+def _index_short_fixture(tmp_path, name: str = "wide"):
+    """Index the short-message fixture through the real save path, so one chunk
+    provably spans messages 0-24 while the needle sits only in 14-16."""
+    manager, indexer = _manager(tmp_path, name)
+    session = manager.get_or_create(SESSION_KEY)
+    for message in _short_fixture_messages():
+        session.messages.append(dict(message))
+    session.metadata["title"] = TITLE
+    manager.save(session)
+    return manager, indexer
+
+
 @contextlib.contextmanager
 def _calling_from(session_key: str):
     """Bind the per-request context the agent loop binds around a tool call, so the
@@ -180,8 +216,9 @@ def test_citation_formats_the_source_messages_and_time(tmp_path):
     citation = format_citation(hit, TITLE)
     assert citation.startswith("[source: ")
     assert TITLE in citation
-    # Message indices are 1-based for humans; the dash is an en-dash, not a hyphen.
-    assert "messages 14\u201316" in citation, citation
+    # The stored range is 0-based; the citation shows 1-based numbers for
+    # humans (stored 14-16 renders as 15-17). The dash is an en-dash.
+    assert "messages 15\u201317" in citation, citation
     assert DAY in citation, citation
 
 
@@ -195,7 +232,144 @@ def test_citation_falls_back_to_the_key_without_a_title(tmp_path):
         msg_start=14,
         msg_end=16,
     )
-    assert format_citation(hit) == f"[source: {SESSION_KEY}, messages 14\u201316, {DAY}]"
+    assert format_citation(hit) == f"[source: {SESSION_KEY}, messages 15\u201317, {DAY}]"
+
+
+# ---------------------------------------------------------------------------
+# 1b. The citation names the messages that answer the query, not the whole
+#     indexed chunk (MEM-01b, the review of #92: "the range covers the whole
+#     indexed chunk ... the citation reads `messages 0–24` even when only
+#     messages 14–16 matched").
+# ---------------------------------------------------------------------------
+
+
+async def test_a_wide_window_cites_the_answering_messages_not_the_whole_chunk(tmp_path):
+    manager, indexer = _index_short_fixture(tmp_path)
+
+    hits = [h for h in indexer.index.search(NEEDLE, limit=5) if NEEDLE in h.body]
+    assert len(hits) == 1, [(h.msg_start, h.msg_end) for h in hits]
+    hit = hits[0]
+    # The review's signature, reproduced through the real write path: with
+    # 30 short messages one indexed chunk spans messages 0-24, while the
+    # needle phrase sits only in messages 14-16.
+    assert (hit.msg_start, hit.msg_end) == (0, 24), (hit.msg_start, hit.msg_end)
+    # Pre-fix, this rendered the 0-based whole chunk ("messages 0-24"). The
+    # full range is still available -- 1-based -- when nothing narrows, but
+    # a hit whose body carries the terms must cite the band, not the chunk.
+    assert "messages 0\u201324" not in format_citation(hit, TITLE, NEEDLE)
+    assert "messages 1\u201325" in format_citation(hit, TITLE)
+    assert "messages 15\u201317" in format_citation(hit, TITLE, NEEDLE), format_citation(
+        hit, TITLE, NEEDLE
+    )
+    # Through the tool, the same evidence reaches the model.
+    with _calling_from(SESSION_KEY):
+        out = str(await _tool(manager).execute(query=NEEDLE))
+    assert "messages 15\u201317" in out, out
+    assert "messages 1\u201325" not in out, out
+
+
+def _message_hit(body: str, msg_start: int, msg_end: int) -> MemoryHit:
+    return MemoryHit(
+        source=SESSION_KEY,
+        kind=KIND_CONVERSATION,
+        ts=f"{DAY}T09:00:00",
+        body=body,
+        score=-1.0,
+        msg_start=msg_start,
+        msg_end=msg_end,
+    )
+
+
+def test_citation_narrows_only_to_messages_containing_the_query_terms():
+    body = "\n".join(
+        f"USER: routine note {i}" + (" kestrelwatch" if i == 6 else "")
+        for i in range(9)
+    )
+    citation = format_citation(_message_hit(body, 20, 28), TITLE, "kestrelwatch")
+    assert "messages 27\u201327" in citation, citation  # only message 26 (0-based) matches
+
+
+def test_citation_spans_the_band_covering_all_matching_messages():
+    body = "\n".join(
+        (
+            "USER: the kestrelwatch arrived"
+            if i == 0
+            else "USER: the survey closed"
+            if i == 2
+            else f"USER: quiet stretch {i}"
+        )
+        for i in range(7)
+    )
+    citation = format_citation(_message_hit(body, 100, 106), TITLE, "kestrelwatch survey")
+    assert "messages 101\u2013103" in citation, citation
+
+
+def test_citation_falls_back_to_the_full_range_when_no_term_matches_a_message():
+    body = "\n".join(f"USER: had to mend fence {i}" for i in range(8))
+    # A porter stem match ("mending" matching the indexed "mend") leaves every
+    # message term-unmatched, exactly like a future pure-semantic hit: the
+    # citation degrades to the full 1-based range, never to a wrong band.
+    citation = format_citation(_message_hit(body, 40, 47), TITLE, "mending")
+    assert "messages 41\u201348" in citation, citation
+
+
+def test_citation_keeps_the_full_range_for_narrow_windows():
+    # At or under the span threshold the whole window is already a handful of
+    # messages: cite it complete, not the one message that happens to match.
+    body = "\n".join(
+        f"ASSISTANT: quick reply {i}" + (" kestrelwatch" if i == 2 else "")
+        for i in range(4)
+    )
+    citation = format_citation(_message_hit(body, 3, 6), TITLE, "kestrelwatch")
+    assert "messages 4\u20137" in citation, citation
+
+
+def test_citation_narrows_a_tail_window_from_its_own_band():
+    # A window at the tail of a long conversation must narrow within its own
+    # stored coordinates, never collapse onto the head of the transcript.
+    body = "\n".join(
+        f"USER: note {i}" + (" kestrelwatch" if i in (6, 7) else "") for i in range(8)
+    )
+    citation = format_citation(_message_hit(body, 22, 29), TITLE, "kestrelwatch")
+    assert "messages 29\u201330" in citation, citation
+
+
+def test_citation_keeps_a_leading_fragment_with_the_message_it_continues():
+    # Windows are cut on a character budget, not on message bounds, so a
+    # window can begin mid-message: the unlabelled leading fragment is
+    # the tail of the window's first message and must stay attributed
+    # to it -- a term matching only that fragment cites the first
+    # message, not the second one down.
+    body = "kestrelwatch tail of the previous message\n" + "\n".join(
+        f"USER: body text {i}" for i in range(6)
+    )
+    citation = format_citation(_message_hit(body, 0, 6), TITLE, "kestrelwatch")
+    assert "messages 1\u20131" in citation, citation
+
+
+def test_citation_falls_back_when_the_body_disagrees_with_the_stored_range():
+    # The segment count must match the stored span, or the attribution is a
+    # guess: a body with fewer rendered messages than the range claims (here,
+    # a row whose text no longer lines up with msg_start..msg_end) cites the
+    # full range rather than a band narrowed by position-wise matching.
+    body = "\n".join(
+        f"USER: plain note {i}" + (" kestrelwatch" if i == 6 else "") for i in range(7)
+    )
+    citation = format_citation(_message_hit(body, 0, 9), TITLE, "kestrelwatch")  # 10 claimed, 7 present
+    assert "messages 1\u201310" in citation, citation
+    assert "messages 7\u20137" not in citation, citation
+
+
+def test_citation_ignores_role_prefixes_inside_message_text():
+    # A turn whose quoted text opens with a role-like prefix is not a window
+    # boundary: the extra segment makes the body disagree with the stored
+    # span, and the safe answer is the full range, not a band cut on the
+    # forged boundary.
+    body = "\n".join(f"USER: plain note {i}" for i in range(6))
+    body += "\nASSISTANT: quoted USER: fake boundary"
+    citation = format_citation(_message_hit(body, 0, 5), TITLE, "fake")  # 6 claimed, 7 segments
+    assert "messages 1\u20136" in citation, citation
+    assert "messages 7\u20137" not in citation, citation
 
 
 # ---------------------------------------------------------------------------
@@ -204,20 +378,39 @@ def test_citation_falls_back_to_the_key_without_a_title(tmp_path):
 
 
 async def test_recall_tool_output_shows_the_citation_line(tmp_path):
-    manager, _ = _index_fixture(tmp_path)
+    manager, indexer = _index_fixture(tmp_path)
     tool = _tool(manager)
+
+    # The window the tool will cite, read from the index (not assumed): in this
+    # fixture the top needle hit is the window stored over messages 10-16, a
+    # 7-message chunk whose needle text sits only in messages 14-16.
+    needle_hits = [h for h in indexer.index.search(NEEDLE, limit=5) if NEEDLE in h.body]
+    assert needle_hits, "the needle window must be retrievable"
+    top = needle_hits[0]
+    assert top.msg_start is not None and top.msg_end is not None
+    # Precondition for this test being about narrowing-at-all: the stored
+    # window must reach strictly below the needle band, so citing the band
+    # is observably different from citing the window.
+    assert top.msg_start < 14, (top.msg_start, top.msg_end)
+    full_range = f"messages {top.msg_start + 1}\u2013{top.msg_end + 1}"
+    stale_range = f"messages {top.msg_start}\u2013{top.msg_end}"
 
     with _calling_from(SESSION_KEY):
         out = str(await tool.execute(query=NEEDLE))
 
     assert NEEDLE in out, "the recalled excerpt must still be returned"
     # The model is shown a repeatable citation naming the source, the message
-    # range, and the date -- not just the body text. The exact range is whatever
-    # window matched, so pin the shape of the line, not one particular span.
+    # range, and the date -- not just the body text. The range is 1-based and
+    # narrowed to the messages carrying the query terms (stored 14-16 ->
+    # shown 15-17); the whole-chunk render, whether 0-based or 1-based, must
+    # not survive for a hit whose messages demonstrably contain the terms.
     assert "[source: " in out
     assert TITLE in out, "the session title is the human label for the source"
     assert DAY in out, "the citation must carry the right date"
     assert "messages " in out and "\u2013" in out, out
+    assert "messages 15\u201317" in out, out
+    assert stale_range not in out, "0-based numbering must not survive"
+    assert full_range not in out, f"un-narrowed window cited: {full_range}"
 
 
 async def test_recall_tool_uses_the_title_and_falls_back_to_the_key(tmp_path):

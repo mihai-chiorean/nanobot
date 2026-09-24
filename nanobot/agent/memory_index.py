@@ -97,6 +97,19 @@ _STOPWORDS = frozenset({
     "thing", "again", "then", "there", "get", "got", "said", "say", "tell",
 })
 
+# A citation is only worth narrowing to its answering messages once the stored
+# window spans more than this many of them; below that the whole window is
+# already a handful of turns and quoting all of them is the honest range.
+_CITATION_NARROW_MIN_SPAN = 5
+
+# ``index_messages`` renders each indexed message as ``"ROLE: text"`` joined
+# by newlines, so a line beginning with one of these prefixes starts a new
+# message. Only the two indexed roles can appear (``INDEXED_ROLES``); a turn
+# whose quoted text merely looks like a boundary is caught by the
+# segment-count guard in :func:`_citation_span`, which falls back to the
+# full range rather than attributing a wrong message.
+_MESSAGE_EDGE = re.compile(r"^(?:USER|ASSISTANT): ", re.M)
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
@@ -118,8 +131,10 @@ CREATE TABLE IF NOT EXISTS chunks (
     ts     TEXT,
     seq    INTEGER NOT NULL,
     body   TEXT NOT NULL,
-    -- Provenance: the first and last message index this window covers, so a
-    -- recall hit can be cited back to "messages 14–16" of its conversation.
+    -- Provenance: the first and last message index this window covers, stored
+    -- 0-based over the source's messages (citations render them 1-based), so
+    -- a recall hit can be cited back to the messages of its conversation it
+    -- actually answers.
     -- Nullable: curated facts and pre-v2 rows have no message range.
     msg_start INTEGER,
     msg_end   INTEGER
@@ -254,25 +269,35 @@ def _render_spans(parts: Sequence[str], *, sep: str = "\n") -> list[tuple[int, i
     return spans
 
 
+def _fts_terms(query: str) -> list[str]:
+    """The query's word terms, lowercased, stop- and short-word filtered.
+
+    Shared by the FTS5 query builder and the citation-narrowing matcher, so
+    the words that made a chunk match are exactly the words that are allowed
+    to narrow its citation.
+    """
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for token in _FTS_TOKEN.findall(query.lower()):
+        token = token.strip("-./").replace('"', "")
+        if len(token) > 1 and token not in _STOPWORDS and token not in seen:
+            seen.add(token)
+            ordered.append(token)
+    return ordered
+
+
 def build_match_expression(query: str) -> str:
     """Translate a natural-language query into a safe FTS5 MATCH expression.
 
     Every term is quoted, so no user or model text can reach the FTS5 query
-    parser as an operator. Terms are OR-ed and bm25 does the ranking, which is
-    what makes half-remembered queries work: the rare words in the query carry
-    the ranking and the common ones cost nothing.
+    parser as an operator. Terms are OR-ed and bm25 does the ranking, which
+    is what makes half-remembered queries work: the rare words in the query
+    carry the ranking and the common ones cost nothing.
     """
-    terms = []
-    for token in _FTS_TOKEN.findall(query.lower()):
-        token = token.strip("-./")
-        if len(token) > 1 and token not in _STOPWORDS:
-            terms.append(token.replace('"', ""))
+    terms = _fts_terms(query)[:24]  # bound the expression size
     if not terms:
         return ""
-    # Dedupe, preserve order, and bound the expression size.
-    seen: set[str] = set()
-    ordered = [t for t in terms if not (t in seen or seen.add(t))][:24]
-    return " OR ".join(f'"{t}"' for t in ordered)
+    return " OR ".join(f'"{t}"' for t in terms)
 
 
 class MemoryIndex:
@@ -705,19 +730,88 @@ class MemoryIndex:
         return {str(r[0]): int(r[1]) for r in rows}
 
 
-def format_citation(hit: MemoryHit, title: str | None = None) -> str:
+def _split_body_by_messages(body: str) -> list[str] | None:
+    """Split a chunk body back into its per-message renders, or ``None``.
+
+    The writer joins rendered ``"ROLE: text"`` messages with newlines, so a
+    line beginning with a role prefix starts a new message. A window is cut
+    on a character budget, not on message bounds, so it may begin
+    mid-message: the leading fragment then belongs to the window's first
+    covered message, which is exactly what ``msg_start`` records. An all
+    blank body yields ``None`` so the caller keeps the full range rather
+    than guessing what it held.
+    """
+    if not body.strip():
+        return None
+    edges = [match.start() for match in _MESSAGE_EDGE.finditer(body)]
+    if not edges:
+        return [body]
+    if edges[0] != 0:
+        edges.insert(0, 0)
+    bounds = edges + [len(body)]
+    return [body[a:b] for a, b in zip(edges, bounds[1:])]
+
+
+def _citation_span(body: str, query: str, msg_start: int, msg_end: int) -> tuple[int, int]:
+    """The 1-based message range a citation of one stored window should show.
+
+    ``msg_start``/``msg_end`` are 0-based indices over the source's messages,
+    and a window is cut on a character budget, so one window can span dozens
+    of messages while only a few of them answer the query. Once the window
+    spans more than :data:`_CITATION_NARROW_MIN_SPAN` messages, narrow to
+    the messages whose rendered text contains a query term -- the body keeps
+    the message boundaries, so a case-insensitive term hit per message is
+    enough. When no message matches (a pure semantic hit, or an FTS porter
+    match whose stem never appears literally) the full stored range is
+    quoted instead: a wide honest range beats a fabricated narrow one. The
+    stored fields are never mutated; only this rendering decides.
+    """
+    span = msg_end - msg_start + 1
+    full = (msg_start + 1, msg_end + 1)
+    if span <= _CITATION_NARROW_MIN_SPAN:
+        return full
+    segments = _split_body_by_messages(body)
+    if segments is None or len(segments) != span:
+        # The body no longer lines up with the stored range (a row written by
+        # another writer, or a message boundary misread): cite the window.
+        return full
+    terms = _fts_terms(query)[:24]
+    if not terms:
+        return full
+    matched = [
+        msg_start + position
+        for position, segment in enumerate(segments)
+        if any(term in segment.lower() for term in terms)
+    ]
+    if not matched:
+        return full
+    return matched[0] + 1, matched[-1] + 1
+
+
+def format_citation(
+    hit: MemoryHit, title: str | None = None, query: str | None = None
+) -> str:
     """One line the model can repeat back verbatim as the source of a fact.
 
-    The point of provenance is that an asserted memory names where it came from
-    -- "our September 21 conversation, messages 14–18" -- rather than the model
-    claiming it with no source. The message range is the part the model cannot
-    reconstruct from the body alone, and a pre-v2 row (or curated fact) has none,
+    The point of provenance is that an asserted memory names where it came
+    from -- "our September 21 conversation, messages 15–17" -- rather than
+    the model claiming it with no source. Message numbers are shown
+    1-based: the stored range is 0-based and reads wrong to a person. The
+    range is the part the model cannot reconstruct from the body alone; when
+    *query* is given and the stored window spans many messages, the range
+    narrows to the messages that actually answer the query
+    (:func:`_citation_span`), falling back to the full stored window when
+    nothing matches. A pre-v2 row (or a curated fact) has no range at all,
     which renders as ``messages ?`` rather than a fabricated range.
     """
     label = title or hit.source
     parts = [f"source: {label}"]
     if hit.msg_start is not None and hit.msg_end is not None:
-        parts.append(f"messages {hit.msg_start}\u2013{hit.msg_end}")
+        if query:
+            first, last = _citation_span(hit.body, query, hit.msg_start, hit.msg_end)
+        else:
+            first, last = hit.msg_start + 1, hit.msg_end + 1
+        parts.append(f"messages {first}\u2013{last}")
     else:
         parts.append("messages ?")
     date = hit.ts[:10] if hit.ts else ""
@@ -755,7 +849,7 @@ def render_hits(
         if hit.ts:
             provenance += f" | {hit.ts}"
         title = title_for(hit.source) if title_for is not None else None
-        citation = format_citation(hit, title)
+        citation = format_citation(hit, title, query)
         # Charge the budget for what is actually emitted, indentation and
         # provenance included. Charging it for the raw body let a capped
         # "4000 char" render reach ~9.8k once every line grew a 4-space
