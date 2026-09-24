@@ -3445,7 +3445,9 @@ async def test_session_delete_rejects_non_websocket_keys(
             "http://127.0.0.1:29909/api/sessions/slack:C123/delete",
             headers=auth,
         )
-        assert get_delete.status_code == 405
+        # MIT-1425: the owner-bearer HTTP delete is allowed, but it runs the
+        # same key gate as the WS mutation, so a non-WebUI key still 404s.
+        assert get_delete.status_code == 404
 
         deny_delete = await _webui_mutate(
             channel,

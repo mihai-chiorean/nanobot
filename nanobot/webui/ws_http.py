@@ -150,6 +150,9 @@ _NO_STORE_HEADERS = [("Cache-Control", "no-store")]
 _PUBLISHED_FILE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
 
+_OWNER_HTTP_SESSION_DELETE_RE = re.compile(r"^/api/sessions/([^/]+)/delete$")
+
+
 def _quoted_etag(revision: str) -> str:
     return f'"{revision}"'
 
@@ -498,6 +501,12 @@ class GatewayHTTPHandler:
         )
 
         try:
+            owner_delete = _OWNER_HTTP_SESSION_DELETE_RE.match(got)
+            if owner_delete is not None:
+                response = self._handle_owner_http_session_delete(
+                    request, owner_delete.group(1)
+                )
+                return response
             if self._is_webui_mutation_path(got):
                 return _http_error(
                     405,
@@ -539,6 +548,31 @@ class GatewayHTTPHandler:
         if isinstance(response, Response):
             return response
         return _http_error(404, "WebUI mutation action not found")
+
+    def _handle_owner_http_session_delete(self, request: WsRequest, key: str) -> Response:
+        """Owner-bearer ``/api/sessions/<key>/delete`` over plain HTTP (MIT-1425).
+
+        The one WebUI mutation still reachable without the WebSocket: iOS
+        (``ZiggyRESTClient.deleteSession``, POST) and the Ziggy web client
+        (``web/src/lib/api.ts`` ``deleteSession``, GET) call this route with the
+        owner API bearer and expect ``{"deleted": bool}``. Every other WebUI
+        mutation stays WS-only (``_is_webui_mutation_path``).
+
+        Auth is the owner API token itself (``tokens.check_api_token``), never
+        the trusted-proxy shortcut in ``check_api_token``: a proxied request
+        without an owner token (a room guest whose room token fell through)
+        gets 401. Room credentials live in the shared-room store, not in
+        ``tokens``, so they are refused the same way. Past that gate the
+        request runs the same handler the WS ``session.delete`` mutation
+        reaches, so the MIT-1416 active-turn 409 and the automation-consent
+        response (``?delete_automations=1`` to confirm) apply unchanged.
+        """
+        method = getattr(request, "method", "GET")
+        if method not in {"GET", "POST"}:
+            return _http_error(405, "Method Not Allowed")
+        if not self.tokens.check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        return self._handle_session_delete(request, key)
 
     def _is_webui_mutation_path(self, path: str) -> bool:
         if self.settings_routes.is_mutation_path(path):
