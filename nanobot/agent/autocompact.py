@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Collection
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Callable, Coroutine
@@ -9,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Callable, Coroutine
 from loguru import logger
 
 from nanobot.events import NO_EVENTS, EventSink
+from nanobot.providers.request_context import reset_scheduling_class, set_scheduling_class
 from nanobot.session.manager import Session, SessionManager
 from nanobot.session.summary import (
     SessionSummary,
@@ -35,6 +37,9 @@ class AutoCompact:
         self._archiving: set[str] = set()
         self._summaries: dict[str, SessionSummary] = {}
         self._bind_events = bind_events
+        # MIT-1439: after a restart every idle session is due at once. Run the
+        # archives one at a time so the sweep cannot flood the model gateway.
+        self._archive_slot = asyncio.Semaphore(1)
 
     def _is_expired(self, ts: datetime | str | None,
                     now: datetime | None = None) -> bool:
@@ -109,11 +114,17 @@ class AutoCompact:
             self._archiving.discard(key)
             return
         try:
-            summary = await self.consolidator.compact_idle_session(
-                key,
-                runtime=runtime,
-                events=self._bind_events(key) if self._bind_events else NO_EVENTS,
-            )
+            async with self._archive_slot:
+                # Idle compaction is background load for the admission gateway.
+                scheduling_token = set_scheduling_class("background")
+                try:
+                    summary = await self.consolidator.compact_idle_session(
+                        key,
+                        runtime=runtime,
+                        events=self._bind_events(key) if self._bind_events else NO_EVENTS,
+                    )
+                finally:
+                    reset_scheduling_class(scheduling_token)
             if summary:
                 session = self.sessions.get_or_create(key)
                 stored = session_summary_from_metadata(
