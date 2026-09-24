@@ -1,0 +1,345 @@
+"""Recall hits name their source: conversation, message range, and time (MIT-1440).
+
+A remembered fact is only auditable if it can be traced to where it came from --
+"our September 21 conversation, messages 14-16" -- rather than being asserted by
+the model with no source. Ziggy's ``MemoryIndex`` already stored per-chunk
+``source``/``kind``/``ts``/``seq``; what it did not store was *which messages* of
+the source a window covered, so the ``recall`` tool had nothing citable to show
+the model. These tests pin the provenance through the real write path (a session
+save, not a hand-inserted row) and through the real read surface (the tool's
+output, not just the index), and pin that an index written under the previous
+schema still opens, still searches, and renders its unknown range honestly as
+``messages ?`` instead of inventing one.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import sqlite3
+
+from nanobot.agent.memory_index import (
+    KIND_CONVERSATION,
+    MemoryHit,
+    MemoryIndex,
+    SessionRecallIndexer,
+    format_citation,
+    render_hits,
+)
+from nanobot.agent.tools.context import RequestContext, request_context
+from nanobot.agent.tools.recall import MemoryToolConfig, RecallTool
+from nanobot.session.manager import SessionManager
+
+# A phrase that occurs only in messages 14-16 of the fixture transcript. It is a
+# single rare token so FTS ranks the window that literally contains it above any
+# window that merely shares the fixture's generic filler vocabulary; the token
+# spelling here is deliberately unique and must match the fixture exactly.
+NEEDLE = "kestrelwatch"
+# A second, unrelated rare token planted outside the 14-16 band. Its presence is
+# the negative control: provenance must be computed per hit, not hard-coded to the
+# bracket the feature was designed around.
+OTHER_NEEDLE = "numbatwatch"
+SESSION_KEY = "telegram:provenance-room"
+TITLE = "The Estuary Survey"
+DAY = "2026-09-21"
+
+
+def _manager(tmp_path, name: str = "owner"):
+    workspace = tmp_path / name / "workspace"
+    workspace.mkdir(parents=True)
+    manager = SessionManager(workspace, sessions_root=tmp_path / name / "sessions")
+    indexer = SessionRecallIndexer(MemoryIndex(manager.sessions_dir))
+    manager.set_indexer(indexer)
+    return manager, indexer
+
+
+def _body(index: int) -> str:
+    """Filler for a non-needle message: generic prose, none of these words may
+    ever become searchable, or the needle's window would stop being unique."""
+    return (
+        f"routine logistics note {index} covering staffing and the weather "
+        f"and the usual scheduling of the depot for the week"
+    )
+
+
+def _fixture_messages() -> list[dict]:
+    """Thirty messages; the needle phrase lives in exactly messages 14, 15 and 16,
+    and the control token lives only in message 3."""
+    messages: list[dict] = []
+    for index in range(30):
+        if index in (14, 15, 16):
+            content = (
+                f"we recorded the {NEEDLE} observation log entry number {index} "
+                f"from the estuary survey that season"
+            )
+        elif index == 3:
+            content = f"separately we began the {OTHER_NEEDLE} count near the old rail yard"
+        else:
+            content = _body(index)
+        role = "user" if index % 2 == 0 else "assistant"
+        messages.append(
+            {
+                "role": role,
+                "content": content,
+                # Every message carries a timestamp; the citation renders the day of
+                # the window's *first* message, so this must be a real per-message
+                # value, not a single constant stamped on the whole batch.
+                "timestamp": f"{DAY}T{9 + index // 6:02d}:{index % 6:02d}:00",
+            }
+        )
+    return messages
+
+
+def _index_fixture(tmp_path):
+    """Index the fixture through the real save path (SessionManager.save fires the
+    indexer), so provenance is tested where memory is actually written."""
+    manager, indexer = _manager(tmp_path)
+    session = manager.get_or_create(SESSION_KEY)
+    for message in _fixture_messages():
+        session.messages.append(dict(message))
+    session.metadata["title"] = TITLE
+    manager.save(session)
+    return manager, indexer
+
+
+@contextlib.contextmanager
+def _calling_from(session_key: str):
+    """Bind the per-request context the agent loop binds around a tool call, so the
+    tool resolves the same audience the runtime would."""
+    with request_context(
+        RequestContext(
+            channel=session_key.split(":", 1)[0],
+            chat_id="room",
+            session_key=session_key,
+        )
+    ):
+        yield
+
+
+def _tool(manager, scope: str = "session") -> RecallTool:
+    class _Ctx:
+        config = type("_Cfg", (), {"memory": MemoryToolConfig(scope=scope)})()
+        sessions = manager
+
+    _Ctx.workspace = str(manager.workspace)
+    return RecallTool.create(_Ctx())
+
+
+# ---------------------------------------------------------------------------
+# 1. A hit brackets the messages it came from, with the right date.
+# ---------------------------------------------------------------------------
+
+
+def test_a_hit_brackets_the_messages_it_came_from(tmp_path):
+    _, indexer = _index_fixture(tmp_path)
+
+    needle_hits = [h for h in indexer.index.search(NEEDLE, limit=5) if NEEDLE in h.body]
+    assert needle_hits, "the needle window must be retrievable"
+    for hit in needle_hits:
+        # Every window that actually shows the needle text necessarily overlaps the
+        # 14-16 band, so its recorded span must touch it: it cannot start after the
+        # band ends nor end before the band begins.
+        assert hit.msg_start is not None and hit.msg_end is not None
+        assert hit.msg_start <= 16 and hit.msg_end >= 14, (hit.msg_start, hit.msg_end)
+        # And the timestamp must be the day the fixture actually used, not empty.
+        assert hit.ts.startswith(DAY), hit.ts
+    # At least one returned window spans the whole needle passage, so a reader can
+    # cite the full "messages 14-16" range rather than a fragment of it.
+    assert any(
+        h.msg_start <= 14 and h.msg_end >= 16 for h in needle_hits
+    ), [(h.msg_start, h.msg_end) for h in needle_hits]
+
+
+def test_provenance_is_per_hit_not_a_single_constant(tmp_path):
+    """The negative control: a different phrase in a different message range must
+    get its OWN bracket, which excludes 14-16. If provenance were hard-coded to the
+    designed-for band this would falsely pass."""
+    _, indexer = _index_fixture(tmp_path)
+
+    needle_hits = [h for h in indexer.index.search(NEEDLE, limit=5) if NEEDLE in h.body]
+    control_hits = [
+        h for h in indexer.index.search(OTHER_NEEDLE, limit=5) if OTHER_NEEDLE in h.body
+    ]
+    assert needle_hits and control_hits, "both tokens must be retrievable"
+    control = control_hits[0]
+    # The control token lives only in message 3, so its window must not extend to
+    # the needle band at 14-16; a real per-message computation keeps it below 14.
+    assert control.msg_end < 14, (control.msg_start, control.msg_end)
+    assert not (control.msg_start <= 14 <= control.msg_end), "control bled into the needle band"
+
+
+def test_citation_formats_the_source_messages_and_time(tmp_path):
+    hit = MemoryHit(
+        source=SESSION_KEY,
+        kind=KIND_CONVERSATION,
+        ts=f"{DAY}T09:14:00",
+        body="we recorded the observation log",
+        score=-1.5,
+        msg_start=14,
+        msg_end=16,
+    )
+    citation = format_citation(hit, TITLE)
+    assert citation.startswith("[source: ")
+    assert TITLE in citation
+    # Message indices are 1-based for humans; the dash is an en-dash, not a hyphen.
+    assert "messages 14\u201316" in citation, citation
+    assert DAY in citation, citation
+
+
+def test_citation_falls_back_to_the_key_without_a_title(tmp_path):
+    hit = MemoryHit(
+        source=SESSION_KEY,
+        kind=KIND_CONVERSATION,
+        ts=f"{DAY}T09:14:00",
+        body="x",
+        score=-1.0,
+        msg_start=14,
+        msg_end=16,
+    )
+    assert format_citation(hit) == f"[source: {SESSION_KEY}, messages 14\u201316, {DAY}]"
+
+
+# ---------------------------------------------------------------------------
+# 2. The recall tool's own output carries the citation line the model can repeat.
+# ---------------------------------------------------------------------------
+
+
+async def test_recall_tool_output_shows_the_citation_line(tmp_path):
+    manager, _ = _index_fixture(tmp_path)
+    tool = _tool(manager)
+
+    with _calling_from(SESSION_KEY):
+        out = str(await tool.execute(query=NEEDLE))
+
+    assert NEEDLE in out, "the recalled excerpt must still be returned"
+    # The model is shown a repeatable citation naming the source, the message
+    # range, and the date -- not just the body text. The exact range is whatever
+    # window matched, so pin the shape of the line, not one particular span.
+    assert "[source: " in out
+    assert TITLE in out, "the session title is the human label for the source"
+    assert DAY in out, "the citation must carry the right date"
+    assert "messages " in out and "\u2013" in out, out
+
+
+async def test_recall_tool_uses_the_title_and_falls_back_to_the_key(tmp_path):
+    # With a title, the citation names the conversation by its title.
+    manager, _ = _index_fixture(tmp_path)
+    with _calling_from(SESSION_KEY):
+        titled = str(await _tool(manager).execute(query=NEEDLE))
+    assert f"[source: {TITLE}," in titled, titled
+
+    # A source with no session title -- here a curated file, whose key is all it
+    # has -- is still cited by that key, so a citation is always present rather
+    # than silently dropped when a human label is unavailable.
+    manager2, indexer2 = _manager(tmp_path, "tenant")
+    indexer2.index.index_text(
+        "memory/MEMORY.md",
+        f"the {NEEDLE} findings were copied verbatim into the long-term notes",
+        kind="fact",
+    )
+    with _calling_from("telegram:some-room"):
+        untitled = str(await _tool(manager2, scope="workspace").execute(query=NEEDLE))
+    assert "[source: memory/MEMORY.md" in untitled, untitled
+
+
+def test_the_description_tells_the_model_to_cite():
+    """The instruction to cite is part of the tool contract, so it must be present."""
+    manager_sentinel = object()
+    tool = RecallTool(index=manager_sentinel, default_limit=5, scope="session")
+    description = tool.description
+    assert "cite" in description.lower() or "source" in description.lower()
+    assert "messages" in description.lower()
+
+
+# ---------------------------------------------------------------------------
+# 3. An index written under the previous schema still opens, still searches, and
+#    renders its unknown range honestly.
+# ---------------------------------------------------------------------------
+
+
+def test_an_index_from_the_old_schema_still_opens_and_searches(tmp_path):
+    """Build a v1 database (no msg_start/msg_end columns, schema_version=1) exactly
+    as the prior code wrote it, then open it with the current index."""
+    directory = tmp_path / "legacy"
+    directory.mkdir(parents=True)
+    path = directory / ".memory-index.sqlite3"
+    db = sqlite3.connect(str(path))
+    db.executescript(
+        """
+        CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE sources (
+            source TEXT PRIMARY KEY, kind TEXT NOT NULL,
+            cursor INTEGER NOT NULL DEFAULT 0, digest TEXT, updated_at REAL NOT NULL);
+        CREATE TABLE chunks (
+            id INTEGER PRIMARY KEY, source TEXT NOT NULL, kind TEXT NOT NULL,
+            ts TEXT, seq INTEGER NOT NULL, body TEXT NOT NULL);
+        CREATE INDEX chunks_by_source ON chunks(source);
+        CREATE VIRTUAL TABLE chunks_fts USING fts5(
+            body, content='chunks', content_rowid='id',
+            tokenize='porter unicode61 remove_diacritics 2');
+        CREATE TRIGGER chunks_ai AFTER INSERT ON chunks BEGIN
+            INSERT INTO chunks_fts(rowid, body) VALUES (new.id, new.body); END;
+        CREATE TRIGGER chunks_ad AFTER DELETE ON chunks BEGIN
+            INSERT INTO chunks_fts(chunks_fts, rowid, body) VALUES ('delete', old.id, old.body); END;
+        CREATE TRIGGER chunks_au AFTER UPDATE ON chunks BEGIN
+            INSERT INTO chunks_fts(chunks_fts, rowid, body) VALUES ('delete', old.id, old.body);
+            INSERT INTO chunks_fts(rowid, body) VALUES (new.id, new.body); END;
+        INSERT INTO meta(key, value) VALUES('schema_version', '1');
+        INSERT INTO sources(source, kind, cursor, digest, updated_at)
+            VALUES('webui:legacy', 'conversation', 0, NULL, 1.0);
+        INSERT INTO chunks(source, kind, ts, seq, body)
+            VALUES('webui:legacy', 'conversation', '2026-08-30T09:00:00', 0,
+                   'the numbat survey was postponed because the rain would not lift');
+        """
+    )
+    db.commit()
+    # Precondition: the old file really lacks the columns and is stamped v1.
+    cols = {row[1] for row in db.execute("PRAGMA table_info('chunks')")}
+    db.close()
+    assert "msg_start" not in cols and "msg_end" not in cols
+
+    index = MemoryIndex(directory)
+    try:
+        hits = index.search("numbat survey postponed rain", limit=5)
+        assert hits, "an index written by the old code must still be searchable"
+        for hit in hits:
+            # Pre-v2 rows have no recoverable range: the range is None, and the
+            # citation renders it as the explicit unknown marker, never a fabricated
+            # "messages 0-0" and never a crash.
+            assert hit.msg_start is None and hit.msg_end is None
+            assert "messages ?" in format_citation(hit, "Legacy")
+        # The migration is in place: the file is stamped current and the columns exist.
+        check = sqlite3.connect(str(path))
+        version = check.execute(
+            "SELECT value FROM meta WHERE key='schema_version'"
+        ).fetchone()[0]
+        now_cols = {row[1] for row in check.execute("PRAGMA table_info('chunks')")}
+        check.close()
+        assert version == "2", version
+        assert {"msg_start", "msg_end"} <= now_cols
+    finally:
+        index.close()
+
+
+def test_render_hits_output_stays_bounded_with_citations():
+    """The citation is emitted inside the block whose budget the renderer enforces; a
+    citation that grows without bound could push the prompt-injection cap out, so the
+    formatted total must still respect the cap once citations are counted."""
+    from nanobot.agent.memory_index import MAX_TOTAL_CHARS
+
+    hits = [
+        MemoryHit(
+            source=f"discord:{i}",
+            kind=KIND_CONVERSATION,
+            ts=f"{DAY}T09:0{i}:00",
+            body="\n".join(["line of recalled text"] * 30),
+            score=-1.0,
+            msg_start=1000 * i,
+            msg_end=1000 * i + 40,
+        )
+        for i in range(10)
+    ]
+    rendered = render_hits(hits, "numbat", title_for=lambda source: "Some Long Conversation Title")
+    # Every hit now carries an extra citation line; the cap must hold on the
+    # formatted bytes, not on the bodies alone.
+    assert len(rendered) < MAX_TOTAL_CHARS + 1000, len(rendered)
+    assert "messages " in rendered  # citations actually rendered

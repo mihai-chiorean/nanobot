@@ -104,7 +104,12 @@ class RecallTool(Tool):
         memory_config = getattr(ctx.config, "memory", None)
         limit = int(getattr(memory_config, "max_results", 5))
         scope = str(getattr(memory_config, "scope", "session"))
-        return cls(index=index, default_limit=limit, scope=scope)
+        return cls(
+            index=index,
+            default_limit=limit,
+            scope=scope,
+            sessions=getattr(ctx, "sessions", None),
+        )
 
     def __init__(
         self,
@@ -112,10 +117,39 @@ class RecallTool(Tool):
         *,
         default_limit: int = 5,
         scope: str = "session",
+        sessions: Any = None,
     ) -> None:
         self._index = index
         self._default_limit = default_limit
         self._scope = scope if scope in {"session", "channel", "workspace"} else "session"
+        # Only ever read, to turn a source key into a human title for the
+        # citation line. The index itself is the authority for what is searchable.
+        self._sessions = sessions
+
+    def _title_for(self, source: str) -> str | None:
+        """Best human label for a source: a session title, else fall back to the key.
+
+        Curated files and consolidation summaries have no session to name them,
+        so they keep their key. Any failure to read metadata degrades to the key
+        rather than dropping the hit -- a citation with a key is still provenance.
+        """
+        if not self._sessions or source in CURATED_SOURCES or source.startswith("history:"):
+            return None
+        reader = getattr(self._sessions, "read_session_metadata", None)
+        if not callable(reader):
+            return None
+        try:
+            payload = reader(source)
+        except Exception:  # noqa: BLE001 - provenance is best-effort, never load-bearing
+            logger.debug("recall: could not read metadata for {}", source)
+            return None
+        if not isinstance(payload, dict):
+            return None
+        metadata = payload.get("metadata")
+        if not isinstance(metadata, dict):
+            return None
+        title = metadata.get("title")
+        return title if isinstance(title, str) and title.strip() else None
 
     def _visible_sources(self) -> tuple[list[str] | None, list[str] | None]:
         """Resolve the audience this call may search.
@@ -160,7 +194,10 @@ class RecallTool(Tool):
             "before that is not in the current conversation — 'what did we "
             "decide about X', 'that thing I mentioned last month', a name or "
             "number you no longer have in context. Searches by keyword, so "
-            "include the distinctive words the user used."
+            "include the distinctive words the user used. Each result carries "
+            "a `[source: ..., messages N–M, date]` citation line; when you "
+            "state something from a result, name that source to the user "
+            "instead of asserting it without one."
         )
 
     @property
@@ -222,4 +259,4 @@ class RecallTool(Tool):
         except Exception as exc:  # noqa: BLE001
             logger.exception("recall: search failed")
             return ToolResult.error(f"Error searching memory: {exc}")
-        return render_hits(hits, query)
+        return render_hits(hits, query, title_for=self._title_for)

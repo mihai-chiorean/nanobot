@@ -36,14 +36,20 @@ import time
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 from loguru import logger
 
 from nanobot.utils.sensitive import scan_content
 
-# Schema identity. Bump to force a rebuild on next open.
-SCHEMA_VERSION = 1
+# Schema identity. Bump to force a rebuild on next open. Version 2 added the
+# ``msg_start``/``msg_end`` provenance columns to ``chunks``; that change is
+# migrated in place (an ``ALTER TABLE ... ADD COLUMN``) rather than rebuilt, so
+# an index written under v1 keeps its contents and simply gains NULL ranges --
+# recall still works, the citation line just shows ``messages ?`` until the
+# source is reindexed. A bump whose migration is not written here still falls
+# back to the destructive rebuild below.
+SCHEMA_VERSION = 2
 INDEX_FILENAME = ".memory-index.sqlite3"
 
 # Chunking. Windows are small on purpose: a recall hit is pasted back into the
@@ -111,7 +117,12 @@ CREATE TABLE IF NOT EXISTS chunks (
     kind   TEXT NOT NULL,
     ts     TEXT,
     seq    INTEGER NOT NULL,
-    body   TEXT NOT NULL
+    body   TEXT NOT NULL,
+    -- Provenance: the first and last message index this window covers, so a
+    -- recall hit can be cited back to "messages 14–16" of its conversation.
+    -- Nullable: curated facts and pre-v2 rows have no message range.
+    msg_start INTEGER,
+    msg_end   INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS chunks_by_source ON chunks(source);
@@ -147,6 +158,8 @@ class MemoryHit:
     ts: str
     body: str
     score: float
+    msg_start: int | None = None
+    msg_end: int | None = None
 
 
 def _like_prefix(prefix: str) -> str:
@@ -184,14 +197,30 @@ def _message_text(message: dict[str, Any]) -> str:
     return text[:MAX_MESSAGE_CHARS]
 
 
-def window(text: str, *, size: int = CHUNK_CHARS, overlap: int = CHUNK_OVERLAP) -> list[str]:
+def window(
+    text: str, *, size: int = CHUNK_CHARS, overlap: int = CHUNK_OVERLAP
+) -> list[str]:
     """Slide a bounded window over *text*, breaking on whitespace."""
+    return [piece for piece, _, _ in _window_spans(text, size=size, overlap=overlap)]
+
+
+def _window_spans(
+    text: str, *, size: int = CHUNK_CHARS, overlap: int = CHUNK_OVERLAP
+) -> list[tuple[str, int, int]]:
+    """Like :func:`window`, but return ``(piece, start, end)`` per window.
+
+    ``start``/``end`` are offsets into the *stripped* ``text`` delimiting the
+    exact characters ``piece`` was cut from, so a caller that knows where each
+    record sat in the source string can attribute a window back to the records
+    it covers. Whitespace trimmed off the piece's edges is excluded, so the span
+    names only the bytes that survived into the window.
+    """
     text = text.strip()
     if not text:
         return []
     if len(text) <= size:
-        return [text]
-    out: list[str] = []
+        return [(text, 0, len(text))]
+    out: list[tuple[str, int, int]] = []
     start = 0
     stride = max(1, size - overlap)
     n = len(text)
@@ -203,13 +232,26 @@ def window(text: str, *, size: int = CHUNK_CHARS, overlap: int = CHUNK_OVERLAP) 
                 cut = text.rfind(" ", start + stride, end)
             if cut != -1:
                 end = cut
-        piece = text[start:end].strip()
-        if piece:
-            out.append(piece)
+        raw = text[start:end]
+        content_start = start + (len(raw) - len(raw.lstrip()))
+        content_end = end - (len(raw) - len(raw.rstrip()))
+        if content_start < content_end:
+            out.append((text[content_start:content_end], content_start, content_end))
         if end >= n:
             break
         start = max(end - overlap, start + 1)
     return out
+
+
+def _render_spans(parts: Sequence[str], *, sep: str = "\n") -> list[tuple[int, int]]:
+    """Return ``[start, end)`` for each part within ``sep.join(parts)``."""
+    spans: list[tuple[int, int]] = []
+    pos = 0
+    for part in parts:
+        end = pos + len(part)
+        spans.append((pos, end))
+        pos = end + len(sep)
+    return spans
 
 
 def build_match_expression(query: str) -> str:
@@ -270,15 +312,16 @@ class MemoryIndex:
                 )
                 db.commit()
             elif version[0] != str(SCHEMA_VERSION):
-                logger.info(
-                    "Memory index schema {} != {}, rebuilding {}",
-                    version[0], SCHEMA_VERSION, self.path,
-                )
-                db.close()
-                self._db = None
-                with suppress(OSError):
-                    self.path.unlink()
-                return self._connect()
+                if not self._migrate(db, version[0]):
+                    logger.info(
+                        "Memory index schema {} != {}, rebuilding {}",
+                        version[0], SCHEMA_VERSION, self.path,
+                    )
+                    db.close()
+                    self._db = None
+                    with suppress(OSError):
+                        self.path.unlink()
+                    return self._connect()
             with suppress(OSError):
                 self.path.chmod(0o600)
             self._db = db
@@ -298,6 +341,48 @@ class MemoryIndex:
             logger.exception("Memory index could not be opened at {}", self.path)
             self._broken = True
             return None
+
+    def _migrate(self, db: sqlite3.Connection, stored: object) -> bool:
+        """Migrate an older schema in place. Returns False if the caller must rebuild.
+
+        Derived data may always be thrown away and rebuilt, but a rebuild of a
+        live index costs a backfill pass and, for a source whose transcript is
+        gone (a deleted session), loses those windows for good. So a change that
+        ``ALTER TABLE`` can express is applied in place and the version stamped
+        forward, exactly as a fresh ``CREATE TABLE`` would have created it.
+        Existing rows keep their content and simply carry NULL for the new
+        columns -- provenance the reader already has to treat as ``None``.
+        """
+        try:
+            stored_version = int(stored)
+        except (TypeError, ValueError):
+            return False
+        if not 1 <= stored_version < SCHEMA_VERSION:
+            # Unknown or newer-than-we-understand: no migration is written for
+            # it, so let the caller fall back to the destructive rebuild.
+            return False
+        try:
+            columns = {row[1] for row in db.execute("PRAGMA table_info('chunks')")}
+            if "msg_start" not in columns:
+                db.execute("ALTER TABLE chunks ADD COLUMN msg_start INTEGER")
+            if "msg_end" not in columns:
+                db.execute("ALTER TABLE chunks ADD COLUMN msg_end INTEGER")
+            db.execute(
+                "UPDATE meta SET value=? WHERE key='schema_version'",
+                (str(SCHEMA_VERSION),),
+            )
+            db.commit()
+        except sqlite3.DatabaseError:
+            logger.exception("Memory index migration {}->{} failed, will rebuild",
+                             stored_version, SCHEMA_VERSION)
+            with suppress(Exception):
+                db.rollback()
+            return False
+        logger.info(
+            "Memory index migrated schema {}->{} in place {}",
+            stored_version, SCHEMA_VERSION, self.path,
+        )
+        return True
 
     def close(self) -> None:
         with self._lock:
@@ -363,31 +448,54 @@ class MemoryIndex:
                     return 0
                 fresh = messages[cursor:total]
                 parts: list[str] = []
+                # Parallel to ``parts``: the transcript index and timestamp of the
+                # message each part was rendered from. A window can straddle
+                # several messages, so this is what lets it be attributed back.
+                origins: list[tuple[int, str]] = []
                 first_ts = ""
-                for message in fresh:
+                for offset, message in enumerate(fresh):
                     text = _message_text(message)
                     if not text:
                         continue
+                    ts = str(message.get("timestamp") or "")[:19]
                     if not first_ts:
-                        first_ts = str(message.get("timestamp") or "")[:19]
+                        first_ts = ts
                     parts.append(f"{str(message.get('role', '?')).upper()}: {text}")
+                    origins.append((cursor + offset, ts))
                 written = 0
                 if parts:
                     seq = self._next_seq(db, source)
+                    spans = _render_spans(parts)
                     rows = []
-                    for piece in window("\n".join(parts)):
+                    for piece, start, end in _window_spans("\n".join(parts)):
                         if not self._safe_to_index(piece):
                             logger.warning(
                                 "Memory index: skipped a window of {} carrying "
                                 "credential-shaped content", source,
                             )
                             continue
-                        rows.append((source, kind, first_ts, seq, piece))
+                        # The window's character span, mapped back to the messages
+                        # whose rendered text falls inside it -- inclusive bounds,
+                        # so the citation brackets every message the excerpt shows.
+                        covered = [
+                            origins[i]
+                            for i in range(len(parts))
+                            if spans[i][0] < end and spans[i][1] > start
+                        ]
+                        if covered:
+                            msg_start, msg_end = covered[0][0], covered[-1][0]
+                            ts = covered[0][1]
+                        else:  # a window that matched no source message: no range
+                            msg_start = msg_end = None
+                            ts = first_ts
+                        rows.append(
+                            (source, kind, ts, seq, piece, msg_start, msg_end)
+                        )
                         seq += 1
                     if rows:
                         db.executemany(
-                            "INSERT INTO chunks(source, kind, ts, seq, body) "
-                            "VALUES (?,?,?,?,?)",
+                            "INSERT INTO chunks(source, kind, ts, seq, body, "
+                            "msg_start, msg_end) VALUES (?,?,?,?,?,?,?)",
                             rows,
                         )
                         written = len(rows)
@@ -527,7 +635,8 @@ class MemoryIndex:
             if db is None:
                 return []
             sql = (
-                "SELECT c.source, c.kind, c.ts, c.body, bm25(chunks_fts) AS score "
+                "SELECT c.source, c.kind, c.ts, c.body, "
+                "c.msg_start, c.msg_end, bm25(chunks_fts) AS score "
                 "FROM chunks_fts JOIN chunks c ON c.id = chunks_fts.rowid "
                 "WHERE chunks_fts MATCH ?"
             )
@@ -559,7 +668,15 @@ class MemoryIndex:
                 logger.exception("Memory index search failed")
                 return []
         return [
-            MemoryHit(source=r[0], kind=r[1], ts=r[2] or "", body=r[3], score=float(r[4]))
+            MemoryHit(
+                source=r[0],
+                kind=r[1],
+                ts=r[2] or "",
+                body=r[3],
+                msg_start=r[4],
+                msg_end=r[5],
+                score=float(r[6]),
+            )
             for r in rows
         ]
 
@@ -588,8 +705,39 @@ class MemoryIndex:
         return {str(r[0]): int(r[1]) for r in rows}
 
 
-def render_hits(hits: Sequence[MemoryHit], query: str) -> str:
-    """Render hits for the model behind an explicit untrusted-content banner."""
+def format_citation(hit: MemoryHit, title: str | None = None) -> str:
+    """One line the model can repeat back verbatim as the source of a fact.
+
+    The point of provenance is that an asserted memory names where it came from
+    -- "our September 21 conversation, messages 14–18" -- rather than the model
+    claiming it with no source. The message range is the part the model cannot
+    reconstruct from the body alone, and a pre-v2 row (or curated fact) has none,
+    which renders as ``messages ?`` rather than a fabricated range.
+    """
+    label = title or hit.source
+    parts = [f"source: {label}"]
+    if hit.msg_start is not None and hit.msg_end is not None:
+        parts.append(f"messages {hit.msg_start}\u2013{hit.msg_end}")
+    else:
+        parts.append("messages ?")
+    date = hit.ts[:10] if hit.ts else ""
+    if date:
+        parts.append(date)
+    return "[" + ", ".join(parts) + "]"
+
+
+def render_hits(
+    hits: Sequence[MemoryHit],
+    query: str,
+    *,
+    title_for: "Callable[[str], str | None] | None" = None,
+) -> str:
+    """Render hits for the model behind an explicit untrusted-content banner.
+
+    ``title_for`` optionally maps a hit's ``source`` to a human title (a session
+    title, say); the source key is used whenever it returns nothing, so a
+    citation is always emitted even when no title is known.
+    """
     if not hits:
         return f"No memories found for {query!r}."
     lines = [
@@ -606,12 +754,19 @@ def render_hits(hits: Sequence[MemoryHit], query: str) -> str:
         provenance = f"[{position}] {hit.kind} | {hit.source}"
         if hit.ts:
             provenance += f" | {hit.ts}"
+        title = title_for(hit.source) if title_for is not None else None
+        citation = format_citation(hit, title)
         # Charge the budget for what is actually emitted, indentation and
         # provenance included. Charging it for the raw body let a capped
         # "4000 char" render reach ~9.8k once every line grew a 4-space
         # indent -- the cap is a prompt-injection bound, so it has to bound
         # the bytes that reach the prompt, not the bytes before formatting.
-        block = [provenance, *(f"    {line}" for line in body.splitlines()), ""]
+        block = [
+            provenance,
+            citation,
+            *(f"    {line}" for line in body.splitlines()),
+            "",
+        ]
         rendered = "\n".join(block)
         budget -= len(rendered) + 1
         lines.extend(block)
