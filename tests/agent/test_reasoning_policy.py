@@ -259,9 +259,11 @@ class _LoopHarness:
             context_window_tokens=200_000,
         )
 
-    async def run_turn(self, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+    async def run_turn(
+        self, metadata: dict[str, Any] | None = None, *, text: str = "hello"
+    ) -> dict[str, Any]:
         await self.loop._run_agent_loop(
-            TranscriptInput(history=[], current_message="hello", media=[]),
+            TranscriptInput(history=[], current_message=text, media=[]),
             runtime=self.runtime,
             request_context=RequestContext(
                 channel="test",
@@ -300,11 +302,96 @@ async def test_loop_binds_fast_profile_to_low_effort_for_the_turn(tmp_path: Path
 
 
 @pytest.mark.asyncio
-async def test_loop_binds_explicit_auto_without_overriding_default(tmp_path: Path) -> None:
+async def test_loop_binds_explicit_auto_to_the_resolved_generation(tmp_path: Path) -> None:
     harness = _LoopHarness(tmp_path)
 
     kwargs = await harness.run_turn({"reasoning_profile": "auto"})
 
+    # Production parity (feat/shared-rooms loop.py:1029-1039): the resolved
+    # auto generation is applied, not discarded.  "hello" is a fast-prefix
+    # greeting -> fast (none, 0.7, 8192), not the provider default.
+    assert kwargs["reasoning_effort"] == "none"
+    assert kwargs["temperature"] == 0.7
+    assert kwargs["max_tokens"] == 8_192
+    # The admitted runtime is a frozen value and was not mutated.
+    assert harness.runtime.generation.reasoning_effort == _DEFAULT_EFFORT
+    assert harness.runtime.generation.max_tokens == 4096
+
+
+@pytest.mark.asyncio
+async def test_loop_auto_resolves_code_text_to_think_code(tmp_path: Path) -> None:
+    harness = _LoopHarness(tmp_path)
+
+    kwargs = await harness.run_turn(
+        {"reasoning_profile": "auto"}, text="please refactor this module"
+    )
+
+    # The auto rules classify the current turn's code request as think-code
+    # (max), and the resolved generation reaches the provider call.
+    assert kwargs["reasoning_effort"] == "max"
+    assert kwargs["temperature"] == 0.6
+    assert kwargs["max_tokens"] == 32_768
+
+
+@pytest.mark.asyncio
+async def test_loop_auto_resolves_background_work_to_think(tmp_path: Path) -> None:
+    harness = _LoopHarness(tmp_path)
+
+    # Owner-created Work jobs are always auto + background (production
+    # websocket.py:1745); the background class must lift the turn to think
+    # even when the prompt text carries no code marker.
+    kwargs = await harness.run_turn(
+        {"reasoning_profile": "auto", "work_mode": "background"}
+    )
+
+    assert kwargs["reasoning_effort"] == "high"
+    assert kwargs["temperature"] == 1.0
+    assert kwargs["max_tokens"] == 32_768
+
+    # "scheduled" is in BACKGROUND_WORK_MODES too: same class, same result.
+    harness2 = _LoopHarness(tmp_path)
+    kwargs = await harness2.run_turn(
+        {"reasoning_profile": "auto", "work_mode": "scheduled"}, text="check my calendar"
+    )
+    assert kwargs["reasoning_effort"] == "high"
+    assert kwargs["max_tokens"] == 32_768
+
+
+@pytest.mark.asyncio
+async def test_loop_explicit_profile_is_never_rerouted_through_auto(tmp_path: Path) -> None:
+    harness = _LoopHarness(tmp_path)
+
+    # Negative control for the unknown->auto fallback: a VALID value must
+    # take the explicit path even when the auto rules would decide otherwise.
+    # "please refactor this module" contains a code marker, so if "fast"
+    # were (wrongly) treated as unknown it would resolve auto -> think-code
+    # (max, 0.6, 32768).  The explicit fast profile must survive instead.
+    kwargs = await harness.run_turn({"reasoning_profile": "fast"}, text="please refactor this module")
+    assert kwargs["reasoning_effort"] == "none"
+    assert kwargs["max_tokens"] == 8_192
+
+    # And symmetrically: "deep" on the same code text stays high (explicit),
+    # not max (what the auto rules would pick for a code request).
+    harness2 = _LoopHarness(tmp_path)
+    kwargs = await harness2.run_turn({"reasoning_profile": "deep"}, text="please refactor this module")
+    assert kwargs["reasoning_effort"] == "high"
+    assert kwargs["max_tokens"] == 32_768
+
+
+@pytest.mark.asyncio
+async def test_loop_non_string_profile_falls_back_to_auto(tmp_path: Path) -> None:
+    harness = _LoopHarness(tmp_path)
+
+    # A non-string value (e.g. a bool slipped through a JSON edge) is not a
+    # valid profile: parse returns None and the present value resolves as
+    # auto, matching the "unknown values -> auto" acceptance criterion.
+    kwargs = await harness.run_turn({"reasoning_profile": True})
+    assert kwargs["reasoning_effort"] == "none"  # auto -> fast for "hello"
+    assert kwargs["max_tokens"] == 8_192
+
+    # None (explicit null) means absent: the admitted generation is untouched.
+    harness2 = _LoopHarness(tmp_path)
+    kwargs = await harness2.run_turn({"reasoning_profile": None})
     assert kwargs["reasoning_effort"] == _DEFAULT_EFFORT
     assert kwargs["max_tokens"] == 4096
 
@@ -324,7 +411,13 @@ async def test_loop_falls_back_to_auto_for_unknown_profile(tmp_path: Path) -> No
 
     kwargs = await harness.run_turn({"reasoning_profile": "bogus"})
 
-    assert kwargs["reasoning_effort"] == _DEFAULT_EFFORT
+    # MIT-1409 acceptance: unknown values resolve as auto, so the turn runs
+    # with the auto-resolved generation ("hello" -> fast: none, 0.7, 8192),
+    # not the untouched provider default.  An absent value stays untouched
+    # (test_loop_without_profile_keeps_provider_default).
+    assert kwargs["reasoning_effort"] == "none"
+    assert kwargs["temperature"] == 0.7
+    assert kwargs["max_tokens"] == 8_192
 
 
 @pytest.mark.asyncio
