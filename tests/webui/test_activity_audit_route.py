@@ -283,6 +283,10 @@ async def test_limit_capped_at_200_and_bad_params_rejected(tmp_path: Path) -> No
         for bad in ("limit=0", "limit=-1", "limit=abc", "before=abc", "before=-3"):
             response = await _get(channel, port, f"/api/activity/audit?{bad}", token=token)
             assert response.status_code == 400, bad
+        # A cursor of 0 is the start of the feed: an empty page, not an error.
+        empty = await _get(channel, port, "/api/activity/audit?before=0", token=token)
+        assert empty.status_code == 200, empty.content
+        assert empty.json() == {"entries": [], "next_cursor": None, "has_more": False}
     finally:
         await channel.stop()
 
