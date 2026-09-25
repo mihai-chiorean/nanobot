@@ -39,7 +39,7 @@ from nanobot.agent.tools.shell import ExecTool
 # their grandchildren by scanning /proc/<pid>/cmdline; there's no portable
 # equivalent we can rely on without shelling out to pgrep, which the exec
 # prescreen may itself filter. The production fix (start_new_session + killpg)
-# is exercised generically via the mocked _kill_process tests below, so the
+# is exercised generically via the mocked _kill_process_tree tests below, so the
 # /proc-dependent cases just add Linux-side defense in depth.
 pytestmark = pytest.mark.skipif(
     sys.platform == "win32" or not os.path.isdir("/proc"),
@@ -234,7 +234,7 @@ class TestSigtermTrappedChildIsSigkilled:
         elapsed = time.monotonic() - start
 
         assert "timed out" in result.lower()
-        # _kill_process has a 5s budget to reap; anything longer hints at a
+        # _kill_process_tree has a 5s budget to reap; anything longer hints at a
         # SIGTERM-only kill stuck waiting on a trap-ignoring process.
         assert elapsed < 10, f"cleanup took {elapsed:.1f}s — SIGTERM likely used"
 
@@ -246,57 +246,75 @@ class TestSigtermTrappedChildIsSigkilled:
 
 
 # ---------------------------------------------------------------------------
-# _kill_process unit tests
+# _kill_process_tree unit tests
 # ---------------------------------------------------------------------------
 
-class TestKillProcessHandlesMissingGroup:
-    """If the group already exited, killpg's ProcessLookupError must not bubble."""
+class TestKillProcessTreeHandlesMissingGroup:
+    """If the group already exited, killpg's ProcessLookupError must not bubble.
 
-    @pytest.mark.asyncio
-    async def test_process_lookup_error_is_swallowed(self, monkeypatch):
+    Since the 0.3.0 refactor (MIT-1428) the group-kill lives in
+    ``_kill_process_tree``; ``_kill_process`` is the Windows spawn-failure
+    cleanup path only. These tests target the real group-kill entry point
+    used by the timeout/cancel paths in ``shell.py``.
+    """
+
+    @staticmethod
+    def _fake_process():
         from unittest.mock import AsyncMock, MagicMock
 
         fake_proc = MagicMock()
         fake_proc.pid = 999999  # almost certainly dead / unused
         fake_proc.returncode = None
-        fake_proc.kill = MagicMock(side_effect=ProcessLookupError)
+        fake_proc.kill = MagicMock()
         fake_proc.wait = AsyncMock(return_value=0)
-
-        def boom_getpgid(_pid):
-            raise ProcessLookupError
-
-        monkeypatch.setattr(os, "getpgid", boom_getpgid)
-
-        # Must not raise — a dead group is a no-op, not an error.
-        await ExecTool._kill_process(fake_proc)
+        return fake_proc
 
     @pytest.mark.asyncio
     async def test_killpg_is_sigkill_not_sigterm(self, monkeypatch):
-        """The fix skips SIGTERM; sudo/trap-installed children need SIGKILL."""
-        from unittest.mock import AsyncMock, MagicMock
-
+        """The fix skips SIGTERM; sudo/trap-installing children need SIGKILL."""
         recorded = []
-
-        def fake_getpgid(pid):
-            return pid  # same-as-pid is fine for bookkeeping
 
         def fake_killpg(pgid, sig):
             recorded.append((pgid, sig))
 
-        monkeypatch.setattr(os, "getpgid", fake_getpgid)
         monkeypatch.setattr(os, "killpg", fake_killpg)
 
-        fake_proc = MagicMock()
-        fake_proc.pid = 12345
-        fake_proc.returncode = None
-        fake_proc.kill = MagicMock()
-        fake_proc.wait = AsyncMock(return_value=0)
-
-        await ExecTool._kill_process(fake_proc)
+        fake_proc = self._fake_process()
+        await ExecTool._kill_process_tree(fake_proc)
 
         assert recorded, "killpg must be invoked on the pgid"
         (pgid, sig) = recorded[0]
+        assert pgid == fake_proc.pid, (
+            "the child is spawned with start_new_session=True, so its pgid is its pid"
+        )
         assert sig == signal.SIGKILL, (
             f"process-group kill must use SIGKILL (got {sig!r}); "
-            "SIGTERM is silently swallowed by sudo/trap-installed children"
+            "SIGTERM is silently swallowed by sudo/trap-installing children"
         )
+
+    @pytest.mark.asyncio
+    async def test_process_lookup_error_is_swallowed(self, monkeypatch):
+        from unittest.mock import MagicMock
+
+        def boom(pgid, sig):
+            raise ProcessLookupError
+
+        monkeypatch.setattr(os, "killpg", boom)
+
+        fake_proc = self._fake_process()
+        fake_proc.kill = MagicMock(side_effect=ProcessLookupError)
+
+        # Must not raise — a dead group is a no-op, not an error.
+        await ExecTool._kill_process_tree(fake_proc)
+
+    @pytest.mark.asyncio
+    async def test_permission_error_is_swallowed(self, monkeypatch):
+        def boom(pgid, sig):
+            raise PermissionError
+
+        monkeypatch.setattr(os, "killpg", boom)
+
+        # Must not raise — e.g. the pgid was reaped and recycled to a
+        # process we do not own; there is nothing left for us to kill.
+        await ExecTool._kill_process_tree(self._fake_process())
+
