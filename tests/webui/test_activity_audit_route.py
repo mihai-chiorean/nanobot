@@ -84,15 +84,16 @@ def _seed_audit_log(workspace: Path) -> Path:
             result_status="error",
             error="Error: HTTP 500 from upstream",
         ),
-        # 3: guard-blocked tool call -> write side records result_status
-        # "blocked" (AuditLogger.log docstring: blocked when the guard
-        # rejected the call); the feed surfaces it as outcome "refused".
+        # 3: guard-blocked tool call -> the real ToolRegistry writer records
+        # result_status "error" plus error_type "prescreen" for every
+        # prepare_call rejection; the feed surfaces that writer shape as
+        # outcome "refused".
         _audit_line(
             timestamp="2026-09-25T10:00:03+00:00",
             event_type="tool_call",
             tool_name="exec",
             arguments={"command": "printenv | grep TOKEN"},
-            result_status="blocked",
+            result_status="error",
             error_type="prescreen",
             error="Error: refused by safety guard",
         ),
@@ -196,7 +197,7 @@ async def test_owner_token_gets_newest_first_with_pagination(tmp_path: Path) -> 
             "2026-09-25T10:00:03+00:00",
             "2026-09-25T10:00:02+00:00",
         ]
-        assert page2["entries"][0]["outcome"] == "refused"  # guard-blocked ("blocked")
+        assert page2["entries"][0]["outcome"] == "refused"  # writer shape: error/prescreen
         assert page2["entries"][1]["outcome"] == "error"
 
         # Page 3: the LLM row and the first tool row, then the feed is exhausted.
@@ -251,6 +252,67 @@ async def test_llm_entry_projects_kind_and_summary(tmp_path: Path) -> None:
         for row in entries:
             assert set(row) == {"ts", "kind", "tool", "outcome", "summary"}
             assert isinstance(row["summary"], str) and row["summary"]
+    finally:
+        await channel.stop()
+
+
+@pytest.mark.asyncio
+async def test_writer_prescreen_rejection_is_refused(tmp_path: Path) -> None:
+    """The real ``ToolRegistry`` writer records refusals as ``error/prescreen``.
+
+    The owner's live log has those rows and no ``blocked`` rows, so the feed
+    must classify that exact writer shape as a refusal rather than a failure.
+    """
+    from nanobot.agent.tools.audit import AuditLogger
+    from nanobot.agent.tools.base import Tool, ToolResult
+    from nanobot.agent.tools.registry import ToolRegistry
+    from nanobot.agent.tools.schema import StringSchema, tool_parameters_schema
+    from nanobot.channels.websocket.tests.test_websocket_http_routes import _free_port
+
+    class _PrescreenTool(Tool):
+        @property
+        def name(self) -> str:
+            return "exec"
+
+        @property
+        def description(self) -> str:
+            return "test tool rejected by the safety guard"
+
+        @property
+        def parameters(self) -> dict:
+            return tool_parameters_schema(command=StringSchema("command"), required=["command"])
+
+        async def execute(self, **kwargs: Any) -> ToolResult:
+            return ToolResult.error("Error: Command blocked by safety guard (dangerous pattern detected)")
+
+    workspace = tmp_path / "prescreen-ws"
+    workspace.mkdir()
+    registry = ToolRegistry()
+    registry.register(_PrescreenTool())
+    registry.set_audit_logger(AuditLogger(workspace / "audit.jsonl"))
+    await registry.execute(
+        "exec",
+        {"command": "rm -rf /scratch"},
+        session_id="websocket:tester",
+        channel="websocket",
+    )
+
+    written = json.loads((workspace / "audit.jsonl").read_text(encoding="utf-8").strip())
+    assert written["result_status"] == "error"
+    assert written["error_type"] == "prescreen"
+
+    sessions = SessionManager(workspace)
+    port = _free_port()
+    channel = _channel(sessions, port, workspace)
+    try:
+        token = channel.gateway.tokens.issue_api_token(300)
+        response = await _get(channel, port, "/api/activity/audit", token=token)
+        assert response.status_code == 200, response.content
+        entries = response.json()["entries"]
+        assert len(entries) == 1
+        assert entries[0]["tool"] == "exec"
+        assert entries[0]["outcome"] == "refused"
+        assert "dangerous pattern detected" in entries[0]["summary"]
     finally:
         await channel.stop()
 
