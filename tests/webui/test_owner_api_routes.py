@@ -31,6 +31,8 @@ from nanobot.bus.queue import MessageBus
 from nanobot.channels.websocket.rooms import SharedRoomStore
 from nanobot.channels.websocket.runtime import WebSocketChannel, WebSocketConfig
 from nanobot.channels.websocket.transport import TransportRequest
+from nanobot.config.loader import load_config, save_config
+from nanobot.config.schema import Config
 from nanobot.session.manager import SessionManager
 from nanobot.webui.gateway_services import build_gateway_services
 
@@ -411,44 +413,39 @@ async def test_model_switch_get_is_method_not_allowed(env: Any) -> None:
 # ---------------------------------------------------------------------------
 
 
-class _Provider:
-    api_key = "sk-test-secret-DO-NOT-LEAK"
+OWNER_OPENAI_KEY = "sk-owner-pool-secret-DO-NOT-LEAK"
+OWNER_ANTHROPIC_KEY = "sk-anthropic-secret-DO-NOT-LEAK"
 
 
-class _Defaults:
-    def __init__(self) -> None:
-        self.model = "openai/gpt-4o"
-        self.provider = "openai"
+def _seed_config(config_path: Path) -> None:
+    """Write a real on-disk config through the production loader.
 
-
-class _Agents:
-    def __init__(self) -> None:
-        self.defaults = _Defaults()
-
-
-class _ProviderConfig:
-    def __init__(self) -> None:
-        self.api_key = _Provider.api_key
-
-
-class _FakeConfig:
-    def __init__(self) -> None:
-        self.agents = _Agents()
-
-    def get_provider_name(self, model: str | None = None) -> str:
-        return "openai"
-
-    def get_provider(self, model: str | None = None) -> _ProviderConfig:
-        return _ProviderConfig()
+    ``update_agent_settings`` (shared with the WebSocket
+    ``settings.agent.update`` path) loads/saves via ``load_config``/
+    ``save_config`` with no explicit path, so the tests pin those seams to
+    *config_path* (same pattern as ``tests/webui/test_settings_api.py``).
+    The payload's ``providers`` rows carry only metadata (``has_api_key``
+    booleans, hints) -- never the key values, which is why the secrets below
+    are safe to seed and are asserted absent from every body.
+    """
+    seed = Config()
+    seed.agents.defaults.model = "openai/gpt-4o"
+    seed.agents.defaults.provider = "openai"
+    seed.providers.openai.api_key = OWNER_OPENAI_KEY
+    seed.providers.anthropic.api_key = OWNER_ANTHROPIC_KEY
+    save_config(seed, config_path)
 
 
 @pytest.fixture
 def config_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
-    """Isolate config to a temp dir with a fake loader (no global mutation).
+    """Isolate the default config path to a temp dir; spy on saves.
 
-    The fake's ``agents.defaults`` is a stable object, so the route's
-    read-modify-write is observable across the two load_config calls the
-    handler makes (its own + ``_settings_payload``'s).
+    The route now runs the shared ``settings_api.update_agent_settings``
+    editor, which resolves the default config path when the caller passes no
+    explicit path -- exactly what the production HTTP call does, so the tests
+    exercise the same path resolution while keeping every write inside
+    *tmp_path*. The save spy wraps the real writer (which the seam patch
+    would otherwise replace) so ``save`` counts are observed, not stubbed.
     """
     sessions = SessionManager(tmp_path)
     sessions.get_or_create(f"websocket:{OWNER_CHAT}")
@@ -456,32 +453,41 @@ def config_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
     channel = _build(tmp_path, sessions)
     token = channel.gateway.http.tokens.issue_api_token(60)
 
-    fake = _FakeConfig()
-    saved: list[_FakeConfig] = []
+    config_path = tmp_path / "config.json"
+    _seed_config(config_path)
+    monkeypatch.setattr("nanobot.config.loader._current_config_path", config_path)
 
-    def fake_load(_path: Any = None) -> _FakeConfig:
-        return fake
+    from nanobot.webui import settings_api as settings_api_module
 
-    def fake_save(cfg: Any, _path: Any = None) -> None:
-        saved.append(cfg)
+    real_save = settings_api_module.save_config
+    calls: list[Any] = []
 
-    monkeypatch.setattr("nanobot.config.loader.load_config", fake_load)
-    monkeypatch.setattr("nanobot.config.loader.save_config", fake_save)
-    monkeypatch.setattr(
-        "nanobot.config.loader.get_config_path", lambda: tmp_path / "config.json"
-    )
+    def spy_save(config: Any, config_path_arg: Any = None) -> None:
+        calls.append(config)
+        real_save(config, config_path_arg)
+
+    monkeypatch.setattr(settings_api_module, "save_config", spy_save)
     # Keep the nested model_runtime status read off any real user file.
     monkeypatch.setattr(
         "nanobot.model_runtime.read_status",
         lambda: {"status": "unknown", "active_model": None, "state_path": "/x"},
     )
-    return channel, token, fake, saved
+    return channel, token, config_path, calls
 
 
 @pytest.mark.asyncio
 async def test_settings_update_writes_model_and_returns_payload(config_env: Any) -> None:
-    """Acceptance (4): owner save -> 200, defaults.model updated, saved once."""
-    channel, token, fake, saved = config_env
+    """Acceptance (4): owner save -> 200, persisted, client-decodable payload.
+
+    The edit goes through the shared ``update_agent_settings`` editor, so a
+    model/provider change alone is ``requires_restart: False`` (the restart
+    hint belongs to runtime-section edits) and the payload carries every key
+    the web/iOS clients decode: ``agent{model,provider,resolved_provider,
+    has_api_key}``, ``providers[{name,label}]``, ``runtime.config_path`` plus
+    the injected ``model_runtime`` status. Configured API keys stay off the
+    wire -- only ``has_api_key`` booleans are serialized.
+    """
+    channel, token, config_path, calls = config_env
     response = await _dispatch(
         channel,
         _request(
@@ -493,51 +499,67 @@ async def test_settings_update_writes_model_and_returns_payload(config_env: Any)
     assert response.status_code == 200, _text(response)
     payload = _body(response)
     assert payload["agent"]["model"] == "anthropic/claude-opus-4"
-    assert fake.agents.defaults.model == "anthropic/claude-opus-4"
-    assert saved == [fake]  # persisted exactly once
-    assert payload["requires_restart"] is True  # a change was made
-    assert "model_runtime" in payload
+    assert payload["agent"]["provider"] == "anthropic"
+    assert payload["agent"]["resolved_provider"] == "anthropic"
+    assert payload["agent"]["has_api_key"] is True
+    assert all({"name" in row and "label" in row for row in payload["providers"]})
+    assert payload["runtime"]["config_path"] == str(config_path.expanduser())
+    assert payload["model_runtime"] == {
+        "status": "unknown",
+        "active_model": None,
+        "state_path": "/x",
+    }
+    assert payload["requires_restart"] is False  # a model change alone needs no restart
+    assert len(calls) == 1  # persisted exactly once
+    reloaded = load_config(config_path)
+    assert reloaded.agents.defaults.model == "anthropic/claude-opus-4"
+    assert reloaded.agents.defaults.provider == "anthropic"
+    text = _text(response)
+    assert OWNER_OPENAI_KEY not in text
+    assert OWNER_ANTHROPIC_KEY not in text
 
 
 @pytest.mark.parametrize("verb", ["GET", "POST"])
 @pytest.mark.asyncio
 async def test_settings_update_accepts_both_verbs(config_env: Any, verb: str) -> None:
     """Production serves GET and POST alike (delete is folded elsewhere)."""
-    channel, token, _fake, _saved = config_env
+    channel, token, _config_path, _calls = config_env
     response = await _dispatch(
         channel,
-        _request("/api/settings/update?model=openai%2Fgpt-4o", method=verb, token=token),
+        _request("/api/settings/update?model=openai%2Fgpt-5", method=verb, token=token),
     )
     assert response.status_code == 200, _text(response)
+    assert _body(response)["agent"]["model"] == "openai/gpt-5"
 
 
 @pytest.mark.asyncio
 async def test_settings_update_no_change_is_not_saved(config_env: Any) -> None:
     """Negative control: re-saving the current model does not touch save_config."""
-    channel, token, fake, saved = config_env
-    same = fake.agents.defaults.model  # 'openai/gpt-4o'
+    channel, token, _config_path, calls = config_env
     response = await _dispatch(
         channel,
-        _request(f"/api/settings/update?model={same}", method="POST", token=token),
+        _request("/api/settings/update?model=openai%2Fgpt-4o", method="POST", token=token),
     )
     assert response.status_code == 200
-    assert saved == []  # nothing written
+    assert calls == []  # nothing written
     assert _body(response)["requires_restart"] is False
 
 
 @pytest.mark.asyncio
 async def test_settings_update_empty_model_is_400_and_not_saved(config_env: Any) -> None:
-    channel, token, _fake, saved = config_env
+    """The shared editor rejects a blank model (``model is required``)."""
+    channel, token, _config_path, calls = config_env
     response = await _dispatch(
         channel, _request("/api/settings/update?model=", method="POST", token=token)
     )
     assert response.status_code == 400
-    assert saved == []
+    assert calls == []
 
 
 @pytest.mark.asyncio
 async def test_settings_update_unknown_provider_is_400(config_env: Any) -> None:
-    channel, token, _fake, saved = config_env
+    """The shared editor's provider resolution rejects an unknown name."""
+    channel, token, config_path, calls = config_env
     response = await _dispatch(
         channel,
         _request(
@@ -547,28 +569,34 @@ async def test_settings_update_unknown_provider_is_400(config_env: Any) -> None:
         ),
     )
     assert response.status_code == 400
-    assert saved == []
+    assert calls == []
+    # The aborted request must not have persisted the partially-applied edit.
+    assert load_config(config_path).agents.defaults.provider == "openai"
 
 
 @pytest.mark.asyncio
 async def test_settings_update_provider_omitted_keeps_explicit(config_env: Any) -> None:
     """Omitting provider must not overwrite an explicit stored provider."""
-    channel, token, fake, saved = config_env
-    before = fake.agents.defaults.provider
+    channel, token, config_path, calls = config_env
     response = await _dispatch(
         channel,
         _request("/api/settings/update?model=deepseek%2Fdeepseek-chat", method="POST", token=token),
     )
     assert response.status_code == 200
-    assert fake.agents.defaults.provider == before  # unchanged
-    assert len(saved) == 1  # saved once for the model change
+    reloaded = load_config(config_path)
+    assert reloaded.agents.defaults.provider == "openai"  # unchanged
+    assert reloaded.agents.defaults.model == "deepseek/deepseek-chat"
+    assert len(calls) == 1  # saved once for the model change
 
 
 @pytest.mark.asyncio
 async def test_settings_update_auto_updates_pinned_provider(config_env: Any) -> None:
     """An explicit non-auto provider reconciles with provider='auto'."""
-    channel, token, fake, saved = config_env
-    fake.agents.defaults.provider = "openai"
+    channel, token, config_path, calls = config_env
+    pinned = load_config(config_path)
+    pinned.agents.defaults.provider = "anthropic"
+    save_config(pinned, config_path)
+    calls.clear()  # the reseed above used the real writer, not the route
     response = await _dispatch(
         channel,
         _request(
@@ -578,13 +606,13 @@ async def test_settings_update_auto_updates_pinned_provider(config_env: Any) -> 
         ),
     )
     assert response.status_code == 200
-    assert fake.agents.defaults.provider == "auto"
-    assert len(saved) == 1
+    assert load_config(config_path).agents.defaults.provider == "auto"
+    assert len(calls) == 1
 
 
 @pytest.mark.asyncio
 async def test_settings_update_refuses_room_credential(config_env: Any) -> None:
-    channel, _token, _fake, _saved = config_env
+    channel, _token, _config_path, calls = config_env
     store = SharedRoomStore(channel.gateway.session_manager, token_ttl_s=300)
     room_token, _credential = store.mint(
         room_id=ROOM_ID,
@@ -598,6 +626,7 @@ async def test_settings_update_refuses_room_credential(config_env: Any) -> None:
         _request("/api/settings/update?model=x%2Fy", method="POST", token=room_token),
     )
     assert response.status_code == 401
+    assert calls == []  # refused before any settings work
 
 
 @pytest.mark.asyncio
@@ -611,12 +640,9 @@ async def test_settings_update_ignores_the_trusted_proxy_shortcut(
     """
     sessions = SessionManager(tmp_path)
     sessions.save(sessions.get_or_create(f"websocket:{OWNER_CHAT}"), fsync=True)
-    fake = _FakeConfig()
-    monkeypatch.setattr("nanobot.config.loader.load_config", lambda _p=None: fake)
-    monkeypatch.setattr("nanobot.config.loader.save_config", lambda *_a: None)
-    monkeypatch.setattr(
-        "nanobot.config.loader.get_config_path", lambda: tmp_path / "config.json"
-    )
+    config_path = tmp_path / "config.json"
+    _seed_config(config_path)
+    monkeypatch.setattr("nanobot.config.loader._current_config_path", config_path)
     monkeypatch.setattr(
         "nanobot.model_runtime.read_status",
         lambda: {"status": "unknown", "active_model": None, "state_path": "/x"},
@@ -627,13 +653,16 @@ async def test_settings_update_ignores_the_trusted_proxy_shortcut(
     response = await _dispatch(channel, proxied)
     assert getattr(proxied, "_nanobot_trusted_proxy_authenticated", False) is True
     assert response.status_code == 401
+    # Refused outright: the on-disk config still holds the seeded model.
+    assert load_config(config_path).agents.defaults.model == "openai/gpt-4o"
 
 
 @pytest.mark.asyncio
 async def test_settings_update_requires_owner_token(config_env: Any) -> None:
-    channel, _token, _fake, _saved = config_env
+    channel, _token, _config_path, calls = config_env
     response = await _dispatch(
         channel, _request("/api/settings/update?model=x%2Fy", method="POST")
     )
     assert response.status_code == 401
     assert _text(response) == "Unauthorized"
+    assert calls == []

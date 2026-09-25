@@ -1956,89 +1956,36 @@ class GatewayHTTPHandler:
         """``GET``/``POST /api/settings/update`` -- edit the default model.
 
         0.3.0 parity with production's ``_handle_settings_update``: the web
-        Settings save (and the iOS default-model picker) post ``model``
-        and/or ``provider`` here with the owner API bearer. ``model`` is
-        required when present and must be non-blank; ``provider`` must resolve
-        via :func:`find_by_name` unless it is ``auto`` -- the validations
-        production performs (read from ``git show`` of the cited commit, not
-        guessed). The change is persisted with ``save_config`` and the response
-        is production's ``_settings_payload`` shape (``agent``/``providers``/
-        ``runtime``/``model_runtime``/``requires_restart``), which the clients
-        decode whole -- a missing key would ``fatal`` their decode, so the
-        nested ``model_runtime`` status is included even though it costs a
-        state-file read. The rich WebUI settings surface is served separately by
+        Settings save (and the iOS default-model picker) pass ``model``
+        and/or ``provider`` here with the owner API bearer. The edit runs
+        through the same :func:`settings_api.update_agent_settings` editor the
+        authenticated WebSocket ``settings.agent.update`` mutation already uses,
+        so both paths share one validation and persistence implementation
+        (preset checks, provider resolution and the restart hint all live
+        there); a user-facing :class:`WebUISettingsError` maps to its own
+        status -- 400 for the model/provider validation failures this route
+        can produce. The response is that editor's payload, which carries the
+        keys the web/iOS clients decode whole (``agent``, ``providers``,
+        ``runtime.config_path``, ``requires_restart``; the API key itself is
+        never serialized), plus the nested ``model_runtime`` status the
+        clients require -- read after the edit so the snapshot reflects it.
+        The rich WebUI settings surface is served separately by
         ``GET /api/settings`` and is not disturbed; the WebSocket
         ``settings.agent.update`` mutation reaches the same editor through
         ``dispatch_webui_mutation`` and does not pass through this route.
         """
         if not self.tokens.check_api_token(request):
             return _http_error(401, "Unauthorized")
-        from nanobot.config.loader import load_config, save_config
-        from nanobot.providers.registry import find_by_name
-
-        query = _parse_query(request.path)
-        config = load_config()
-        defaults = config.agents.defaults
-        changed = False
-
-        model = _query_first(query, "model")
-        if model is not None:
-            model = model.strip()
-            if not model:
-                return _http_error(400, "model is required")
-            if defaults.model != model:
-                defaults.model = model
-                changed = True
-
-        provider = _query_first(query, "provider")
-        if provider is not None:
-            provider = provider.strip() or "auto"
-            if provider != "auto" and find_by_name(provider) is None:
-                return _http_error(400, "unknown provider")
-            if defaults.provider != provider:
-                defaults.provider = provider
-                changed = True
-
-        if changed:
-            save_config(config)
-        return _http_json_response(self._settings_payload(requires_restart=changed))
-
-    def _settings_payload(self, *, requires_restart: bool = False) -> dict[str, Any]:
-        """The settings snapshot ``/api/settings/update`` returns (production shape).
-
-        Ported from production's ``_settings_payload`` so the settings-save
-        response carries the keys the web/iOS clients decode whole: ``agent``
-        (model/provider/resolved_provider/has_api_key), ``providers``,
-        ``runtime.config_path``, ``model_runtime`` and ``requires_restart``. The
-        API key itself is never serialized -- only the ``has_api_key`` boolean.
-        """
-        from nanobot.config.loader import get_config_path, load_config
         from nanobot.model_runtime import read_status
-        from nanobot.providers.registry import PROVIDERS, find_by_name
+        from nanobot.webui.settings_api import update_agent_settings
+        from nanobot.webui.settings_contracts import WebUISettingsError
 
-        config = load_config()
-        defaults = config.agents.defaults
-        provider_name = config.get_provider_name(defaults.model) or defaults.provider
-        provider = config.get_provider(defaults.model)
-        selected_provider = provider_name
-        if defaults.provider != "auto":
-            spec = find_by_name(defaults.provider)
-            selected_provider = spec.name if spec else provider_name
-        return {
-            "agent": {
-                "model": defaults.model,
-                "provider": selected_provider,
-                "resolved_provider": provider_name,
-                "has_api_key": bool(provider and provider.api_key),
-            },
-            "providers": [{"name": "auto", "label": "Auto"}]
-            + [{"name": spec.name, "label": spec.label} for spec in PROVIDERS],
-            "runtime": {
-                "config_path": str(get_config_path().expanduser()),
-            },
-            "model_runtime": read_status(),
-            "requires_restart": requires_restart,
-        }
+        try:
+            payload = update_agent_settings(_parse_query(request.path))
+        except WebUISettingsError as exc:
+            return _http_error(exc.status, exc.message)
+        payload["model_runtime"] = read_status()
+        return _http_json_response(payload)
 
     def _handle_workspaces(self, connection: Any, request: WsRequest) -> Response:
         if not self.check_api_token(request):
