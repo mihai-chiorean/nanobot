@@ -2518,10 +2518,13 @@ _AUDIT_TOOL_NAME_MAX_CHARS = 80
 _AUDIT_TS_MAX_CHARS = 128
 
 # Wire outcomes of the owner-facing feed. The audit writer records
-# ``result_status`` on tool rows (``ok`` / ``error``; ``AuditLogger.log``
-# documents ``blocked`` for safety-guard rejections, and the approval flow
-# adds refusals). Anything unrecognised degrades to ``error`` -- never to
-# ``ok``, so an unreadable status can not masquerade as a successful action.
+# ``result_status`` on tool rows (``ok`` / ``error``; ``ToolRegistry.execute``
+# audits safety-guard, room-policy, scheduled-``ask_user`` and read-only
+# refusals as ``error`` with ``error_type="prescreen"``, while the approval
+# flow uses expired statuses). ``AuditLogger.log`` also accepts legacy
+# ``blocked``/``refused``/``denied`` statuses. Anything unrecognised degrades
+# to ``error`` -- never to ``ok``, so an unreadable status can not masquerade
+# as a successful action.
 _AUDIT_OUTCOME_BY_STATUS: dict[str, str] = {
     "ok": "ok",
     "success": "ok",
@@ -2623,8 +2626,14 @@ def _audit_activity_entry(entry: dict[str, Any]) -> dict[str, Any]:
         if isinstance(tool_name, str) and tool_name.strip()
         else "tool"
     )
-    status = entry.get("result_status")
-    outcome = _AUDIT_OUTCOME_BY_STATUS.get(status.casefold() if isinstance(status, str) else "", "error")
+    error_type = entry.get("error_type")
+    if isinstance(error_type, str) and error_type.casefold() == "prescreen":
+        outcome = "refused"
+    else:
+        status = entry.get("result_status")
+        outcome = _AUDIT_OUTCOME_BY_STATUS.get(
+            status.casefold() if isinstance(status, str) else "", "error"
+        )
     summary = f"Tool {tool}"
     arguments = entry.get("arguments")
     if isinstance(arguments, dict) and arguments:
