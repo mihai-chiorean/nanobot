@@ -115,6 +115,76 @@ _UNRESOLVABLE_HOST_NOTE = (
     "reach it and ask for the correct URL."
 )
 
+# MIT-1397: a whole-word `..` (delimited by start/end, whitespace or a shell
+# separator/redirection/quote) is a path component, not a name: `cd ..` and
+# `cat <>..` resolve exactly like `cd ../`. A dot pair glued to a word
+# character on either side (`a..b`, `v1..v2`, `...`) is not, so those keep
+# passing; `../` and `..\` stay covered by the literal substring checks.
+#
+# PR #85 review round 2: the left-hand class also admits `=`, so an assignment
+# of a bare traversal (`D=..; cd $D`, verified reaching the parent with
+# `bash -c`) is caught on the raw text, where the `..` sits directly after the
+# `=`. The value side of an assignment is not a shell word boundary, which is
+# why this is a left-hand-only extension: adding `=` to the right-hand class
+# would flag `echo ..=foo` / `cat f..=g`, where a dotted word merely precedes
+# an `=` and bash performs no traversal at all.
+_BARE_PARENT_WORD_RE = re.compile(
+    r"(?:^|[ \t\r\n;|&(<>\"'=])\.\.(?:$|[ \t\r\n;|&)<>\"'])"
+)
+
+# Quotes/backslashes removed to build the guard's *second* look at the command,
+# so a traversal reassembled by the shell (`./x` -> `../x` after the shell drops
+# the quotes/backslashes) is visible to the whole-word scan above. This copy is
+# only ever an additional input -- the raw command is still scanned unchanged and
+# nothing is stripped from the value that is executed -- so over-stripping a
+# command that was never a traversal is harmless (it can only reveal a `..` the
+# raw scan would already have caught, never hide one).
+_QUOTE_OR_BACKSLASH_RE = re.compile(r"[\"'\\]")
+
+
+def _bare_parent_referred_to(command: str) -> bool:
+    """True when a whole-word ``..`` is present, on the raw or de-quoted text.
+
+    Two views are scanned: the command as written, and a copy with the quote and
+    escape characters removed, which is how bash reassembles ``./x`` once the
+    quotes are gone. The second view is what closes the quoting/escaping escapes
+    the raw scan can not see (``cd .''.;``, ``cd \\..``, ``D=..; cd $D``); it is
+    additive -- a command blocked here was already blockable on the raw text or
+    is a genuine reassembly, never a false positive on ordinary input.
+    """
+    if _BARE_PARENT_WORD_RE.search(command):
+        return True
+    dequoted = _QUOTE_OR_BACKSLASH_RE.sub("", command)
+    if dequoted != command and _BARE_PARENT_WORD_RE.search(dequoted):
+        return True
+    return False
+
+
+def _param_expansion_has_path(command: str) -> bool:
+    """True when a ``${...}`` body in *command* contains a slash.
+
+    The guard cannot resolve what an expansion expands to, so a body that
+    carries a path (``${X:-/etc}``, ``${X#/etc}``) is rejected fail-closed
+    before any literal extraction runs. Braces are tracked by depth so a
+    nested ``${a:-${b}}`` is measured against its own closing brace, and an
+    unterminated ``${`` is treated as reaching the end of the command.
+    """
+    start = command.find("${")
+    while start >= 0:
+        depth = 1
+        pos = start + 2
+        while pos < len(command) and depth:
+            if command[pos] == "{":
+                depth += 1
+            elif command[pos] == "}":
+                depth -= 1
+            pos += 1
+        body = command[start + 2 : pos - 1] if depth == 0 else command[start + 2 :]
+        if "/" in body:
+            return True
+        start = command.find("${", start + 2)
+    return False
+
 
 class ExecToolConfig(Base):
     """Shell exec tool configuration."""
@@ -1042,6 +1112,34 @@ class ExecTool(Tool):
             if "..\\" in cmd or "../" in cmd:
                 return ToolResult.error(
                     "Error: Command blocked by safety guard (path traversal detected)"
+                    + _WORKSPACE_BOUNDARY_NOTE
+                )
+
+            # The traversal scan above only sees `../` / `..\`, so a bare `..`
+            # followed by a delimiter (`cd ..; cd ..; cat etc/passwd`) walked
+            # the tenant up one level per pair with no slash for the scan to
+            # find. The shell resolves such a word against the cwd exactly
+            # like `../`, so it is rejected as a whole word; names that merely
+            # contain dots (`a..b`, `...`, `foo..txt`) are not whole words and
+            # keep passing. The scan runs on both the raw command and a copy
+            # with quotes/backslashes removed, so a traversal the shell only
+            # reassembles after de-quoting (`cd .''.;`, `cd \..`, `D=..; cd $D`)
+            # is caught too.
+            if _bare_parent_referred_to(cmd):
+                return ToolResult.error(
+                    "Error: Command blocked by safety guard (path traversal detected)"
+                    + _WORKSPACE_BOUNDARY_NOTE
+                )
+
+            # A `${...}` expansion whose body carries a slash (`${X:-/etc}`,
+            # `${X#/etc}`) materialises a path only at run time, so no literal
+            # ever reaches the checks above and the word is otherwise opaque.
+            # Fail closed on the shape instead of trusting the value; bodies
+            # without a slash (`${path}`, `${#ref}`) stay allowed, and text
+            # *after* the closing brace is not body material.
+            if _param_expansion_has_path(cmd):
+                return ToolResult.error(
+                    "Error: Command blocked by safety guard (path outside working dir)"
                     + _WORKSPACE_BOUNDARY_NOTE
                 )
 
