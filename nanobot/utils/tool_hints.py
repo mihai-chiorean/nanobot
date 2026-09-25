@@ -13,6 +13,7 @@ _TOOL_FORMATS: dict[str, tuple[list[str], str, bool, bool]] = {
     "read_file":  (["path", "file_path"],              "read {}",     True,  False),
     "write_file": (["path", "file_path"],              "write {}",    True,  False),
     "edit":       (["file_path", "path"],              "edit {}",     True,  False),
+    "glob":       (["pattern"],                        'glob "{}"',   False, False),
     "find_files": (["query", "glob", "path"],           "find {}",     False, False),
     "grep":       (["pattern"],                        'grep "{}"',   False, False),
     "exec":       (["command"],                        "$ {}",        False, True),
@@ -45,6 +46,14 @@ def format_tool_hints(tool_calls: list[ToolCallRequest], max_length: int = 40) -
         if not isinstance(name, str) or not name:
             # Degenerate/malformed tool call (e.g. a model emits name=None);
             # skip it instead of raising AttributeError on the whole turn.
+            continue
+        if name == "briefing":
+            formatted.append({
+                "inspect": "Checking your briefing", "create": "Creating your briefing",
+                "update": "Updating future editions", "pause": "Pausing your briefing",
+                "resume": "Resuming your briefing", "regenerate": "Requesting a new edition",
+                "feedback": "Saving edition feedback",
+            }.get(_get_args(tc).get("action"), "Checking your briefing"))
             continue
         fmt = _TOOL_FORMATS.get(name)
         if fmt:
