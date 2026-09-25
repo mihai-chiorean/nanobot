@@ -38,6 +38,7 @@ from nanobot.session.session_handles import (
 )
 from nanobot.triggers.local_types import LocalTrigger
 from nanobot.utils.activity_history import project_activity_history
+from nanobot.utils.sensitive import redact_if_sensitive
 from nanobot.webui.automation_results import cron_run_response, trigger_run_response
 from nanobot.webui.file_preview import (
     WebUIFilePreviewError,
@@ -1040,6 +1041,71 @@ class GatewayHTTPHandler:
         )
         return _http_json_response({"results": results})
 
+    async def _handle_activity_audit(self, request: WsRequest) -> Response:
+        """``GET /api/activity/audit?limit=N&before=<cursor>`` -- owner-only tester feed (MIT-1450).
+
+        The workspace's own ``audit.jsonl`` -- the :class:`AuditLogger` the
+        agent loop attaches at its workspace root (MIT-1401) -- rendered as a
+        readable activity feed, the way Go.AI shows testers every action
+        including refusals. Newest entries first; ``before`` is an opaque
+        cursor (the position of the oldest entry already returned) into the
+        parsed log. Because the log is append-only, positions of existing
+        entries never shift, so pages stay stable while new rows land.
+
+        Each entry carries ``ts``, ``kind`` (``tool`` / ``llm``), ``tool``,
+        ``outcome`` (``ok`` / ``error`` / ``refused`` / ``approval_expired``)
+        and a short human summary. Raw arguments and results never leave the
+        process: the argument map and error text are flattened, passed through
+        the shared ``redact_if_sensitive`` screen and truncated before
+        rendering. Unparsable lines are skipped; ``limit`` is capped at 200.
+
+        Auth is the owner API token itself (``tokens.check_api_token``), never
+        the trusted-proxy shortcut in ``check_api_token``: a proxied request
+        with no owner token (a room guest whose room credential fell through)
+        gets 401. Room credentials (``nbrt_``, a distinct audience in the
+        shared-room store) are refused the same way -- a guest must never read
+        the owner's audit trail through this route.
+        """
+        if not self.tokens.check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        query = _parse_query(request.path)
+        limit = _AUDIT_ACTIVITY_DEFAULT_LIMIT
+        raw_limit = _query_first(query, "limit")
+        if raw_limit not in (None, ""):
+            try:
+                limit = int(raw_limit)
+            except ValueError:
+                return _http_error(400, "limit must be an integer")
+            if limit < 1:
+                return _http_error(400, "limit must be >= 1")
+            limit = min(limit, _AUDIT_ACTIVITY_MAX_LIMIT)
+        before: int | None = None
+        raw_before = _query_first(query, "before")
+        if raw_before not in (None, ""):
+            try:
+                before = int(raw_before)
+            except ValueError:
+                return _http_error(400, "before must be an integer")
+            if before < 0:
+                return _http_error(400, "before must be >= 0")
+        # ``skills_workspace_path`` is the runtime's workspace root as handed
+        # to build_gateway_services (manager.py passes config.workspace_path,
+        # the same value AgentLoop uses for its AuditLogger), so this is the
+        # *own* workspace's log -- never another tenant's.
+        log_path = self.skills_workspace_path / _AUDIT_LOG_FILENAME
+        entries = await asyncio.to_thread(_read_workspace_audit_entries, log_path)
+        upper = len(entries) if before is None else min(before, len(entries))
+        lower = max(0, upper - limit)
+        page = [_audit_activity_entry(entry) for entry in reversed(entries[lower:upper])]
+        return _http_json_response(
+            {
+                "entries": page,
+                "next_cursor": str(lower) if lower > 0 else None,
+                "has_more": lower > 0,
+            },
+            extra_headers=_NO_STORE_HEADERS,
+        )
+
     async def _handle_webui_thread_get_async(self, request: WsRequest, key: str) -> Response:
         diagnostics = _WebUIThreadDiagnostics()
         loop = asyncio.get_running_loop()
@@ -1815,6 +1881,10 @@ class GatewayHTTPHandler:
             if getattr(request, "method", "GET") != "GET":
                 return _http_error(405, "Method Not Allowed")
             return await self._handle_conversation_search(request)
+        if got == "/api/activity/audit":
+            if getattr(request, "method", "GET") != "GET":
+                return _http_error(405, "Method Not Allowed")
+            return await self._handle_activity_audit(request)
         if got == "/api/activity":
             if getattr(request, "method", "GET") != "GET":
                 return _http_error(405, "Method Not Allowed")
@@ -2589,6 +2659,158 @@ def _conversation_search_row(
     if isinstance(timestamp, str) and timestamp:
         result["timestamp"] = timestamp
     return result
+
+
+# -- Tester activity feed (MIT-1450) -------------------------------------------
+
+_AUDIT_LOG_FILENAME = "audit.jsonl"
+_AUDIT_ACTIVITY_DEFAULT_LIMIT = 50
+_AUDIT_ACTIVITY_MAX_LIMIT = 200
+_AUDIT_SUMMARY_ARG_CHARS = 80
+_AUDIT_TOOL_NAME_MAX_CHARS = 80
+_AUDIT_TS_MAX_CHARS = 128
+
+# Wire outcomes of the owner-facing feed. The audit writer records
+# ``result_status`` on tool rows (``ok`` / ``error``; ``ToolRegistry.execute``
+# audits safety-guard, room-policy, scheduled-``ask_user`` and read-only
+# refusals as ``error`` with ``error_type="prescreen"``, while the approval
+# flow uses expired statuses). ``AuditLogger.log`` also accepts legacy
+# ``blocked``/``refused``/``denied`` statuses. Anything unrecognised degrades
+# to ``error`` -- never to ``ok``, so an unreadable status can not masquerade
+# as a successful action.
+_AUDIT_OUTCOME_BY_STATUS: dict[str, str] = {
+    "ok": "ok",
+    "success": "ok",
+    "error": "error",
+    "failed": "error",
+    "blocked": "refused",
+    "refused": "refused",
+    "denied": "refused",
+    "approval_expired": "approval_expired",
+    "expired": "approval_expired",
+}
+
+
+def _read_workspace_audit_entries(log_path: Path) -> list[dict[str, Any]]:
+    """Parse ``<workspace>/audit.jsonl`` chronologically, skipping bad lines.
+
+    A missing/unreadable log is an empty feed (the workspace simply has no
+    recorded activity yet), never an error. Lines that are not JSON objects
+    are dropped so one corrupt row cannot hide every action around it.
+    """
+    try:
+        raw = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    entries: list[dict[str, Any]] = []
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            parsed = json.loads(stripped)
+        except ValueError:
+            continue
+        if isinstance(parsed, dict):
+            entries.append(cast("dict[str, Any]", parsed))
+    return entries
+
+
+def _redact_activity_snippet(value: str, *, limit: int = _AUDIT_SUMMARY_ARG_CHARS) -> str:
+    """Single-line, secret-screened, length-capped snippet for the feed."""
+    text = " ".join(str(value).split())
+    text = redact_if_sensitive(text)
+    if len(text) > limit:
+        text = text[: max(0, limit - 3)].rstrip() + "..."
+    return text
+
+
+def _clean_activity_field(value: Any, *, limit: int) -> str:
+    """Collapse an untrusted audit-log string into a bounded printable line.
+
+    The log file is server-side data, but defence in depth: control characters
+    (which would let a stored value forge a visual log line in a terminal
+    renderer) and over-long values are neutralised before reaching a client.
+    """
+    text = " ".join(str(value).split())
+    text = "".join(ch for ch in text if ch.isprintable() or ch in {" ", "\t"})
+    text = text.strip()
+    if len(text) > limit:
+        text = text[: max(0, limit - 3)].rstrip() + "..."
+    return text
+
+
+def _audit_activity_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    """Project one raw audit row onto the owner-facing activity entry shape.
+
+    Only the timestamp, kind, actor name, outcome and a redacted summary
+    leave the process -- never raw argument or result payloads (MIT-122
+    redaction discipline applies verbatim to the audit log: the writer's
+    field-name screen misses free-text secrets in ``command``-style values,
+    so the summary is put through :func:`redact_if_sensitive` as well).
+    """
+    if entry.get("event_type") == "llm_call":
+        model = entry.get("model")
+        model_text = (
+            _clean_activity_field(model, limit=_AUDIT_TOOL_NAME_MAX_CHARS)
+            if isinstance(model, str) and model.strip()
+            else "model call"
+        )
+        summary = f"LLM call: {model_text}"
+        tokens_in = entry.get("tokens_in")
+        tokens_out = entry.get("tokens_out")
+        if isinstance(tokens_in, (int, float)) and isinstance(tokens_out, (int, float)):
+            summary += f" ({int(tokens_in)} in / {int(tokens_out)} out)"
+        timestamp = entry.get("timestamp")
+        return {
+            "ts": (
+                _clean_activity_field(timestamp, limit=_AUDIT_TS_MAX_CHARS)
+                if isinstance(timestamp, str)
+                else ""
+            ),
+            "kind": "llm",
+            "tool": None,
+            "outcome": "ok",
+            "summary": " ".join(redact_if_sensitive(summary).split())[:400],
+        }
+    tool_name = entry.get("tool_name")
+    tool = (
+        _clean_activity_field(tool_name, limit=_AUDIT_TOOL_NAME_MAX_CHARS)
+        if isinstance(tool_name, str) and tool_name.strip()
+        else "tool"
+    )
+    error_type = entry.get("error_type")
+    if isinstance(error_type, str) and error_type.casefold() == "prescreen":
+        outcome = "refused"
+    else:
+        status = entry.get("result_status")
+        outcome = _AUDIT_OUTCOME_BY_STATUS.get(
+            status.casefold() if isinstance(status, str) else "", "error"
+        )
+    summary = f"Tool {tool}"
+    arguments = entry.get("arguments")
+    if isinstance(arguments, dict) and arguments:
+        arguments_map = cast("dict[str, Any]", arguments)
+        try:
+            rendered = json.dumps(arguments_map, ensure_ascii=False, sort_keys=True)
+        except (TypeError, ValueError):
+            rendered = str(arguments_map)
+        summary += f" {_redact_activity_snippet(rendered)}"
+    error = entry.get("error")
+    if isinstance(error, str) and error.strip():
+        summary += f" -- {_redact_activity_snippet(error)}"
+    timestamp = entry.get("timestamp")
+    return {
+        "ts": (
+            _clean_activity_field(timestamp, limit=_AUDIT_TS_MAX_CHARS)
+            if isinstance(timestamp, str)
+            else ""
+        ),
+        "kind": "tool",
+        "tool": tool,
+        "outcome": outcome,
+        "summary": " ".join(redact_if_sensitive(summary).split())[:400],
+    }
 
 
 # -- Activity feed (MIT-1431) -------------------------------------------------
