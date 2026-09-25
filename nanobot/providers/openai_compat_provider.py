@@ -1172,12 +1172,10 @@ class OpenAICompatProvider(LLMProvider):
         # the cap silently stops separating them, so background Work can take
         # all of vLLM's slots and stall an interactive turn. Only sent to the
         # local endpoint -- it is a Ziggy-private header and has no meaning to
-        # Anthropic, OpenAI, or any other upstream.
-        if (
-            "qwen" in model_name.lower()
-            and bool(spec and spec.name == "custom")
-            and _is_local_endpoint(spec, self.api_base)
-        ):
+        # Anthropic, OpenAI, or any other upstream. Same deployment gate as the
+        # profile above: the custom spec's _request_model_name is identity, so
+        # the flag matches this branch's original condition exactly.
+        if local_qwen:
             headers = dict(extra_headers or {})
             headers["X-Ziggy-Scheduling-Class"] = current_scheduling_class()
             extra_headers = headers
