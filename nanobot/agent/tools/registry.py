@@ -14,19 +14,25 @@ from nanobot.agent.tools.ask import (
     ask_user_unanswerable,
     ask_user_unavailable_message,
 )
+
+# Ziggy-local (fork): audit + redaction layer.
+from nanobot.agent.tools.audit import ErrorType
 from nanobot.agent.tools.base import Tool, ToolResult
 from nanobot.agent.tools.context import ContextAware, current_request_context
+
 # Ziggy-local (MIT-1010): shared-room tool authorization.  Upstream 6e9ae5bd
 # removed Tool.available() and the request-scoped session grant; prepare_call is
 # the remaining single funnel for every tool call, so the gate lives here.
+from nanobot.agent.tools.read_only import (
+    read_only_denial_message,
+    read_only_turn,
+)
 from nanobot.agent.tools.room_policy import (
     RoomPolicy,
     room_denial_message,
     room_policy_for,
     room_scope,
 )
-# Ziggy-local (fork): audit + redaction layer.
-from nanobot.agent.tools.audit import ErrorType
 from nanobot.utils.sensitive import redact_if_sensitive
 
 if TYPE_CHECKING:
@@ -205,6 +211,11 @@ class ToolRegistry:
         name = schema.get("name")
         return name if isinstance(name, str) else ""
 
+    def _declares_read_only(self, name: str) -> bool:
+        """Whether *name* resolves to a registered tool that declares itself read-only."""
+        tool = self.get(name)
+        return tool is not None and bool(tool.read_only)
+
     def get_definitions(self) -> list[dict[str, Any]]:
         """Get tool definitions with stable ordering for cache-friendly prompts.
 
@@ -234,21 +245,32 @@ class ToolRegistry:
         # Applied after the cache, exactly where upstream's available() filter
         # used to sit, so the cached prefix stays prompt-cache stable.
         ctx = current_request_context()
-        if ctx is not None and room_scope(ctx.metadata) is not None:
-            return [
+        if ctx is None:
+            return self._cached_definitions
+
+        definitions = self._cached_definitions
+        in_room = room_scope(ctx.metadata) is not None
+        if in_room:
+            definitions = [
                 schema
-                for schema in self._cached_definitions
+                for schema in definitions
                 if room_policy_for(self._schema_name(schema)) is RoomPolicy.ALLOWED
+            ]
+        if read_only_turn(ctx.metadata):
+            definitions = [
+                schema
+                for schema in definitions
+                if self._declares_read_only(self._schema_name(schema))
             ]
         # Ziggy-local: a scheduled / cron turn has nobody to answer ask_user,
         # so it is not offered there (prepare_call refuses it as well).
-        if ctx is not None and ask_user_unanswerable(ctx.metadata, ctx.session_key):
-            return [
+        if not in_room and ask_user_unanswerable(ctx.metadata, ctx.session_key):
+            definitions = [
                 schema
-                for schema in self._cached_definitions
+                for schema in definitions
                 if self._schema_name(schema) != ASK_USER_TOOL_NAME
             ]
-        return self._cached_definitions
+        return definitions
 
     def prepare_call(
         self,
@@ -280,6 +302,11 @@ class ToolRegistry:
             and ask_user_unanswerable(ctx.metadata, ctx.session_key)
         ):
             return tool, params, ToolResult.error(ask_user_unavailable_message())
+        # Read-only turns expose and accept only tools whose implementation
+        # declares itself side-effect free. The check is deliberately before
+        # coercion/validation so an injected call cannot probe parameter shapes.
+        if ctx is not None and read_only_turn(ctx.metadata) and not tool.read_only:
+            return tool, params, ToolResult.error(read_only_denial_message(tool.name))
         # Compatibility for external tools that still implement the legacy
         # setter protocol. Built-ins read the authoritative ContextVar
         # directly and never copy routing state.

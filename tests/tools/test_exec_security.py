@@ -948,3 +948,140 @@ def test_exec_prescreen_allows_legitimate_commands(command):
         assert "sensitive data" not in result.lower(), (
             f"command was wrongly flagged as sensitive-data access: {command!r} -> {result!r}"
         )
+
+
+# --- MIT-1397: input redirects, bare `..` words and `${...}` expansions -----
+#
+# The #3599 fix allow-listed /dev device targets for *output* redirection and
+# taught the path guard to see redirect targets after `>` and `>>`. The *read*
+# side (`<`, `N<`, `<>`) was never given the same treatment: on the reviewed
+# branches the path-extraction pattern did not list `<` as a token boundary,
+# so `cat </etc/passwd` never reached the path check at all. Production
+# tenants run exec with restrictToWorkspace: true and sandbox: "", so this
+# guard is the only thing keeping a tenant inside its workspace.
+
+
+# Module-level so the direct `_guard_command` test and the end-to-end
+# `execute()` test below drive the *same* battery: the PR promises coverage on
+# both surfaces and a shared list stops the two from drifting.
+_MIT1397_BLOCKED_BATTERY = [
+    # Input redirects: the target never passed a boundary the extractor
+    # recognized, so the absolute path was invisible to the guard.
+    "cat </etc/passwd",
+    "cat 0</etc/passwd",
+    "cat <>/etc/passwd",
+    # /dev/tcp/<ip>/<port> is not a benign device file: it opens a TCP
+    # connection from inside the tenant workspace.
+    "cat </dev/tcp/1.1.1.1/80",
+    # Relative traversal built from bare `..` words: neither the substring
+    # traversal check (which needs `../`) nor the absolute-path extraction
+    # (which skips relative components) ever saw these.
+    "cd ..; cd ..; cat etc/passwd",
+    "cat ..",
+    "tail -n 5 ..",
+    # Parameter expansions whose text carries a path: the value is only
+    # known at runtime, so a slash inside ${...} must fail closed instead
+    # of being treated as an opaque word.
+    "cat ${X:-/etc}/passwd",
+    "cat ${X#/etc}passwd",
+    "cat ${X:-etc/passwd}",
+    "grep ${Y:-/etc/shadow} app.py",
+    # PR #85 review round 2 (finding 1): the whole-word scan ran on the raw
+    # text, so dropping quotes/escapes or a variable hid the traversal token.
+    # bash resolves each of these to the parent directory (verified with
+    # `bash -c` before adding); the guard now also scans a de-quoted copy.
+    "cd .''.; cd .''.; cat etc/passwd",
+    "cd \\..; cd \\..; cat etc/passwd",
+    "D=..; cd $D; cd $D; cat etc/passwd",
+]
+
+
+@pytest.mark.parametrize("command", _MIT1397_BLOCKED_BATTERY)
+def test_exec_blocks_read_redirect_and_expansion_bypasses(tmp_path, command):
+    """Read-direction redirects, bare `..` words and ${...} paths are blocked."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "app.py").write_text("print('x')\n", encoding="utf-8")
+    tool = ExecTool(working_dir=str(workspace), restrict_to_workspace=True)
+
+    result = tool._guard_command(command, str(workspace), workspace_root=str(workspace))
+
+    assert result is not None, f"expected block for {command!r}"
+    assert "safety guard" in result, result
+    assert "path" in result, result
+
+
+@pytest.mark.parametrize("command", _MIT1397_BLOCKED_BATTERY)
+async def test_exec_blocks_bypasses_end_to_end_via_execute(tmp_path, command):
+    """The same battery through the production entry point, unmocked.
+
+    The direct `_guard_command` calls pin the guard; this drives
+    ``ExecTool.execute()`` -- the caller that actually spawns the shell -- with
+    a *restricted* workspace scope bound the way ``AgentLoop`` binds one on a
+    real turn, so the path-confinement block is genuinely on the path (a
+    default/unbound scope would leave ``restrict_to_workspace`` False and the
+    guard would skip it -- the no-op this round must not regress to). Every
+    command here is blocked, so the guard returns before any subprocess is
+    spawned; the block message must therefore come back from the real
+    ``execute()`` call, not a mock.
+    """
+    from nanobot.security.workspace_access import (
+        bind_workspace_scope,
+        build_workspace_scope,
+        reset_workspace_scope,
+    )
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "app.py").write_text("print('x')\n", encoding="utf-8")
+    tool = ExecTool(working_dir=str(workspace), restrict_to_workspace=True, sandbox="")
+    scope = build_workspace_scope(workspace, "restricted", source_channel="websocket")
+    token = bind_workspace_scope(scope)
+    try:
+        result = await tool.execute(command=command)
+    finally:
+        reset_workspace_scope(token)
+
+    assert "blocked by safety guard" in str(result), (command, result)
+    assert "path" in str(result), (command, result)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Redirect reads from a file inside the workspace must stay allowed.
+        "cat <./notes.txt",
+        "cat <README.md",
+        "sort <data/in.txt",
+        # The #3599 controls: /dev device targets and stderr redirection must
+        # keep working on both sides of the redirect.
+        "head -c 16 /dev/urandom | base64",
+        "ls 2>/dev/null",
+        "echo hi </dev/null",
+        # `..` only as part of a larger word or an expansion payload, not as
+        # a whole path component.
+        "echo a..b",
+        'echo "... pasted text"',
+        "sed -n '1,2p' app.py",
+        # `${...}` whose brace text carries no slash: runtime values the
+        # guard cannot resolve, but not the path-bearing class this issue
+        # targets.
+        'git commit -m "Done ${path}"',
+        'cat "${notes[0]}"',
+        "echo ${PWD}/file",
+    ],
+)
+def test_exec_allows_read_redirect_and_expansion_negatives(tmp_path, command):
+    """Workspace-relative inputs and the #3599 controls must not be flagged."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "notes.txt").write_text("hi\n", encoding="utf-8")
+    (workspace / "README.md").write_text("hi\n", encoding="utf-8")
+    (workspace / "data").mkdir()
+    (workspace / "data" / "in.txt").write_text("hi\n", encoding="utf-8")
+    (workspace / "app.py").write_text("print('x')\n", encoding="utf-8")
+    tool = ExecTool(working_dir=str(workspace), restrict_to_workspace=True)
+
+    result = tool._guard_command(command, str(workspace), workspace_root=str(workspace))
+
+    assert result is None, f"{command!r} was flagged: {result}"
