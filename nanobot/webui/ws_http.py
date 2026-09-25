@@ -507,6 +507,21 @@ class GatewayHTTPHandler:
                     request, owner_delete.group(1)
                 )
                 return response
+            if got == "/api/settings/update":
+                # Plain-HTTP owner route (MIT-1431). The WebUI settings editor
+                # reaches this with an owner API bearer token, exactly as the
+                # 0.2.x client did; ``settings.agent.update`` over the
+                # authenticated WebSocket still mutates through
+                # ``dispatch_webui_mutation`` and is unaffected. Served here --
+                # before the WS-mutation gate below, which otherwise 405s it --
+                # so a proxied room guest with no owner token is refused the
+                # same way as the other owner routes (``tokens.check_api_token``
+                # is bearer-only; a room ``nbrt_`` credential is a different
+                # audience and never passes).
+                if getattr(request, "method", "GET") not in {"GET", "POST"}:
+                    return _http_error(405, "Method Not Allowed")
+                response = self._handle_settings_update(request)
+                return response
             if self._is_webui_mutation_path(got):
                 return _http_error(
                     405,
@@ -1800,6 +1815,14 @@ class GatewayHTTPHandler:
             if getattr(request, "method", "GET") != "GET":
                 return _http_error(405, "Method Not Allowed")
             return await self._handle_conversation_search(request)
+        if got == "/api/activity":
+            if getattr(request, "method", "GET") != "GET":
+                return _http_error(405, "Method Not Allowed")
+            return self._handle_activity(request)
+        if got == "/api/model/switch":
+            if getattr(request, "method", "GET") != "POST":
+                return _http_error(405, "Method Not Allowed")
+            return self._handle_model_switch(request)
         if got == "/api/commands":
             return self._handle_commands(request)
         if got == "/api/workspaces/pick-folder":
@@ -1833,6 +1856,189 @@ class GatewayHTTPHandler:
         if not self.check_api_token(request):
             return _http_error(401, "Unauthorized")
         return _http_json_response({"commands": builtin_command_palette()})
+
+    def _handle_activity(self, request: WsRequest) -> Response:
+        """``GET /api/activity`` -- owner read of the per-chat activity feed.
+
+        0.3.0 parity with production's ``_handle_activity``
+        (``feat/shared-rooms`` ``nanobot/channels/websocket.py``): the WebUI
+        Activity view calls this and 404s when the route is absent. The wire
+        shape (``{"activity": [{key, chat_id, created_at, updated_at, preview,
+        status, live, message_count, last_role, last_text}]}``) is pinned to
+        production because the browser client decodes those keys directly; a
+        missing key would empty the view. Only WebUI (``websocket:``) sessions
+        are listed and the on-disk ``path`` never leaves the process.
+
+        Auth is the owner API token itself (``tokens.check_api_token`` is
+        bearer/``?token=`` only), never the trusted-proxy shortcut in
+        ``check_api_token``: a proxied request without an owner token -- or a
+        room ``nbrt_`` credential, which is a different audience -- is refused
+        with 401, exactly as the other owner ``/api/sessions`` routes require.
+        """
+        if not self.tokens.check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        if self.session_manager is None:
+            return _http_error(503, "session manager unavailable")
+        active_keys = self._active_webui_session_keys()
+        rows = _activity_rows(self.session_manager, active_keys=active_keys)
+        return _http_json_response({"activity": rows})
+
+    def _active_webui_session_keys(self) -> set[str]:
+        """Keys of WebUI sessions with an in-flight turn (best-effort).
+
+        Mirrors how ``_handle_session_messages`` decides ``active`` for
+        ``project_activity_history``: a chat is live while
+        ``websocket_turn_id(chat_id)`` is registered. Used to mark an activity
+        row ``live``/``active`` without porting production's injected
+        ``_active_session_keys`` callback, which this composition root does not
+        own.
+        """
+        from nanobot.session.webui_turns import websocket_turn_id
+
+        active: set[str] = set()
+        if self.session_manager is None:
+            return active
+        for summary in self.session_manager.list_sessions():
+            key = summary.get("key")
+            if not isinstance(key, str) or not is_webui_session_key(key):
+                continue
+            chat_id = key.split(":", 1)[1] if ":" in key else ""
+            if chat_id and websocket_turn_id(chat_id) is not None:
+                active.add(key)
+        return active
+
+    def _handle_model_switch(self, request: WsRequest) -> Response:
+        """``POST /api/model/switch`` -- request an appliance model swap.
+
+        0.3.0 parity with production's ``_handle_model_switch``. The web model
+        switch posts ``?target=qwen|minimax`` (optionally ``force``) with the
+        owner API bearer; the appliance runs its configured switch script
+        out-of-band and reports ``202`` with the merged ``model_runtime``
+        status. A bad target is ``400``, an unconfigured switch is ``503`` and
+        a concurrent switch is ``409`` -- the codes production returns, read
+        from ``git show`` of the cited commit rather than guessed. Owner token
+        required; a room credential is a different audience and is refused.
+        """
+        if not self.tokens.check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        from nanobot.model_runtime import (
+            ModelSwitchInProgressError,
+            ModelSwitchUnavailableError,
+            request_switch,
+        )
+
+        query = _parse_query(request.path)
+        body = request_json(request)
+        if body is None:
+            return _http_error(400, "invalid JSON body")
+        raw_target = body.get("target") or _query_first(query, "target") or ""
+        target = str(raw_target).strip().lower()
+        if target not in {"qwen", "minimax"}:
+            return _http_error(400, "target must be qwen or minimax")
+        raw_force = body.get("force", _query_first(query, "force"))
+        force = raw_force is True or str(raw_force or "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+        try:
+            status = request_switch(target, force=force)
+        except ModelSwitchInProgressError as exc:
+            return _http_error(409, str(exc))
+        except ModelSwitchUnavailableError as exc:
+            return _http_error(503, str(exc))
+        except Exception:
+            self._log.exception("failed to start model switch")
+            return _http_error(500, "failed to start model switch")
+        return _http_json_response({"model_runtime": status}, status=202)
+
+    def _handle_settings_update(self, request: WsRequest) -> Response:
+        """``GET``/``POST /api/settings/update`` -- edit the default model.
+
+        0.3.0 parity with production's ``_handle_settings_update``: the web
+        Settings save (and the iOS default-model picker) post ``model``
+        and/or ``provider`` here with the owner API bearer. ``model`` is
+        required when present and must be non-blank; ``provider`` must resolve
+        via :func:`find_by_name` unless it is ``auto`` -- the validations
+        production performs (read from ``git show`` of the cited commit, not
+        guessed). The change is persisted with ``save_config`` and the response
+        is production's ``_settings_payload`` shape (``agent``/``providers``/
+        ``runtime``/``model_runtime``/``requires_restart``), which the clients
+        decode whole -- a missing key would ``fatal`` their decode, so the
+        nested ``model_runtime`` status is included even though it costs a
+        state-file read. The rich WebUI settings surface is served separately by
+        ``GET /api/settings`` and is not disturbed; the WebSocket
+        ``settings.agent.update`` mutation reaches the same editor through
+        ``dispatch_webui_mutation`` and does not pass through this route.
+        """
+        if not self.tokens.check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        from nanobot.config.loader import load_config, save_config
+        from nanobot.providers.registry import find_by_name
+
+        query = _parse_query(request.path)
+        config = load_config()
+        defaults = config.agents.defaults
+        changed = False
+
+        model = _query_first(query, "model")
+        if model is not None:
+            model = model.strip()
+            if not model:
+                return _http_error(400, "model is required")
+            if defaults.model != model:
+                defaults.model = model
+                changed = True
+
+        provider = _query_first(query, "provider")
+        if provider is not None:
+            provider = provider.strip() or "auto"
+            if provider != "auto" and find_by_name(provider) is None:
+                return _http_error(400, "unknown provider")
+            if defaults.provider != provider:
+                defaults.provider = provider
+                changed = True
+
+        if changed:
+            save_config(config)
+        return _http_json_response(self._settings_payload(requires_restart=changed))
+
+    def _settings_payload(self, *, requires_restart: bool = False) -> dict[str, Any]:
+        """The settings snapshot ``/api/settings/update`` returns (production shape).
+
+        Ported from production's ``_settings_payload`` so the settings-save
+        response carries the keys the web/iOS clients decode whole: ``agent``
+        (model/provider/resolved_provider/has_api_key), ``providers``,
+        ``runtime.config_path``, ``model_runtime`` and ``requires_restart``. The
+        API key itself is never serialized -- only the ``has_api_key`` boolean.
+        """
+        from nanobot.config.loader import get_config_path, load_config
+        from nanobot.model_runtime import read_status
+        from nanobot.providers.registry import PROVIDERS, find_by_name
+
+        config = load_config()
+        defaults = config.agents.defaults
+        provider_name = config.get_provider_name(defaults.model) or defaults.provider
+        provider = config.get_provider(defaults.model)
+        selected_provider = provider_name
+        if defaults.provider != "auto":
+            spec = find_by_name(defaults.provider)
+            selected_provider = spec.name if spec else provider_name
+        return {
+            "agent": {
+                "model": defaults.model,
+                "provider": selected_provider,
+                "resolved_provider": provider_name,
+                "has_api_key": bool(provider and provider.api_key),
+            },
+            "providers": [{"name": "auto", "label": "Auto"}]
+            + [{"name": spec.name, "label": spec.label} for spec in PROVIDERS],
+            "runtime": {
+                "config_path": str(get_config_path().expanduser()),
+            },
+            "model_runtime": read_status(),
+            "requires_restart": requires_restart,
+        }
 
     def _handle_workspaces(self, connection: Any, request: WsRequest) -> Response:
         if not self.check_api_token(request):
@@ -2436,3 +2642,116 @@ def _conversation_search_row(
     if isinstance(timestamp, str) and timestamp:
         result["timestamp"] = timestamp
     return result
+
+
+# -- Activity feed (MIT-1431) -------------------------------------------------
+#
+# Port of production's ``_handle_activity`` / ``_activity_status`` /
+# ``_session_preview`` / ``_message_text`` (feat/shared-rooms,
+# nanobot/channels/websocket.py). The per-row keys are the contract the browser
+# Activity view decodes, so keep this in lock-step with production: a renamed or
+# dropped key empties the view rather than degrading gracefully.
+
+
+def _message_text(content: Any) -> str:
+    """Flatten a message's ``content`` to plain text (str, or parts joined)."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in cast(list[object], content):
+            if isinstance(item, dict):
+                text = cast(dict[str, object], item).get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        return " ".join(parts)
+    return ""
+
+
+def _session_messages_list(payload: object) -> list[Any]:
+    """Return the raw ``messages`` array of a session payload (``[]`` if absent)."""
+    if not isinstance(payload, dict):
+        return []
+    raw = cast(dict[str, object], payload).get("messages")
+    if isinstance(raw, list):
+        return cast(list[Any], raw)
+    return []
+
+
+def _session_preview(messages: list[Any]) -> str:
+    """First user message's text (whitespace-collapsed, capped), else a marker."""
+    for raw_message in messages:
+        if not isinstance(raw_message, dict):
+            continue
+        message = cast(dict[str, object], raw_message)
+        if message.get("role") != "user":
+            continue
+        text = " ".join(_message_text(message.get("content", "")).split())
+        if text:
+            return text[:160]
+        media = message.get("media")
+        if isinstance(media, list) and media:
+            return "Media attachment"
+    return ""
+
+
+def _activity_status(messages: list[Any], live: bool) -> str:
+    """``active`` while a turn runs; else ``waiting`` on a pending prompt, ``idle``."""
+    if live:
+        return "active"
+    for raw_message in reversed(messages):
+        if not isinstance(raw_message, dict):
+            continue
+        message = cast(dict[str, object], raw_message)
+        if message.get("role") == "assistant" and message.get("buttons"):
+            return "waiting"
+        if message.get("role") in {"user", "assistant"}:
+            break
+    return "idle"
+
+
+def _activity_rows(
+    session_manager: SessionManager, *, active_keys: set[str]
+) -> list[dict[str, Any]]:
+    """Build production's ``/api/activity`` rows for the owner's WebUI chats.
+
+    Only ``websocket:``-namespaced sessions are listed (Slack/Telegram/CLI chats
+    can't be resumed from the browser), the on-disk ``path`` never leaves the
+    process, and a session counts as ``live`` when its key is in *active_keys*
+    (the caller resolves that from the in-flight turn registry, matching how
+    ``_handle_session_messages`` derives ``active`` for the activity projection).
+    """
+    rows: list[dict[str, Any]] = []
+    for summary in session_manager.list_sessions():
+        key = summary.get("key")
+        if not isinstance(key, str) or not is_webui_session_key(key):
+            continue
+        payload = session_manager.read_session_file(key)
+        messages = _session_messages_list(payload)
+        chat_id = key.split(":", 1)[1]
+        live = key in active_keys
+        last: dict[str, Any] = next(
+            (
+                cast(dict[str, Any], message)
+                for message in reversed(messages)
+                if isinstance(message, dict)
+            ),
+            cast("dict[str, Any]", {}),
+        )
+        last_role = last.get("role")
+        last_text = _message_text(last.get("content", ""))
+        rows.append(
+            {
+                "key": key,
+                "chat_id": chat_id,
+                "created_at": summary.get("created_at"),
+                "updated_at": summary.get("updated_at"),
+                "preview": _session_preview(messages),
+                "status": _activity_status(messages, live),
+                "live": live,
+                "message_count": len(messages),
+                "last_role": last_role if isinstance(last_role, str) else None,
+                "last_text": " ".join(last_text.split())[:240],
+            }
+        )
+    return rows
