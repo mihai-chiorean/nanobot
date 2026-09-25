@@ -31,6 +31,7 @@ from urllib.parse import unquote
 
 from loguru import logger
 
+from nanobot.agent.tools.read_only import READ_ONLY_META_KEY, read_only_value
 from nanobot.bus.events import InboundMessage
 from nanobot.webui.session_identity import is_valid_webui_chat_id
 from nanobot.work.store import ACTIVE_STATUSES, MAX_EVENT_PAGE, WorkStore
@@ -286,6 +287,7 @@ class WorkStreamHub:
             )
             return
         title = envelope.get("title")
+        read_only = read_only_value(envelope.get("read_only", False))
         task = await self._store.run_io(
             self._store.create_task,
             chat_id=str(chat_id),
@@ -294,6 +296,7 @@ class WorkStreamHub:
             title=title if isinstance(title, str) else None,
             model=self.runtime_model_name,
             reasoning_profile=profile,
+            read_only=read_only,
             request_id=request_id,
         )
         was_created = bool(task.pop("_was_created", True))
@@ -485,6 +488,8 @@ class WorkStreamHub:
                 task.get("reasoning_profile") or DEFAULT_REASONING_PROFILE
             ),
         }
+        if read_only_value(task.get("read_only", False)):
+            metadata[READ_ONLY_META_KEY] = True
         if remote is not None:
             metadata["remote"] = remote
         await self._bus.publish_inbound(

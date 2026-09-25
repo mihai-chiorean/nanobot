@@ -191,6 +191,7 @@ class WorkRouter:
         if profile is None:
             return http_error(400, "invalid reasoning_profile")
         title = body.get("title")
+        read_only = body.get("read_only", False)
         store = self.hub.store
         task = await store.run_io(
             store.create_task,
@@ -200,6 +201,7 @@ class WorkRouter:
             title=title if isinstance(title, str) else None,
             model=self.hub.runtime_model_name,
             reasoning_profile=profile,
+            read_only=read_only,
         )
         task_id = str(task["task_id"])
         try:
