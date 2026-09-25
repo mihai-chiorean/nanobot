@@ -16,6 +16,7 @@ from typing import Any
 
 from loguru import logger
 
+from nanobot.agent.tools.read_only import read_only_value
 from nanobot.utils.helpers import ensure_dir, safe_filename
 
 TERMINAL_STATUSES = frozenset({"succeeded", "failed", "cancelled", "interrupted"})
@@ -127,6 +128,7 @@ class WorkStore:
                     mode TEXT NOT NULL,
                     model TEXT NOT NULL DEFAULT '',
                     reasoning_profile TEXT NOT NULL DEFAULT 'auto',
+                    read_only INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     started_at TEXT,
@@ -206,6 +208,10 @@ class WorkStore:
                     "ALTER TABLE work_tasks "
                     "ADD COLUMN reasoning_profile TEXT NOT NULL DEFAULT 'auto'"
                 )
+            if "read_only" not in task_columns:
+                connection.execute(
+                    "ALTER TABLE work_tasks ADD COLUMN read_only INTEGER NOT NULL DEFAULT 0"
+                )
             connection.execute(
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_work_tasks_request_id
@@ -226,6 +232,7 @@ class WorkStore:
         item.pop("scope", None)
         item.pop("request_id", None)
         item.pop("dispatched_at", None)
+        item["read_only"] = read_only_value(item.get("read_only", False))
         return item
 
     @staticmethod
@@ -242,6 +249,7 @@ class WorkStore:
         title: str | None = None,
         model: str = "",
         reasoning_profile: str = "auto",
+        read_only: Any = False,
         status: str = "queued",
         request_id: str | None = None,
     ) -> dict[str, Any]:
@@ -251,6 +259,7 @@ class WorkStore:
         prompt_preview = self._preview(content)
         clean_title = self._preview(title or prompt_preview, 96) or "Untitled task"
         clean_status = status if status in {"scheduled", *ACTIVE_STATUSES} else "queued"
+        clean_read_only = 1 if read_only_value(read_only) else 0
         columns = [
             "task_id",
             "session_key",
@@ -261,6 +270,7 @@ class WorkStore:
             "mode",
             "model",
             "reasoning_profile",
+            "read_only",
             "created_at",
             "updated_at",
             "last_seq",
@@ -275,6 +285,7 @@ class WorkStore:
             mode,
             model,
             reasoning_profile,
+            clean_read_only,
             now,
             now,
             0,

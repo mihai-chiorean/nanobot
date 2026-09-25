@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from loguru import logger
 
+from nanobot.agent.tools.read_only import READ_ONLY_META_KEY, read_only_value
 from nanobot.cron.types import CronJob
 from nanobot.work.context import reset_work_context, set_work_context
 
@@ -32,6 +33,8 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 WORK_TASK_META_TASK_ID = "work_task_id"
 WORK_TASK_META_MODE = "work_mode"
 WORK_TASK_META_CRON_JOB_ID = "cron_job_id"
+WORK_TASK_META_READ_ONLY = READ_ONLY_META_KEY
+WORK_TASK_ROUTING_READ_ONLY = "work_read_only"
 
 
 class WorkCronAgent(Protocol):
@@ -93,6 +96,7 @@ async def run_work_task_cron_job(
     channel = job.payload.origin_channel or job.payload.channel or "websocket"
     title = str(routing.get("work_title") or job.name or "Scheduled work")
     plan_task_id = _plan_task_id(routing)
+    read_only = read_only_value(routing.get(WORK_TASK_ROUTING_READ_ONLY, False))
 
     task = await store.run_io(
         store.create_task,
@@ -102,6 +106,7 @@ async def run_work_task_cron_job(
         mode="scheduled",
         title=title,
         model=agent.model,
+        read_only=read_only,
     )
     task_id = str(task["task_id"])
     logger.info(
@@ -134,16 +139,19 @@ async def run_work_task_cron_job(
         workspace=agent.workspace,
     )
     try:
+        turn_metadata: dict[str, Any] = {
+            WORK_TASK_META_TASK_ID: task_id,
+            WORK_TASK_META_MODE: "scheduled",
+            WORK_TASK_META_CRON_JOB_ID: job.id,
+        }
+        if read_only_value(task.get("read_only", False)):
+            turn_metadata[WORK_TASK_META_READ_ONLY] = True
         response = await agent.process_direct(
             job.payload.message,
             session_key=session_key,
             channel=channel,
             chat_id=chat_id,
-            metadata={
-                WORK_TASK_META_TASK_ID: task_id,
-                WORK_TASK_META_MODE: "scheduled",
-                WORK_TASK_META_CRON_JOB_ID: job.id,
-            },
+            metadata=turn_metadata,
             on_progress=_silent,
         )
     except asyncio.CancelledError:
