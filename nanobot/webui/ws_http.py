@@ -1866,8 +1866,8 @@ class GatewayHTTPHandler:
         shape (``{"activity": [{key, chat_id, created_at, updated_at, preview,
         status, live, message_count, last_role, last_text}]}``) is pinned to
         production because the browser client decodes those keys directly; a
-        missing key would empty the view. Only WebUI (``websocket:``) sessions
-        are listed and the on-disk ``path`` never leaves the process.
+        missing key would empty the view. Only WebUI sessions are listed and
+        the on-disk ``path`` never leaves the process.
 
         Auth is the owner API token itself (``tokens.check_api_token`` is
         bearer/``?token=`` only), never the trusted-proxy shortcut in
@@ -1902,7 +1902,7 @@ class GatewayHTTPHandler:
             key = summary.get("key")
             if not isinstance(key, str) or not is_webui_session_key(key):
                 continue
-            chat_id = key.split(":", 1)[1] if ":" in key else ""
+            chat_id = webui_chat_id(key)
             if chat_id and websocket_turn_id(chat_id) is not None:
                 active.add(key)
         return active
@@ -2715,7 +2715,7 @@ def _activity_rows(
 ) -> list[dict[str, Any]]:
     """Build production's ``/api/activity`` rows for the owner's WebUI chats.
 
-    Only ``websocket:``-namespaced sessions are listed (Slack/Telegram/CLI chats
+    Only WebUI sessions are listed (Slack/Telegram/CLI chats
     can't be resumed from the browser), the on-disk ``path`` never leaves the
     process, and a session counts as ``live`` when its key is in *active_keys*
     (the caller resolves that from the in-flight turn registry, matching how
@@ -2728,7 +2728,7 @@ def _activity_rows(
             continue
         payload = session_manager.read_session_file(key)
         messages = _session_messages_list(payload)
-        chat_id = key.split(":", 1)[1]
+        chat_id = webui_chat_id(key) or ""
         live = key in active_keys
         last: dict[str, Any] = next(
             (
