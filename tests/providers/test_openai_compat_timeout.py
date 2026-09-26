@@ -1,3 +1,4 @@
+import importlib
 from unittest.mock import patch, sentinel
 
 from nanobot.providers import openai_compat_provider
@@ -63,6 +64,15 @@ async def test_openai_compat_provider_timeout_can_be_overridden_by_env(monkeypat
 
 
 async def test_missing_langfuse_warning_recommends_plugin_command(monkeypatch) -> None:
+    # Warm the lazily-imported observability module while the environment is
+    # still neutral.  `_ensure_client` below imports it inside its function
+    # body; if a previous test had evicted it from sys.modules, that import
+    # would re-run the module's import-time gate (`_detect_enabled`) under
+    # this test's LANGFUSE_* env and patched find_spec, logging a second
+    # warning through the shared loguru logger and breaking the
+    # assert_called_once_with below (MIT-1466).
+    importlib.import_module("nanobot.observability.langfuse")
+
     monkeypatch.setenv("LANGFUSE_SECRET_KEY", "secret")
     # A pinned destination isolates this to the "not installed" case; an unset
     # LANGFUSE_HOST is its own (fail-closed) warning, covered separately.
