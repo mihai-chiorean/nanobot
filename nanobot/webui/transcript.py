@@ -19,7 +19,6 @@ from urllib.parse import unquote, urlparse
 
 from loguru import logger
 
-from nanobot.channels.websocket.message_ack import CLIENT_MESSAGE_ID_RE
 from nanobot.config.paths import get_webui_dir
 from nanobot.runtime_context import public_history_message
 from nanobot.session.automation_turns import is_automation_kind
@@ -1508,6 +1507,11 @@ def _normalized_client_message_id(value: Any) -> str | None:
     envelope field, so a stored value that does not conform is omitted rather
     than echoed back through ``/webui-thread``.
     """
+    # Imported here, not at module scope: importing any
+    # ``nanobot.channels.websocket`` submodule loads the websocket runtime
+    # package, which test_settings_contract_import_does_not_eagerly_load_runtime_graph forbids.
+    from nanobot.channels.websocket.message_ack import CLIENT_MESSAGE_ID_RE
+
     if not isinstance(value, str) or CLIENT_MESSAGE_ID_RE.fullmatch(value.lower()) is None:
         return None
     return value
