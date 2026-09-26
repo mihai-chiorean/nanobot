@@ -120,6 +120,25 @@ async def test_after_iteration_records_llm_call_in_the_audit_log() -> None:
     assert kwargs["model"] == "test-model"
     assert kwargs["latency_ms"] == pytest.approx(123.4)
     assert kwargs["ttft_ms"] == 42
+    assert kwargs["tokens_in"] == 10
+    assert kwargs["tokens_out"] == 3
+
+
+@pytest.mark.asyncio
+async def test_after_iteration_logs_null_tokens_without_usage() -> None:
+    from nanobot.providers.base import LLMResponse
+
+    loop = _loop_stub()
+    hook = _ZiggyTurnHook(loop, _turn())
+    ctx = AgentHookContext(
+        iteration=0, messages=[], response=LLMResponse(content="hi"), latency_ms=5.0, usage=None
+    )
+
+    await hook.after_iteration(ctx)
+
+    kwargs = loop._audit_logger.log_llm_call.call_args.kwargs
+    assert kwargs["tokens_in"] is None
+    assert kwargs["tokens_out"] is None
 
 
 @pytest.mark.asyncio

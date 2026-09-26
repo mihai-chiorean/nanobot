@@ -354,8 +354,10 @@ class _ZiggyTurnHook(AgentHook):
                 session_id=self._chat_id,
                 channel=self._channel,
                 model=self._loop.model,
-                tokens_in=getattr(usage, "prompt_tokens", None),
-                tokens_out=getattr(usage, "completion_tokens", None),
+                # 0.3.0's LLMUsage names these input_tokens/output_tokens; the
+                # 0.2.x prompt_tokens/completion_tokens names logged null (MIT-1470).
+                tokens_in=getattr(usage, "input_tokens", None),
+                tokens_out=getattr(usage, "output_tokens", None),
                 latency_ms=latency_ms,
                 ttft_ms=getattr(response, "ttft_ms", None) if response else None,
             )
