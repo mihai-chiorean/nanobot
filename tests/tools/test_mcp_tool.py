@@ -496,7 +496,7 @@ def test_normalize_windows_stdio_command_skips_existing_shells(
 
 @pytest.mark.asyncio
 async def test_execute_returns_text_blocks() -> None:
-    async def call_tool(_name: str, arguments: dict) -> object:
+    async def call_tool(_name: str, arguments: dict, meta: dict | None = None) -> object:
         assert arguments == {"value": 1}
         return SimpleNamespace(content=[_FakeTextContent("hello"), 42])
 
@@ -509,7 +509,7 @@ async def test_execute_returns_text_blocks() -> None:
 
 @pytest.mark.asyncio
 async def test_execute_wraps_mcp_is_error_result() -> None:
-    async def call_tool(_name: str, arguments: dict) -> object:
+    async def call_tool(_name: str, arguments: dict, meta: dict | None = None) -> object:
         return SimpleNamespace(
             content=[_FakeTextContent("Error: server-side MCP failure")],
             isError=True,
@@ -525,7 +525,7 @@ async def test_execute_wraps_mcp_is_error_result() -> None:
 
 @pytest.mark.asyncio
 async def test_execute_contains_malformed_success_result() -> None:
-    async def call_tool(_name: str, arguments: dict) -> object:
+    async def call_tool(_name: str, arguments: dict, meta: dict | None = None) -> object:
         return SimpleNamespace(content=None)
 
     wrapper = _make_wrapper(SimpleNamespace(call_tool=call_tool))
@@ -538,7 +538,7 @@ async def test_execute_contains_malformed_success_result() -> None:
 
 @pytest.mark.asyncio
 async def test_registry_adds_retry_hint_to_malformed_mcp_result() -> None:
-    async def call_tool(_name: str, arguments: dict) -> object:
+    async def call_tool(_name: str, arguments: dict, meta: dict | None = None) -> object:
         return SimpleNamespace(content=None)
 
     wrapper = _make_wrapper(SimpleNamespace(call_tool=call_tool))
@@ -554,7 +554,7 @@ async def test_registry_adds_retry_hint_to_malformed_mcp_result() -> None:
 
 @pytest.mark.asyncio
 async def test_execute_preserves_success_text_that_starts_with_error() -> None:
-    async def call_tool(_name: str, arguments: dict) -> object:
+    async def call_tool(_name: str, arguments: dict, meta: dict | None = None) -> object:
         return SimpleNamespace(
             content=[_FakeTextContent("Error: generated report successfully")],
             isError=False,
@@ -581,7 +581,7 @@ async def test_execute_persists_image_block_as_artifact(tmp_path: Path) -> None:
 
     set_config_path(tmp_path / "config.json")
 
-    async def call_tool(_name: str, arguments: dict) -> object:
+    async def call_tool(_name: str, arguments: dict, meta: dict | None = None) -> object:
         return SimpleNamespace(
             content=[
                 _FakeTextContent("here you go"),
@@ -612,7 +612,7 @@ async def test_execute_notes_unstorable_image_block(tmp_path: Path) -> None:
 
     set_config_path(tmp_path / "config.json")
 
-    async def call_tool(_name: str, arguments: dict) -> object:
+    async def call_tool(_name: str, arguments: dict, meta: dict | None = None) -> object:
         return SimpleNamespace(content=[_FakeImageContent("not-valid-base64!!", "image/png")])
 
     wrapper = _make_wrapper(SimpleNamespace(call_tool=call_tool))
@@ -624,7 +624,7 @@ async def test_execute_notes_unstorable_image_block(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_execute_returns_timeout_message() -> None:
-    async def call_tool(_name: str, arguments: dict) -> object:
+    async def call_tool(_name: str, arguments: dict, meta: dict | None = None) -> object:
         await asyncio.sleep(1)
         return SimpleNamespace(content=[])
 
@@ -638,7 +638,7 @@ async def test_execute_returns_timeout_message() -> None:
 
 @pytest.mark.asyncio
 async def test_execute_handles_server_cancelled_error() -> None:
-    async def call_tool(_name: str, arguments: dict) -> object:
+    async def call_tool(_name: str, arguments: dict, meta: dict | None = None) -> object:
         raise asyncio.CancelledError()
 
     wrapper = _make_wrapper(SimpleNamespace(call_tool=call_tool))
@@ -653,7 +653,7 @@ async def test_execute_handles_server_cancelled_error() -> None:
 async def test_execute_re_raises_external_cancellation() -> None:
     started = asyncio.Event()
 
-    async def call_tool(_name: str, arguments: dict) -> object:
+    async def call_tool(_name: str, arguments: dict, meta: dict | None = None) -> object:
         started.set()
         await asyncio.sleep(60)
         return SimpleNamespace(content=[])
@@ -670,7 +670,7 @@ async def test_execute_re_raises_external_cancellation() -> None:
 
 @pytest.mark.asyncio
 async def test_execute_handles_generic_exception() -> None:
-    async def call_tool(_name: str, arguments: dict) -> object:
+    async def call_tool(_name: str, arguments: dict, meta: dict | None = None) -> object:
         raise RuntimeError("boom")
 
     wrapper = _make_wrapper(SimpleNamespace(call_tool=call_tool))
