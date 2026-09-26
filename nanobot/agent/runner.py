@@ -629,6 +629,8 @@ class AgentRunner:
                         workspace_violation_counts=workspace_violation_counts,
                         hook=hook,
                         context=context,
+                        model_messages=messages_for_model,
+                        compacted_tool_results=request_state.compacted_tool_results,
                     )
                     repeated_exec = exec_progress.observe(tool_calls, results, new_events)
                     if repeated_exec >= _REPEATED_EXEC_RECOVERY_THRESHOLD:

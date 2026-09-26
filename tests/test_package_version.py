@@ -191,7 +191,7 @@ def test_no_source_and_no_metadata_falls_back(monkeypatch) -> None:
 
     monkeypatch.setattr(nanobot, "_read_pyproject_version", lambda: None)
     monkeypatch.setattr(nanobot, "_dist_version", lambda: None)
-    assert nanobot._resolve_version() == "0.3.0"
+    assert nanobot._resolve_version() == "0.3.5"
 
 
 def _fake_checkout(tmp_path, *, name: str | None, version: str) -> Path:

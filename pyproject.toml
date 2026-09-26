@@ -1,6 +1,6 @@
 [project]
 name = "nanobot-ai"
-version = "0.3.0"
+version = "0.3.5"
 description = "A lightweight personal AI assistant framework"
 readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.11"
@@ -54,6 +54,7 @@ dependencies = [
     # resource-exhaustion advisories. Full suite verified green on
     # dulwich 1.2.12 + pypdf 6.16.1 (7,630 passed).
     "dulwich>=1.2.11,<2.0.0",
+    "rapidfuzz>=3.14.6,<4.0.0",
     "pyyaml>=6.0,<7.0.0",
     "filelock>=3.25.2",
     "watchfiles>=1.1.1,<2.0.0",

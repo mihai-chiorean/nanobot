@@ -5,12 +5,15 @@ from __future__ import annotations
 import asyncio
 import re
 from collections.abc import Callable
+from contextlib import nullcontext
+from functools import cache
 from typing import Any, cast
 
 from loguru import logger
 
 from nanobot.agent.hook import AgentHook, AgentHookContext
 from nanobot.agent.tools.ask import AskUserInterrupt
+from nanobot.agent.tools.file_state import file_read_context
 from nanobot.agent.tools.registry import ToolRegistry, is_tool_error_result
 
 # Ziggy-local (fork, MIT-202/MIT-211): Langfuse tool span (no-op without Langfuse).
@@ -79,6 +82,8 @@ async def execute_tool_calls(
     workspace_violation_counts: dict[str, int],
     hook: AgentHook,
     context: AgentHookContext,
+    model_messages: list[dict[str, Any]] | None = None,
+    compacted_tool_results: set[str] | None = None,
 ) -> tuple[list[Any], list[dict[str, str]], BaseException | None]:
     """Execute one model response's tool calls in stable result order.
 
@@ -86,6 +91,17 @@ async def execute_tool_calls(
     turn-aborting signal seen (today only :class:`AskUserInterrupt`); later
     batches are skipped once one is observed so nothing runs past the pause.
     """
+    @cache
+    def read_results() -> dict[str, str]:
+        """Index once, on the first read-dedup check in this batch."""
+        return {
+            message["tool_call_id"]: message["content"]
+            for message in model_messages or []
+            if message.get("role") == "tool"
+            and isinstance(message.get("tool_call_id"), str)
+            and isinstance(message.get("content"), str)
+            and message["tool_call_id"] not in (compacted_tool_results or ())
+        }
     tool_results: list[tuple[Any, dict[str, str], BaseException | None]] = []
     for batch in _partition_tool_batches(tools, tool_calls, concurrent=concurrent):
         if concurrent and len(batch) > 1:
@@ -97,6 +113,7 @@ async def execute_tool_calls(
                     workspace_violation_counts,
                     hook,
                     context,
+                    read_results,
                 )
                 for tool_call in batch
             ))
@@ -111,6 +128,7 @@ async def execute_tool_calls(
                     workspace_violation_counts,
                     hook,
                     context,
+                    read_results,
                 )
                 tool_results.append(result)
                 batch_results.append(result)
@@ -135,6 +153,7 @@ async def _execute_tool_call(
     workspace_violation_counts: dict[str, int],
     hook: AgentHook,
     context: AgentHookContext,
+    read_results: Callable[[], dict[str, str]],
 ) -> tuple[Any, dict[str, str], BaseException | None]:
     lookup_error = repeated_external_lookup_error(
         tool_call.name,
@@ -185,7 +204,11 @@ async def _execute_tool_call(
         # "llm-iteration -> tool:<name>". observe_tool redacts and truncates
         # the arguments before export (MIT-211) and is a no-op when Langfuse
         # is not configured.
-        with observe_tool(tool_name=tool_call.name, arguments=params):
+        with (
+            observe_tool(tool_name=tool_call.name, arguments=params),
+            file_read_context(tool_call.id, read_results)
+            if tool_call.name == "read_file" else nullcontext(),
+        ):
             if tool is not None:
                 result = await tool.execute(**params)
             else:

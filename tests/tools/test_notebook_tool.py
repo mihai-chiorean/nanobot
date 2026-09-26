@@ -298,7 +298,7 @@ class TestNotebookEditCoexistence:
             new_text='"source": "print(2)"',
             replace_all=True,
         )
-        assert "Successfully" in result
+        assert "Patch applied:" in result
         # The dropped-guard behaviour: no refusal, no routing to notebook_edit.
         assert "refuse" not in str(result).lower()
         assert "use the notebook" not in str(result).lower()
@@ -324,7 +324,7 @@ class TestNotebookEditCoexistence:
             new_text='"source": "b = 100"',
             replace_all=True,
         )
-        assert "Successfully edited" in r2
+        assert "Patch applied:" in r2
         # No staleness warning leaked into the result.
         assert "Warning" not in r2
         saved = json.loads((tmp_path / "nb.ipynb").read_text())
@@ -351,7 +351,7 @@ class TestNotebookEditCoexistence:
             new_text='"source": "x = 2"',
             replace_all=True,
         )
-        assert "Successfully edited" in re_
+        assert "Patch applied:" in re_
         rn = await nb_tool.execute(path=path, cell_index=0, new_source="x = 3")
         assert "Successfully" in rn
         assert "Warning" not in rn

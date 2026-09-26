@@ -130,7 +130,7 @@ class TestEditFileTool:
         f = tmp_path / "a.py"
         f.write_text("hello world", encoding="utf-8")
         result = await tool.execute(path=str(f), old_text="world", new_text="earth")
-        assert "Successfully" in result
+        assert "Patch applied:" in result
         assert f.read_text() == "hello earth"
 
     @pytest.mark.asyncio
@@ -150,7 +150,7 @@ class TestEditFileTool:
         result = await tool.execute(
             path=str(f), old_text="line1\nline2", new_text="LINE1\nLINE2",
         )
-        assert "Successfully" in result
+        assert "Patch applied:" in result
         raw = f.read_bytes()
         assert b"LINE1" in raw
         # CRLF line endings should be preserved throughout the file
@@ -163,7 +163,7 @@ class TestEditFileTool:
         result = await tool.execute(
             path=str(f), old_text="def foo():\n    pass", new_text="def bar():\n    return 1",
         )
-        assert "Successfully" in result
+        assert "Patch applied:" in result
         assert "bar" in f.read_text()
 
     @pytest.mark.asyncio
@@ -180,7 +180,7 @@ class TestEditFileTool:
         result = await tool.execute(
             path=str(f), old_text="foo", new_text="baz", replace_all=True,
         )
-        assert "Successfully" in result
+        assert "Patch applied:" in result
         assert f.read_text() == "baz bar baz bar baz"
 
     @pytest.mark.asyncio
@@ -476,7 +476,7 @@ class TestWorkspaceRestriction:
             old_text="before",
             new_text="after",
         )
-        assert "Successfully edited" in result
+        assert "Patch applied:" in result
         assert target.read_text(encoding="utf-8") == "after\n"
 
 
@@ -579,7 +579,7 @@ class TestEditFileSensitivePathBlocking:
         f.write_text("x = 1\n", encoding="utf-8")
         result = await tool.execute(path=str(f), old_text="x = 1", new_text="x = 2")
         assert isinstance(result, str)
-        assert "Successfully edited" in result
+        assert "Patch applied:" in result
         assert f.read_text() == "x = 2\n"
 
     @pytest.mark.asyncio
