@@ -1269,6 +1269,11 @@ class WebUITranscriptRecorder:
         )
         if payload is None:
             return False
+        client_message_id = _normalized_client_message_id(
+            (metadata or {}).get("client_message_id")
+        )
+        if client_message_id is not None:
+            payload["client_message_id"] = client_message_id
         return self.prepare_and_append(chat_id, payload, metadata=metadata, phase="user")
 
     def append(self, chat_id: str, event: dict[str, Any]) -> bool:
@@ -1394,6 +1399,9 @@ def write_session_messages_as_transcript(
                 value = msg.get(key)
                 if isinstance(value, list) and value:
                     row[key] = json.loads(json.dumps(value, ensure_ascii=False))
+            client_message_id = _normalized_client_message_id(msg.get("client_message_id"))
+            if client_message_id is not None:
+                row["client_message_id"] = client_message_id
         elif role == "assistant" and text.strip():
             row = {"event": "message", "chat_id": target_chat_id, "text": text}
             media = msg.get("media")
@@ -1491,6 +1499,24 @@ def normalize_session_message_ui_metadata(raw: object) -> dict[str, Any] | None:
     }
 
 
+def _normalized_client_message_id(value: Any) -> str | None:
+    """Echo a persisted ``client_message_id`` verbatim, or ``None`` when unfit.
+
+    The same grammar the inbound accept path enforces
+    (``nanobot.channels.websocket.message_ack``): a room guest controls the
+    envelope field, so a stored value that does not conform is omitted rather
+    than echoed back through ``/webui-thread``.
+    """
+    # Imported here, not at module scope: importing any
+    # ``nanobot.channels.websocket`` submodule loads the websocket runtime
+    # package, which test_settings_contract_import_does_not_eagerly_load_runtime_graph forbids.
+    from nanobot.channels.websocket.message_ack import CLIENT_MESSAGE_ID_RE
+
+    if not isinstance(value, str) or CLIENT_MESSAGE_ID_RE.fullmatch(value.lower()) is None:
+        return None
+    return value
+
+
 def build_user_transcript_event(
     chat_id: str,
     text: str,
@@ -1561,7 +1587,7 @@ def _session_user_event(
     mcp_presets = message.get("mcp_presets")
     session_mentions = message.get("session_mentions")
     chat_id = session_key.split(":", 1)[1] if ":" in session_key else session_key
-    return build_user_transcript_event(
+    event = build_user_transcript_event(
         chat_id,
         text,
         media_paths=cast(list[Any], media) if isinstance(media, list) else None,
@@ -1571,6 +1597,12 @@ def _session_user_event(
             cast(list[Any], session_mentions) if isinstance(session_mentions, list) else None
         ),
     )
+    if event is None:
+        return None
+    client_message_id = _normalized_client_message_id(message.get("client_message_id"))
+    if client_message_id is not None:
+        event["client_message_id"] = client_message_id
+    return event
 
 
 def _assistant_text_signature(value: Any) -> str:
@@ -2694,6 +2726,9 @@ def replay_transcript_to_ui_messages(
                 **_turn_fields(rec, "user"),
                 "createdAt": _created_at_ms(rec, idx),
             }
+            client_message_id = _normalized_client_message_id(rec.get("client_message_id"))
+            if client_message_id is not None:
+                row["client_message_id"] = client_message_id
             if media_att:
                 row["media"] = media_att
                 if all(m.get("kind") == "image" for m in media_att):
