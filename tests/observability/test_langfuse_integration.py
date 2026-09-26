@@ -12,26 +12,43 @@ import importlib
 import os
 import sys
 from contextlib import contextmanager
+from types import ModuleType
 from typing import Iterator
 from unittest.mock import MagicMock, patch
+
+_OBSERVABILITY_MODULES = ("nanobot.observability", "nanobot.observability.langfuse")
 
 
 @contextmanager
 def _clean_langfuse_env() -> Iterator[None]:
-    """Temporarily remove every LANGFUSE_* env var and cached import."""
+    """Temporarily remove every LANGFUSE_* env var and cached import.
+
+    The purge must not leak: leaving the modules evicted (as a bare pop in
+    the teardown would) makes the *next* test's lazy import re-run the
+    module's import-time gate (``_detect_enabled``) inside that test's
+    patched environment — e.g. inside
+    ``test_missing_langfuse_warning_recommends_plugin_command``, where the
+    extra warning lands on the shared loguru logger and breaks its
+    ``assert_called_once_with`` (MIT-1466).  Restore the pre-test module
+    objects instead of dropping them.
+    """
     saved = {k: v for k, v in os.environ.items() if k.startswith("LANGFUSE_")}
     for k in list(os.environ):
         if k.startswith("LANGFUSE_"):
             del os.environ[k]
     # Purge cached module so module-level LANGFUSE_ENABLED re-evaluates.
-    for mod in ("nanobot.observability", "nanobot.observability.langfuse"):
+    original = {mod: sys.modules.get(mod) for mod in _OBSERVABILITY_MODULES}
+    for mod in _OBSERVABILITY_MODULES:
         sys.modules.pop(mod, None)
     try:
         yield
     finally:
         os.environ.update(saved)
-        for mod in ("nanobot.observability", "nanobot.observability.langfuse"):
-            sys.modules.pop(mod, None)
+        for mod, module in original.items():
+            if module is not None:
+                sys.modules[mod] = module
+            else:
+                sys.modules.pop(mod, None)
 
 
 def test_langfuse_disabled_when_env_var_absent() -> None:
@@ -165,10 +182,21 @@ def test_capture_trace_context_shape_when_enabled() -> None:
         mock_client = MagicMock()
         mock_client.get_current_trace_id.return_value = "abc123"
         with patch.object(obs_mod, "_safe_get_client", return_value=mock_client):
-            # Mock the OTel span layer too.
+            # Mock the OTel span layer too — as a sys.modules stub, because
+            # opentelemetry only ships with the optional langfuse extra and
+            # patching its attributes would make this test depend on what
+            # happens to be installed (or left in sys.modules by other
+            # tests) rather than on the code under test.
             mock_span = MagicMock()
             mock_span.get_span_context.return_value = MagicMock(span_id=0xdeadbeef)
-            with patch("opentelemetry.trace.get_current_span", return_value=mock_span):
+            otel_trace = ModuleType("opentelemetry.trace")
+            otel_trace.get_current_span = MagicMock(return_value=mock_span)
+            otel_pkg = ModuleType("opentelemetry")
+            otel_pkg.trace = otel_trace
+            with patch.dict(
+                sys.modules,
+                {"opentelemetry": otel_pkg, "opentelemetry.trace": otel_trace},
+            ):
                 ctx = obs_mod.capture_trace_context()
         assert ctx is not None
         assert ctx["trace_id"] == "abc123"
