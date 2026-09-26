@@ -24,6 +24,44 @@ def _isolate_nanobot_log_activation() -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True)
+def _isolate_home_dir(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[None]:
+    """Point HOME at a per-test temp dir so the suite never touches the real ~/.nanobot.
+
+    MIT-1473: running the suite on a host with a live ``~/.nanobot`` wrote
+    test rows into the owner's real ``audit.jsonl`` (on the ``cli``, ``api``,
+    ``telegram`` and ``feishu`` channels) and left ~20 stray test namespace
+    dirs under ``~/.nanobot/sessions``. Every one of those paths -- the
+    default config path (``nanobot.config.loader.get_config_path``), the
+    default workspace (``nanobot.config.paths.get_workspace_path`` /
+    ``nanobot.utils.helpers``), the ``AuditLogger`` fallback log path
+    (``nanobot.agent.tools.audit``), and the CLI history path -- falls back
+    to ``Path.home() / ".nanobot"`` when nothing more specific is
+    configured. ``Path.home()`` resolves via the ``HOME`` environment
+    variable on POSIX, so redirecting ``HOME`` here covers every one of
+    those fallbacks in one place instead of patching each call site.
+
+    A test that needs a specific ``HOME`` (for example to assert on
+    ``Path.home()`` directly) can still call
+    ``monkeypatch.setenv("HOME", ...)`` itself -- that overrides this
+    fixture's value for the rest of that test, and monkeypatch unwinds both
+    in reverse order at teardown.
+
+    Uses ``tmp_path_factory.mktemp`` rather than deriving a path from
+    ``tmp_path`` for two reasons: it never nests under a test's own
+    ``tmp_path`` (some tests assert that dir holds nothing they didn't put
+    there), and its name is a fixed, generic basename plus a counter, not
+    the test's nodeid -- a test named e.g. ``test_secrets_excluded`` would
+    otherwise get a HOME path containing the substring "secrets", tripping
+    up assertions that scan environment values for leaked secrets.
+    """
+    fake_home = tmp_path_factory.mktemp("home")
+    monkeypatch.setenv("HOME", str(fake_home))
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _isolate_sessions_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """Redirect session storage away from the real active config data directory.
 
