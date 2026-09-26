@@ -102,7 +102,7 @@ def _resolve_version() -> str:
     if dist is not None:
         return dist
     # Source checkouts without pyproject and installs without dist-info.
-    return "0.3.0"
+    return "0.3.5"
 
 
 __version__ = _resolve_version()
