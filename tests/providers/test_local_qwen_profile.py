@@ -26,16 +26,20 @@ import pytest
 from nanobot.providers.openai_compat_provider import OpenAICompatProvider
 from nanobot.providers.registry import find_by_name
 
-# The Spark's vLLM deployment (verified read-only against the live server's
-# /v1/models on this box: served id "qwen3.8-flash-next", root
-# Mia-AiLab/Qwen3.8-Flash-Next-NVFP4).
-SPARK_BASE = "http://127.0.0.1:8001/v1"
-# Prod's canonical local name from the ported tests' fixture.
-QWEN_36_MODEL = "qwen3.6-35b"
-# The model actually deployed on this box today; the preserve_thinking gate
-# is deliberately a qwen3.6-only check in prod (d4ccb836), so this name must
-# NOT receive the preserve key -- pinned below as an open owner question.
-DEPLOYED_MODEL = "qwen3.8-flash-next"
+# What deployed Ziggy actually sends (main config and all three tenants): the
+# admission gateway in front of the local vLLM, not the vLLM proxy port, and
+# the gateway-facing model name, not the raw vLLM served id.
+SPARK_BASE = "http://127.0.0.1:8013/v1"
+# The name every deployed tenant puts on the wire; the preserve gate is a
+# 3.6-only string check (prod d4ccb836), and this name matches it, so the
+# deployed model does receive the preserve key.
+DEPLOYED_MODEL = "qwen3.6-35b"
+# Prod's canonical local name from the ported tests' fixture; the deployment
+# above uses it, so the profile tests exercise the real served name.
+QWEN_36_MODEL = DEPLOYED_MODEL
+# A Qwen name outside the 3.6 gate, used only as the negative control for the
+# preserve gate; it is not what this box serves.
+NON_36_MODEL = "qwen3.8-flash-next"
 
 _CALLER_TEMPERATURE = 0.1  # caller default; the profile must override it
 
@@ -131,14 +135,15 @@ class TestLocalQwenProfile:
             "preserve_thinking": True,
         }
 
-    @pytest.mark.parametrize("effort", ["medium", "high"])
+    @pytest.mark.parametrize("effort", ["low", "medium", "high"])
     def test_thinking_effort_enables_template_and_preserves_reasoning(
         self, effort: str
     ) -> None:
-        """Medium/high effort: thinking on, thinking-mode sampling, and
+        """Low/medium/high effort: thinking on, thinking-mode sampling, and
         preserve_thinking keeps earlier reasoning in context (prod's
         test_per_request_thinking_overrides_static_default, which also proves
-        the per-request profile wins over a stale static False)."""
+        the per-request profile wins over a stale static False). Production
+        turns thinking off only for None/none/minimal, so "low" is on."""
         kwargs = _build(
             _make_local_qwen({"chat_template_kwargs": {"enable_thinking": False}}),
             tools=_tools(),
@@ -218,19 +223,39 @@ class TestLocalQwenProfile:
         assert config == {"chat_template_kwargs": {"preserve_thinking": False}}
         assert provider._extra_body == {"chat_template_kwargs": {"preserve_thinking": False}}
 
-    def test_deployed_spark_model_gates_preserve_on_3_6(self) -> None:
-        """The model actually served on this box (qwen3.8-flash-next) gets the
-        per-effort switch and sampling, but the preserve gate is prod's 3.6-only
-        string check, so it must not receive the preserve key. Pinning current
-        behavior; widening the gate is an open owner question (prod has the
-        same gap)."""
-        kwargs = _build(_make_local_qwen(model=DEPLOYED_MODEL), reasoning_effort="high")
+    def test_non_3_6_qwen_name_gets_no_preserve_gate(self) -> None:
+        """A Qwen name outside the 3.6 string gate (a future 3.8 serve) gets
+        the per-effort switch and sampling, but the preserve gate is prod's
+        3.6-only check, so it must not receive the preserve key. Pinning the
+        gate; widening it is an open owner question (prod has the same gap)."""
+        kwargs = _build(_make_local_qwen(model=NON_36_MODEL), reasoning_effort="high")
 
         assert kwargs["extra_body"]["chat_template_kwargs"] == {"enable_thinking": True}
         assert "preserve_thinking" not in kwargs["extra_body"]["chat_template_kwargs"]
         assert kwargs["temperature"] == 1.0
         assert kwargs["top_p"] == 0.95
         assert kwargs["extra_body"]["top_k"] == 20
+        assert "reasoning_effort" not in kwargs
+
+    def test_deployed_model_at_gateway_base_gets_preserve(self) -> None:
+        """The real deployment: the name and admission-gateway base that
+        deployed Ziggy actually sends (main config plus all three tenants) sit
+        behind the local gate, so the served 3.6 model gets the preserved
+        reasoning key on the wire -- the whole point of the profile. If the
+        deployment constants and the gate ever drift apart, this is the test
+        that goes red."""
+        assert _make_local_qwen().api_base == SPARK_BASE
+        assert _make_local_qwen().default_model == DEPLOYED_MODEL
+
+        kwargs = _build(_make_local_qwen(), reasoning_effort="high")
+
+        assert kwargs["model"] == DEPLOYED_MODEL
+        assert kwargs["extra_body"]["chat_template_kwargs"] == {
+            "enable_thinking": True,
+            "preserve_thinking": True,
+        }
+        assert kwargs["temperature"] == 1.0
+        assert kwargs["top_p"] == 0.95
         assert "reasoning_effort" not in kwargs
 
 
