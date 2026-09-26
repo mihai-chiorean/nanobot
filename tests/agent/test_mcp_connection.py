@@ -609,7 +609,9 @@ async def test_mcp_tool_reconnects_after_session_terminated(
             self.index = index
             self.call_count = 0
 
-        async def call_tool(self, _name: str, arguments: dict[str, Any]) -> Any:
+        async def call_tool(
+            self, _name: str, arguments: dict[str, Any], meta: dict | None = None
+        ) -> Any:
             self.call_count += 1
             assert arguments == {"symbol": "AAPL"}
             if self.index == 1:
@@ -668,7 +670,9 @@ async def test_mcp_reconnect_handler_uses_sanitized_server_prefix(
         def __init__(self, index: int) -> None:
             self.index = index
 
-        async def call_tool(self, _name: str, arguments: dict[str, Any]) -> Any:
+        async def call_tool(
+            self, _name: str, arguments: dict[str, Any], meta: dict | None = None
+        ) -> Any:
             assert arguments == {}
             if self.index == 1:
                 raise McpError(ErrorData(code=-32000, message="Session terminated"))

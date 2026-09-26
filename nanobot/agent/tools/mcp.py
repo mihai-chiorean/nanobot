@@ -19,6 +19,7 @@ import httpx
 from loguru import logger
 
 from nanobot.agent.tools.base import Tool, ToolResult
+from nanobot.agent.tools.context import _CURRENT_REQUEST_CONTEXT
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.security.network import (
     PinnedDNSAsyncTransport,
@@ -680,6 +681,29 @@ def _mcp_image_tool_result(text_parts: list[str], artifacts: list[dict[str, Any]
     return json.dumps(payload, ensure_ascii=False)
 
 
+def _ziggy_meta() -> dict[str, object]:
+    """Ziggy task-context meta sent as ``params._meta`` on every tools/call.
+
+    Connectors use this to know which Work task a call belongs to (to park and
+    resume it) and whether the user is present. A Work turn is unattended but
+    may still sign in unattended (DEC-19). No session key is ever sent (DEC-20).
+    """
+    ctx = _CURRENT_REQUEST_CONTEXT.get()
+    if ctx is None:
+        return {}
+    work_id = str((ctx.metadata or {}).get("work_task_id") or "")
+    is_work = bool(re.fullmatch(r"work_[a-f0-9]{32}", work_id)) or bool(
+        (ctx.metadata or {}).get("work_mode")
+    )
+    meta: dict[str, object] = {
+        "ziggy.dev/origin": "work" if is_work else "chat",
+        "ziggy.dev/attended": not is_work,
+    }
+    if re.fullmatch(r"work_[a-f0-9]{32}", work_id):
+        meta["ziggy.dev/work_task_id"] = work_id
+    return meta
+
+
 class MCPToolWrapper(_MCPWrapperBase):
     """Wraps a single MCP server tool as a nanobot Tool."""
 
@@ -718,7 +742,11 @@ class MCPToolWrapper(_MCPWrapperBase):
         while True:
             try:
                 result = await asyncio.wait_for(
-                    self._session.call_tool(self._original_name, arguments=kwargs),
+                    self._session.call_tool(
+                        self._original_name,
+                        arguments=kwargs,
+                        meta=_ziggy_meta() or None,
+                    ),
                     timeout=self._tool_timeout,
                 )
             except asyncio.TimeoutError:
