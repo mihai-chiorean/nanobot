@@ -608,6 +608,42 @@ class WebSocketChannel(BaseChannel):
             self._chat_inbox = ChatInboxStore(self.gateway.session_manager.workspace)
         return self._chat_inbox
 
+    async def _recover_chat_inbox(self) -> None:
+        """Re-publish durable owner messages acked ``accepted`` but never turned.
+
+        Production parity (``websocket.py::_recover_chat_inbox`` on
+        ``feat/shared-rooms``, called from ``start()`` before accepting
+        sockets): the agent loop marks a receipt processed when its turn
+        completes, so anything still recoverable at start-up lost its turn to
+        the restart. Claiming before publishing marks the entry in-flight so a
+        concurrent claim (e.g. a client resend) cannot recover it twice.
+        """
+        inbox = self.chat_inbox
+        if inbox is None:
+            return
+        records = await inbox.recoverable()
+        recovered = 0
+        for record in records:
+            if record.state in {"stored", "retry_wait"}:
+                claim = (
+                    inbox.claim_for_enqueue
+                    if record.state == "stored"
+                    else inbox.claim_retry_for_enqueue
+                )
+                if not await claim(record.message.chat_id, record.client_message_id):
+                    continue
+            try:
+                await self.bus.publish_inbound(record.message)
+            except Exception:
+                await inbox.release_enqueue_claim(
+                    record.message.chat_id,
+                    record.client_message_id,
+                )
+                raise
+            recovered += 1
+        if recovered:
+            self.logger.info("Recovered {} durable WebSocket message(s)", recovered)
+
     async def webui_prepare_message(
         self,
         *,
@@ -1032,6 +1068,8 @@ class WebSocketChannel(BaseChannel):
 
         stop_event = asyncio.Event()
         self._stop_event = stop_event
+
+        await self._recover_chat_inbox()
 
         ssl_context = self._build_ssl_context()
         scheme = "wss" if ssl_context else "ws"
