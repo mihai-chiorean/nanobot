@@ -53,7 +53,7 @@ dependencies = [
     # `pip install -e` downgrade pypdf back out of the range that fixes six
     # resource-exhaustion advisories. Full suite verified green on
     # dulwich 1.2.12 + pypdf 6.16.1 (7,630 passed).
-    "dulwich>=0.22.0,<2.0.0",
+    "dulwich>=1.2.11,<2.0.0",
     "pyyaml>=6.0,<7.0.0",
     "filelock>=3.25.2",
     "watchfiles>=1.1.1,<2.0.0",
@@ -61,7 +61,7 @@ dependencies = [
     "tzdata>=2025.2",
     "tzlocal>=5.3.1,<6.0.0",
     "defusedxml>=0.7.1,<1.0.0",
-    "pypdf>=5.0.0,<7.0.0",
+    "pypdf>=6.14.2,<7.0.0",
     "python-docx>=1.1.0,<2.0.0",
     "openpyxl>=3.1.0,<4.0.0",
     "python-pptx>=1.0.0,<2.0.0",
@@ -93,7 +93,7 @@ ziggy = [
 documents = [
     # Compatibility extra: document readers are bundled since v0.2.3.
     "defusedxml>=0.7.1,<1.0.0",
-    "pypdf>=5.0.0,<7.0.0",
+    "pypdf>=6.14.2,<7.0.0",
     "python-docx>=1.1.0,<2.0.0",
     "openpyxl>=3.1.0,<4.0.0",
     "python-pptx>=1.0.0,<2.0.0",
@@ -103,7 +103,7 @@ langfuse = [
 ]
 pdf = [
     # Compatibility extra: PDF reading is bundled since v0.2.3.
-    "pypdf>=5.0.0,<7.0.0",
+    "pypdf>=6.14.2,<7.0.0",
 ]
 olostep = [
     "olostep>=0.1.0; python_version < '3.14'",
@@ -117,7 +117,7 @@ dev = [
     "ruff>=0.1.0",
     "basedpyright>=1.39.0,<2.0.0",
     "pymupdf>=1.25.0",
-    "pypdf>=5.0.0,<7.0.0",
+    "pypdf>=6.14.2,<7.0.0",
     "python-docx>=1.1.0,<2.0.0",
     "openpyxl>=3.1.0,<4.0.0",
     "python-pptx>=1.0.0,<2.0.0",
