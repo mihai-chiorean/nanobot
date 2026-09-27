@@ -273,9 +273,9 @@ async def test_a_failing_work_run_still_publishes_a_terminal_status(
     )
     loop.tools.get_definitions = MagicMock(return_value=[])  # type: ignore[method-assign]
 
-    # Go through _dispatch, not process_direct: a work.create task arrives on
-    # the bus, and _dispatch is where a failed turn is caught and recorded.
-    await loop._dispatch(  # pyright: ignore[reportPrivateUsage]
+    # Go through _dispatch_one, not process_direct: a work.create task arrives on
+    # the bus, and _dispatch_one is where a failed turn is caught and recorded.
+    await loop._dispatch_one(  # pyright: ignore[reportPrivateUsage]
         InboundMessage(
             channel="websocket",
             sender_id="client-1",
@@ -283,7 +283,8 @@ async def test_a_failing_work_run_still_publishes_a_terminal_status(
             content="explode",
             metadata={"work_task_id": task_id, "work_mode": "background"},
             session_key_override=f"work:{task_id}",
-        )
+        ),
+        asyncio.Queue(),
     )
     await asyncio.sleep(0)
     collector.drain()
@@ -356,7 +357,7 @@ async def test_a_work_task_refused_by_the_owner_guard_still_ends_terminal(
     content = "modify your code"
     assert is_system_modification(content), "guard no longer trips on this phrasing"
 
-    await loop._dispatch(  # pyright: ignore[reportPrivateUsage]
+    await loop._dispatch_one(  # pyright: ignore[reportPrivateUsage]
         InboundMessage(
             channel="websocket",
             sender_id="ziggy-work",
@@ -364,7 +365,8 @@ async def test_a_work_task_refused_by_the_owner_guard_still_ends_terminal(
             content=content,
             metadata={"work_task_id": task_id, "work_mode": "background"},
             session_key_override=f"work:{task_id}",
-        )
+        ),
+        asyncio.Queue(),
     )
     await asyncio.sleep(0)
     collector.drain()

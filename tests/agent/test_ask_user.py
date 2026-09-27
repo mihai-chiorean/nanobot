@@ -332,8 +332,9 @@ async def test_cancelled_turn_while_parked_leaves_no_pending_ask(tmp_path):
     loop.tools.register(_BlockingAskTool())
 
     task = asyncio.create_task(
-        loop._dispatch(
-            InboundMessage(channel="cli", sender_id="user", chat_id="abandon", content="go")
+        loop._dispatch_one(
+            InboundMessage(channel="cli", sender_id="user", chat_id="abandon", content="go"),
+            asyncio.Queue(),
         )
     )
     await asyncio.wait_for(ask_started.wait(), timeout=5)
