@@ -231,6 +231,44 @@ def test_the_exploited_tools_from_review_are_denied() -> None:
         assert room_policy_for(name) is RoomPolicy.DENIED, name
 
 
+@pytest.mark.parametrize(
+    "name",
+    [
+        "mcp_ziggy_gmail_linkedin_read_page",
+        "mcp_ziggy_connectors_browser_read_page",
+        "mcp_ziggy_connectors_site_login",
+        "mcp_ziggy_connectors_vault_list_sites",
+    ],
+)
+def test_browser_and_vault_tools_get_shared_room_denied(name: str) -> None:
+    """NFR-ISO-006 / UX D2b: credential and logged-in-browser refusals carry
+    the typed ``shared_room_denied`` code so the agent and client can render
+    them. Checked through ``prepare_call``, the production caller."""
+    registry = ToolRegistry()
+    registry.register(_StubTool(name))
+    with request_context(guest_request_context()):
+        _tool, _params, error = registry.prepare_call(name, {})
+    assert isinstance(error, ToolResult) and error.is_error
+    assert '"code":"shared_room_denied"' in str(error)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "mcp_ziggy_gmail_gmail_search",  # the issue's named control
+        "mcp_ziggy_connectors_work_app_submit_feedback",
+        "some_tool_that_does_not_exist_yet",
+    ],
+)
+def test_other_denied_tools_keep_the_generic_room_text(name: str) -> None:
+    """Negative control: non-browser denial messages must not gain the code."""
+    from nanobot.agent.tools.room_policy import room_denial_message
+
+    msg = room_denial_message(name)
+    assert "shared_room_denied" not in msg
+    assert f"Tool '{name}' is unavailable in a shared conversation." in msg
+
+
 def test_a_half_populated_scope_denies_rather_than_falling_open() -> None:
     """A malformed scope is a minting bug; it must not read as 'no room'."""
     registry = ToolRegistry()
