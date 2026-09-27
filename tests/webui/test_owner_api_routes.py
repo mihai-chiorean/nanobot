@@ -1,16 +1,20 @@
 """Owner-gated WebUI HTTP routes restored for 0.3.0 parity (MIT-1431).
 
-Covers three ``GET``/``POST`` routes the embedded WebUI calls with an **owner
-API token** (bearer) that had gone missing on the 0.3.0 cutover line, so the
-browser views 404'd (``/api/activity``, ``/api/model/switch``) or 405'd
-(``/api/settings/update`` -- it was only reachable as a WebSocket *mutation*,
-never as a plain HTTP call):
+Covers the ``GET``/``POST`` route the embedded WebUI calls with an **owner API
+token** (bearer) that had gone missing on the 0.3.0 cutover line, so the
+browser view 405'd (``/api/settings/update`` -- it was only reachable as a
+WebSocket *mutation*, never as a plain HTTP call):
 
-* ``GET  /api/activity``          -- the Activity view's per-chat feed.
-* ``POST /api/model/switch``      -- the web model switch (qwen <-> minimax).
 * ``GET|POST /api/settings/update`` -- the Settings save / default-model picker.
 
-Each route must (a) refuse a room credential and a bare trusted-proxy mark
+The dead 0.2.x compatibility routes ``GET /api/activity`` and
+``POST /api/model/switch`` (and ``nanobot/model_runtime.py``) were removed in
+MIT-1481: ``/api/activity`` had no live client and ``/api/model/switch``
+always answered 503 because ``ZIGGY_MODEL_SWITCH_SCRIPT`` is unset.
+``GET /api/activity/audit`` (MIT-1450) stays, covered by
+``tests/webui/test_activity_audit_route.py``.
+
+The route must (a) refuse a room credential and a bare trusted-proxy mark
 (the owner ``tokens.check_api_token``, not the ``check_api_token`` shortcut --
 mirrors the PR #76 rename regression this class of bug was found by), and (b)
 serve production's response shape, since the browser decodes these objects
@@ -37,7 +41,6 @@ from nanobot.session.manager import SessionManager
 from nanobot.webui.gateway_services import build_gateway_services
 
 OWNER_CHAT = "chat_owner"
-OTHER_CHAT = "chat_other"
 ROOM_CHAT = "11111111-2222-3333-4444-555555555555"
 ROOM_ID = "room_" + "a" * 32
 PARTICIPANT_ID = "participant_" + "b" * 32
@@ -96,32 +99,6 @@ def _build(tmp_path: Path, sessions: SessionManager, *, proxy: bool = False) -> 
     return WebSocketChannel(_config(proxy=proxy), bus, gateway=gateway)
 
 
-@pytest.fixture
-def env(tmp_path: Path) -> Any:
-    """A gateway wired like the real server, with owner + non-webui sessions.
-
-    Two owner webui conversations (one active-pending, one idle) plus a
-    non-webui ``cli:`` session that must never leak into the activity feed.
-    """
-    sessions = SessionManager(tmp_path)
-    pending = sessions.get_or_create(f"websocket:{OWNER_CHAT}")
-    pending.add_message("user", "need a plan for my trip")
-    pending.add_message("assistant", "Sure", buttons=[["Confirm"]])
-    sessions.save(pending, fsync=True)
-    idle = sessions.get_or_create(f"websocket:{OTHER_CHAT}")
-    idle.add_message("user", "just notes")
-    idle.add_message("assistant", "noted")
-    sessions.save(idle, fsync=True)
-    # A non-webui session: must be filtered out of /api/activity.
-    outside = sessions.get_or_create("cli:direct")
-    outside.add_message("user", "secret CLI exchange")
-    sessions.save(outside, fsync=True)
-
-    channel = _build(tmp_path, sessions)
-    token = channel.gateway.http.tokens.issue_api_token(60)
-    return channel, sessions, token
-
-
 def _request(
     path: str,
     *,
@@ -153,259 +130,6 @@ def _body(response: Any) -> dict[str, Any]:
 def _text(response: Any) -> str:
     assert response is not None
     return bytes(response.body).decode()
-
-
-# ---------------------------------------------------------------------------
-# GET /api/activity
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_activity_lists_owner_webui_sessions_in_production_shape(env: Any) -> None:
-    """Acceptance (1): owner GET /api/activity -> 200, production keys.
-
-    Pins the row contract from ``_handle_activity``: only the owner's
-    ``websocket:`` chats appear (the ``cli:`` session is filtered), each row
-    carries the exact key set, ``live`` defaults False, and the assistant
-    button row is ``waiting``.
-    """
-    channel, _sessions, token = env
-    response = await _dispatch(channel, _request("/api/activity", token=token))
-    assert response.status_code == 200, _text(response)
-    rows = {row["key"]: row for row in _body(response)["activity"]}
-    assert set(rows) == {f"websocket:{OWNER_CHAT}", f"websocket:{OTHER_CHAT}"}
-    # Non-webui session must not leak.
-    assert "cli:direct" not in rows
-    for row in rows.values():
-        assert set(row) >= {
-            "key",
-            "chat_id",
-            "created_at",
-            "updated_at",
-            "preview",
-            "status",
-            "live",
-            "message_count",
-            "last_role",
-            "last_text",
-        }
-        assert row["live"] is False  # no in-flight turn registered
-        assert "path" not in row  # on-disk path never leaks
-        assert isinstance(row["message_count"], int)
-    pending = rows[f"websocket:{OWNER_CHAT}"]
-    assert pending["chat_id"] == OWNER_CHAT
-    assert pending["status"] == "waiting"  # assistant with pending buttons
-    assert pending["preview"] == "need a plan for my trip"  # first user msg
-    assert pending["last_role"] == "assistant"
-    assert pending["last_text"] == "Sure"
-    assert pending["message_count"] == 2
-    idle = rows[f"websocket:{OTHER_CHAT}"]
-    assert idle["status"] == "idle"
-
-
-@pytest.mark.asyncio
-async def test_activity_marks_live_and_active_when_a_turn_is_in_flight(
-    env: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Acceptance (1b): an in-flight key -> live True, status 'active'.
-
-    Drives the ``active_keys`` wiring independently of the real turn registry
-    by seeding a known key; the negative control (a key not in the set) stays
-    non-active, proving ``live`` is carried from the provider and not a
-    constant.
-    """
-    channel, _sessions, token = env
-    active_key = f"websocket:{OWNER_CHAT}"
-    monkeypatch.setattr(
-        channel.gateway.http,
-        "_active_webui_session_keys",
-        lambda: {active_key},
-    )
-    response = await _dispatch(channel, _request("/api/activity", token=token))
-    assert response.status_code == 200, _text(response)
-    rows = {row["key"]: row for row in _body(response)["activity"]}
-    assert rows[active_key]["live"] is True
-    assert rows[active_key]["status"] == "active"
-    # Negative control: the other owner chat is not in the injected set.
-    other = f"websocket:{OTHER_CHAT}"
-    assert rows[other]["live"] is False
-    assert rows[other]["status"] != "active"
-
-
-@pytest.mark.asyncio
-async def test_activity_requires_owner_token(env: Any) -> None:
-    """Acceptance (2a): no token / wrong token -> 401 (GET is the only verb)."""
-    channel, _, _ = env
-    anonymous = await _dispatch(channel, _request("/api/activity"))
-    assert anonymous.status_code == 401
-    assert _text(anonymous) == "Unauthorized"
-    wrong = await _dispatch(
-        channel, _request("/api/activity", token="not-a-real-token")
-    )
-    assert wrong.status_code == 401
-
-
-@pytest.mark.asyncio
-async def test_activity_refuses_room_credential(env: Any) -> None:
-    """Acceptance (2b): a room ``nbrt_`` credential is not an owner token."""
-    channel, sessions, _ = env
-    store = SharedRoomStore(sessions, token_ttl_s=300)
-    room_token, _credential = store.mint(
-        room_id=ROOM_ID,
-        chat_id=ROOM_CHAT,
-        participant_id=PARTICIPANT_ID,
-        display_name="Guest",
-        role="contributor",
-    )
-    assert room_token.startswith("nbrt_")
-    assert store.api_credential(room_token) is not None  # the credential is real
-    # ... yet it is refused on this owner-only route.
-    assert channel.gateway.http.tokens.check_api_token(
-        _request("/api/activity", token=room_token)
-    ) is False
-    response = await _dispatch(channel, _request("/api/activity", token=room_token))
-    assert response.status_code == 401
-
-
-@pytest.mark.asyncio
-async def test_activity_ignores_the_trusted_proxy_shortcut(tmp_path: Path) -> None:
-    """Regression (PR #76 class): a bare trusted-proxy mark is not an owner.
-
-    ``check_api_token`` returns True for any request the proxy vouched for; the
-    activity route must use the owner pool directly, so a proxied request with
-    no Authorization header is refused -- while the owner bearer still works
-    through the same proxy (non-vacuity control).
-    """
-    sessions = SessionManager(tmp_path)
-    owner = sessions.get_or_create(f"websocket:{OWNER_CHAT}")
-    owner.add_message("user", "plan my trip")
-    sessions.save(owner, fsync=True)
-    channel = _build(tmp_path, sessions, proxy=True)
-    token = channel.gateway.http.tokens.issue_api_token(60)
-
-    proxied = _request("/api/activity")
-    proxied.headers[PROXY_ASSERTION_HEADER] = "room-guest"
-    response = await _dispatch(channel, proxied)
-    assert getattr(proxied, "_nanobot_trusted_proxy_authenticated", False) is True
-    assert response.status_code == 401
-
-    as_owner = _request("/api/activity", token=token)
-    as_owner.headers[PROXY_ASSERTION_HEADER] = "owner"
-    ok = await _dispatch(channel, as_owner)
-    assert ok.status_code == 200
-
-
-@pytest.mark.asyncio
-async def test_activity_post_is_method_not_allowed(env: Any) -> None:
-    channel, _, token = env
-    # GET is the only verb served; a POST must not silently succeed.
-    response = await _dispatch(
-        channel, _request("/api/activity", method="POST", token=token)
-    )
-    assert response.status_code == 405
-
-
-# ---------------------------------------------------------------------------
-# POST /api/model/switch
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_model_switch_forwards_target_and_returns_status(
-    env: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Acceptance (3): POST target=minimax -> 202, model_runtime status."""
-    channel, _, token = env
-    recorded: list[tuple[str, bool]] = []
-
-    def fake_switch(target: str, *, force: bool = False) -> dict[str, Any]:
-        recorded.append((target, force))
-        return {"active_model": target, "status": "switching", "state_path": "/x/state.json"}
-
-    monkeypatch.setattr("nanobot.model_runtime.request_switch", fake_switch)
-    response = await _dispatch(
-        channel,
-        _request("/api/model/switch?target=minimax&force=1", method="POST", token=token),
-    )
-    assert response.status_code == 202, _text(response)
-    assert recorded == [("minimax", True)]
-    assert _body(response)["model_runtime"]["active_model"] == "minimax"
-
-
-@pytest.mark.parametrize("target", ["bogus", "qwenx", ""])
-@pytest.mark.asyncio
-async def test_model_switch_rejects_invalid_target(
-    env: Any, monkeypatch: pytest.MonkeyPatch, target: str
-) -> None:
-    """Negative control: a target outside {qwen,minimax} is a 400, not a switch."""
-    channel, _, token = env
-    called: list[str] = []
-    monkeypatch.setattr(
-        "nanobot.model_runtime.request_switch",
-        lambda target, *, force=False: called.append(target) or {},
-    )
-    response = await _dispatch(
-        channel,
-        _request(f"/api/model/switch?target={target}", method="POST", token=token),
-    )
-    assert response.status_code == 400
-    assert called == []  # never reaches the switch
-
-
-@pytest.mark.asyncio
-async def test_model_switch_maps_busy_to_409(
-    env: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A concurrent switch (ModelSwitchInProgressError) -> 409, prod's code."""
-    from nanobot.model_runtime import ModelSwitchInProgressError
-
-    channel, _, token = env
-
-    def boom(target: str, *, force: bool = False) -> dict[str, Any]:
-        raise ModelSwitchInProgressError("a model switch is already in progress")
-
-    monkeypatch.setattr("nanobot.model_runtime.request_switch", boom)
-    response = await _dispatch(
-        channel, _request("/api/model/switch?target=qwen", method="POST", token=token)
-    )
-    assert response.status_code == 409
-
-
-@pytest.mark.asyncio
-async def test_model_switch_maps_unavailable_to_503(
-    env: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from nanobot.model_runtime import ModelSwitchUnavailableError
-
-    channel, _, token = env
-
-    def boom(target: str, *, force: bool = False) -> dict[str, Any]:
-        raise ModelSwitchUnavailableError("model switching is not enabled")
-
-    monkeypatch.setattr("nanobot.model_runtime.request_switch", boom)
-    response = await _dispatch(
-        channel, _request("/api/model/switch?target=qwen", method="POST", token=token)
-    )
-    assert response.status_code == 503
-
-
-@pytest.mark.asyncio
-async def test_model_switch_requires_owner_token(env: Any) -> None:
-    channel, _, _ = env
-    response = await _dispatch(
-        channel, _request("/api/model/switch?target=qwen", method="POST")
-    )
-    assert response.status_code == 401
-    assert _text(response) == "Unauthorized"
-
-
-@pytest.mark.asyncio
-async def test_model_switch_get_is_method_not_allowed(env: Any) -> None:
-    channel, _, token = env
-    response = await _dispatch(
-        channel, _request("/api/model/switch?target=qwen", method="GET", token=token)
-    )
-    assert response.status_code == 405
 
 
 # ---------------------------------------------------------------------------
@@ -467,11 +191,6 @@ def config_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
         real_save(config, config_path_arg)
 
     monkeypatch.setattr(settings_api_module, "save_config", spy_save)
-    # Keep the nested model_runtime status read off any real user file.
-    monkeypatch.setattr(
-        "nanobot.model_runtime.read_status",
-        lambda: {"status": "unknown", "active_model": None, "state_path": "/x"},
-    )
     return channel, token, config_path, calls
 
 
@@ -483,9 +202,9 @@ async def test_settings_update_writes_model_and_returns_payload(config_env: Any)
     model/provider change alone is ``requires_restart: False`` (the restart
     hint belongs to runtime-section edits) and the payload carries every key
     the web/iOS clients decode: ``agent{model,provider,resolved_provider,
-    has_api_key}``, ``providers[{name,label}]``, ``runtime.config_path`` plus
-    the injected ``model_runtime`` status. Configured API keys stay off the
-    wire -- only ``has_api_key`` booleans are serialized.
+    has_api_key}``, ``providers[{name,label}]``, ``runtime.config_path``.
+    Configured API keys stay off the wire -- only ``has_api_key`` booleans are
+    serialized.
     """
     channel, token, config_path, calls = config_env
     response = await _dispatch(
@@ -504,11 +223,7 @@ async def test_settings_update_writes_model_and_returns_payload(config_env: Any)
     assert payload["agent"]["has_api_key"] is True
     assert all({"name" in row and "label" in row for row in payload["providers"]})
     assert payload["runtime"]["config_path"] == str(config_path.expanduser())
-    assert payload["model_runtime"] == {
-        "status": "unknown",
-        "active_model": None,
-        "state_path": "/x",
-    }
+    assert "model_runtime" not in payload  # MIT-1481: dead field, never serialized
     assert payload["requires_restart"] is False  # a model change alone needs no restart
     assert len(calls) == 1  # persisted exactly once
     reloaded = load_config(config_path)
@@ -643,10 +358,6 @@ async def test_settings_update_ignores_the_trusted_proxy_shortcut(
     config_path = tmp_path / "config.json"
     _seed_config(config_path)
     monkeypatch.setattr("nanobot.config.loader._current_config_path", config_path)
-    monkeypatch.setattr(
-        "nanobot.model_runtime.read_status",
-        lambda: {"status": "unknown", "active_model": None, "state_path": "/x"},
-    )
     channel = _build(tmp_path, sessions, proxy=True)
     proxied = _request("/api/settings/update?model=x%2Fy", method="POST")
     proxied.headers[PROXY_ASSERTION_HEADER] = "room-guest"
