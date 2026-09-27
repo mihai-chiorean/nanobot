@@ -3323,6 +3323,12 @@ def _client_projection_event(
         session_message = normalize_session_message_ui_metadata(record.get("session_message"))
         if session_message:
             projected["provenance"] = {"session_message": session_message}
+        # Ziggy-local (MIT-1486): the events projection echoes the client's
+        # ``client_message_id`` like the legacy ``messages`` replay does, so
+        # clients can reconcile their optimistic send with the stored turn.
+        client_message_id = _normalized_client_message_id(record.get("client_message_id"))
+        if client_message_id is not None:
+            projected["client_message_id"] = client_message_id
         return projected
 
     if event in {"delta", "stream_end", "reasoning_delta", "reasoning_end"}:

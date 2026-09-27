@@ -1,6 +1,8 @@
 """Bounded presentation events, separate from model reasoning/history."""
 
 import json
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, cast
 
@@ -73,17 +75,6 @@ def _valid_created_ms(value: Any) -> int | None:
     if value < 0:
         return None
     return int(value)
-
-
-def _row_created_ms(row: Any) -> int | None:
-    """The replayed row's own timestamp, used to place recovered rows.
-
-    Transcript replay always stamps a ``createdAt``; a row without one (a
-    hand-built payload in a test) is not a usable turn boundary.
-    """
-    if not isinstance(row, dict):
-        return None
-    return _valid_created_ms(cast(dict[str, Any], row).get("createdAt"))
 
 
 def _record_started_ms(record: dict[str, Any]) -> int | None:
@@ -238,6 +229,62 @@ def _activity_item(record: dict[str, Any], status: str, chat_id: str) -> dict[st
     }
 
 
+def _activity_event(
+    record: dict[str, Any],
+    status: str,
+    chat_id: str,
+    anchor: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """The ``?projection=events`` form of :func:`_activity_item`.
+
+    Mirrors what ``_client_projection_event`` emits for a journaled
+    ``tool_hint``/``progress`` message, joined to the anchoring user event's
+    turn so clients group it under the turn that ran the tool.
+    """
+    summary = str(record.get("summary") or "Tool activity")
+    event: dict[str, Any] = {
+        "event": "message",
+        "chat_id": chat_id,
+        "projection_id": "activity-" + str(record.get("call_id", "")),
+        "kind": "progress",
+        "text": summary,
+        "tool_events": [_record_tool_event(record, status)],
+    }
+    turn_id = anchor.get("turn_id") if anchor is not None else None
+    if isinstance(turn_id, str) and turn_id:
+        event["turn_id"] = turn_id
+        event["turn_phase"] = "activity"
+    started = _record_started_ms(record)
+    if started is not None:
+        event["created_at_ms"] = started
+    return event
+
+
+@dataclass(frozen=True)
+class _RowShape:
+    """How one thread projection spells the fields recovery reads and writes."""
+
+    tool_events_key: str
+    is_user: Callable[[dict[str, Any]], bool]
+    created_ms_key: str
+    make_item: Callable[[dict[str, Any], str, str, dict[str, Any] | None], dict[str, Any]]
+
+
+_MESSAGES_SHAPE = _RowShape(
+    tool_events_key="toolEvents",
+    is_user=lambda row: row.get("role") == "user",
+    created_ms_key="createdAt",
+    make_item=lambda record, status, chat_id, _anchor: _activity_item(record, status, chat_id),
+)
+# Ziggy-local (MIT-1486): upstream #5819's opt-in ``?projection=events``.
+_EVENTS_SHAPE = _RowShape(
+    tool_events_key="tool_events",
+    is_user=lambda row: row.get("event") == "user_message",
+    created_ms_key="created_at_ms",
+    make_item=_activity_event,
+)
+
+
 def _splice_by_message_index(
     messages: list[Any],
     recoverable: list[dict[str, Any]],
@@ -271,6 +318,7 @@ def _splice_into_open_turn(
     chat_id: str,
     active: bool,
     last_turn_end_ms: int | None,
+    shape: _RowShape = _MESSAGES_SHAPE,
 ) -> None:
     """Anchor recovered rows to the turn that actually ran the tool.
 
@@ -290,14 +338,17 @@ def _splice_into_open_turn(
         index
         for index, raw_message in enumerate(messages)
         if isinstance(raw_message, dict)
-        and cast(dict[str, Any], raw_message).get("role") == "user"
+        and shape.is_user(cast(dict[str, Any], raw_message))
     ]
     if not user_positions:
         # The page does not host the turn that ran the tool; its rows belong
         # to the page that does.
         return
     last_user = user_positions[-1]
-    dated = [(index, _row_created_ms(messages[index])) for index in user_positions]
+    dated = [
+        (index, _valid_created_ms(cast(dict[str, Any], messages[index]).get(shape.created_ms_key)))
+        for index in user_positions
+    ]
     rows_are_dated = any(created is not None for _, created in dated)
     # A session with no journaled ``turn_end`` at all is mid its first (open)
     # turn: every unjournaled record belongs to that one live turn, so anchor
@@ -328,10 +379,11 @@ def _splice_into_open_turn(
             if not started > last_turn_end_ms:
                 continue
         in_live_turn = anchor == last_user
-        item = _activity_item(
+        item = shape.make_item(
             record,
             _resolved_status(record, active=active, in_live_turn=in_live_turn),
             chat_id,
+            cast(dict[str, Any], messages[anchor]),
         )
         groups.setdefault(anchor, []).append(item)
     for anchor in sorted(groups, reverse=True):
@@ -344,23 +396,61 @@ def project_activity_history(
     active: bool,
     is_latest_page: bool = True,
 ) -> None:
+    """Splice unjournaled tool activity into ``payload["messages"]`` and/or
+    ``payload["events"]`` (the ``?projection=events`` response, MIT-1486)."""
     stored_metadata: Any = payload.get("metadata", {})
     metadata = cast(dict[str, Any], stored_metadata) if isinstance(stored_metadata, dict) else {}
     raw_records: Any = metadata.pop(KEY, [])
-    raw_messages: Any = payload.get("messages")
-    if not isinstance(raw_records, list) or not isinstance(raw_messages, list):
+    if not isinstance(raw_records, list):
         return
     records = cast(list[Any], raw_records)
-    messages = cast(list[Any], raw_messages)
+    targets: list[tuple[list[Any], _RowShape]] = []
+    for field, shape in (("messages", _MESSAGES_SHAPE), ("events", _EVENTS_SHAPE)):
+        rows: Any = payload.get(field)
+        if isinstance(rows, list):
+            targets.append((cast(list[Any], rows), shape))
+    journal: tuple[set[str], int | None, bool, bool] | None = None
+    journal_read = False
+    for rows, shape in targets:
+        recoverable = _page_candidates(rows, records, shape)
+        if not recoverable:
+            continue
+        # Only the latest page can host recovered rows (the open turn lives at
+        # the tail). Bail before reading the journal so an older ``before=``
+        # page does not pay for a whole-journal scan it cannot render.
+        if not is_latest_page:
+            return
+        if not journal_read:
+            journal = _journaled_activity_state(str(payload.get("key", "")))
+            journal_read = True
+        if journal is None:
+            # Without a readable journal coverage cannot be proven; leaving the
+            # page untouched is safer than risking a double-rendered call.
+            return
+        _splice_recoverable(
+            rows,
+            recoverable,
+            journal=journal,
+            shape=shape,
+            chat_id=webui_chat_id(str(payload.get("key", ""))) or "",
+            active=active,
+        )
+
+
+def _page_candidates(
+    rows: list[Any],
+    records: list[Any],
+    shape: _RowShape,
+) -> list[dict[str, Any]]:
     # A turn whose activity already reached the transcript journal renders its
-    # own Activity rows; replayed ``toolEvents`` name the calls they cover.
+    # own Activity rows; replayed tool events name the calls they cover.
     # Skip those records here so a recovered row never doubles up.
     page_covered: set[str] = set()
-    for raw_message in messages:
-        if not isinstance(raw_message, dict):
+    for raw_row in rows:
+        if not isinstance(raw_row, dict):
             continue
         page_covered |= _tool_event_call_ids(
-            cast(dict[str, Any], raw_message).get("toolEvents")
+            cast(dict[str, Any], raw_row).get(shape.tool_events_key)
         )
     candidates: list[dict[str, Any]] = []
     for raw_record in records:
@@ -373,46 +463,48 @@ def project_activity_history(
         if isinstance(call_id, str) and call_id in page_covered:
             continue
         candidates.append(record)
-    if not candidates:
-        return
-    # Only the latest page can host recovered rows (the open turn lives at the
-    # tail). Bail before reading the journal so an older ``before=`` page does
-    # not pay for a whole-journal scan it cannot render anything from.
-    if not is_latest_page:
-        return
-    journal = _journaled_activity_state(str(payload.get("key", "")))
-    if journal is None:
-        # Without a readable journal coverage cannot be proven; leaving the
-        # page untouched is safer than risking a double-rendered call.
-        return
+    return candidates
+
+
+def _splice_recoverable(
+    rows: list[Any],
+    candidates: list[dict[str, Any]],
+    *,
+    journal: tuple[set[str], int | None, bool, bool],
+    shape: _RowShape,
+    chat_id: str,
+    active: bool,
+) -> None:
     journaled, last_turn_end_ms, has_journal_lines, _open_trailing_turn = journal
-    recoverable: list[dict[str, Any]] = []
-    for record in candidates:
-        call_id = record.get("call_id")
-        # The whole-journal call-id set (not just this page) is what keeps a
-        # call journaled on an older page from being re-synthesized here; a
-        # genuinely lost call is one its turn never journaled at all, which the
-        # timestamp anchor below places under its own turn's user row.
-        if isinstance(call_id, str) and call_id in journaled:
-            continue
-        recoverable.append(record)
+    # The whole-journal call-id set (not just this page) is what keeps a call
+    # journaled on an older page from being re-synthesized here; a genuinely
+    # lost call is one its turn never journaled at all, which the timestamp
+    # anchor below places under its own turn's user row.
+    recoverable = [
+        record
+        for record in candidates
+        if not (isinstance(record.get("call_id"), str) and record.get("call_id") in journaled)
+    ]
     if not recoverable:
         return
-    chat_id = webui_chat_id(str(payload.get("key", ""))) or ""
-    if not has_journal_lines:
-        _splice_by_message_index(messages, recoverable, chat_id=chat_id, active=active)
-    elif is_latest_page:
-        # The open turn's tool call (or a crashed turn that never journaled its
-        # trace) is recovered by anchoring each record to the user row of the
-        # turn that ran it, by timestamp. Runs whether or not the trailing turn
-        # is still open: a turn that crashed without a ``turn_end`` still needs
-        # its rows, and they must survive later turns completing. A record that
-        # predates every user row on this page belongs to a turn the journal
-        # lost (it is not on this page) and is dropped rather than re-anchored.
-        _splice_into_open_turn(
-            messages,
-            recoverable,
-            chat_id=chat_id,
-            active=active,
-            last_turn_end_ms=last_turn_end_ms,
-        )
+    if not has_journal_lines and shape is _MESSAGES_SHAPE:
+        # Journal-less: the replayed rows are the session messages themselves,
+        # so ``before_message_count`` still addresses the right slot. Events
+        # never index session messages, so they always anchor by timestamp.
+        _splice_by_message_index(rows, recoverable, chat_id=chat_id, active=active)
+        return
+    # The open turn's tool call (or a crashed turn that never journaled its
+    # trace) is recovered by anchoring each record to the user row of the
+    # turn that ran it, by timestamp. Runs whether or not the trailing turn
+    # is still open: a turn that crashed without a ``turn_end`` still needs
+    # its rows, and they must survive later turns completing. A record that
+    # predates every user row on this page belongs to a turn the journal
+    # lost (it is not on this page) and is dropped rather than re-anchored.
+    _splice_into_open_turn(
+        rows,
+        recoverable,
+        chat_id=chat_id,
+        active=active,
+        last_turn_end_ms=last_turn_end_ms,
+        shape=shape,
+    )

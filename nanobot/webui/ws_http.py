@@ -1367,9 +1367,15 @@ class GatewayHTTPHandler:
         # ``running`` really is running; without one it is an interrupted one.
         # Records the replay already rendered are skipped by call id, so a
         # journaled turn never shows its activity twice.
-        raw_thread_messages: Any = data.get("messages")
-        if isinstance(raw_thread_messages, list):
-            thread_messages = cast(list[Any], raw_thread_messages)
+        # MIT-1486: the same recovery applies to upstream's opt-in
+        # ``?projection=events`` response, which carries ``events`` instead
+        # of ``messages`` (or ``messages`` when it falls back for huge traces).
+        thread_rows: dict[str, list[Any]] = {
+            field: cast(list[Any], rows)
+            for field in ("messages", "events")
+            if isinstance(rows := data.get(field), list)
+        }
+        if thread_rows:
             raw_persisted: dict[str, Any] = latest_session_metadata or {}
             # ``read_session_metadata`` returns a wrapper; the activity records
             # live in the inner session-metadata payload.
@@ -1381,7 +1387,7 @@ class GatewayHTTPHandler:
             activity_payload: dict[str, Any] = {
                 "key": decoded_key,
                 "metadata": dict(persisted),
-                "messages": thread_messages,
+                **thread_rows,
             }
             project_activity_history(
                 activity_payload,
@@ -1393,7 +1399,8 @@ class GatewayHTTPHandler:
                 # activity is recovered; older pages stay journal-driven.
                 is_latest_page=before is None,
             )
-            data["messages"] = activity_payload["messages"]
+            for field in thread_rows:
+                data[field] = activity_payload[field]
         revision_variant["session_updated_at"] = (
             latest_session_metadata.get("updated_at")
             if latest_session_metadata is not None
