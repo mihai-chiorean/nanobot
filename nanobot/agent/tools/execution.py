@@ -13,6 +13,7 @@ from loguru import logger
 
 from nanobot.agent.hook import AgentHook, AgentHookContext
 from nanobot.agent.tools.ask import AskUserInterrupt
+from nanobot.agent.tools.browser_budget import browser_budget_error
 from nanobot.agent.tools.file_state import file_read_context
 from nanobot.agent.tools.registry import ToolRegistry, is_tool_error_result
 
@@ -167,6 +168,15 @@ async def _execute_tool_call(
             "detail": "repeated external lookup blocked",
         }
         return _with_retry_hint(lookup_error), event, None
+
+    budget = browser_budget_error(tool_call.name, external_lookup_counts)
+    if budget:
+        event = {
+            "name": tool_call.name,
+            "status": "error",
+            "detail": "browser turn budget exhausted",
+        }
+        return budget, event, None
 
     prepare_call = cast(
         Callable[[str, Any], object] | None,
