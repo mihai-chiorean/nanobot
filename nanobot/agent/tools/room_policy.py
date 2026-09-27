@@ -182,7 +182,22 @@ def room_scope_session_key(
     return f"{channel}:{chat_id}" if chat_id else NO_SESSION_KEY
 
 
+# Credential and logged-in-browser tools get a typed refusal (NFR-ISO-006,
+# UX D2b) so the agent and client can render it, instead of the generic text.
+# Substring matching because MCP tools are named ``mcp_<server>_<tool>``
+# (e.g. ``mcp_ziggy_gmail_linkedin_read_page``).
+ROOM_TYPED_DENIAL_MARKERS: tuple[str, ...] = ("browser_", "linkedin_", "site_login", "vault_")
+
+_TYPED_ROOM_DENIAL = (
+    'Error: {"ok":false,"error":{"code":"shared_room_denied",'
+    '"message":"I only use saved logins and signed-in browsing in your own '
+    'conversations.","class":"auth","retryable":false}}'
+)
+
+
 def room_denial_message(tool_name: str) -> str:
+    if any(marker in tool_name for marker in ROOM_TYPED_DENIAL_MARKERS):
+        return _TYPED_ROOM_DENIAL
     return (
         f"Error: Tool '{tool_name}' is unavailable in a shared conversation. "
         "Only public web lookups and visible progress updates are available here."
@@ -193,6 +208,7 @@ __all__ = [
     "DENY_EVERYTHING_SCOPE",
     "NO_SESSION_KEY",
     "ROOM_ALLOWED_TOOLS",
+    "ROOM_TYPED_DENIAL_MARKERS",
     "RoomPolicy",
     "room_denial_message",
     "room_policy_for",
