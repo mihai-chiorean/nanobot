@@ -1,5 +1,6 @@
 """A turn that runs tools must leave recoverable Activity rows in the session file."""
 
+import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -55,12 +56,12 @@ async def test_tool_call_persists_activity_rows_before_turn_end(tmp_path: Path) 
 
     loop.sessions.update_session_metadata = spy_update  # type: ignore[method-assign]
 
-    await loop._dispatch(InboundMessage(
+    await loop._dispatch_one(InboundMessage(
         channel="websocket",
         sender_id="u1",
         chat_id="chat1",
         content="list the files",
-    ))
+    ), asyncio.Queue())
     while bus.outbound_size > 0:
         await bus.consume_outbound()
 
