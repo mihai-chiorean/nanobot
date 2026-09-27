@@ -240,6 +240,14 @@ class TurnContext:
     pending_summary: SessionSummary | None = None
     summary_checkpoint: SessionSummaryCheckpoint | None = None
     provider_compaction_applied: bool = False
+    # Ziggy-local (MIT-1486): websocket follow-ups the pending-queue drain
+    # absorbed into THIS turn (``_drain_pending`` / ``_try_drain_injections``),
+    # as opposed to the message that started the turn. Populated by
+    # ``_run_agent_loop`` as it runs; the caller marks each one's durable
+    # ChatInboxStore receipt processed alongside the root message once the
+    # turn actually completes, so ``_recover_chat_inbox`` on the next gateway
+    # start does not republish an already-answered follow-up as a fresh turn.
+    injected_messages: list[InboundMessage] = field(default_factory=list, repr=False)
 
     ephemeral: bool = False
     run_extra_hooks_for_ephemeral: bool = False
@@ -1637,6 +1645,7 @@ class AgentLoop:
         provider_state: ProviderConversationState | None = None,
         publish_file_turn: PublishFileTurn | None = None,
         initial_messages: list[dict[str, Any]] | None = None,
+        injected_messages_sink: list[InboundMessage] | None = None,
     ) -> AgentRunResult:
         """Run the agent iteration loop.
 
@@ -1652,6 +1661,15 @@ class AgentLoop:
         Returns the complete result produced by ``AgentRunner``.
         """
         self._sync_subagent_runtime_limits()
+
+        # Ziggy-local (MIT-1486): messages the pending-queue drain below
+        # absorbs into this turn (as opposed to the message that started it).
+        # Shared with the caller via ``injected_messages_sink`` when given, so
+        # it can mark their durable chat receipts processed once the turn
+        # completes -- mirroring what happens to the root message.
+        injected_messages: list[InboundMessage] = (
+            injected_messages_sink if injected_messages_sink is not None else []
+        )
 
         if (
             events.publish is not None
@@ -1810,6 +1828,11 @@ class AgentLoop:
                         break
                     converted.append(await _to_user_message(pending_msg))
                 consumed = len(converted)
+                # MIT-1486: record the messages this drain actually committed
+                # into the turn (the requeued remainder below is NOT recorded)
+                # so the caller can mark their durable chat receipts processed
+                # once the turn completes, same as the message that started it.
+                injected_messages.extend(pending_messages[:consumed])
                 return converted
             finally:
                 # Commit only a successfully converted prefix. On failure or
@@ -2368,10 +2391,16 @@ class AgentLoop:
                         session_key,
                         enable_stream=True,
                     )
+                    # Ziggy-local (MIT-1486): collects websocket follow-ups the
+                    # pending-queue drain absorbs into this turn, so their
+                    # durable chat receipts can be marked processed below
+                    # alongside the root message's -- see TurnContext.injected_messages.
+                    injected_messages: list[InboundMessage] = []
                     response = await self._process_message(
                         msg,
                         pending_queue=pending,
                         delivery=delivery,
+                        injected_messages=injected_messages,
                     )
                     continuing = turn_continuation.internal_continuation_pending(msg.metadata)
                     await delivery.complete(
@@ -2380,6 +2409,13 @@ class AgentLoop:
                     )
                     completion_published = not continuing
                     await self._mark_chat_message_processed(msg)
+                    # Only reached once the turn has actually completed: a
+                    # crash or cancellation above skips this, leaving an
+                    # absorbed follow-up's receipt enqueued so the next
+                    # gateway start's recovery sweep retries it, exactly like
+                    # the root message on the same failure paths.
+                    for followup_msg in injected_messages:
+                        await self._mark_chat_message_processed(followup_msg)
                     for coordinator in self._automation_turn_coordinators:
                         coordinator.complete(msg, response=response)
                 except asyncio.CancelledError:
@@ -2611,6 +2647,7 @@ class AgentLoop:
         delivery: TurnDelivery | None = None,
         on_runtime_admitted: Callable[[LLMRuntime], Awaitable[None]] | None = None,
         attributes: Mapping[str, Any] | None = None,
+        injected_messages: list[InboundMessage] | None = None,
     ) -> OutboundMessage | None:
         """Process a single inbound message and return the response."""
         kind = TurnKind.USER if msg.is_user_input else TurnKind.SYSTEM
@@ -2653,6 +2690,10 @@ class AgentLoop:
             streaming=on_stream is not None or delivery.streaming,
             on_runtime_admitted=on_runtime_admitted,
             pending_queue=pending_queue,
+            # Share the caller's list (when given) so mutations made while
+            # running the turn are visible to it without threading a second
+            # return value through the whole stage pipeline.
+            injected_messages=injected_messages if injected_messages is not None else [],
             ephemeral=ephemeral,
             run_extra_hooks_for_ephemeral=run_extra_hooks_for_ephemeral,
             hooks=list(hooks or []),
@@ -3069,6 +3110,7 @@ class AgentLoop:
                 initial_messages=ctx.initial_messages,
                 events=ctx.events,
                 publish_file_turn=ctx.publish_file_turn,
+                injected_messages_sink=ctx.injected_messages,
             )
         ctx.final_content = result.final_content
         ctx.all_messages = result.messages
