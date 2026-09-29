@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 from collections.abc import Callable
 from contextlib import nullcontext
@@ -72,6 +73,33 @@ def _with_retry_hint(payload: str) -> str:
     if payload.endswith(_RETRY_HINT):
         return payload
     return payload + _RETRY_HINT
+
+
+# Failure-envelope ``error.next`` values that instruct the model to stop
+# trying (FR-FAIL-004, D5-agent-tools.md §3.4.2). Appending the generic
+# "try a different approach" hint to these contradicts the envelope and
+# invites workarounds, so the hint is suppressed for them.
+_NO_RETRY_NEXTS: frozenset[str] = frozenset({"ask_user", "hand_off", "conclude"})
+
+
+def _envelope_forbids_retry(text: str) -> bool:
+    """Return whether a tool error is a failure envelope that says do not retry.
+
+    True iff ``text`` parses as a JSON dict with ``ok`` exactly ``False`` and
+    ``error.next`` in :data:`_NO_RETRY_NEXTS`. Anything else (plain text,
+    malformed JSON, a retry envelope, an envelope without a dict ``error``)
+    is False, so the generic retry hint is still appended.
+    """
+    try:
+        payload = json.loads(text)
+    except (ValueError, TypeError):
+        return False
+    if not isinstance(payload, dict) or payload.get("ok") is not False:
+        return False
+    error = payload.get("error")
+    if not isinstance(error, dict):
+        return False
+    return error.get("next") in _NO_RETRY_NEXTS
 
 
 async def execute_tool_calls(
@@ -253,7 +281,7 @@ async def _execute_tool_call(
 
     if is_tool_error_result(result):
         await hook.on_execute_tool_error(context, tool_call, tool, params, result)
-        payload = _with_retry_hint(result)
+        payload = str(result) if _envelope_forbids_retry(result) else _with_retry_hint(result)
         event = {
             "name": tool_call.name,
             "status": "error",
