@@ -19,7 +19,7 @@ import httpx
 from loguru import logger
 
 from nanobot.agent.tools.base import Tool, ToolResult
-from nanobot.agent.tools.context import _CURRENT_REQUEST_CONTEXT
+from nanobot.agent.tools.context import _CURRENT_REQUEST_CONTEXT, ZIGGY_PARK_ATTRIBUTE
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.security.network import (
     PinnedDNSAsyncTransport,
@@ -704,6 +704,28 @@ def _ziggy_meta() -> dict[str, object]:
     return meta
 
 
+_ZIGGY_PARK_META_KEY = "ziggy.dev/park"
+
+
+def _record_park_meta(result: Any) -> None:
+    """Copy a Work park signal from the MCP result onto the turn's RequestContext.
+
+    D5 stamps ``_meta["ziggy.dev/park"] = {"task_id": ..., "site": ...}`` on a
+    Work-origin park.  ``AgentLoop._record_work_outcome`` reads the attribute
+    back to end the turn with Work status ``waiting`` instead of ``succeeded``.
+    Silently no-ops outside a request context.
+    """
+    raw_meta = getattr(result, "meta", None)
+    if not isinstance(raw_meta, dict):
+        return
+    park = cast("dict[str, Any]", raw_meta).get(_ZIGGY_PARK_META_KEY)
+    if not park:
+        return
+    ctx = _CURRENT_REQUEST_CONTEXT.get()
+    if ctx is not None:
+        ctx.attributes[ZIGGY_PARK_ATTRIBUTE] = park
+
+
 class MCPToolWrapper(_MCPWrapperBase):
     """Wraps a single MCP server tool as a nanobot Tool."""
 
@@ -801,6 +823,7 @@ class MCPToolWrapper(_MCPWrapperBase):
                 )
             else:
                 # Success — extract text and persist any image content as artifacts.
+                _record_park_meta(result)
                 try:
                     rendered = self._render_call_result(result.content, kwargs)
                     if getattr(result, "isError", False):
