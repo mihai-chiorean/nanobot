@@ -91,6 +91,15 @@ ziggy = [
     "prometheus-client>=0.20.0,<1.0.0",
     "langfuse>=4.0.0,<5.0.0",
 ]
+# Ziggy-local (fork, MIT-1442): optional local embeddings for the memory
+# index. fastembed runs BAAI/bge-small-en-v1.5 (~130 MB, ONNX on CPU, no
+# torch); sqlite-vec keeps the vectors in the same per-workspace SQLite
+# file as the FTS5 index, so there is no new process or service. Without
+# the extra the index is pure FTS5 and nothing raises.
+memory-embeddings = [
+    "fastembed>=0.4.0,<1.0.0",
+    "sqlite-vec>=0.1.6,<1.0.0",
+]
 documents = [
     # Compatibility extra: document readers are bundled since v0.2.3.
     "defusedxml>=0.7.1,<1.0.0",

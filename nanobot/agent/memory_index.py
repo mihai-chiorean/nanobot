@@ -21,14 +21,19 @@ second namespace and therefore a second database; there is no shared store to
 leak across. That placement is also why backup and deletion cover it: it sits on
 the exact path the backup already asserts non-empty.
 
-Storage is SQLite FTS5 — no embedding model, no ONNX runtime, no first-use
-download. See ``docs/architecture/ziggy-memory.md`` for the measurement that
-chose it over a vector store.
+Storage is SQLite FTS5 — keyword search with no embedding model, no ONNX
+runtime and no first-use download. See ``docs/architecture/ziggy-memory.md``
+for the measurement that chose it over a vector store. When the optional
+``memory-embeddings`` extra is installed (fastembed + sqlite-vec, MIT-1442),
+384-dim local vectors for the same chunks live in ``chunks_vec`` *inside the
+same per-workspace file* — no new process, no shared table, and still a pure
+FTS5 fallback whenever the model or the extension is unavailable.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import sqlite3
 import threading
@@ -40,6 +45,7 @@ from typing import Any, Callable, Iterable, Sequence
 
 from loguru import logger
 
+from nanobot.agent import memory_embed
 from nanobot.utils.sensitive import scan_content
 
 # Schema identity. Bump to force a rebuild on next open. Version 2 added the
@@ -90,6 +96,23 @@ KIND_CONVERSATION = "conversation"
 KIND_FACT = "fact"
 KIND_HISTORY = "history"
 KINDS = (KIND_CONVERSATION, KIND_FACT, KIND_HISTORY)
+
+# Vector layer (MIT-1442, optional). Vectors live in ``chunks_vec``, a
+# sqlite-vec vec0 table keyed by ``chunks.id``, in this same file. Both the
+# extension and the embedder are optional: without them the index is pure
+# FTS5 and every vector path below is a silent no-op.
+EMBED_DIMS = memory_embed.EMBED_DIMS
+EMBED_BATCH_SIZE = 16
+# New chunks are embedded at index time, but a single save must not become
+# an inference batch: at most this many chunks per index call, in batches of
+# ``EMBED_BATCH_SIZE``. Whatever is left over is picked up lazily by
+# :meth:`MemoryIndex.backfill_embeddings`.
+EMBED_PER_INDEX_CALL = 64
+# The lazy backfill slice. Bounded per call so a large owner index (tens of
+# thousands of windows) can never stall a search or the startup burst of
+# MIT-1439's shape.
+BACKFILL_PER_CALL = 32
+BACKFILL_MIN_INTERVAL_S = 30.0
 
 _THINK_BLOCK = re.compile(r"<think>.*?</think>", re.S)
 _FTS_TOKEN = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.\-/]*")
@@ -328,6 +351,11 @@ class MemoryIndex:
         self._lock = threading.RLock()
         self._db: sqlite3.Connection | None = None
         self._broken = False
+        # Vector layer state, (re)set in _connect. Both the sqlite-vec
+        # extension and the embedder are optional; either missing and the
+        # index is pure FTS5.
+        self._vec_ready = False
+        self._next_embed_at = 0.0
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -368,6 +396,8 @@ class MemoryIndex:
                     return self._connect()
             with suppress(OSError):
                 self.path.chmod(0o600)
+            self._vec_ready = self._open_vec(db)
+            self._next_embed_at = 0.0
             self._db = db
             return db
         except sqlite3.DatabaseError:
@@ -430,6 +460,132 @@ class MemoryIndex:
         )
         return True
 
+    # -- vector layer (optional, MIT-1442) ----------------------------------
+    #
+    # Everything below treats the vector layer as an enhancement that may be
+    # absent: the sqlite-vec extension may not load, the embedder may not be
+    # installed or may not have its weights cached. Each such case collapses
+    # to "no vectors, pure FTS5" and never raises into the caller. The table
+    # is NOT in ``_SCHEMA``: vec0 can only be created once the extension is
+    # loaded on the connection, and its absence must not fail the FTS5 build.
+
+    @staticmethod
+    def _open_vec(db: sqlite3.Connection) -> bool:
+        """Load sqlite-vec and create ``chunks_vec``. False if unavailable."""
+        try:
+            import sqlite_vec  # pyright: ignore[reportMissingTypeStubs]
+        except ImportError:
+            logger.debug("sqlite-vec not installed; memory index stays FTS5-only")
+            return False
+        try:
+            sqlite_vec.load(db)
+            db.execute(
+                f"CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0("
+                f"embedding float[{int(EMBED_DIMS)}])"
+            )
+            db.commit()
+            return True
+        except Exception:
+            logger.opt(exception=True).debug(
+                "sqlite-vec could not be enabled on {}; memory index stays FTS5-only",
+                db,
+            )
+            with suppress(Exception):
+                db.rollback()
+            return False
+
+    def _forget_vectors(self, db: sqlite3.Connection, source: str) -> None:
+        """Drop the vectors of *source*'s chunks before its chunks are deleted.
+
+        Called under the index lock. A stale vector is only cosmetic today
+        (no read path joins through it), but an id reused after a rebuild
+        would answer with a dead body, and the delete is one statement.
+        """
+        if not self._vec_ready:
+            return
+        try:
+            db.execute(
+                "DELETE FROM chunks_vec WHERE rowid IN "
+                "(SELECT id FROM chunks WHERE source=?)",
+                (source,),
+            )
+        except Exception:
+            logger.opt(exception=True).debug("Memory index: vector delete failed")
+            with suppress(Exception):
+                db.rollback()
+
+    def _embed_new(self, db: sqlite3.Connection, *, limit: int) -> int:
+        """Embed up to *limit* chunks that have no vector row yet. Never raises.
+
+        Caller holds the lock. Embedding runs inside the lock so a vector set
+        is never observed half-written against its chunks; the per-call bounds
+        above keep that window small. Any failure (model load, ONNX, disk)
+        discards the pending vectors and leaves the FTS5 rows standing.
+        """
+        if limit <= 0 or not self._vec_ready:
+            return 0
+        embedder = memory_embed.get_embedder()
+        if embedder is None:
+            return 0
+        try:
+            pending = db.execute(
+                "SELECT c.id, c.body FROM chunks c "
+                "WHERE c.id NOT IN (SELECT rowid FROM chunks_vec) "
+                "ORDER BY c.id LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+            if not pending:
+                return 0
+            for start in range(0, len(pending), EMBED_BATCH_SIZE):
+                batch = pending[start:start + EMBED_BATCH_SIZE]
+                vectors: list[list[float]] = embedder.embed(
+                    [body for _, body in batch]
+                )
+                rows: list[tuple[int, str]] = []
+                for (chunk_id, _), vector in zip(batch, vectors):
+                    if len(vector) != EMBED_DIMS:
+                        raise ValueError(
+                            f"embedder returned {len(vector)} dims, "
+                            f"chunks_vec holds {EMBED_DIMS}"
+                        )
+                    rows.append((chunk_id, json.dumps([float(x) for x in vector])))
+                db.executemany(
+                    "INSERT INTO chunks_vec(rowid, embedding) VALUES (?, ?)", rows
+                )
+            db.commit()
+            return len(pending)
+        except Exception:
+            logger.opt(exception=True).debug(
+                "Memory index: vector embedding skipped ({} chunk(s) left pending)",
+                limit,
+            )
+            with suppress(Exception):
+                db.rollback()
+            return 0
+
+    def backfill_embeddings(self, *, limit: int = BACKFILL_PER_CALL) -> int:
+        """Embed at most *limit* chunks that lack vectors; return how many.
+
+        Lazy repair for chunks written before vectors existed, or through a
+        window where the model or extension was unavailable. Bounded per call
+        by design: the large owner index must never make one call — and so
+        one startup or one search — wait on a full corpus of inference.
+        """
+        with self._lock:
+            db = self._connect()
+            if db is None:
+                return 0
+            return self._embed_new(db, limit=int(limit))
+
+    def _maybe_backfill_embeddings(self) -> None:
+        """Top up vectors opportunistically while the index is being read."""
+        now = time.monotonic()
+        if now < self._next_embed_at:
+            return
+        self._next_embed_at = now + BACKFILL_MIN_INTERVAL_S
+        if self._db is not None:
+            self._embed_new(self._db, limit=BACKFILL_PER_CALL)
+
     def close(self) -> None:
         with self._lock:
             if self._db is not None:
@@ -487,6 +643,7 @@ class MemoryIndex:
                 cursor = 0 if force else self._cursor_for(db, source)
                 total = len(messages)
                 if force:
+                    self._forget_vectors(db, source)
                     db.execute("DELETE FROM chunks WHERE source=?", (source,))
                 if cursor >= total:
                     self._touch(db, source, kind, total)
@@ -557,6 +714,7 @@ class MemoryIndex:
                         written = len(rows)
                 self._touch(db, source, kind, total)
                 db.commit()
+                self._embed_new(db, limit=EMBED_PER_INDEX_CALL)
                 return written
             except sqlite3.DatabaseError:
                 logger.exception("Memory index write failed for {}", source)
@@ -585,6 +743,7 @@ class MemoryIndex:
                 ).fetchone()
                 if row and row[0] == digest:
                     return 0
+                self._forget_vectors(db, source)
                 db.execute("DELETE FROM chunks WHERE source=?", (source,))
                 rows = []
                 for seq, piece in enumerate(window(text)):
@@ -604,6 +763,7 @@ class MemoryIndex:
                     (source, kind, 0, digest, time.time()),
                 )
                 db.commit()
+                self._embed_new(db, limit=EMBED_PER_INDEX_CALL)
                 return len(rows)
             except sqlite3.DatabaseError:
                 logger.exception("Memory index text write failed for {}", source)
@@ -632,6 +792,7 @@ class MemoryIndex:
                     )
                 self._touch(db, source, kind, seq)
                 db.commit()
+                self._embed_new(db, limit=EMBED_PER_INDEX_CALL)
                 return len(rows)
             except sqlite3.DatabaseError:
                 logger.exception("Memory index append failed for {}", source)
@@ -655,6 +816,7 @@ class MemoryIndex:
             if db is None:
                 return
             try:
+                self._forget_vectors(db, source)
                 db.execute("DELETE FROM chunks WHERE source=?", (source,))
                 db.execute("DELETE FROM sources WHERE source=?", (source,))
                 db.commit()
@@ -723,6 +885,12 @@ class MemoryIndex:
             except sqlite3.DatabaseError:
                 logger.exception("Memory index search failed")
                 return []
+            # Reading the index is the signal that someone cares about recall
+            # right now: spend a bounded slice of CPU catching up on chunks
+            # that never got a vector (written before the extra existed, or
+            # during a window without the model). Throttled and capped so
+            # this can never be a startup-scale burst on the query path.
+            self._maybe_backfill_embeddings()
         return [
             MemoryHit(
                 source=r[0],
@@ -1039,10 +1207,21 @@ class SessionRecallIndexer:
             count += 1
             if limit is not None and count >= limit:
                 break
-        if written:
+        # Drain any vector backlog in bounded slices. This runs on the
+        # startup reconcile thread, off the event loop and off the first
+        # turn; the per-call bound is what keeps a large owner index from
+        # turning "eventually caught up" into "stalled right now".
+        embedded = 0
+        while True:
+            made = self.index.backfill_embeddings(limit=BACKFILL_PER_CALL)
+            embedded += made
+            if made < BACKFILL_PER_CALL:
+                break
+        if written or embedded:
             logger.info(
-                "Recall backfill indexed {} window(s) from {} session(s)",
-                written, count,
+                "Recall backfill indexed {} window(s) from {} session(s), "
+                "embedded {} window(s)",
+                written, count, embedded,
             )
         return written
 
