@@ -233,6 +233,12 @@ def test_backfill_processes_at_most_n_chunks_per_call(tmp_path):
 
 
 def test_backfill_default_slice_bounds_a_large_index(tmp_path):
+    # The contract is the vec table's fill ratio, so this test needs the
+    # extension installed: without it _embed_new is a no-op by design and the
+    # count assertion below would fail for the wrong reason.
+    pytest.importorskip(
+        "sqlite_vec", reason="memory-embeddings extra required for the vector table"
+    )
     memory_embed.set_embedder(None)
     index = MemoryIndex(tmp_path / "ws")
     _append_chunks(index, BACKFILL_PER_CALL + 3)
