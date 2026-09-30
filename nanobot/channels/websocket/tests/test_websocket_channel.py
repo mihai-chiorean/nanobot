@@ -4098,8 +4098,13 @@ async def test_http_route_issues_token_then_websocket_requires_it(bus: MagicMock
 
 
 @pytest.mark.asyncio
-async def test_token_issue_returns_ws_path_and_model_name(bus: MagicMock) -> None:
-    """/auth/token matches production's payload: web and ziggy-worker need ws_path, iOS reads model_name."""
+async def test_token_issue_drops_ws_path_and_model_name(bus: MagicMock) -> None:
+    """/auth/token no longer carries the 0.2.x ws_path/model_name fields.
+
+    The non-default path and a live model name are configured on purpose: the
+    fields must be absent even when the gateway has values to report, proving
+    they were dropped and not merely empty.
+    """
     port = 29878
     channel = _ch(
         bus, port=port,
@@ -4119,11 +4124,18 @@ async def test_token_issue_returns_ws_path_and_model_name(bus: MagicMock) -> Non
         )
         assert issue.status_code == 200
         body = issue.json()
-        assert set(body) == {"token", "ws_path", "expires_in", "model_name"}
+        assert set(body) == {"token", "expires_in"}
+        assert "ws_path" not in body
+        assert "model_name" not in body
         assert body["token"].startswith("nbwt_")
-        assert body["ws_path"] == "/chat"
         assert isinstance(body["expires_in"], int)
-        assert body["model_name"] == "openai/gpt-4.1"
+        # The token still completes a WebSocket handshake on the configured
+        # path, so dropping ws_path does not break clients that know it.
+        async with websockets.connect(
+            f"ws://127.0.0.1:{port}/chat?token={body['token']}&client_id=caller"
+        ) as client:
+            ready = json.loads(await client.recv())
+            assert ready["event"] == "ready"
     finally:
         await channel.stop()
         await server_task
