@@ -117,15 +117,11 @@ class GatewayTokenStore:
 def token_response_payload(
     token: str,
     expires_in: Any,
-    *,
-    ws_path: str,
-    model_name: str | None,
 ) -> dict[str, Any]:
-    # Same fields as production's transport token: web and ziggy-worker require
-    # ``ws_path``; iOS shows ``model_name`` (null when no model is configured).
+    # 0.3.0 transport token. The 0.2.x ``ws_path``/``model_name`` fields are
+    # gone: ziggy-worker and ziggy-work default an absent ``ws_path`` to "/",
+    # and iOS tolerates a missing ``model_name``.
     return {
         "token": token,
-        "ws_path": ws_path,
         "expires_in": expires_in,
-        "model_name": model_name,
     }

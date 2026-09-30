@@ -754,12 +754,6 @@ class GatewayHTTPHandler:
             token_response_payload(
                 token_value,
                 self.config.token_ttl_s,
-                ws_path=_normalize_config_path(self.config.path),
-                model_name=_resolve_bootstrap_model_name(
-                    self.runtime_model_name,
-                    self.settings.config.path,
-                )
-                or None,
             ),
             extra_headers=_NO_STORE_HEADERS,
         )
