@@ -27,7 +27,10 @@ for the measurement that chose it over a vector store. When the optional
 ``memory-embeddings`` extra is installed (fastembed + sqlite-vec, MIT-1442),
 384-dim local vectors for the same chunks live in ``chunks_vec`` *inside the
 same per-workspace file* — no new process, no shared table, and still a pure
-FTS5 fallback whenever the model or the extension is unavailable.
+FTS5 fallback whenever the model or the extension is unavailable. When both
+layers are live, :meth:`MemoryIndex.search` fuses the keyword and vector
+rankings with reciprocal rank fusion (MIT-1444) so paraphrases and exact
+terms compete on rank alone, under one shared audience filter.
 """
 
 from __future__ import annotations
@@ -113,6 +116,14 @@ EMBED_PER_INDEX_CALL = 64
 # MIT-1439's shape.
 BACKFILL_PER_CALL = 32
 BACKFILL_MIN_INTERVAL_S = 30.0
+
+# Hybrid recall (MIT-1444). Reciprocal rank fusion merges the two rankings
+# with no tuning: a chunk's score is the sum of 1 / (RRF_K + rank) over the
+# legs (FTS5, vector) it appears in, rank 1-based. 60 is the published
+# constant; each leg feeds the fusion ``VECTOR_CANDIDATE_FACTOR`` x the final
+# limit so one leg can promote a chunk the other never ranked.
+RRF_K = 60
+VECTOR_CANDIDATE_FACTOR = 4
 
 _THINK_BLOCK = re.compile(r"<think>.*?</think>", re.S)
 _FTS_TOKEN = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.\-/]*")
@@ -208,6 +219,9 @@ class MemoryHit:
     kind: str
     ts: str
     body: str
+    # Ranking score from ``search``: bm25 on the FTS5-only path, the
+    # reciprocal-rank-fusion sum once the vector leg is live (MIT-1444).
+    # The order of hits is what is meaningful, not the absolute value.
     score: float
     msg_start: int | None = None
     msg_end: int | None = None
@@ -340,6 +354,91 @@ def build_match_expression(query: str) -> str:
     if not terms:
         return ""
     return " OR ".join(f'"{t}"' for t in terms)
+
+
+def _kind_filter(wanted: Sequence[str]) -> tuple[str, list[Any]]:
+    """The ``kinds`` restriction as a SQL fragment over ``chunks c``."""
+    if not wanted:
+        return "", []
+    return f" AND c.kind IN ({','.join('?' * len(wanted))})", list(wanted)
+
+
+def _audience_filter(
+    sources: Sequence[str] | None,
+    source_prefixes: Sequence[str] | None,
+) -> tuple[str, list[Any]] | None:
+    """The caller's audience as a SQL fragment over ``chunks c``.
+
+    ``None`` means an explicit empty scope: both arguments were given but
+    named nothing, i.e. "nothing is in scope" — the caller then returns no
+    hits without asking the database. Both search legs splice in this one
+    fragment verbatim, so the vector leg can never carry a wider boundary
+    than the keyword leg (the hard requirement in ``search``'s docstring).
+    """
+    if sources is None and source_prefixes is None:
+        return "", []
+    clauses: list[str] = []
+    params: list[Any] = []
+    for source in sources or ():
+        clauses.append("c.source = ?")
+        params.append(source)
+    for prefix in source_prefixes or ():
+        # LIKE with an escaped prefix: session keys are operator- and
+        # channel-derived, never free text, but escape anyway so a
+        # key containing % or _ cannot widen its own scope.
+        clauses.append("c.source LIKE ? ESCAPE '\\'")
+        params.append(_like_prefix(prefix))
+    if not clauses:
+        return None
+    return f" AND ({' OR '.join(clauses)})", params
+
+
+def _fuse_rankings(
+    fts_rows: Sequence[tuple[Any, ...]],
+    vector_rows: Sequence[tuple[Any, ...]],
+    *,
+    limit: int,
+) -> list[tuple[tuple[Any, ...], float]]:
+    """Reciprocal rank fusion of the two search legs (MIT-1444).
+
+    ``score(chunk) = sum(1 / (RRF_K + rank))`` over the legs it appears in,
+    ranks 1-based. No tuning and no normalising bm25 against cosine: a chunk
+    either leg ranks early is strong, and a chunk both legs rank is stronger.
+    Ties break toward the keyword leg — the FTS rows are inserted first and
+    ``sorted`` is stable — because an exact-term match is evidence a reader
+    can check and a near embedding is not.
+    """
+    fused: dict[int, list[Any]] = {}
+    for rank, row in enumerate(fts_rows, 1):
+        fused[row[0]] = [row, 1.0 / (RRF_K + rank)]
+    for rank, row in enumerate(vector_rows, 1):
+        contribution = 1.0 / (RRF_K + rank)
+        entry = fused.get(row[0])
+        if entry is None:
+            fused[row[0]] = [row, contribution]
+        else:
+            entry[1] += contribution
+    ordered = sorted(fused.values(), key=lambda entry: -entry[1])
+    return [(entry[0], float(entry[1])) for entry in ordered[:limit]]
+
+
+def _hit_from_fused_row(row: tuple[Any, ...], score: float) -> MemoryHit:
+    """A fused leg row (``_fts_ranked``/``_vector_ranked`` shape) as a hit.
+
+    Provenance (kind, timestamps, message range) is read from the ``chunks``
+    row itself, so a hit only the vector leg found cites as precisely as one
+    bm25 found.
+    """
+    return MemoryHit(
+        source=row[1],
+        kind=row[2],
+        ts=row[3] or "",
+        body=row[4],
+        msg_start=row[5],
+        msg_end=row[6],
+        msg_indices=_parse_msg_indices(row[7], row[5], row[6]),
+        score=score,
+    )
 
 
 class MemoryIndex:
@@ -497,9 +596,10 @@ class MemoryIndex:
     def _forget_vectors(self, db: sqlite3.Connection, source: str) -> None:
         """Drop the vectors of *source*'s chunks before its chunks are deleted.
 
-        Called under the index lock. A stale vector is only cosmetic today
-        (no read path joins through it), but an id reused after a rebuild
-        would answer with a dead body, and the delete is one statement.
+        Called under the index lock. The hybrid search leg joins through this
+        table (MIT-1444), so a stale vector is no longer cosmetic: an id
+        reused after a rebuild would put a dead body in front of a live
+        query, and the delete is one statement.
         """
         if not self._vec_ready:
             return
@@ -843,67 +943,174 @@ class MemoryIndex:
         audiences inside a single tenant. Callers that cannot name their
         audience get nothing but explicitly curated memory; see
         ``RecallScope`` in ``nanobot/agent/tools/recall.py``.
+
+        When the vector layer is live — sqlite-vec loaded, embedder
+        available, at least one embedded chunk — the FTS5 list and a vector
+        k-NN list (``k = 4 x limit``) are fused with reciprocal rank fusion,
+        ``score = sum(1 / (RRF_K + rank))`` over the legs a chunk appears in
+        (MIT-1444), and the fused top ``limit`` is returned. Both legs carry
+        the *same* ``kinds``/``sources``/``source_prefixes`` filter: the
+        vector leg joins ``chunks`` and re-applies it, so a chunk outside
+        the caller's audience is never returned by it, however close its
+        embedding sits to the query. Without a live vector layer the query
+        is exactly the FTS5-only query it has always been, bm25 scores
+        included.
         """
-        expression = build_match_expression(query)
-        if not expression:
-            return []
         limit = max(1, min(int(limit), MAX_RESULTS))
+        audience = _audience_filter(sources, source_prefixes)
+        if audience is None:
+            # An explicit empty scope means "nothing is in scope".
+            return []
+        audience_sql, audience_params = audience
+        kind_sql, kind_params = _kind_filter([k for k in (kinds or ()) if k in KINDS])
+        expression = build_match_expression(query)
+        candidates = limit * VECTOR_CANDIDATE_FACTOR
         with self._lock:
             db = self._connect()
             if db is None:
-                return []
-            sql = (
-                "SELECT c.source, c.kind, c.ts, c.body, "
-                "c.msg_start, c.msg_end, c.msg_idx, bm25(chunks_fts) AS score "
-                "FROM chunks_fts JOIN chunks c ON c.id = chunks_fts.rowid "
-                "WHERE chunks_fts MATCH ?"
-            )
-            params: list[Any] = [expression]
-            wanted = [k for k in (kinds or ()) if k in KINDS]
-            if wanted:
-                sql += f" AND c.kind IN ({','.join('?' * len(wanted))})"
-                params.extend(wanted)
-            if sources is not None or source_prefixes is not None:
-                clauses: list[str] = []
-                for source in sources or ():
-                    clauses.append("c.source = ?")
-                    params.append(source)
-                for prefix in source_prefixes or ():
-                    # LIKE with an escaped prefix: session keys are operator- and
-                    # channel-derived, never free text, but escape anyway so a
-                    # key containing % or _ cannot widen its own scope.
-                    clauses.append("c.source LIKE ? ESCAPE '\\'")
-                    params.append(_like_prefix(prefix))
-                if not clauses:
-                    # An explicit empty scope means "nothing is in scope".
-                    return []
-                sql += f" AND ({' OR '.join(clauses)})"
-            sql += " ORDER BY score LIMIT ?"
-            params.append(limit)
-            try:
-                rows = db.execute(sql, params).fetchall()
-            except sqlite3.DatabaseError:
-                logger.exception("Memory index search failed")
                 return []
             # Reading the index is the signal that someone cares about recall
             # right now: spend a bounded slice of CPU catching up on chunks
             # that never got a vector (written before the extra existed, or
             # during a window without the model). Throttled and capped so
-            # this can never be a startup-scale burst on the query path.
+            # this can never be a startup-scale burst on the query path. It
+            # runs before both legs below so the vector leg competes over as
+            # complete a table as this call can afford.
             self._maybe_backfill_embeddings()
-        return [
-            MemoryHit(
-                source=r[0],
-                kind=r[1],
-                ts=r[2] or "",
-                body=r[3],
-                msg_start=r[4],
-                msg_end=r[5],
-                msg_indices=_parse_msg_indices(r[6], r[4], r[5]),
-                score=float(r[7]),
+            vector_rows = self._vector_ranked(
+                db, query, kind_sql, kind_params, audience_sql, audience_params,
+                k=candidates,
             )
-            for r in rows
-        ]
+            if vector_rows is None:
+                # No live vector layer (extension, embedder or table absent):
+                # the historical FTS5-only path, scores and all.
+                if not expression:
+                    return []
+                sql = (
+                    "SELECT c.source, c.kind, c.ts, c.body, "
+                    "c.msg_start, c.msg_end, c.msg_idx, bm25(chunks_fts) AS score "
+                    "FROM chunks_fts JOIN chunks c ON c.id = chunks_fts.rowid "
+                    "WHERE chunks_fts MATCH ?"
+                    + kind_sql
+                    + audience_sql
+                    + " ORDER BY score LIMIT ?"
+                )
+                params: list[Any] = [expression, *kind_params, *audience_params, limit]
+                try:
+                    rows = db.execute(sql, params).fetchall()
+                except sqlite3.DatabaseError:
+                    logger.exception("Memory index search failed")
+                    return []
+                return [
+                    MemoryHit(
+                        source=r[0],
+                        kind=r[1],
+                        ts=r[2] or "",
+                        body=r[3],
+                        msg_start=r[4],
+                        msg_end=r[5],
+                        msg_indices=_parse_msg_indices(r[6], r[4], r[5]),
+                        score=float(r[7]),
+                    )
+                    for r in rows
+                ]
+            fts_rows = (
+                self._fts_ranked(
+                    db, expression, kind_sql, kind_params,
+                    audience_sql, audience_params, cap=candidates,
+                )
+                if expression
+                else []
+            )
+            fused = _fuse_rankings(fts_rows, vector_rows, limit=limit)
+        return [_hit_from_fused_row(row, score) for row, score in fused]
+
+    def _fts_ranked(
+        self,
+        db: sqlite3.Connection,
+        expression: str,
+        kind_sql: str,
+        kind_params: list[Any],
+        audience_sql: str,
+        audience_params: list[Any],
+        *,
+        cap: int,
+    ) -> list[tuple[Any, ...]]:
+        """One leg of a hybrid search: the FTS5 list, best bm25 first."""
+        sql = (
+            "SELECT c.id, c.source, c.kind, c.ts, c.body, "
+            "c.msg_start, c.msg_end, c.msg_idx "
+            "FROM chunks_fts JOIN chunks c ON c.id = chunks_fts.rowid "
+            "WHERE chunks_fts MATCH ?"
+            + kind_sql
+            + audience_sql
+            + " ORDER BY bm25(chunks_fts) LIMIT ?"
+        )
+        params = [expression, *kind_params, *audience_params, cap]
+        try:
+            return db.execute(sql, params).fetchall()
+        except sqlite3.DatabaseError:
+            logger.exception("Memory index search failed")
+            return []
+
+    def _vector_ranked(
+        self,
+        db: sqlite3.Connection,
+        query: str,
+        kind_sql: str,
+        kind_params: list[Any],
+        audience_sql: str,
+        audience_params: list[Any],
+        *,
+        k: int,
+    ) -> list[tuple[Any, ...]] | None:
+        """The other leg: the k nearest chunks by embedding distance.
+
+        ``None`` means "there is no live vector layer for this call" — the
+        extension did not load, the embedder is unavailable, or no chunk has
+        ever been embedded — and the caller must fall back to the FTS5-only
+        path unchanged. An empty list is different: the layer is live and
+        this audience genuinely yielded nothing.
+
+        The leg joins ``chunks`` and splices in the caller's kind/audience
+        clauses against it. vec0 proposes its ``k`` nearest; the join decides
+        what the caller may see, so an out-of-audience chunk is dropped here
+        however close it sits to the query. Any failure — a broken extension,
+        a bad model output, a damaged vec table — reports ``None`` and the
+        search degrades to FTS5-only, per the class contract.
+        """
+        if not self._vec_ready:
+            return None
+        embedder = memory_embed.get_embedder()
+        if embedder is None:
+            return None
+        try:
+            if not db.execute("SELECT EXISTS(SELECT 1 FROM chunks_vec)").fetchone()[0]:
+                return None
+            vectors = embedder.embed([query])
+            if not vectors or len(vectors[0]) != EMBED_DIMS:
+                return None
+            sql = (
+                "SELECT c.id, c.source, c.kind, c.ts, c.body, "
+                "c.msg_start, c.msg_end, c.msg_idx "
+                "FROM chunks_vec v JOIN chunks c ON c.id = v.rowid "
+                "WHERE v.embedding MATCH ? AND v.k = ?"
+                + kind_sql
+                + audience_sql
+                + " ORDER BY v.distance"
+            )
+            params = [
+                json.dumps([float(x) for x in vectors[0]]),
+                int(k),
+                *kind_params,
+                *audience_params,
+            ]
+            return db.execute(sql, params).fetchall()
+        except Exception:
+            logger.opt(exception=True).debug("Memory index: vector search skipped")
+            with suppress(Exception):
+                db.rollback()
+            return None
 
     def stats(self) -> dict[str, int]:
         with self._lock:
