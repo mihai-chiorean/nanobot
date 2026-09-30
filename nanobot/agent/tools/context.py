@@ -26,6 +26,14 @@ _CURRENT_REQUEST_CONTEXT: ContextVar["RequestContext | None"] = ContextVar(
     default=None,
 )
 
+#: ``RequestContext.attributes`` key carrying a park signal a tool stamped during
+#: the turn (MCP result ``_meta["ziggy.dev/park"]``, D4-36/D5).  The carrier is
+#: the per-turn ``RequestContext`` (bound through ``_CURRENT_REQUEST_CONTEXT``),
+#: which tools can reach; ``TurnContext.attributes`` is a snapshot copy and is
+#: *not* visible to tool calls.  ``AgentLoop._record_work_outcome`` reads this
+#: key back to end a Work turn in ``waiting`` instead of ``succeeded``.
+ZIGGY_PARK_ATTRIBUTE = "ziggy_park"
+
 
 @dataclass(frozen=True)
 class RequestContext:

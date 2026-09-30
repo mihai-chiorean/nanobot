@@ -50,7 +50,12 @@ from nanobot.agent.tools.ask import (
     pending_ask_user_id,
 )
 from nanobot.agent.tools.audit import AuditLogger
-from nanobot.agent.tools.context import RequestContext, bind_request_context, reset_request_context
+from nanobot.agent.tools.context import (
+    ZIGGY_PARK_ATTRIBUTE,
+    RequestContext,
+    bind_request_context,
+    reset_request_context,
+)
 from nanobot.agent.tools.exec_session import ExecSessionManager
 from nanobot.agent.tools.file_state import FileStateStore, bind_file_states, reset_file_states
 from nanobot.agent.tools.message import capture_message_deliveries
@@ -1153,6 +1158,25 @@ class AgentLoop:
                 "failed",
                 error=final_content,
                 result_summary=final_content,
+            )
+            return
+        request_attrs: dict[str, Any] = (
+            ctx.request_context.attributes if ctx.request_context is not None else {}
+        )
+        park: Any = request_attrs.get(ZIGGY_PARK_ATTRIBUTE)
+        # A tool (MCPToolWrapper, D4-36) stamped a park signal onto the turn's
+        # RequestContext: ziggy-work re-queues a waiting task on a follow-up,
+        # so end ``waiting`` rather than pretending the work is done.
+        if park:
+            site = (
+                cast("dict[str, Any]", park).get("site") if isinstance(park, dict) else None
+            )
+            await self.record_work_status(
+                ctx.msg,
+                "waiting",
+                result_summary=(
+                    f"Waiting for a sign-in to {site}" if site else "Waiting for a sign-in"
+                ),
             )
             return
         await self.record_work_status(

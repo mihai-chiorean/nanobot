@@ -12,6 +12,11 @@ import httpx
 import pytest
 
 import nanobot.agent.tools.mcp as mcp_mod
+from nanobot.agent.tools.context import (
+    ZIGGY_PARK_ATTRIBUTE,
+    RequestContext,
+    request_context,
+)
 from nanobot.agent.tools.mcp import (
     MCPPromptWrapper,
     MCPProvider,
@@ -521,6 +526,65 @@ async def test_execute_wraps_mcp_is_error_result() -> None:
 
     assert result == "Error: server-side MCP failure"
     assert is_tool_error_result(result)
+
+
+@pytest.mark.asyncio
+async def test_execute_records_park_meta_on_request_context() -> None:
+    """D4-36: ``_meta["ziggy.dev/park"]`` rides the result onto the turn's attributes."""
+    park = {"task_id": "btask_" + "a" * 24, "site": "example.com"}
+
+    async def call_tool(_name: str, arguments: dict, meta: dict | None = None) -> object:
+        return SimpleNamespace(
+            content=[_FakeTextContent("task parked for sign-in")],
+            meta={"ziggy.dev/park": park, "unrelated": True},
+        )
+
+    wrapper = _make_wrapper(SimpleNamespace(call_tool=call_tool))
+    ctx = RequestContext(channel="test", chat_id="c")
+
+    with request_context(ctx):
+        result = await wrapper.execute()
+
+    assert result == "task parked for sign-in"
+    assert ctx.attributes[ZIGGY_PARK_ATTRIBUTE] == park
+
+
+@pytest.mark.asyncio
+async def test_execute_ignores_meta_without_park_key() -> None:
+    """Negative control: ordinary result meta must not touch the park attribute."""
+
+    async def call_tool(_name: str, arguments: dict, meta: dict | None = None) -> object:
+        return SimpleNamespace(
+            content=[_FakeTextContent("ok")],
+            meta={"ziggy.dev/origin": "work", "unrelated": True},
+        )
+
+    wrapper = _make_wrapper(SimpleNamespace(call_tool=call_tool))
+    ctx = RequestContext(channel="test", chat_id="c")
+
+    with request_context(ctx):
+        result = await wrapper.execute()
+
+    assert result == "ok"
+    assert ZIGGY_PARK_ATTRIBUTE not in ctx.attributes
+
+
+@pytest.mark.asyncio
+async def test_execute_park_meta_without_request_context_is_inert() -> None:
+    """No bound request context (e.g. a non-turn call) must not crash or leak."""
+    park = {"task_id": "btask_" + "a" * 24, "site": "example.com"}
+
+    async def call_tool(_name: str, arguments: dict, meta: dict | None = None) -> object:
+        return SimpleNamespace(
+            content=[_FakeTextContent("task parked for sign-in")],
+            meta={"ziggy.dev/park": park},
+        )
+
+    wrapper = _make_wrapper(SimpleNamespace(call_tool=call_tool))
+
+    result = await wrapper.execute()
+
+    assert result == "task parked for sign-in"
 
 
 @pytest.mark.asyncio
