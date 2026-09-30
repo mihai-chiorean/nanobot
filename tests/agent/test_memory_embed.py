@@ -17,9 +17,11 @@ for its *offline* behaviour (uncached model => no vectors, no fetch).
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import sqlite3
 import sys
+import threading
 from contextlib import closing
 from typing import Iterator
 
@@ -43,6 +45,18 @@ class FakeEmbedder:
             seed = sum(bytearray(text.encode("utf-8"))) or 1
             out.append([((seed * (i + 1)) % 1000) / 1000.0 for i in range(self.dims)])
         return out
+
+
+class ThreadRecordingEmbedder(FakeEmbedder):
+    """Records which thread each ONNX-shaped batch ran on (MIT-1442)."""
+
+    def __init__(self, dims: int = 384) -> None:
+        super().__init__(dims)
+        self.threads: list[threading.Thread] = []
+
+    def embed(self, texts: list[str]):
+        self.threads.append(threading.current_thread())
+        return super().embed(texts)
 
 
 @pytest.fixture(autouse=True)
@@ -261,3 +275,92 @@ def test_search_tops_up_vectors_in_a_bounded_lazy_slice(tmp_path):
 
     index.search("spark deterministic")  # throttled: no second slice
     assert len(_vec_rowids(index)) == after_first
+
+
+# ---------------------------------------------------------------------------
+# 4. Inference never runs on the event-loop thread (MIT-1442).
+#
+# Both async call sites — RecallTool.execute and the turn save in
+# AgentLoop._persist_turn — must hand the embedding work to a worker thread.
+# Without sqlite-vec the embedder is never called at all (the vector layer is
+# a no-op), so these tests would pass vacuously; the guard makes them skip
+# instead.
+# ---------------------------------------------------------------------------
+
+
+def test_async_recall_runs_the_embedder_off_the_event_loop(tmp_path):
+    pytest.importorskip(
+        "sqlite_vec", reason="memory-embeddings extra required for the embedder to run at all"
+    )
+    from nanobot.agent.tools.recall import RecallTool
+
+    memory_embed.set_embedder(None)
+    index = MemoryIndex(tmp_path / "ws")
+    assert _append_chunks(index, 3, source="cli:direct") == 3
+
+    embedder = ThreadRecordingEmbedder()
+    memory_embed.set_embedder(embedder)
+    tool = RecallTool(index, scope="workspace")
+
+    loop_thread = threading.current_thread()
+
+    async def call() -> str:
+        return await tool.execute(query="spark deterministic")
+
+    out = asyncio.run(call())
+
+    assert "No memories found" not in out
+    assert embedder.batches, "the bounded read-path backfill must have run"
+    assert all(
+        thread is not loop_thread for thread in embedder.threads
+    ), "ONNX inference ran inline on the event-loop thread"
+
+
+async def test_turn_save_runs_the_embedder_off_the_event_loop(tmp_path):
+    pytest.importorskip(
+        "sqlite_vec", reason="memory-embeddings extra required for the embedder to run at all"
+    )
+    from agent.test_loop_save_turn import (
+        _agent_run_result,
+        _assembled_messages,
+        _make_full_loop,
+    )
+    from nanobot.bus.events import InboundMessage
+    from nanobot.session.turn_continuation import SKIP_USER_PERSIST_META
+
+    loop = _make_full_loop(tmp_path)
+
+    async def fake_run_agent_loop(transcript_input, **_kwargs):
+        initial = _assembled_messages(loop.context, transcript_input)
+        return _agent_run_result(
+            "noted",
+            [
+                *initial,
+                {"role": "assistant", "content": "noted: the spark restarts clean"},
+            ],
+            stop_reason="stop",
+        )
+
+    loop._run_agent_loop = fake_run_agent_loop  # type: ignore[method-assign]
+
+    embedder = ThreadRecordingEmbedder()
+    memory_embed.set_embedder(embedder)
+    loop_thread = threading.current_thread()
+
+    await loop._process_message(
+        InboundMessage(
+            channel="system",
+            sender_id="cron",
+            chat_id="cli:embed",
+            content="scheduled check: the spark runs vllm",
+            metadata={SKIP_USER_PERSIST_META: True},
+        )
+    )
+
+    assert embedder.batches, "the turn's new windows must have been embedded"
+    assert all(
+        thread is not loop_thread for thread in embedder.threads
+    ), "turn-save inference ran inline on the event-loop thread"
+    # Non-vacuous end state: the vectors actually landed in the same file.
+    assert loop.memory_index.stats()["chunks"] > 0
+    assert _vec_rowids(loop.memory_index) == _chunk_ids(loop.memory_index)
