@@ -3205,7 +3205,11 @@ class AgentLoop:
         ctx.delivery.record_latency(ctx.turn_latency_ms)
         self._clear_pending_user_turn(session)
         self._clear_runtime_checkpoint(session)
-        self.sessions.save(session)
+        # The save feeds the recall indexer, which embeds this turn's new
+        # windows (bounded ONNX inference) under the index lock. Model
+        # inference must never run on the event-loop thread (MIT-1442), so
+        # the whole save — file write plus indexing — runs on a worker thread.
+        await asyncio.to_thread(self.sessions.save, session)
         if not ctx.ephemeral:
             await self.runtime_event_publisher.session_turn_persisted(
                 ctx.msg,

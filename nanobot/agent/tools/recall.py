@@ -16,6 +16,7 @@ is a liability, not a feature.
 
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING, Any, Literal
 
 from loguru import logger
@@ -249,7 +250,11 @@ class RecallTool(Tool):
         kinds = None if scope == "all" else [scope]
         sources, prefixes = self._visible_sources()
         try:
-            hits = self._index.search(
+            # Off the event loop: search tops up missing vectors under the
+            # index lock (a bounded slice of ONNX inference, MIT-1442), and
+            # model inference has no business running on the loop thread.
+            hits = await asyncio.to_thread(
+                self._index.search,
                 query,
                 limit=limit or self._default_limit,
                 kinds=kinds,
