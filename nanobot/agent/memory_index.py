@@ -1136,6 +1136,55 @@ class MemoryIndex:
                 return {}
         return {str(r[0]): int(r[1]) for r in rows}
 
+    def windows_for_range(
+        self,
+        source: str,
+        msg_start: int,
+        msg_end: int,
+        *,
+        kind: str = KIND_CONVERSATION,
+    ) -> list[MemoryHit]:
+        """Stored windows of *source* whose message range overlaps ``[start, end]``.
+
+        The read path behind ``memory_explain`` (MIT-1441): a provenance record
+        names a message band of a conversation, and the caller needs the text
+        the index stored for it. Windows are cut on a character budget, so the
+        overlap test — not an equality — is what finds the windows a band was
+        smeared across. Rows with no recoverable range (pre-v2) cannot be
+        placed on the band and are excluded; an empty result honestly means
+        "nothing stored covers that band", never a fabricated excerpt.
+        """
+        with self._lock:
+            db = self._connect()
+            if db is None:
+                return []
+            try:
+                rows = db.execute(
+                    "SELECT source, kind, ts, body, msg_start, msg_end, msg_idx "
+                    "FROM chunks "
+                    "WHERE source=? AND kind=? "
+                    "AND msg_start IS NOT NULL AND msg_end IS NOT NULL "
+                    "AND msg_start <= ? AND msg_end >= ? "
+                    "ORDER BY seq",
+                    (source, kind, msg_end, msg_start),
+                ).fetchall()
+            except sqlite3.DatabaseError:
+                logger.exception("Memory index range lookup failed for {}", source)
+                return []
+        return [
+            MemoryHit(
+                source=r[0],
+                kind=r[1],
+                ts=r[2] or "",
+                body=r[3],
+                msg_start=r[4],
+                msg_end=r[5],
+                msg_indices=_parse_msg_indices(r[6], r[4], r[5]),
+                score=0.0,
+            )
+            for r in rows
+        ]
+
 
 def _split_body_by_messages(body: str) -> list[str] | None:
     """Split a chunk body back into its per-message renders, or ``None``.
