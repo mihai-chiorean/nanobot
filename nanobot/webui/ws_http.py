@@ -1389,8 +1389,9 @@ class GatewayHTTPHandler:
                     active_turn_id is not None
                     or active_turn_started_at is not None
                 ),
-                # Only the latest page can host the open turn whose unjournaled
-                # activity is recovered; older pages stay journal-driven.
+                # Older ``before=`` pages recover only the crashed-tail records
+                # their own time range covers; activity_history bails before the
+                # journal read for the rest (MIT-1060).
                 is_latest_page=before is None,
             )
             for field in thread_rows:

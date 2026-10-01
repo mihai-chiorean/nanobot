@@ -103,12 +103,14 @@ def _journaled_activity_state(
     Returns ``(journaled_call_ids, last_turn_end_ms, has_lines, open_trailing_turn)``,
     or ``None`` when the journal cannot be read at all.
 
-    Only the active chunk is consulted on the common path. Recovery is gated
-    to the latest page and to records that fall after the last journaled
-    ``turn_end``, so a call that was journaled on an older page is dropped by
-    the timestamp anchor (its turn's user row is not on this page), not by a
-    whole-journal scan. A call whose trace reached the journal is always
-    journaled in the same chunk as the turn that ran it, so the active chunk
+    Only the active chunk is consulted on the common path. The caller only
+    reads this for a page that can host a recovered row: the latest page, or
+    an older page whose time range covers a record's ``started_at``
+    (MIT-1060). A call that was journaled on an older page is dropped by the
+    whole-journal call-id dedup and the timestamp anchor (its turn's user row
+    is not on this page), not by a whole-journal scan. A call whose trace
+    reached the journal is always journaled in the same chunk as the turn that
+    ran it, so the active chunk
     carries everything still relevant to the latest page. When the active chunk
     is empty (a journal that has rotated every turn, or none at all) we fall
     back to the full read so "no journal" is not confused with "journal
@@ -415,11 +417,12 @@ def project_activity_history(
         recoverable = _page_candidates(rows, records, shape)
         if not recoverable:
             continue
-        # Only the latest page can host recovered rows (the open turn lives at
-        # the tail). Bail before reading the journal so an older ``before=``
-        # page does not pay for a whole-journal scan it cannot render.
-        if not is_latest_page:
-            return
+        # The latest page hosts the open turn unconditionally (it lives at the
+        # tail). An older ``before=`` page hosts recovered rows only when its
+        # own time range covers a record's ``started_at``; bail before reading
+        # the journal when it cannot render them (MIT-1060).
+        if not is_latest_page and not _page_covers_record_times(rows, recoverable, shape):
+            continue
         if not journal_read:
             journal = _journaled_activity_state(str(payload.get("key", "")))
             journal_read = True
@@ -433,8 +436,47 @@ def project_activity_history(
             journal=journal,
             shape=shape,
             chat_id=webui_chat_id(str(payload.get("key", ""))) or "",
-            active=active,
+            # Only the latest page can hold the live turn; a record left
+            # ``running`` by an older page's crashed turn is interrupted.
+            active=active and is_latest_page,
         )
+
+
+def _page_covers_record_times(
+    rows: list[Any],
+    records: list[dict[str, Any]],
+    shape: _RowShape,
+) -> bool:
+    """Whether any record's ``started_at`` could belong to a turn this page hosts.
+
+    The page spans its dated rows' timestamps, open-ended upwards only when
+    its last dated row is a user row: that turn may have run tools whose trace
+    never reached the journal (the crashed tail turn an older page scrolls
+    back to). Pages with no usable timestamps cannot prove coverage, so they
+    keep the journal-less bail-out.
+    """
+    timestamps: list[int] = []
+    tail_is_user = False
+    for raw_row in rows:
+        if not isinstance(raw_row, dict):
+            continue
+        row = cast(dict[str, Any], raw_row)
+        created = _valid_created_ms(row.get(shape.created_ms_key))
+        if created is None:
+            continue
+        timestamps.append(created)
+        tail_is_user = shape.is_user(row)
+    if not timestamps:
+        return False
+    lower = min(timestamps)
+    upper = max(timestamps)
+    for record in records:
+        started = _record_started_ms(record)
+        if started is None or started < lower:
+            continue
+        if tail_is_user or started <= upper:
+            return True
+    return False
 
 
 def _page_candidates(

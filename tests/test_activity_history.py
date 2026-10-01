@@ -156,19 +156,25 @@ def _append_journal_turn(
     *,
     tool_events: list[dict] | None = None,
     close: bool = True,
+    base_ms: int | None = None,
 ) -> None:
     from nanobot.webui.transcript import append_transcript_object
 
+    def _ts(offset: int) -> dict:
+        if base_ms is None:
+            return {}
+        return {"created_at_ms": base_ms + offset}
+
     append_transcript_object(
-        key, {"event": "user", "chat_id": chat_id, "text": f"question {idx}"}
+        key, {"event": "user", "chat_id": chat_id, "text": f"question {idx}", **_ts(0)}
     )
-    record: dict = {"event": "message", "chat_id": chat_id, "text": f"answer {idx}"}
+    record: dict = {"event": "message", "chat_id": chat_id, "text": f"answer {idx}", **_ts(100)}
     if tool_events is not None:
         record["kind"] = "tool_hint"
         record["tool_events"] = tool_events
     append_transcript_object(key, record)
     if close:
-        append_transcript_object(key, {"event": "turn_end", "chat_id": chat_id})
+        append_transcript_object(key, {"event": "turn_end", "chat_id": chat_id, **_ts(200)})
 
 
 def _activity_records(*events: dict, messages: list[dict]) -> list[dict]:
@@ -201,30 +207,41 @@ def test_latest_page_does_not_resynthesize_calls_journaled_on_older_pages() -> N
     assert [row.get("id") for row in payload["messages"]] == [None, None]
 
 
-def test_older_pages_never_host_recovered_rows() -> None:
+def test_older_pages_host_recovered_rows_only_within_their_time_range() -> None:
+    """MIT-1060: a ``before=`` page recovers the records its own time range
+    covers; records outside that range stay dropped."""
     key = "websocket:older-page"
-    _append_journal_turn(key, "older-page", 1)
-    _append_journal_turn(key, "older-page", 2, close=False)
+    _append_journal_turn(key, "older-page", 1, base_ms=1_000)
+    _append_journal_turn(key, "older-page", 2, close=False, base_ms=1_000)
 
     page = [
-        {"role": "user", "content": "question 1"},
-        {"role": "assistant", "content": "answer 1"},
+        {"role": "user", "content": "question 1", "createdAt": 2_000},
+        {"role": "assistant", "content": "answer 1", "createdAt": 2_500},
     ]
-    payload = {"key": key, "metadata": {}, "messages": page}
-    payload["metadata"] = {
-        KEY: _activity_records(
-            _start_event("call-b", "exec"),
-            messages=[
-                {"role": "user", "content": "question 1"},
-                {"role": "assistant", "content": "answer 1"},
-                {"role": "user", "content": "question 2"},
-            ],
-        )
+    inside = {
+        "call_id": "call-inside",
+        "name": "exec",
+        "summary": "s",
+        "status": "running",
+        "started_at": _iso_ms(2_200),  # within the page's [2000, 2500] span
+        "before_message_count": 1,
+        "text": "{}",
     }
+    outside = {
+        "call_id": "call-outside",
+        "name": "exec",
+        "summary": "s",
+        "status": "running",
+        "started_at": _iso_ms(500),  # predates every row on the page
+        "before_message_count": 1,
+        "text": "{}",
+    }
+    payload = {"key": key, "metadata": {KEY: [dict(inside), dict(outside)]}, "messages": page}
 
     project_activity_history(payload, active=False, is_latest_page=False)
 
-    assert [row.get("id") for row in payload["messages"]] == [None, None]
+    ids = [row.get("id") for row in payload["messages"]]
+    assert ids == [None, "tool-call-inside", None]
 
 
 def test_recovered_rows_anchor_to_the_open_turn_user_row() -> None:
