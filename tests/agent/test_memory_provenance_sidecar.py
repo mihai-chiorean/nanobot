@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import builtins
 import os
+import pathlib
 import threading
 
 from nanobot.agent.memory import MemoryStore, provenance_key
@@ -482,6 +483,45 @@ def _two_fact_store_prepared(tmp_path, name: str) -> MemoryStore:
     store.git.init()
     store.write_memory(f"# Memory\n\n{FACT}\n{FACT_B}\n")
     return store
+
+
+def _fail_memory_read(monkeypatch):
+    """Make reading ``store.memory_file`` raise OSError, as a transient I/O
+    error or a locked file would; every other read is untouched. Returns a
+    (real_read_text, calls) pair so the test can restore the original and
+    prove the refusal was attributable to the injected failure."""
+    real_read_text = pathlib.Path.read_text
+    calls: list[str] = []
+
+    def guarded_read_text(self, *args, **kwargs):
+        if self.name == "MEMORY.md":
+            calls.append(str(self))
+            raise OSError(5, "Input/output error: MEMORY.md")
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "read_text", guarded_read_text)
+    return real_read_text, calls
+
+
+def test_unreadable_memory_md_skips_prune_and_keeps_every_record(tmp_path, monkeypatch):
+    """Reviewer case (MIT-1591): a transient read error on MEMORY.md must never
+    be treated as "MEMORY.md is empty". The prune skips itself when the fact
+    keys cannot be read; treating the failure as an empty file would delete the
+    whole audit trail on one bad read."""
+    store = _two_fact_store(tmp_path, "unreadable-memory")
+    seeded = store._read_provenance_records()
+    assert {record["line"] for record in seeded} == {FACT, FACT_B}
+
+    real_read_text, calls = _fail_memory_read(monkeypatch)
+    try:
+        store.record_dream_provenance("", _batch(SESSION_KEY, [7]))  # must not raise
+    finally:
+        monkeypatch.setattr(pathlib.Path, "read_text", real_read_text)
+
+    assert calls, "MEMORY.md was never read: the injected failure was a no-op"
+    records = store._read_provenance_records()
+    assert [record["line"] for record in records] == [FACT, FACT_B], records
+    assert records == seeded, "the sidecar was rewritten despite the failed read"
 
 
 def test_concurrent_record_dream_provenance_writes_one_record_per_key(tmp_path):
