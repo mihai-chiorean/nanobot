@@ -268,3 +268,69 @@ async def test_cancelled_runtime_tasks_gather_does_not_raise() -> None:
     assert runtime_tasks.done()  # the cancelled gather was awaited without raising
     assert agent.close_calls == 1
     assert provider.close_calls == 1
+
+
+async def test_dream_cron_job_records_provenance_off_the_event_loop(tmp_path) -> None:
+    """Coverage asked for in the MIT-1441 re-review (MIT-1591): the cron Dream
+    call site must hand the blocking provenance write to a worker thread.
+    Pinning the fake's executing thread downgrades a reverted
+    ``asyncio.to_thread`` into a red test instead of a silent pass.
+
+    Drives the real ``_run_dream_cron_job`` (the extracted body of the
+    on_cron_job dream branch) with a real MemoryStore so the finally-path
+    (commit check, compact, prune) also runs for real."""
+    import threading
+    from types import SimpleNamespace
+
+    from nanobot.agent.memory import MemoryStore
+    from nanobot.bus.events import OutboundMessage
+    from nanobot.cli.gateway_runtime import _run_dream_cron_job
+    from nanobot.session.manager import SessionManager
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    store = MemoryStore(workspace)
+    batch = [{"cursor": 42, "content": "consolidated entry 42", "session_key": "cli:direct"}]
+    store.build_dream_prompt = lambda: ("dream prompt", 42, batch)
+    store.dream_content_diff = lambda: "memory/MEMORY.md: +1 -0"
+    seen: dict = {}
+
+    def record(diff_body, provenance_batch):
+        seen["thread"] = threading.current_thread()
+        seen["args"] = (diff_body, provenance_batch)
+
+    store.record_dream_provenance = record
+
+    async def process_direct(prompt, **kwargs):
+        return OutboundMessage(
+            channel="cli",
+            chat_id="direct",
+            content="done",
+            metadata={"_stop_reason": "completed"},
+        )
+
+    agent = SimpleNamespace(
+        context=SimpleNamespace(memory=store),
+        dream_runtime=lambda: None,
+        process_direct=process_direct,
+        sessions=SessionManager(workspace, sessions_root=tmp_path / "sessions"),
+    )
+
+    class _Provider:
+        def __init__(self) -> None:
+            self.connects = 0
+
+        async def connect(self) -> None:
+            self.connects += 1
+
+    provider = _Provider()
+
+    loop_thread = threading.current_thread()  # this coroutine runs on the loop thread
+    await _run_dream_cron_job(agent, provider)
+
+    assert provider.connects == 1
+    assert store.get_last_dream_cursor() == 42  # completed run advanced the cursor
+    assert seen["thread"] is not None
+    assert seen["thread"] is not loop_thread, "provenance ran on the event-loop thread"
+    assert seen["thread"] is not threading.main_thread()
+    assert seen["args"] == ("memory/MEMORY.md: +1 -0", batch)

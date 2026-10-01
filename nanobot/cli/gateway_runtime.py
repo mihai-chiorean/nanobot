@@ -277,6 +277,78 @@ def _commit_dream_changes(memory: Any) -> str | None:
     return memory.git.auto_commit(message)
 
 
+async def _run_dream_cron_job(agent: Any, mcp_provider: Any) -> None:
+    """Run the periodic Dream consolidation (the cron branch of on_cron_job).
+
+    Extracted from the on_cron_job closure unchanged; it is module-level so
+    tests can pin that the blocking provenance write runs off the event loop.
+    """
+    from nanobot.agent.memory import MemoryStore
+
+    async def _silent(*_args: Any, **_kwargs: Any) -> None:
+        pass
+
+    dream_session_key = MemoryStore.dream_session_key
+    prune_dream_sessions = MemoryStore.prune_dream_sessions
+
+    store = agent.context.memory
+    resp = None
+    diff_body = ""
+    try:
+        result = store.build_dream_prompt()
+        if result is None:
+            logger.info("Dream: nothing to process")
+            return
+        prompt, last_cursor, batch = result
+        key = dream_session_key()
+        dream_runtime = agent.dream_runtime()
+        await mcp_provider.connect()
+        resp = await agent.process_direct(
+            prompt,
+            session_key=key,
+            ephemeral=True,
+            tools=store.build_dream_tools(),
+            on_progress=_silent,
+            runtime=dream_runtime,
+        )
+        # The real file delta grounds the audit record; normal completion
+        # decides whether this history batch has finished processing.
+        diff_body = store.dream_content_diff()
+        # Facts the run added to MEMORY.md are attributed to the batch
+        # it consumed (MIT-1441). Single-session batches only; see
+        # MemoryStore.record_dream_provenance. The append + fsync is
+        # blocking file I/O, so it runs off the event loop.
+        await asyncio.to_thread(store.record_dream_provenance, diff_body, batch)
+        completed = MemoryStore.dream_run_completed(resp)
+        if completed:
+            store.set_last_dream_cursor(last_cursor)
+            if diff_body:
+                logger.info(
+                    "Dream cron job completed, cursor advanced to {}",
+                    last_cursor,
+                )
+            else:
+                logger.info(
+                    "Dream cron job completed with no memory changes; "
+                    "cursor advanced to {}",
+                    last_cursor,
+                )
+        else:
+            logger.warning(
+                "Dream cron job did not complete ({}); cursor remains at {}",
+                MemoryStore.dream_incompletion_reason(resp),
+                store.get_last_dream_cursor(),
+            )
+    except Exception:
+        logger.exception("Dream cron job failed")
+    finally:
+        sha = _commit_dream_changes(store)
+        if sha:
+            logger.info("Dream commit: {}", sha)
+        store.compact_history()
+        prune_dream_sessions(agent.sessions)
+
+
 _HEARTBEAT_PREAMBLE = (
     "[Your response will be delivered directly to the user's messaging app. "
     "Output ONLY the final user-facing message. Never reference internal "
@@ -675,67 +747,7 @@ def _run_gateway(
 
         # Dream is an internal job — run directly, not through the agent loop.
         if job.name == "dream":
-            from nanobot.agent.memory import MemoryStore
-
-            dream_session_key = MemoryStore.dream_session_key
-            prune_dream_sessions = MemoryStore.prune_dream_sessions
-
-            store = agent.context.memory
-            resp = None
-            diff_body = ""
-            try:
-                result = store.build_dream_prompt()
-                if result is None:
-                    logger.info("Dream: nothing to process")
-                    return None
-                prompt, last_cursor, batch = result
-                key = dream_session_key()
-                dream_runtime = agent.dream_runtime()
-                await mcp_provider.connect()
-                resp = await agent.process_direct(
-                    prompt,
-                    session_key=key,
-                    ephemeral=True,
-                    tools=store.build_dream_tools(),
-                    on_progress=_silent,
-                    runtime=dream_runtime,
-                )
-                # The real file delta grounds the audit record; normal completion
-                # decides whether this history batch has finished processing.
-                diff_body = store.dream_content_diff()
-                # Facts the run added to MEMORY.md are attributed to the batch
-                # it consumed (MIT-1441). Single-session batches only; see
-                # MemoryStore.record_dream_provenance. The append + fsync is
-                # blocking file I/O, so it runs off the event loop.
-                await asyncio.to_thread(store.record_dream_provenance, diff_body, batch)
-                completed = MemoryStore.dream_run_completed(resp)
-                if completed:
-                    store.set_last_dream_cursor(last_cursor)
-                    if diff_body:
-                        logger.info(
-                            "Dream cron job completed, cursor advanced to {}",
-                            last_cursor,
-                        )
-                    else:
-                        logger.info(
-                            "Dream cron job completed with no memory changes; "
-                            "cursor advanced to {}",
-                            last_cursor,
-                        )
-                else:
-                    logger.warning(
-                        "Dream cron job did not complete ({}); cursor remains at {}",
-                        MemoryStore.dream_incompletion_reason(resp),
-                        store.get_last_dream_cursor(),
-                    )
-            except Exception:
-                logger.exception("Dream cron job failed")
-            finally:
-                sha = _commit_dream_changes(store)
-                if sha:
-                    logger.info("Dream commit: {}", sha)
-                store.compact_history()
-                prune_dream_sessions(agent.sessions)
+            await _run_dream_cron_job(agent, mcp_provider)
             return None
 
         # Heartbeat is a system job that checks HEARTBEAT.md for active tasks.

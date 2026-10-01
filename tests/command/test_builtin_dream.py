@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import builtins
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -257,6 +258,31 @@ async def _wait_for_dream_report(ctx: CommandContext) -> None:
             return
         await asyncio.sleep(0.01)
     pytest.fail("Dream run never published its report")
+
+
+@pytest.mark.asyncio
+async def test_dream_records_provenance_off_the_event_loop(tmp_path) -> None:
+    """Coverage asked for in the MIT-1441 re-review (MIT-1591): the manual
+    /dream call site must hand the blocking provenance write to a worker
+    thread. Pinning the fake's executing thread downgrades a reverted
+    ``asyncio.to_thread`` into a red test instead of a silent pass."""
+    ctx, store = _build_runnable_dream(tmp_path, initialized=True, content_diff="memory/MEMORY.md: +1 -0")
+    loop_thread = threading.current_thread()  # this coroutine runs on the loop thread
+    seen: dict = {}
+
+    def record(diff_body: str, batch: list[dict]) -> None:
+        seen["thread"] = threading.current_thread()
+        seen["args"] = (diff_body, batch)
+
+    store.record_dream_provenance = record
+
+    await cmd_dream(ctx)
+    await _wait_for_dream_report(ctx)
+
+    assert seen["thread"] is not None
+    assert seen["thread"] is not loop_thread, "provenance ran on the event-loop thread"
+    assert seen["thread"] is not threading.main_thread()
+    assert seen["args"] == ("memory/MEMORY.md: +1 -0", [{"cursor": 42, "content": "x"}])
 
 
 @pytest.mark.asyncio
