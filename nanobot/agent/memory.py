@@ -8,13 +8,14 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
 import threading
 import weakref
 from contextlib import suppress
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterator, cast
 from uuid import uuid4
@@ -54,6 +55,23 @@ if TYPE_CHECKING:
 # MemoryStore — pure file I/O layer
 # ---------------------------------------------------------------------------
 
+#: Sidecar carrying the source of each fact in MEMORY.md (MIT-1441).
+#: Written by code — from the Dream run's git diff, which is ground truth —
+#: never by the Dream model turn itself: a free-form file-editing agent can
+#: neither reliably attach nor preserve an inline provenance comment, so the
+#: provenance lives beside the file it describes instead of inside it.
+PROVENANCE_FILENAME = "provenance.jsonl"
+
+
+def provenance_key(line: str) -> str:
+    """The sidecar key for one MEMORY.md fact line.
+
+    Writer (:meth:`MemoryStore.record_dream_provenance`) and reader
+    (``memory_explain``) both go through this, so a lookup can never drift
+    from the form the record was stored under.
+    """
+    return hashlib.sha256(line.strip().encode("utf-8")).hexdigest()[:16]
+
 
 class MemoryStore:
     """Pure file I/O for memory files: MEMORY.md, history.jsonl, SOUL.md, USER.md."""
@@ -62,6 +80,10 @@ class MemoryStore:
     # Durable files whose real working-tree delta grounds Dream commit messages.
     # Deliberately excludes memory/.dream_cursor so progress bookkeeping never
     # appears as a durable-memory edit in the audit record.
+    # memory/provenance.jsonl is deliberately absent too: it is written by code
+    # FROM this diff (record_dream_provenance), never by the model turn, so
+    # diffing it here would be circular. It rides in the same auto-commit via
+    # GitStore's tracked-file list instead.
     _DREAM_CONTENT_PATHS = ("SOUL.md", "USER.md", "memory/MEMORY.md")
     _LEGACY_ENTRY_START_RE = re.compile(r"^\[(\d{4}-\d{2}-\d{2}[^\]]*)\]\s*")
     _LEGACY_TIMESTAMP_RE = re.compile(r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2})\]\s*")
@@ -75,6 +97,7 @@ class MemoryStore:
         self.memory_dir = ensure_dir(workspace / "memory")
         self.memory_file = self.memory_dir / "MEMORY.md"
         self.history_file = self.memory_dir / "history.jsonl"
+        self.provenance_file = self.memory_dir / PROVENANCE_FILENAME
         self.legacy_history_file = self.memory_dir / "HISTORY.md"
         self.soul_file = workspace / "SOUL.md"
         self.user_file = workspace / "USER.md"
@@ -91,6 +114,7 @@ class MemoryStore:
         self._recall: Any = None
         self._git = GitStore(workspace, tracked_files=[
             "SOUL.md", "USER.md", "memory/MEMORY.md", "memory/.dream_cursor",
+            "memory/provenance.jsonl",
         ])
         self._maybe_migrate_legacy_history()
 
@@ -574,10 +598,15 @@ class MemoryStore:
             return text
         return self.default_dream_prompt()
 
-    def build_dream_prompt(self, *, max_entries: int = 20) -> tuple[str, int] | None:
+    def build_dream_prompt(
+        self, *, max_entries: int = 20
+    ) -> tuple[str, int, list[dict[str, Any]]] | None:
         """Build the Dream prompt with unprocessed history context.
 
-        Returns ``(prompt, last_cursor)`` or ``None`` if nothing to process.
+        Returns ``(prompt, last_cursor, batch)`` or ``None`` if nothing to
+        process, where *batch* is the list of raw history entries fed into the
+        prompt. The caller threads *batch* to :meth:`record_dream_provenance`
+        so the fact provenance names the very entries the run consumed.
 
         The current contents of the durable memory files (SOUL.md, USER.md,
         memory/MEMORY.md) reach Dream through the normal agent system context.
@@ -594,7 +623,7 @@ class MemoryStore:
         )
         template = self._dream_template()
         prompt = f"{template}\n\n## Conversation History\n{history_text}"
-        return (prompt, batch[-1]["cursor"])
+        return (prompt, batch[-1]["cursor"], batch)
 
     def dream_content_diff(self) -> str:
         """Structured summary of uncommitted changes to the durable memory files.
@@ -605,6 +634,147 @@ class MemoryStore:
         if not self._git.is_initialized():
             return ""
         return self._git.summarize_working_tree(list(self._DREAM_CONTENT_PATHS))
+
+    # -- MEMORY.md provenance sidecar (MIT-1441) -------------------------------
+
+    _MEMORY_DIFF_FILE = "memory/MEMORY.md"
+
+    @classmethod
+    def _added_memory_lines(cls, diff_body: str) -> list[str]:
+        """Fact lines *diff_body* added to memory/MEMORY.md, in order.
+
+        *diff_body* is the string :meth:`dream_content_diff` returns (a
+        per-file ``+N -M`` summary plus a fenced ```diff block of unified
+        hunks, see :meth:`GitStore.summarize_working_tree`). The added lines
+        of that diff are the ground truth of what the Dream run wrote — no
+        model compliance is involved, which is why provenance is parsed from
+        the diff rather than asked of the model.
+
+        Blank lines and Markdown headings (``#``…) are structural, not facts,
+        and are skipped: a heading carries no claim to trace back to a
+        conversation, and recording it would bury the real entries.
+        """
+        added: list[str] = []
+        seen: set[str] = set()
+        in_memory_file = False
+        for line in diff_body.splitlines():
+            if line.startswith("+++ "):
+                in_memory_file = line[4:].strip() == cls._MEMORY_DIFF_FILE
+                continue
+            if line.startswith("--- "):
+                in_memory_file = False
+                continue
+            if not in_memory_file or not line.startswith("+"):
+                continue
+            fact = line[1:].strip()
+            if not fact or fact.startswith("#"):
+                continue
+            if fact not in seen:
+                seen.add(fact)
+                added.append(fact)
+        return added
+
+    def _read_provenance_records(self) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
+        with suppress(FileNotFoundError):
+            with open(self.provenance_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        parsed: object = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(parsed, dict):
+                        records.append(cast(dict[str, Any], parsed))
+        return records
+
+    def find_provenance(self, line: str) -> dict[str, Any] | None:
+        """The sidecar record for one MEMORY.md line, or None.
+
+        The most recent record wins: a fact corrected by a later Dream run
+        cites the run that last introduced the line as it now stands.
+        """
+        key = provenance_key(line)
+        found: dict[str, Any] | None = None
+        for record in self._read_provenance_records():
+            if record.get("key") == key:
+                found = record
+        return found
+
+    def record_dream_provenance(self, diff_body: str, batch: list[dict[str, Any]]) -> None:
+        """Append source records for facts a Dream run added to MEMORY.md.
+
+        The added lines are parsed from *diff_body* (the run's real
+        working-tree diff) and attributed to *batch* — the history entries the
+        run consumed. Attribution is deliberately restricted to the
+        single-session batch: with several distinct session keys in one batch
+        there is no honest answer to "which conversation produced this fact",
+        and a guessed source is worse than none, so such runs are skipped at
+        debug level (documented limitation).
+
+        Each record is one JSON line in memory/provenance.jsonl::
+
+            {"key", "line", "session_key", "cursor_start", "cursor_end", "date"}
+
+        *cursor_start* / *cursor_end* are the batch's history cursors; the
+        ``memory_explain`` tool reads them as the 1-based message range of the
+        cited conversation, which is the numbering the citation shows a
+        human. Never raises into the Dream run: provenance is an audit
+        enhancement, not a load-bearing step.
+        """
+        added = self._added_memory_lines(diff_body)
+        if not added or not batch:
+            return
+        session_keys = {
+            entry.get("session_key")
+            for entry in batch
+            if entry.get("session_key")
+        }
+        if len(session_keys) != 1:
+            logger.debug(
+                "Dream provenance skipped: batch spans {} distinct session(s); "
+                "fact sources are only recorded for single-session batches",
+                len(session_keys),
+            )
+            return
+        session_key = next(iter(session_keys))
+        cursors = [
+            cursor
+            for entry in batch
+            if not isinstance(cursor := entry.get("cursor"), bool)
+            and isinstance(cursor, int)
+        ]
+        if not cursors:
+            logger.debug("Dream provenance skipped: batch carries no usable cursors")
+            return
+        record_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        known = {record.get("key") for record in self._read_provenance_records()}
+        lines: list[str] = []
+        for fact in added:
+            key = provenance_key(fact)
+            if key in known:
+                continue
+            known.add(key)
+            lines.append(json.dumps({
+                "key": key,
+                "line": fact,
+                "session_key": session_key,
+                "cursor_start": min(cursors),
+                "cursor_end": max(cursors),
+                "date": record_date,
+            }, ensure_ascii=False))
+        if not lines:
+            return
+        try:
+            with open(self.provenance_file, "a", encoding="utf-8") as f:
+                for line in lines:
+                    f.write(line + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+        except OSError:
+            logger.exception("Could not write dream provenance to {}", self.provenance_file)
 
     def build_dream_tools(self) -> ToolRegistry:
         """Build the restricted tool registry used by Dream runs."""

@@ -688,7 +688,7 @@ def _run_gateway(
                 if result is None:
                     logger.info("Dream: nothing to process")
                     return None
-                prompt, last_cursor = result
+                prompt, last_cursor, batch = result
                 key = dream_session_key()
                 dream_runtime = agent.dream_runtime()
                 await mcp_provider.connect()
@@ -703,6 +703,10 @@ def _run_gateway(
                 # The real file delta grounds the audit record; normal completion
                 # decides whether this history batch has finished processing.
                 diff_body = store.dream_content_diff()
+                # Facts the run added to MEMORY.md are attributed to the batch
+                # it consumed (MIT-1441). Single-session batches only; see
+                # MemoryStore.record_dream_provenance.
+                store.record_dream_provenance(diff_body, batch)
                 completed = MemoryStore.dream_run_completed(resp)
                 if completed:
                     store.set_last_dream_cursor(last_cursor)

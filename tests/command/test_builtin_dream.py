@@ -33,12 +33,16 @@ class _FakeStore:
         self._dream_prompt_result = dream_prompt_result
         self._content_diff = content_diff
         self.compact_history_called = False
+        self.provenance_calls: list[tuple[str, list[dict]]] = []
 
     def get_last_dream_cursor(self) -> int:
         return self._last_dream_cursor
 
     def build_dream_prompt(self):
         return self._dream_prompt_result
+
+    def record_dream_provenance(self, diff_body: str, batch: list[dict]) -> None:
+        self.provenance_calls.append((diff_body, batch))
 
     def build_dream_tools(self):
         return None
@@ -162,7 +166,10 @@ async def test_dream_no_history_explains_how_to_create_input(tmp_path) -> None:
 @pytest.mark.asyncio
 async def test_dream_internal_run_silences_progress(tmp_path) -> None:
     msg = InboundMessage(channel="feishu", sender_id="u1", chat_id="chat1", content="/dream")
-    store = _FakeStore(_FakeGit(initialized=False), dream_prompt_result=("dream prompt", 123))
+    store = _FakeStore(
+        _FakeGit(initialized=False),
+        dream_prompt_result=("dream prompt", 123, [{"cursor": 123, "content": "x"}]),
+    )
     bus = _FakeBus()
     calls = []
 
@@ -206,7 +213,7 @@ def _build_runnable_dream(
     store = _FakeStore(
         _FakeGit(initialized=initialized),
         last_dream_cursor=5,
-        dream_prompt_result=("dream prompt", 42),
+        dream_prompt_result=("dream prompt", 42, [{"cursor": 42, "content": "x"}]),
         content_diff=content_diff,
     )
 
@@ -331,7 +338,7 @@ async def test_dream_noop_batch_unlocks_following_history(tmp_path) -> None:
     assert store.get_last_dream_cursor() == 20
     next_result = store.build_dream_prompt()
     assert next_result is not None
-    next_prompt, next_cursor = next_result
+    next_prompt, next_cursor, _next_batch = next_result
     assert next_cursor == 21
     assert "entry-21" in next_prompt
     assert "entry-01" not in next_prompt

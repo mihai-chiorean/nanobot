@@ -29,7 +29,7 @@ class TestBuildDreamPrompt:
         store.append_history("hello")
         result = store.build_dream_prompt()
         assert result is not None
-        prompt, cursor = result
+        prompt, cursor, _batch = result
         assert cursor > 0
         assert "## Conversation History" in prompt
         assert "hello" in prompt
@@ -38,7 +38,7 @@ class TestBuildDreamPrompt:
         store.append_history("first")
         r1 = store.build_dream_prompt()
         assert r1 is not None
-        _, c1 = r1
+        _, c1, _batch = r1
 
         # Cursor not yet advanced — same entries are still available
         assert store.build_dream_prompt() is not None
@@ -52,21 +52,21 @@ class TestBuildDreamPrompt:
         store.append_history("second")
         r2 = store.build_dream_prompt()
         assert r2 is not None
-        _, c2 = r2
+        _, c2, _batch = r2
         assert c2 > c1
 
     def test_prompt_includes_skill_creator_path(self, store):
         store.append_history("test")
         result = store.build_dream_prompt()
         assert result is not None
-        prompt, _ = result
+        prompt, _, _batch = result
         assert "skill-creator" in prompt
 
     def test_prompt_does_not_duplicate_current_memory_file_contents(self, store):
         store.append_history("hello")
         result = store.build_dream_prompt()
         assert result is not None
-        prompt, _ = result
+        prompt, _, _batch = result
         assert "## Current Memory Files" not in prompt
         assert "Project X active" not in prompt
         assert "Helpful" not in prompt
@@ -82,7 +82,7 @@ class TestBuildDreamPrompt:
         result = store.build_dream_prompt()
 
         assert result is not None
-        prompt, _ = result
+        prompt, _, _batch = result
         assert prompt.startswith("Custom Dream prompt.")
         assert "## Conversation History" in prompt
         assert "keep this fact" in prompt
@@ -95,7 +95,7 @@ class TestBuildDreamPrompt:
         result = store.build_dream_prompt()
 
         assert result is not None
-        prompt, _ = result
+        prompt, _, _batch = result
         assert "x" * 40_000 not in prompt
         assert "... (truncated)" in prompt
         assert "## Conversation History" in prompt
@@ -109,7 +109,7 @@ class TestBuildDreamPrompt:
         result = store.build_dream_prompt()
 
         assert result is not None
-        prompt, _ = result
+        prompt, _, _batch = result
         assert prompt.startswith(store.default_dream_prompt() + "\n\n## Conversation History\n")
 
     def test_truncates_long_entries_at_1000_chars(self, store):
@@ -117,7 +117,7 @@ class TestBuildDreamPrompt:
         store.append_history(long_content)
         result = store.build_dream_prompt()
         assert result is not None
-        prompt, _ = result
+        prompt, _, _batch = result
         assert long_content not in prompt
         assert "x" * 1000 in prompt
         assert "x" * 1001 not in prompt
@@ -128,7 +128,7 @@ class TestBuildDreamPrompt:
 
         result = store.build_dream_prompt(max_entries=20)
         assert result is not None
-        prompt, cursor = result
+        prompt, cursor, _batch = result
 
         assert cursor == 20
         assert "entry-01" in prompt
@@ -138,7 +138,7 @@ class TestBuildDreamPrompt:
         store.set_last_dream_cursor(cursor)
         next_result = store.build_dream_prompt(max_entries=20)
         assert next_result is not None
-        next_prompt, next_cursor = next_result
+        next_prompt, next_cursor, _next_batch = next_result
         assert next_cursor == 25
         assert "entry-21" in next_prompt
         assert "entry-25" in next_prompt
@@ -154,7 +154,7 @@ class TestBuildDreamPrompt:
         result = store.build_dream_prompt()
 
         assert result is not None
-        prompt, cursor = result
+        prompt, cursor, _batch = result
         assert cursor == 2
         assert "usable memory" in prompt
 
@@ -562,7 +562,7 @@ class TestEphemeralDirect:
 
         result = store.build_dream_prompt(max_entries=20)
         assert result is not None
-        prompt, cursor = result
+        prompt, cursor, _batch = result
         assert cursor == 20
 
         captured: dict[str, list[dict]] = {}
@@ -620,7 +620,7 @@ class TestEphemeralDirect:
 
         result = store.build_dream_prompt()
         assert result is not None
-        prompt, _ = result
+        prompt, _, _batch = result
 
         captured: dict[str, list[dict]] = {}
         provider = MagicMock()
