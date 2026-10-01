@@ -73,6 +73,58 @@ class MemoryToolConfig(BaseModel):
 _SCOPES = {"all", *KINDS}
 
 
+def visible_sources_for(
+    session_key: str | None, scope: str
+) -> tuple[list[str] | None, list[str] | None]:
+    """Resolve the audience a call may see, given its bound session and scope.
+
+    Shared by ``recall`` and ``memory_explain`` (MIT-1441): both surface
+    conversation content and must apply one audience boundary, not two that
+    can drift apart. The session key comes from the per-request context the
+    agent loop binds around tool execution — server-side, per turn, and never
+    from a tool argument, so the model cannot widen its own reach by asking.
+
+    Returns ``(sources, prefixes)`` in the shape
+    :meth:`nanobot.agent.memory_index.MemoryIndex.search` takes:
+    ``(None, None)`` means the whole workspace is visible; a session key with
+    no bound session fails closed to curated memory only.
+    """
+    if scope == "workspace":
+        return None, None
+
+    if not session_key:
+        # Fails closed: an internal or malformed invocation sees curated
+        # memory only, never another conversation's transcript.
+        return list(CURATED_SOURCES), None
+
+    sources = [*CURATED_SOURCES, session_key, f"history:{session_key}"]
+    if scope == "channel" and ":" in session_key:
+        channel = session_key.split(":", 1)[0]
+        return sources, [f"{channel}:", f"history:{channel}:"]
+    return sources, None
+
+
+def source_is_visible(
+    source: str,
+    sources: list[str] | None,
+    prefixes: list[str] | None,
+) -> bool:
+    """Whether *source* falls inside the boundary ``(sources, prefixes)``.
+
+    The same check :class:`MemoryIndex.search` applies to its rows, run here
+    against a value that came from somewhere other than the index itself — a
+    provenance record's session key, say — so a tool can refuse before ever
+    returning content the caller's audience may not see.
+    """
+    if sources is None and prefixes is None:
+        return True
+    if sources is not None and source in sources:
+        return True
+    if prefixes:
+        return any(source.startswith(prefix) for prefix in prefixes)
+    return False
+
+
 class RecallTool(Tool):
     """Keyword search over this workspace's conversations and curated memory."""
 
@@ -155,29 +207,17 @@ class RecallTool(Tool):
     def _visible_sources(self) -> tuple[list[str] | None, list[str] | None]:
         """Resolve the audience this call may search.
 
-        The session key comes from the per-request contextvar the agent loop
-        binds around tool execution — server-side, per turn, and never from a
-        tool argument, so the model cannot widen its own reach by asking. The
-        tool object itself is shared across every conversation this runtime
-        serves, so the boundary has to be resolved per call, not per tool.
-
-        Fails closed: a call with no bound session key (an internal or
-        malformed invocation) sees curated memory only, never another
-        conversation's transcript.
+        The boundary logic itself lives in :func:`visible_sources_for`, shared
+        with ``memory_explain`` (MIT-1441) so the two tools can never drift
+        apart. The session key is taken here, from the per-request contextvar
+        the agent loop binds around tool execution; the tool object itself is
+        shared across every conversation this runtime serves, so the boundary
+        has to be resolved per call, not per tool.
         """
-        if self._scope == "workspace":
-            return None, None
-
         session_key = current_request_session_key()
-        if not session_key:
+        if self._scope != "workspace" and not session_key:
             logger.warning("recall: no bound session key; restricting to curated memory")
-            return list(CURATED_SOURCES), None
-
-        sources = [*CURATED_SOURCES, session_key, f"history:{session_key}"]
-        if self._scope == "channel" and ":" in session_key:
-            channel = session_key.split(":", 1)[0]
-            return sources, [f"{channel}:", f"history:{channel}:"]
-        return sources, None
+        return visible_sources_for(session_key, self._scope)
 
     @property
     def name(self) -> str:
