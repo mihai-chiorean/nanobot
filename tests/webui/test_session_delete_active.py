@@ -8,7 +8,7 @@ writing transcript rows into a session that no longer existed.
 
 The gate reads the gateway's WebUI turn registry -- the same
 ``websocket_turn_wall_started_at`` signal the sessions list reports as
-``run_started_at`` and the messages route reports as ``active_turn_*``.
+``run_started_at`` and ``/webui-thread`` reports as ``active_turn_id``.
 Turns are opened and closed through the registry's own entry points
 (``register_queued_websocket_turn_if_idle`` /
 ``clear_websocket_turn_if_current``, the pair the WebSocket ingress and the

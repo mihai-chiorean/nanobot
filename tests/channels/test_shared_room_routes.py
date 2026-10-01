@@ -351,7 +351,8 @@ async def test_messages_route_rejects_an_unauthenticated_read(
     await _create_room(router)
     path = f"/api/sessions/websocket:{ROOM_CHAT}/messages"
     # No room token: not the room router's request. It falls through to the
-    # owner route, which requires the owner API token (401 otherwise).
+    # gateway, where no owner /messages route exists any more (MIT-1623) and
+    # the generic /api 404 answers it.
     assert await router.dispatch(_Request(path, method="GET"), path) is None
     response = await router.dispatch(
         _Request(path, method="GET", headers={"Authorization": "Bearer owner-api-token"}),
@@ -377,7 +378,8 @@ async def test_revoked_credential_cannot_read(router: SharedRoomRouter) -> None:
         path,
     )
     # A revoked token is no longer a room credential; the room router does not
-    # serve it and the owner route rejects it (it is not an owner API token).
+    # serve it, and with the owner /messages route gone (MIT-1623) the generic
+    # /api 404 answers it at the gateway.
     assert response is None
     assert router.store.api_credential(token) is None
 

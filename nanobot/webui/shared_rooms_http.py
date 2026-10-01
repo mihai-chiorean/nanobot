@@ -482,9 +482,10 @@ class SharedRoomRouter:
         exactly its own session, and the body is the ``shareable_messages``
         projection rather than the raw session file.
 
-        A request that carries no live room token falls through (``None``) to
-        the owner route in ``ws_http`` (MIT-1404), which requires the owner API
-        token and answers 401 otherwise, exactly as production does.
+        A request that carries no live room token falls through (``None``).
+        There is no owner ``/messages`` route to reach any more (removed by
+        MIT-1623), so owner and API-token callers get the generic ``/api``
+        404 here and use ``/webui-thread``, exactly as production does.
         """
         credential = self.store.api_credential(bearer_token(request.headers))
         if credential is None:
