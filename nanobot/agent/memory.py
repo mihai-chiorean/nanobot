@@ -108,6 +108,10 @@ class MemoryStore:
         self._oversize_logged = False  # rate-limit oversized-entry warning
         self._dream_prompt_oversize_logged = False
         self._append_lock = threading.Lock()  # serialize cursor allocation + append
+        # MIT-1591: one lock over the whole provenance read-dedup-append-prune
+        # sequence, so two Dream runs sharing a store can never interleave and
+        # double-append (or clobber each other's prune rewrite).
+        self._provenance_lock = threading.Lock()
         # Ziggy-local (fork, MIT-1013): the curated layer feeds recall too, so
         # `recall` can surface a remembered fact and not only raw chat. Set by
         # the Agent once the per-workspace index exists; None in plain CLI use.
@@ -681,6 +685,17 @@ class MemoryStore:
         locked, or a mid-read I/O error — reads as "no records" instead of
         propagating into the async Dream run or the memory_explain tool.
         """
+        return self._read_provenance_records_checked() or []
+
+    def _read_provenance_records_checked(self) -> list[dict[str, Any]] | None:
+        """Like :meth:`_read_provenance_records`, but distinguishes an unreadable
+        sidecar (``None``) from an empty one (``[]``).
+
+        A caller about to rewrite the file must treat ``None`` as "do not
+        rewrite": what could not be read is not the same as what is not there,
+        and rewriting on the strength of a failed read could erase records
+        nobody ever saw.
+        """
         records: list[dict[str, Any]] = []
         try:
             with open(self.provenance_file, "r", encoding="utf-8") as f:
@@ -695,13 +710,40 @@ class MemoryStore:
                     if isinstance(parsed, dict):
                         records.append(cast(dict[str, Any], parsed))
         except FileNotFoundError:
-            pass
+            return []
         except OSError:
             logger.exception(
                 "Could not read dream provenance from {}; running without audit records",
                 self.provenance_file,
             )
+            return None
         return records
+
+    def _current_memory_fact_keys(self) -> set[str] | None:
+        """Sidecar keys of the fact lines currently in MEMORY.md, or None.
+
+        Mirrors :meth:`_added_memory_lines`' definition of a fact: blank lines
+        and Markdown headings are structural, were never recorded, and so never
+        keep a record alive. A missing MEMORY.md has no facts at all (every
+        record is orphaned); an unreadable one yields ``None`` so the caller
+        skips the prune — a transient I/O error must never be able to wipe the
+        audit trail.
+        """
+        try:
+            content = self.memory_file.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return set()
+        except OSError:
+            logger.exception(
+                "Could not read {} for provenance pruning; keeping every record",
+                self.memory_file,
+            )
+            return None
+        return {
+            provenance_key(fact)
+            for line in content.splitlines()
+            if (fact := line.strip()) and not fact.startswith("#")
+        }
 
     def find_provenance(self, line: str) -> dict[str, Any] | None:
         """The sidecar record for one MEMORY.md line, or None.
@@ -717,15 +759,19 @@ class MemoryStore:
         return found
 
     def record_dream_provenance(self, diff_body: str, batch: list[dict[str, Any]]) -> None:
-        """Append source records for facts a Dream run added to MEMORY.md.
+        """Sync the provenance sidecar after a Dream run.
 
-        The added lines are parsed from *diff_body* (the run's real
-        working-tree diff) and attributed to *batch* — the history entries the
-        run consumed. Attribution is deliberately restricted to the
-        single-session batch: with several distinct session keys in one batch
-        there is no honest answer to "which conversation produced this fact",
-        and a guessed source is worse than none, so such runs are skipped at
-        debug level (documented limitation).
+        Two things happen, under one store-wide lock so a concurrent Dream run
+        (a manual /dream plus the cron job) can never interleave between the
+        dedup read and the write (MIT-1591):
+
+        * source records are appended for facts *diff_body* (the run's real
+          working-tree diff) added to MEMORY.md, attributed to *batch* — the
+          history entries the run consumed;
+        * records whose key no longer matches any fact in the current
+          MEMORY.md are pruned (facts the run deleted), so the file stops
+          growing without bound. The prune runs even when this run added no
+          facts at all — that is the common shape of a deletion-only run.
 
         Each record is one JSON line in memory/provenance.jsonl::
 
@@ -735,11 +781,32 @@ class MemoryStore:
         ``memory_explain`` tool reads them as the 1-based message range of the
         cited conversation, which is the numbering the citation shows a
         human. Never raises into the Dream run: provenance is an audit
-        enhancement, not a load-bearing step.
+        enhancement, not a load-bearing step. A prune rewrite that fails is
+        logged and leaves the existing file untouched.
         """
         added = self._added_memory_lines(diff_body)
+        new_records = self._dream_provenance_records(added, batch)
+        try:
+            with self._provenance_lock:
+                self._sync_provenance_locked(new_records)
+        except OSError:
+            logger.exception("Could not write dream provenance to {}", self.provenance_file)
+
+    def _dream_provenance_records(
+        self,
+        added: list[str],
+        batch: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Candidate records for *added* fact lines, attributed to *batch*.
+
+        Attribution is deliberately restricted to the single-session batch:
+        with several distinct session keys in one batch there is no honest
+        answer to "which conversation produced this fact", and a guessed
+        source is worse than none, so such runs are skipped at debug level
+        (documented limitation).
+        """
         if not added or not batch:
-            return
+            return []
         session_keys = {
             entry.get("session_key")
             for entry in batch
@@ -751,7 +818,7 @@ class MemoryStore:
                 "fact sources are only recorded for single-session batches",
                 len(session_keys),
             )
-            return
+            return []
         session_key = next(iter(session_keys))
         cursors = [
             cursor
@@ -761,33 +828,79 @@ class MemoryStore:
         ]
         if not cursors:
             logger.debug("Dream provenance skipped: batch carries no usable cursors")
-            return
+            return []
         record_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        known = {record.get("key") for record in self._read_provenance_records()}
-        lines: list[str] = []
-        for fact in added:
-            key = provenance_key(fact)
-            if key in known:
-                continue
-            known.add(key)
-            lines.append(json.dumps({
-                "key": key,
+        return [
+            {
+                "key": provenance_key(fact),
                 "line": fact,
                 "session_key": session_key,
                 "cursor_start": min(cursors),
                 "cursor_end": max(cursors),
                 "date": record_date,
-            }, ensure_ascii=False))
-        if not lines:
-            return
-        try:
+            }
+            for fact in added
+        ]
+
+    def _sync_provenance_locked(self, new_records: list[dict[str, Any]]) -> None:
+        """Dedup-append *new_records* and prune orphaned records; the caller
+        must hold ``_provenance_lock``. Raises OSError if a write fails."""
+        records = self._read_provenance_records_checked()
+        if records is None:
+            # Unreadable sidecar: keep its bytes and only append, exactly as
+            # before the prune existed. Rewriting from a read that failed is
+            # how an audit trail disappears; appending through that failed
+            # dedup read is the pinned degraded-but-safe behavior.
+            if not new_records:
+                return
             with open(self.provenance_file, "a", encoding="utf-8") as f:
-                for line in lines:
-                    f.write(line + "\n")
+                for record in new_records:
+                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
                 f.flush()
                 os.fsync(f.fileno())
-        except OSError:
-            logger.exception("Could not write dream provenance to {}", self.provenance_file)
+            return
+
+        live_keys = self._current_memory_fact_keys()
+        kept = (
+            records
+            if live_keys is None
+            else [record for record in records if record.get("key") in live_keys]
+        )
+        known = {record.get("key") for record in kept}
+        additions: list[dict[str, Any]] = []
+        for record in new_records:
+            if record["key"] in known:
+                continue
+            known.add(record["key"])
+            additions.append(record)
+        if not additions and len(kept) == len(records):
+            return
+        self._write_provenance_records(kept + additions)
+
+    def _write_provenance_records(self, records: list[dict[str, Any]]) -> None:
+        """Overwrite provenance.jsonl with *records* (atomic write)."""
+        tmp_path = self.provenance_file.with_suffix(self.provenance_file.suffix + ".tmp")
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                for record in records:
+                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, self.provenance_file)
+
+            # fsync the directory so the rename is durable.
+            # On Windows, opening a directory with O_RDONLY raises
+            # PermissionError — skip the dir sync there (NTFS
+            # journals metadata synchronously).
+            with suppress(PermissionError):
+                fd = os.open(str(self.provenance_file.parent), os.O_RDONLY)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+        except BaseException:
+            tmp_path.unlink(missing_ok=True)
+            raise
 
     def build_dream_tools(self) -> ToolRegistry:
         """Build the restricted tool registry used by Dream runs."""

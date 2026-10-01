@@ -27,6 +27,8 @@ that the MEMORY.md line was echoed.
 from __future__ import annotations
 
 import builtins
+import os
+import threading
 
 from nanobot.agent.memory import MemoryStore, provenance_key
 from nanobot.agent.memory_index import MemoryIndex, SessionRecallIndexer
@@ -373,3 +375,175 @@ async def test_memory_explain_unbound_caller_is_refused(tmp_path):
     tool = _tool(store, indexer, manager, "session")
     out = str(await tool.execute(phrase=PHRASE))  # no request_context bound
     assert out == _OUT_OF_SCOPE, out
+
+
+# ---------------------------------------------------------------------------
+# 4. MIT-1591: entries for facts deleted from MEMORY.md are pruned, and the
+#    dedup check + append + prune rewrite are one critical section.
+# ---------------------------------------------------------------------------
+
+FACT_B = "- The depot report ships on Fridays"  # the survivor, a distinct token
+
+
+def _two_fact_store(tmp_path, name: str) -> MemoryStore:
+    """A store whose MEMORY.md carries FACT + FACT_B, both recorded, as after
+    a Dream run that added them; returns the store with a clean diff baseline."""
+    workspace = tmp_path / name / "workspace"
+    workspace.mkdir(parents=True)
+    store = MemoryStore(workspace)
+    store.git.init()
+    store.write_memory(f"# Memory\n\n{FACT}\n{FACT_B}\n")
+    diff_body = store.dream_content_diff()
+    assert f"+{FACT}" in diff_body and f"+{FACT_B}" in diff_body, diff_body
+    store.record_dream_provenance(diff_body, _batch(SESSION_KEY, [5, 6]))
+    assert {r["line"] for r in store._read_provenance_records()} == {FACT, FACT_B}
+    return store
+
+
+def test_prune_removes_record_for_deleted_fact_keeps_unchanged(tmp_path):
+    """Issue acceptance: delete a fact from MEMORY.md, run Dream, its provenance
+    entry is gone; the entry for the unchanged fact survives. The deleting run
+    adds nothing, so the prune must run on the no-additions path too."""
+    store = _two_fact_store(tmp_path, "prune")
+
+    store.write_memory(f"# Memory\n\n{FACT_B}\n")  # Dream deleted FACT
+    store.record_dream_provenance(store.dream_content_diff(), _batch(SESSION_KEY, [7]))
+
+    records = store._read_provenance_records()
+    assert [record["line"] for record in records] == [FACT_B]
+    assert store.find_provenance(FACT) is None  # memory_explain now says "no source"
+    assert store.find_provenance(FACT_B) is not None
+
+
+def test_prune_keeps_heading_only_and_blank_changes_no_record_alive(tmp_path):
+    """Negative control on the prune's fact definition: growing the file with a
+    heading and blank lines must NOT count as facts — the orphaned FACT entry
+    still goes, FACT_B (a real line) still stays."""
+    store = _two_fact_store(tmp_path, "prune-heading")
+
+    store.write_memory(f"# Memory\n\n## Notes\n\n\n{FACT_B}\n")  # FACT gone, boilerplate grown
+    store.record_dream_provenance(store.dream_content_diff(), _batch(SESSION_KEY, [7]))
+
+    assert [r["line"] for r in store._read_provenance_records()] == [FACT_B]
+
+
+def test_prune_rewrite_failure_never_raises_and_keeps_old_file(tmp_path, monkeypatch):
+    """The rewrite is temp-file + fsync + replace; if the replace fails the
+    Dream run must not see the error, the original sidecar must be intact, and
+    no temp file may leak."""
+    store = _two_fact_store(tmp_path, "rewrite-fail")
+    store.write_memory(f"# Memory\n\n{FACT_B}\n")
+    diff_body = store.dream_content_diff()  # computed before the fault is armed
+
+    def failing_replace(src, dst, *args, **kwargs):
+        raise OSError(5, "Input/output error")
+
+    real_replace = os.replace
+    monkeypatch.setattr(os, "replace", failing_replace)
+    store.record_dream_provenance(diff_body, _batch(SESSION_KEY, [7]))
+    monkeypatch.setattr(os, "replace", real_replace)
+
+    # The failed rewrite neither raised (this line ran) nor destroyed anything:
+    records = store._read_provenance_records()
+    assert {record["line"] for record in records} == {FACT, FACT_B}
+    assert not list(store.memory_dir.glob("*.tmp")), list(store.memory_dir.iterdir())
+    # ...and once the I/O fault clears, the next run prunes as designed.
+    store.record_dream_provenance(store.dream_content_diff(), _batch(SESSION_KEY, [8]))
+    assert [record["line"] for record in store._read_provenance_records()] == [FACT_B]
+
+
+def test_unreadable_sidecar_is_appended_to_not_rewritten(tmp_path, monkeypatch):
+    """A sidecar whose READ fails must never be rewritten from the failed
+    result (that is how records silently vanish): the run falls back to the
+    old append, so pre-existing records survive."""
+    store = _two_fact_store(tmp_path, "append-not-rewrite")
+    # A brand-new fact (MEMORY.md diff vs the empty initial commit), appended
+    # while every sidecar read fails.
+    new_fact = "- The estuary survey uses transect seven"
+    store.write_memory(f"# Memory\n\n{FACT_B}\n{new_fact}\n")
+    diff_body = store.dream_content_diff()
+    assert f"+{new_fact}" in diff_body, diff_body
+
+    real_open = _fail_provenance_reads(monkeypatch)
+    store.record_dream_provenance(diff_body, _batch(SESSION_KEY, [9]))  # must not raise
+    monkeypatch.setattr(builtins, "open", real_open)
+
+    lines = {record["line"] for record in store._read_provenance_records()}
+    assert new_fact in lines  # the append still happened
+    assert FACT in lines, "the unreadable sidecar must be kept, not rewritten away"
+
+
+def _two_fact_store_prepared(tmp_path, name: str) -> MemoryStore:
+    """Like _two_fact_store but nothing recorded yet: returns a store whose
+    MEMORY.md additions are still pending in the working-tree diff."""
+    workspace = tmp_path / name / "workspace"
+    workspace.mkdir(parents=True)
+    store = MemoryStore(workspace)
+    store.git.init()
+    store.write_memory(f"# Memory\n\n{FACT}\n{FACT_B}\n")
+    return store
+
+
+def test_concurrent_record_dream_provenance_writes_one_record_per_key(tmp_path):
+    """Reviewer case (MIT-1591 #120 re-review): a manual /dream and the cron
+    Dream can overlap on one store; without one lock over read+append+prune
+    both threads pass the dedup check and double-append. The barrier makes the
+    overlap real — without the lock both threads read an empty sidecar and
+    write 2 records each."""
+    store = _two_fact_store_prepared(tmp_path, "concurrent")
+    diff_body = store.dream_content_diff()
+    assert f"+{FACT}" in diff_body and f"+{FACT_B}" in diff_body, diff_body
+
+    barrier = threading.Barrier(2)
+
+    def dream() -> None:
+        barrier.wait(5)
+        store.record_dream_provenance(diff_body, _batch(SESSION_KEY, [5, 6]))
+
+    threads = [threading.Thread(target=dream) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(30)
+
+    records = store._read_provenance_records()
+    keys = [record["key"] for record in records]
+    assert len(keys) == len(set(keys)) == 2, records
+    assert {record["line"] for record in records} == {FACT, FACT_B}
+
+
+def _diff_for(fact: str) -> str:
+    """A GitStore.summarize_working_tree-shaped diff adding one MEMORY.md line."""
+    return (
+        "memory/MEMORY.md: +1 -0\n"
+        "```diff\n--- memory/MEMORY.md\n+++ memory/MEMORY.md\n"
+        f"+{fact}\n```\n"
+    )
+
+
+def test_concurrent_provenance_runs_never_lose_records(tmp_path):
+    """Lost-update detector for the MIT-1591 lock. Two overlapping Dream runs
+    add DIFFERENT facts: without one lock over read+write, both threads read
+    the empty sidecar and each full rewrite clobbers the other's record — a
+    remembered fact silently loses its provenance. Repeated races so one lucky
+    serialization cannot hide a missing lock."""
+    for iteration in range(20):
+        store = _two_fact_store_prepared(tmp_path, f"race-{iteration}")
+        barrier = threading.Barrier(2)
+
+        def dream(diff_body: str) -> None:
+            barrier.wait(5)
+            store.record_dream_provenance(diff_body, _batch(SESSION_KEY, [iteration]))
+
+        threads = [
+            threading.Thread(target=dream, args=(diff,))
+            for diff in (_diff_for(FACT), _diff_for(FACT_B))
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(30)
+
+        records = store._read_provenance_records()
+        lines = {record["line"] for record in records}
+        assert lines == {FACT, FACT_B}, (iteration, records)
