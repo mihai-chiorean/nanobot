@@ -175,6 +175,18 @@ def _legacy_webui_thread_path(session_key: str) -> Path:
     return get_webui_dir() / f"{stem}.json"
 
 
+def has_webui_transcript(session_key: str) -> bool:
+    """Return whether either transcript artifact already exists for the session.
+
+    MIT-1489: the journal-less backfill uses this as its idempotence gate, so a
+    session that already has an active or legacy transcript is left untouched.
+    """
+    return (
+        webui_transcript_path(session_key).is_file()
+        or _legacy_webui_thread_path(session_key).is_file()
+    )
+
+
 def webui_transcript_revision(
     session_key: str,
     *,
