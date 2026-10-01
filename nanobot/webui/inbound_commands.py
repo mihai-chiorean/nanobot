@@ -877,7 +877,12 @@ class WebUICommandRouter:
 
         accepted = False
         try:
-            if is_webui and (
+            # MIT-1622: a worker-originated turn (no ``webui`` flag) carries a
+            # ``client_message_id`` for exactly-once delivery; journaling its
+            # user message is what lets ``/webui-thread`` serve the turn
+            # without the legacy ``/messages`` fallback. A worker frame with
+            # no id keeps the pre-MIT-1622 behavior: not journaled.
+            if (is_webui or client_message_id is not None) and (
                 temporary_policy is None or temporary_policy.persist_transcript
             ):
                 self._transcripts.append_user_message(
