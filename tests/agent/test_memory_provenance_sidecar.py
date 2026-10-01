@@ -26,6 +26,8 @@ that the MEMORY.md line was echoed.
 
 from __future__ import annotations
 
+import builtins
+
 from nanobot.agent.memory import MemoryStore, provenance_key
 from nanobot.agent.memory_index import MemoryIndex, SessionRecallIndexer
 from nanobot.agent.tools.context import RequestContext, request_context
@@ -115,6 +117,22 @@ def _write_fact_and_record(store: MemoryStore, session_key: str, cursors: list[i
 
 def _tool(store, indexer, sessions, scope: str) -> MemoryExplainTool:
     return MemoryExplainTool(store=store, index=indexer.index, sessions=sessions, scope=scope)
+
+
+def _fail_provenance_reads(monkeypatch):
+    """Make any *read* open of provenance.jsonl raise PermissionError, as a
+    locked file or I/O error would; other opens (including the append) are
+    untouched. Returns the real open so the test can restore it and prove the
+    refusal was attributable to the injected failure, not a broken path."""
+    real_open = builtins.open
+
+    def guarded_open(file, mode="r", *args, **kwargs):
+        if str(file).endswith("provenance.jsonl") and "r" in mode and "+" not in mode:
+            raise PermissionError(13, "Permission denied: provenance.jsonl")
+        return real_open(file, mode, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", guarded_open)
+    return real_open
 
 
 def _calling_from(session_key: str):
@@ -213,6 +231,43 @@ def test_record_dream_provenance_skips_multi_session_batch(tmp_path):
     store.record_dream_provenance(diff_body, batch)  # must not raise
 
     assert store._read_provenance_records() == []
+
+
+def test_record_dream_provenance_survives_unreadable_sidecar(tmp_path, monkeypatch):
+    """Reviewer case: the dedup read raising PermissionError must not raise into
+    the Dream run ("Never raises into the Dream run"). The old code suppressed
+    only FileNotFoundError, so any other OSError propagated to the async callers."""
+    workspace = tmp_path / "unreadable" / "workspace"
+    workspace.mkdir(parents=True)
+    store = MemoryStore(workspace)
+    store.git.init()
+    store.write_memory(f"# Memory\n\n{FACT}\n")
+    diff_body = store.dream_content_diff()
+    assert f"+{FACT}" in diff_body, diff_body
+
+    real_open = _fail_provenance_reads(monkeypatch)
+    store.record_dream_provenance(diff_body, _batch(SESSION_KEY, [5, 6]))  # must not raise
+    monkeypatch.setattr(builtins, "open", real_open)
+
+    # Degraded, not crashed: the failed read did not stop the append either.
+    records = store._read_provenance_records()
+    assert [record["line"] for record in records] == [FACT]
+
+
+def test_find_provenance_survives_unreadable_sidecar(tmp_path, monkeypatch):
+    """memory_explain's read path never raises either: an unreadable sidecar reads
+    as "no record" (the tool's honest no-source answer), and restoring the file
+    shows the record was always there — the refusal was the read failure, not a
+    broken write path."""
+    workspace = tmp_path / "find-unreadable" / "workspace"
+    workspace.mkdir(parents=True)
+    store = MemoryStore(workspace)
+    _write_fact_and_record(store, SESSION_KEY, [5])
+
+    real_open = _fail_provenance_reads(monkeypatch)
+    assert store.find_provenance(FACT) is None
+    monkeypatch.setattr(builtins, "open", real_open)
+    assert store.find_provenance(FACT) is not None
 
 
 # ---------------------------------------------------------------------------

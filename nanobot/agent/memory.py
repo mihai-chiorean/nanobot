@@ -675,8 +675,14 @@ class MemoryStore:
         return added
 
     def _read_provenance_records(self) -> list[dict[str, Any]]:
+        """Read all records from provenance.jsonl; never raises.
+
+        The sidecar is an audit enhancement, so an unreadable file — missing,
+        locked, or a mid-read I/O error — reads as "no records" instead of
+        propagating into the async Dream run or the memory_explain tool.
+        """
         records: list[dict[str, Any]] = []
-        with suppress(FileNotFoundError):
+        try:
             with open(self.provenance_file, "r", encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
@@ -688,6 +694,13 @@ class MemoryStore:
                         continue
                     if isinstance(parsed, dict):
                         records.append(cast(dict[str, Any], parsed))
+        except FileNotFoundError:
+            pass
+        except OSError:
+            logger.exception(
+                "Could not read dream provenance from {}; running without audit records",
+                self.provenance_file,
+            )
         return records
 
     def find_provenance(self, line: str) -> dict[str, Any] | None:
