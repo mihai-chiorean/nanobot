@@ -510,6 +510,32 @@ def sessions_restore_workspace(
         raise typer.Exit(1)
 
 
+@sessions_app.command("backfill-transcripts")
+def sessions_backfill_transcripts(
+    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
+    workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
+) -> None:
+    """Regenerate missing WebUI transcripts from persisted session history."""
+    from nanobot.cli.transcript_backfill import backfill_journalless_webui_transcripts
+    from nanobot.session.manager import SessionManager
+
+    runtime_config = _load_runtime_config(config, workspace)
+    manager = SessionManager(runtime_config.workspace_path)
+    result = backfill_journalless_webui_transcripts(manager)
+    console.print(
+        f"Scanned {result.scanned} WebUI session(s): backfilled {result.backfilled}, "
+        f"kept {result.skipped_existing} existing, skipped {result.skipped_empty} empty, "
+        f"{result.skipped_unreadable} unreadable."
+    )
+    for key in result.backfilled_keys:
+        console.print(Text(f"- {key}", style="green"))
+    if result.failed:
+        console.print(
+            f"[red]{result.failed} transcript write(s) failed; see the nanobot logs.[/red]"
+        )
+        raise typer.Exit(1)
+
+
 # ============================================================================
 # Channel Commands
 # ============================================================================
