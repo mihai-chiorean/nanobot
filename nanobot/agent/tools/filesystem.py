@@ -5,6 +5,7 @@
 import difflib
 import hashlib
 import mimetypes
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -25,9 +26,8 @@ from nanobot.utils.file_edit_events import FileDiff, FileEditResult, display_fil
 from nanobot.utils.helpers import build_image_content_blocks, detect_image_mime
 from nanobot.utils.sensitive import is_sensitive_path
 
-
 # ---------------------------------------------------------------------------
-# Module-level context set by ToolRegistry.set_context().
+# Per-turn context set by ToolRegistry.set_context().
 #
 # `_current_sender_id` carries the identity of the message sender whose
 # request is currently being executed.  It is set by
@@ -36,8 +36,18 @@ from nanobot.utils.sensitive import is_sensitive_path
 # (e.g. owner-only write/edit guards on protected paths — see MIT-121-series
 # security work).  Defaults to empty string, meaning "no sender attributed"
 # (internal caller, subagent, or legacy path).
+#
+# MIT-142: this is a `contextvars.ContextVar` rather than a module-level
+# mutable so concurrent turns (gateway, tool runner, streaming provider)
+# cannot leak each other's sender identity — each asyncio task sees its own
+# value.  Read it via `current_sender_id()`, not as a bare attribute.
 # ---------------------------------------------------------------------------
-_current_sender_id: str = ""
+_current_sender_id: ContextVar[str] = ContextVar("current_sender_id", default="")
+
+
+def current_sender_id() -> str:
+    """Sender id of the request executing in the current context."""
+    return _current_sender_id.get()
 
 
 class SensitivePathError(PermissionError):

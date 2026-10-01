@@ -163,7 +163,7 @@ class ToolRegistry:
         self._sender_id = sender_id
         # Propagate sender to filesystem tools for protected-path checks
         from nanobot.agent.tools import filesystem as _fs
-        _fs._current_sender_id = sender_id
+        _fs._current_sender_id.set(sender_id)
 
     def get(self, name: str) -> Tool | None:
         """Get a tool by name."""
