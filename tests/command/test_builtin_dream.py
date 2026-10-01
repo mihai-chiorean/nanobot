@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import builtins
 from types import SimpleNamespace
 
 import pytest
@@ -150,7 +151,7 @@ async def test_dream_no_history_explains_how_to_create_input(tmp_path) -> None:
     ctx, bus = _make_dream_ctx(tmp_path)
 
     immediate = await cmd_dream(ctx)
-    await asyncio.sleep(0)
+    await _wait_for_dream_report(ctx)
 
     assert immediate.content == "Dreaming..."
     assert len(bus.outbound) == 1
@@ -193,7 +194,7 @@ async def test_dream_internal_run_silences_progress(tmp_path) -> None:
     ctx = CommandContext(msg=msg, session=None, key=msg.session_key, raw="/dream", args="", loop=loop)
 
     await cmd_dream(ctx)
-    await asyncio.sleep(0)
+    await _wait_for_dream_report(ctx)
 
     assert len(calls) == 1
     assert callable(calls[0][1]["on_progress"])
@@ -246,12 +247,24 @@ def _build_runnable_dream(
     return ctx, store
 
 
+async def _wait_for_dream_report(ctx: CommandContext) -> None:
+    """Wait for the background _run_dream task to publish its report. Since the
+    MIT-1441 review the task suspends on asyncio.to_thread for the provenance
+    append, so a single sleep(0) no longer guarantees the run has finished."""
+    bus = ctx.loop.bus
+    for _ in range(200):
+        if bus.outbound:
+            return
+        await asyncio.sleep(0.01)
+    pytest.fail("Dream run never published its report")
+
+
 @pytest.mark.asyncio
 async def test_dream_advances_cursor_when_diff_nonempty(tmp_path) -> None:
     """A completed run with a real file delta advances the cursor."""
     ctx, store = _build_runnable_dream(tmp_path, initialized=True, content_diff="SOUL.md: +1 -0")
     await cmd_dream(ctx)
-    await asyncio.sleep(0)
+    await _wait_for_dream_report(ctx)
     assert store._last_dream_cursor == 42
 
 
@@ -260,7 +273,7 @@ async def test_dream_advances_cursor_on_completed_noop(tmp_path) -> None:
     """A completed no-op has processed the batch and must not repeat it."""
     ctx, store = _build_runnable_dream(tmp_path, initialized=True, content_diff="")
     await cmd_dream(ctx)
-    await asyncio.sleep(0)
+    await _wait_for_dream_report(ctx)
     assert store._last_dream_cursor == 42
     assert "no memory changes" in ctx.loop.bus.outbound[0].content
 
@@ -275,7 +288,7 @@ async def test_dream_keeps_cursor_when_incomplete_with_diff(tmp_path) -> None:
         stop_reason="length",
     )
     await cmd_dream(ctx)
-    await asyncio.sleep(0)
+    await _wait_for_dream_report(ctx)
     assert store._last_dream_cursor == 5
     assert "did not complete" in ctx.loop.bus.outbound[0].content
 
@@ -290,9 +303,81 @@ async def test_dream_advances_cursor_when_completed_after_tool_error(tmp_path) -
         tool_error=True,
     )
     await cmd_dream(ctx)
-    await asyncio.sleep(0)
+    await _wait_for_dream_report(ctx)
     assert store._last_dream_cursor == 42
     assert "no memory changes" in ctx.loop.bus.outbound[0].content
+
+
+@pytest.mark.asyncio
+async def test_dream_run_completes_when_provenance_read_fails(tmp_path, monkeypatch) -> None:
+    """Reviewer case: reading memory/provenance.jsonl raises PermissionError
+    mid-Dream. Provenance is an audit enhancement, so the run must still
+    complete — cursor advanced, report published — not be reported as failed
+    with the batch left permanently retryable."""
+    workspace = tmp_path / "prov-ws"
+    workspace.mkdir(parents=True)
+    real = MemoryStore(workspace)
+    real.git.init()
+    real.write_memory("# Memory\n\n- User prefers the kestrel editor\n")
+    diff_body = real.dream_content_diff()
+    assert "+- User prefers the kestrel editor" in diff_body, diff_body
+
+    msg = InboundMessage(channel="cli", sender_id="u1", chat_id="direct", content="/dream")
+    store = _FakeStore(
+        _FakeGit(initialized=True),
+        last_dream_cursor=5,
+        dream_prompt_result=(
+            "dream prompt",
+            42,
+            [{"cursor": 42, "content": "x", "session_key": "cli:direct"}],
+        ),
+        content_diff=diff_body,
+    )
+    # The real sidecar writer, so the PermissionError fires inside the real
+    # MemoryStore read path, not from a fake.
+    store.record_dream_provenance = real.record_dream_provenance
+
+    async def process_direct(*args, **kwargs):
+        return OutboundMessage(
+            channel="cli",
+            chat_id="direct",
+            content="done",
+            metadata={"_stop_reason": "completed"},
+        )
+
+    bus = _FakeBus()
+    loop = SimpleNamespace(
+        bus=bus,
+        context=SimpleNamespace(memory=store, timezone="UTC"),
+        sessions=_make_sessions(tmp_path),
+        process_direct=process_direct,
+        dream_runtime=lambda: None,
+    )
+    ctx = CommandContext(
+        msg=msg, session=None, key=msg.session_key, raw="/dream", args="", loop=loop
+    )
+
+    real_open = builtins.open
+
+    def guarded_open(file, mode="r", *args, **kwargs):
+        if str(file).endswith("provenance.jsonl") and "r" in mode and "+" not in mode:
+            raise PermissionError(13, "Permission denied: provenance.jsonl")
+        return real_open(file, mode, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", guarded_open)
+    try:
+        await cmd_dream(ctx)
+        await _wait_for_dream_report(ctx)
+    finally:
+        monkeypatch.setattr(builtins, "open", real_open)
+
+    content = bus.outbound[0].content
+    assert "Dream failed" not in content, content
+    assert "Dream completed" in content, content
+    assert store._last_dream_cursor == 42
+    # The audit step degraded instead of crashing: its record still landed.
+    records = real._read_provenance_records()
+    assert [record["line"] for record in records] == ["- User prefers the kestrel editor"]
 
 
 @pytest.mark.asyncio
@@ -330,7 +415,7 @@ async def test_dream_noop_batch_unlocks_following_history(tmp_path) -> None:
     ctx = CommandContext(msg=msg, session=None, key=msg.session_key, raw="/dream", args="", loop=loop)
 
     await cmd_dream(ctx)
-    await asyncio.sleep(0)
+    await _wait_for_dream_report(ctx)
 
     assert len(processed_prompts) == 1
     assert "entry-20" in processed_prompts[0]
@@ -351,7 +436,7 @@ async def test_dream_non_git_falls_back_to_completion_gate(tmp_path) -> None:
         tmp_path, initialized=False, content_diff="", stop_reason="completed",
     )
     await cmd_dream(ctx)
-    await asyncio.sleep(0)
+    await _wait_for_dream_report(ctx)
     assert store._last_dream_cursor == 42  # advanced via completion fallback
 
 
