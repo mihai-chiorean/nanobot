@@ -221,17 +221,57 @@ async def test_explicit_final_with_different_text_is_still_recorded() -> None:
     assert lines[-1]["text"] == "Sorry, something went wrong."
 
 
-# -- worker reconciliation read (review F1) --------------------------------------
+# -- worker reconciliation read (review F1, MIT-1623) ----------------------------
+#
+# The owner ``GET /api/sessions/<key>/messages`` route was removed (MIT-1623):
+# once MIT-1489 backfilled transcripts and MIT-1622 journaled worker user
+# messages, ziggy-worker reconciles its turn from the same
+# ``/webui-thread?projection=events`` path every other consumer uses
+# (client.go ``FinalMessage`` -> ``reconciledFinalFromEvents``). These tests
+# pin the removal (generic API 404 for every caller), the events path serving
+# the same turn, and the room-scoped ``/messages`` feature route
+# (``shared_rooms_http.py``) surviving the removal untouched.
+
+PROXY_ASSERTION_HEADER = "X-Ziggy-Proxy-Assertion"
+WORKER_CLIENT_MESSAGE_ID = "3f2a9c1e-58d4-4b6f-9e2c-7d0a1b3c5e6f"
+ROOM_ISSUE_SECRET = "tenant-issue-secret"
+ROOM_CHAT = "11111111-2222-3333-4444-555555555555"
+ROOM_ID = "room_" + "a" * 32
+
+
+class _Headers(dict):
+    """Minimal aiohttp-like headers: case-insensitive ``get``."""
+
+    def get(self, key: str, default: Any = None) -> Any:  # type: ignore[override]
+        for name, value in self.items():
+            if name.lower() == key.lower():
+                return value
+        return default
+
+
+class _Connection:
+    remote_address = ("127.0.0.1", 41000)
+
+    def respond(self, status: int, text: str) -> Any:
+        return (status, text)
+
+
+def _text_of(response: Any) -> str:
+    return bytes(response.body).decode()
 
 
 @pytest.mark.asyncio
-async def test_worker_reconcile_reads_owner_session_messages_after_final_stream_end(
+async def test_worker_reconcile_reads_turn_from_webui_thread_events_after_final_stream_end(
     tmp_path: Path,
 ) -> None:
-    """The ziggy-worker flow: stream_end resuming:false starts a background
-    GET /api/sessions/websocket:<chat>/messages with the owner API token
-    (services/ziggy-worker/internal/control/client.go FinalMessage). It must be
-    200 JSON with ``messages`` carrying the final reply, not 404."""
+    """The ziggy-worker flow after MIT-1623: ``stream_end`` with
+    ``resuming: false`` triggers a background GET
+    ``/api/sessions/websocket:<chat>/webui-thread?projection=events`` with the
+    owner API token (services/ziggy-worker/internal/control/client.go
+    FinalMessage). The turn must reconcile from the journal -- the
+    ``user_message`` carrying the ``client_message_id`` plus the assistant
+    final -- and the removed owner ``/messages`` route must answer the
+    generic API 404 for every caller, bearer or not."""
     import asyncio
 
     from nanobot.channels.websocket.tests.test_websocket_http_routes import _ch, _free_port
@@ -240,10 +280,6 @@ async def test_worker_reconcile_reads_owner_session_messages_after_final_stream_
 
     sessions = SessionManager(tmp_path / "workspace")
     chat_id = "worker-chat"
-    session = sessions.get_or_create(f"websocket:{chat_id}")
-    session.add_message("user", "what is on my calendar?")
-    session.add_message("assistant", "Two meetings today.")
-    sessions.save(session)
 
     port = _free_port()
     bus = MagicMock()
@@ -253,64 +289,152 @@ async def test_worker_reconcile_reads_owner_session_messages_after_final_stream_
     try:
         ws = AsyncMock()
         channel._attach(ws, chat_id)
+        connection = AsyncMock()
+        connection.remote_address = ("127.0.0.1", 5000)
+
+        # Worker ingress, exactly as ziggy-worker posts it: no ``webui``
+        # flag, a ``client_message_id`` for exactly-once delivery (MIT-1622
+        # journals the user message) and ``explicit_final_message``.
+        await channel._dispatch_envelope(
+            connection,
+            "worker",
+            {
+                "type": "message",
+                "chat_id": chat_id,
+                "content": "what is on my calendar?",
+                "client_message_id": WORKER_CLIENT_MESSAGE_ID,
+                "explicit_final_message": True,
+            },
+        )
+
+        # The agent's reply, as the runner emits it over this channel.
         meta = {"explicit_final_message": True}
         await channel.send_delta(chat_id, "Two meetings today.", meta, stream_id="sid")
         await channel.send_delta(chat_id, "", meta, stream_id="sid", stream_end=True)
         stream_end = _frames(ws)[-1]
         assert stream_end["event"] == "stream_end"
         assert stream_end["resuming"] is False  # the worker's reconcile trigger
+        await ChannelManager._send_once(
+            channel,
+            OutboundMessage(
+                channel="websocket",
+                chat_id=chat_id,
+                content="Two meetings today.",
+                metadata=dict(meta),
+            ),
+        )
 
         token = channel.gateway.tokens.issue_api_token(300)
-        url = f"http://127.0.0.1:{port}/api/sessions/websocket:{chat_id}/messages"
-        owner = await http_get(url, headers={"Authorization": f"Bearer {token}"})
-        anonymous = await http_get(url)
-        wrong = await http_get(url, headers={"Authorization": "Bearer not-a-token"})
-        other = await http_get(
-            f"http://127.0.0.1:{port}/api/sessions/cli:direct/messages",
-            headers={"Authorization": f"Bearer {token}"},
+        auth = {"Authorization": f"Bearer {token}"}
+        encoded_key = "websocket%3A" + chat_id
+        thread = await http_get(
+            f"http://127.0.0.1:{port}/api/sessions/{encoded_key}/webui-thread?projection=events",
+            headers=auth,
         )
+        replay = await http_get(
+            f"http://127.0.0.1:{port}/api/sessions/{encoded_key}/webui-thread",
+            headers=auth,
+        )
+        messages_url = f"http://127.0.0.1:{port}/api/sessions/{encoded_key}/messages"
+        owner = await http_get(messages_url, headers=auth)
+        anonymous = await http_get(messages_url)
+        wrong = await http_get(messages_url, headers={"Authorization": "Bearer not-a-token"})
     finally:
         await channel.stop()
         await server
 
-    assert owner.status_code == 200
-    assert owner.headers["content-type"].startswith("application/json")
-    messages = owner.json()["messages"]
-    assert [(m["role"], m["content"]) for m in messages] == [
+    assert thread.status_code == 200, thread.text
+    body = thread.json()
+    assert body.get("projection") == "events"
+    events: list[dict[str, Any]] = body["events"]
+    users = [event for event in events if event.get("event") == "user_message"]
+    assert [(u.get("text"), u.get("client_message_id")) for u in users] == [
+        ("what is on my calendar?", WORKER_CLIENT_MESSAGE_ID),
+    ]
+    # The worker's completion candidates (client.go
+    # reconciledFinalFromEvents): the kindless message row or the final
+    # stream boundary after the turn's user_message.
+    finals = [
+        event
+        for event in events[events.index(users[0]) + 1 :]
+        if event.get("event") == "stream_end"
+        or (
+            event.get("event") == "message"
+            and not event.get("kind")
+            and not event.get("tool_events")
+        )
+    ]
+    assert finals, events
+    assert all(event.get("text") == "Two meetings today." for event in finals)
+
+    # Nothing was lost with the raw-session read: the default projection
+    # replays the same turn the removed route served, id included.
+    assert replay.status_code == 200, replay.text
+    replay_messages = replay.json()["messages"]
+    assert [(m.get("role"), m.get("content")) for m in replay_messages] == [
         ("user", "what is on my calendar?"),
         ("assistant", "Two meetings today."),
     ]
-    assert anonymous.status_code == 401
-    assert wrong.status_code == 401
-    assert other.status_code == 404  # only websocket sessions, as in production
+    replay_users = [m for m in replay_messages if m.get("role") == "user"]
+    assert replay_users[-1].get("client_message_id") == WORKER_CLIENT_MESSAGE_ID
+
+    # The removed owner route: the generic API 404 for every caller, and it
+    # never carries transcript data.
+    for response in (owner, anonymous, wrong):
+        assert response.status_code == 404, response.text
+        assert response.text == "API route not found"
+        assert "Two meetings" not in response.text
 
 
-def test_session_messages_route_ignores_the_trusted_proxy_shortcut(tmp_path: Path) -> None:
-    """A proxied request is not an owner API token: a room guest whose room
-    token fell through (revoked or expired) must get 401, never the owner's
-    transcript. Mirrors the /api/work regression test."""
+@pytest.mark.asyncio
+async def test_owner_messages_path_404s_for_proxied_and_owner_requests(
+    tmp_path: Path,
+) -> None:
+    """MIT-1623 replacement for the ``/messages`` trusted-proxy test: with
+    the route gone, neither a trusted-proxy-marked request with no bearer --
+    the revoked/expired-room-guest fall-through the old handler had to reject
+    with 401 -- nor the owner API token reads the transcript at ``/messages``.
+    The generic API 404 answers, and ``/webui-thread`` still serves the owner
+    (non-vacuity: the 404 is the route being gone, not a broken harness)."""
     from nanobot.channels.websocket.tests.test_websocket_http_routes import _ch, _free_port
     from nanobot.channels.websocket.transport import TransportRequest
     from nanobot.session.manager import SessionManager
-
-    class _Headers(dict):
-        def get(self, key, default=None):  # case-insensitive like the transport
-            for k, v in self.items():
-                if k.lower() == key.lower():
-                    return v
-            return default
+    from nanobot.webui.transcript import write_session_messages_as_transcript
 
     sessions = SessionManager(tmp_path / "workspace")
     session = sessions.get_or_create("websocket:owner-chat")
     session.add_message("assistant", "private owner reply")
     sessions.save(session)
-    channel = _ch(MagicMock(), session_manager=sessions, port=_free_port())
-    http = channel.gateway.http
-    path = "/api/sessions/websocket:owner-chat/messages"
+    # MIT-1489 backfill shape: a journaled transcript is what makes
+    # /webui-thread serve this session.
+    write_session_messages_as_transcript(
+        "websocket:owner-chat",
+        [{"role": "assistant", "content": "private owner reply"}],
+    )
+    channel = _ch(
+        MagicMock(),
+        session_manager=sessions,
+        port=_free_port(),
+        trustedProxyAuth={
+            "trustedPeerCidrs": ["127.0.0.1/32"],
+            "assertionHeader": PROXY_ASSERTION_HEADER,
+        },
+    )
 
-    proxied = TransportRequest(method="GET", path=path, headers=_Headers(), body=b"", raw_path=path)
-    setattr(proxied, "_nanobot_trusted_proxy_authenticated", True)
-    assert http._handle_session_messages(proxied, "websocket:owner-chat").status_code == 401
+    path = "/api/sessions/websocket%3Aowner-chat/messages"
+    proxied = TransportRequest(
+        method="GET",
+        path=path,
+        headers=_Headers({PROXY_ASSERTION_HEADER: "room-guest"}),
+        body=b"",
+        raw_path=path,
+    )
+    response = await channel._dispatch_http(_Connection(), proxied)
+    assert response is not None
+    # Non-vacuity: dispatch really stamped the proxy mark on this request.
+    assert getattr(proxied, "_nanobot_trusted_proxy_authenticated", False) is True
+    assert response.status_code == 404
+    assert _text_of(response) == "API route not found"
 
     token = channel.gateway.tokens.issue_api_token(60)
     owner = TransportRequest(
@@ -320,4 +444,132 @@ def test_session_messages_route_ignores_the_trusted_proxy_shortcut(tmp_path: Pat
         body=b"",
         raw_path=path,
     )
-    assert http._handle_session_messages(owner, "websocket:owner-chat").status_code == 200
+    response = await channel._dispatch_http(_Connection(), owner)
+    assert response is not None
+    assert response.status_code == 404
+    assert "private owner reply" not in _text_of(response)
+
+    thread_path = "/api/sessions/websocket%3Aowner-chat/webui-thread"
+    thread = await channel._dispatch_http(
+        _Connection(),
+        TransportRequest(
+            method="GET",
+            path=thread_path,
+            headers=_Headers({"Authorization": f"Bearer {token}"}),
+            body=b"",
+            raw_path=thread_path,
+        ),
+    )
+    assert thread is not None
+    assert thread.status_code == 200
+    assert "private owner reply" in _text_of(thread)
+
+
+@pytest.mark.asyncio
+async def test_room_bearer_still_reads_room_messages_after_owner_route_removal(
+    tmp_path: Path,
+) -> None:
+    """Regression guard (MIT-1623): the room-scoped ``/messages`` feature
+    route (``shared_rooms_http.py``, out of scope here) shares the removed
+    URL shape and must keep serving guests through the same dispatcher. A
+    room bearer reads exactly its own room (redacted projection); the owner
+    token reads nothing at ``/messages``; and the room bearer must not reach
+    the unredacted ``/webui-thread`` -- the split ziggy-control's
+    ``roomCredentialRequestAllowed`` comment relies on."""
+    from nanobot.channels.websocket.tests.test_websocket_http_routes import _ch, _free_port
+    from nanobot.channels.websocket.transport import TransportRequest
+    from nanobot.session.manager import SessionManager
+
+    sessions = SessionManager(tmp_path / "workspace")
+    owner_session = sessions.get_or_create("websocket:chat_owner")
+    owner_session.add_message("user", "private question", reasoning="chain of thought")
+    owner_session.add_message("assistant", "private answer")
+    sessions.save(owner_session, fsync=True)
+
+    channel = _ch(
+        MagicMock(),
+        session_manager=sessions,
+        port=_free_port(),
+        tokenIssueSecret=ROOM_ISSUE_SECRET,
+        sharedRoomsEnabled=True,
+    )
+    shared = channel.gateway.http.shared_rooms
+    assert shared is not None
+    created = await shared.dispatch(
+        TransportRequest(
+            method="POST",
+            path="/auth/shared-rooms",
+            headers=_Headers({"Authorization": f"Bearer {ROOM_ISSUE_SECRET}"}),
+            body=json.dumps(
+                {
+                    "source_session_key": "websocket:chat_owner",
+                    "chat_id": ROOM_CHAT,
+                    "room_id": ROOM_ID,
+                    "title": "Shared conversation",
+                    "owner_display_name": "Owner",
+                }
+            ).encode(),
+            raw_path="/auth/shared-rooms",
+        ),
+        "/auth/shared-rooms",
+    )
+    assert created.status_code == 201
+    assert channel.rooms is not None
+    room_token, _ = channel.rooms.mint(
+        room_id=ROOM_ID,
+        chat_id=ROOM_CHAT,
+        participant_id="participant_" + "e" * 32,
+        display_name="Guest",
+        role="contributor",
+    )
+
+    room_key = "websocket%3A" + ROOM_CHAT
+
+    guest = await channel._dispatch_http(
+        _Connection(),
+        TransportRequest(
+            method="GET",
+            path=f"/api/sessions/{room_key}/messages",
+            headers=_Headers({"Authorization": f"Bearer {room_token}"}),
+            body=b"",
+            raw_path=f"/api/sessions/{room_key}/messages",
+        ),
+    )
+    assert guest is not None
+    assert guest.status_code == 200, _text_of(guest)
+    served = _text_of(guest)
+    body = json.loads(served)
+    assert body["key"] == f"websocket:{ROOM_CHAT}"
+    assert [m["content"] for m in body["messages"]] == [
+        "private question",
+        "private answer",
+    ]
+    assert "chain of thought" not in served  # redacted projection, not the raw file
+
+    api_token = channel.gateway.tokens.issue_api_token(60)
+    owner_read = await channel._dispatch_http(
+        _Connection(),
+        TransportRequest(
+            method="GET",
+            path=f"/api/sessions/{room_key}/messages",
+            headers=_Headers({"Authorization": f"Bearer {api_token}"}),
+            body=b"",
+            raw_path=f"/api/sessions/{room_key}/messages",
+        ),
+    )
+    assert owner_read is not None
+    assert owner_read.status_code == 404
+    assert "private answer" not in _text_of(owner_read)
+
+    thread = await channel._dispatch_http(
+        _Connection(),
+        TransportRequest(
+            method="GET",
+            path=f"/api/sessions/{room_key}/webui-thread",
+            headers=_Headers({"Authorization": f"Bearer {room_token}"}),
+            body=b"",
+            raw_path=f"/api/sessions/{room_key}/webui-thread",
+        ),
+    )
+    assert thread is not None
+    assert thread.status_code == 401

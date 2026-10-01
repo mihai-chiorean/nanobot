@@ -483,9 +483,8 @@ async def test_a_trusted_proxy_request_is_not_an_owner_credential_for_rename(
 
     ``WebUIHTTPRouter.check_api_token`` returns True for any request the
     trusted proxy vouched for. The rename route must demand the owner API
-    token itself (``tokens.check_api_token``), as ``/api/work`` and
-    ``/api/sessions/<key>/messages`` do, or a proxied request with no bearer
-    can rename any owner conversation.
+    token itself (``tokens.check_api_token``), as ``/api/work`` does, or a
+    proxied request with no bearer can rename any owner conversation.
     """
     channel, sessions, token = proxied_env
     key = f"websocket:{OWNER_CHAT}"

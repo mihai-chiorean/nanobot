@@ -650,7 +650,9 @@ class GatewayHTTPHandler:
             return self._handle_bootstrap(connection, request, terminal_probe=True)
 
         # Shared-room routes (Ziggy-local, MIT-1010). Dispatched before the
-        # WebUI session routes so the room-scoped /messages read is not shadowed.
+        # WebUI session routes so the room-scoped reads (``/messages`` guest
+        # read, ``/files/<id>`` guest download) are served on the room
+        # credential rather than the owner routes (MIT-1407, MIT-1623).
         if self.shared_rooms is not None:
             response = await self.shared_rooms.dispatch(request, got)
             if response is not None:
@@ -871,12 +873,6 @@ class GatewayHTTPHandler:
         m = re.match(r"^/api/sessions/([^/]+)/webui-thread$", got)
         if m:
             return await self._handle_webui_thread_get_async(request, m.group(1))
-
-        m = re.match(r"^/api/sessions/([^/]+)/messages$", got)
-        if m:
-            if getattr(request, "method", "GET") != "GET":
-                return _http_error(405, "Method Not Allowed")
-            return await asyncio.to_thread(self._handle_session_messages, request, m.group(1))
 
         m = re.match(r"^/api/sessions/([^/]+)/context$", got)
         if m:
@@ -1174,64 +1170,6 @@ class GatewayHTTPHandler:
             round(diagnostics.event_loop_lag_ms, 1),
             round(diagnostics.total_ms, 1),
         )
-
-    def _handle_session_messages(self, request: WsRequest, key: str) -> Response:
-        """Ziggy-local (MIT-1404): owner read of the raw session, as production serves it.
-
-        Upstream deleted this route (``cdb2a474``). The ziggy-worker reconciles
-        a turn from it after a ``stream_end`` with ``resuming: false``; on a 404
-        it probes ``/webui-thread``, finds it, and fails the turn as
-        ``session_transcript_unavailable``. Production's contract is restored:
-        owner API token only, websocket (WebUI) sessions only, activity
-        projected, server-only provenance stripped and raw media paths replaced
-        by signed URLs. Room credentials are served by the shared-room router
-        (their own session only) before this route is reached. The owner API
-        token itself is required: the trusted-proxy shortcut in
-        ``check_api_token`` would also admit a proxied room guest whose room
-        token fell through as revoked or expired (as for ``/api/work``).
-        """
-        if not self.tokens.check_api_token(request):
-            return _http_error(401, "Unauthorized")
-        if self.session_manager is None:
-            return _http_error(503, "session manager unavailable")
-        decoded_key = _decode_api_key(key)
-        if decoded_key is None:
-            return _http_error(400, "invalid session key")
-        if not _is_websocket_channel_session_key(decoded_key):
-            return _http_error(404, "session not found")
-        data = self.session_manager.read_session_file(decoded_key)
-        if not isinstance(data, dict):
-            return _http_error(404, "session not found")
-        from nanobot.session.webui_turns import websocket_turn_id
-
-        project_activity_history(
-            data,
-            active=websocket_turn_id(decoded_key.split(":", 1)[1]) is not None,
-        )
-        _strip_private_session_fields(data)
-        self._augment_session_media_urls(data)
-        return _http_json_response(data)
-
-    def _augment_session_media_urls(self, payload: dict[str, Any]) -> None:
-        """Replace each message's raw ``media`` paths with signed ``media_urls``."""
-        messages = payload.get("messages")
-        if not isinstance(messages, list):
-            return
-        for message in messages:
-            if not isinstance(message, dict):
-                continue
-            media = message.pop("media", None)
-            if not isinstance(media, list):
-                continue
-            urls: list[dict[str, str]] = []
-            for entry in media:
-                if not isinstance(entry, str) or not entry:
-                    continue
-                signed = self.media.sign_or_stage_media_path(Path(entry))
-                if signed is not None:
-                    urls.append(signed)
-            if urls:
-                message["media_urls"] = [*(message.get("media_urls") or []), *urls]
 
     def _handle_webui_thread_get(
         self,
@@ -1553,7 +1491,8 @@ class GatewayHTTPHandler:
         # while a turn is still running in the conversation (feat/shared-rooms
         # 5cdea416). The gateway's WebUI turn registry is this branch's single
         # source of "turn in progress" for a key (same signal the sessions list
-        # and the messages route report as ``active_turn_*``); deleting
+        # reports as ``run_started_at`` and ``/webui-thread`` as
+        # ``active_turn_*``); deleting
         # underneath a running turn orphans the transcript rows it keeps
         # writing.
         from nanobot.session.webui_turns import websocket_turn_wall_started_at
@@ -1606,7 +1545,7 @@ class GatewayHTTPHandler:
         the same split-brain guard the room routes enforce.
 
         Auth is the owner API bearer only (``tokens.check_api_token``), as for
-        ``/api/work`` and ``/api/sessions/<key>/messages``: the trusted-proxy
+        ``/api/work``: the trusted-proxy
         shortcut in ``check_api_token`` would also admit a proxied request
         that carries no owner token (a room guest whose room token fell
         through). Room credentials live in the shared-room store, never in
@@ -2396,18 +2335,6 @@ def _positive_int(value: Any) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int):
         return None
     return value if value > 0 else None
-
-
-def _strip_private_session_fields(payload: dict[str, Any]) -> None:
-    """Remove server-only publication provenance from raw session JSON."""
-    metadata = payload.get("metadata")
-    if isinstance(metadata, dict):
-        metadata.pop("published_file_provenance", None)
-    messages = payload.get("messages")
-    if isinstance(messages, list):
-        for message in messages:
-            if isinstance(message, dict):
-                message.pop("_published_message_id", None)
 
 
 def _is_websocket_channel_session_key(key: str) -> bool:
