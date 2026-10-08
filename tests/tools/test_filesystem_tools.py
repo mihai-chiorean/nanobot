@@ -2,11 +2,18 @@
 
 import pytest
 
+from nanobot.agent.tools.apply_patch import ApplyPatchTool
 from nanobot.agent.tools.filesystem import (
     EditFileTool,
     ListDirTool,
     ReadFileTool,
+    SkillDraftRequiredError,
     WriteFileTool,
+)
+from nanobot.security.workspace_access import (
+    bind_workspace_scope,
+    default_workspace_scope,
+    reset_workspace_scope,
 )
 
 # ---------------------------------------------------------------------------
@@ -723,3 +730,132 @@ class TestSymlinkTraversalBlocking:
         assert result.startswith("Error:")
         assert "sensitive path" in result.lower()
         assert secret.read_text() == original
+
+
+# ---------------------------------------------------------------------------
+# MIT-1850: agent skill writes become drafts under skills/_proposed/
+# ---------------------------------------------------------------------------
+
+
+class TestSkillDraftsGuard:
+    """tools.skills.drafts refuses live-skill writes with a /skill accept hint."""
+
+    @pytest.fixture()
+    def workspace(self, tmp_path):
+        ws = tmp_path / "ws"
+        (ws / "skills" / "weather").mkdir(parents=True)
+        (ws / "skills" / "weather" / "SKILL.md").write_text(
+            "# Weather\nOriginal content.\n", encoding="utf-8"
+        )
+        return ws
+
+    @pytest.mark.asyncio
+    async def test_write_live_skill_refused_with_draft_hint(self, workspace):
+        expected = (
+            "Error: Skills you write are drafts. Write the changed file to "
+            "skills/_proposed/weather/SKILL.md instead; the user accepts it "
+            "with /skill accept weather."
+        )
+        live = workspace / "skills" / "weather" / "SKILL.md"
+        before = live.read_text(encoding="utf-8")
+
+        write = await WriteFileTool(workspace=workspace).execute(
+            path="skills/weather/SKILL.md", content="# Weather\nRewritten\n"
+        )
+        edit = await EditFileTool(workspace=workspace).execute(
+            path="skills/weather/SKILL.md",
+            old_text="Original content.",
+            new_text="Rewritten.",
+        )
+        patch = await ApplyPatchTool(workspace=workspace).execute(
+            edits=[{
+                "path": "skills/weather/SKILL.md",
+                "action": "replace",
+                "old_text": "Original content.",
+                "new_text": "Rewritten.",
+            }]
+        )
+
+        for result in (write, edit, patch):
+            assert expected in str(result), result
+        with pytest.raises(SkillDraftRequiredError):
+            WriteFileTool(workspace=workspace)._resolve_write("skills/weather/SKILL.md")
+        assert live.read_text(encoding="utf-8") == before
+        assert not (workspace / "skills" / "_proposed").exists()
+
+    @pytest.mark.asyncio
+    async def test_write_proposed_allowed(self, workspace):
+        write = await WriteFileTool(workspace=workspace).execute(
+            path="skills/_proposed/weather/SKILL.md", content="# Weather\nDraft\n"
+        )
+        assert "Successfully wrote" in write
+        draft = workspace / "skills" / "_proposed" / "weather" / "SKILL.md"
+        assert draft.read_text(encoding="utf-8") == "# Weather\nDraft\n"
+
+        patch = await ApplyPatchTool(workspace=workspace).execute(
+            edits=[{
+                "path": "skills/_proposed/weather/SKILL.md",
+                "action": "replace",
+                "old_text": "Draft",
+                "new_text": "Final draft",
+            }]
+        )
+        assert "Patch applied" in str(patch)
+
+        nested = await WriteFileTool(workspace=workspace).execute(
+            path="skills/_proposed/weather/references/tips.md", content="tips\n"
+        )
+        assert "Successfully wrote" in nested
+        assert (
+            workspace / "skills" / "_proposed" / "weather" / "references" / "tips.md"
+        ).exists()
+
+        # Outside skills/ the tools behave exactly as before.
+        outside = await WriteFileTool(workspace=workspace).execute(
+            path="notes.md", content="free\n"
+        )
+        assert "Successfully wrote" in outside
+        assert (workspace / "notes.md").read_text(encoding="utf-8") == "free\n"
+
+    @pytest.mark.asyncio
+    async def test_drafts_off_allows_live_write(self, workspace):
+        tool = WriteFileTool(workspace=workspace, skills_drafts=False)
+        result = await tool.execute(
+            path="skills/weather/SKILL.md", content="# Weather\nLive rewrite\n"
+        )
+        assert "Successfully wrote" in result
+        live = workspace / "skills" / "weather" / "SKILL.md"
+        assert live.read_text(encoding="utf-8") == "# Weather\nLive rewrite\n"
+
+    @pytest.mark.asyncio
+    async def test_project_scope_does_not_bypass_guard(self, workspace):
+        """A wider allowed root must not let a live skill be edited in place."""
+        parent = workspace.parent
+        live = workspace / "skills" / "weather" / "SKILL.md"
+        before = live.read_text(encoding="utf-8")
+
+        tool = WriteFileTool(workspace=workspace, allowed_dir=parent)
+        result = await tool.execute(path=str(live), content="owned\n")
+        assert "Skills you write are drafts" in str(result)
+        assert "/skill accept weather" in str(result)
+        assert live.read_text(encoding="utf-8") == before
+
+        scope = default_workspace_scope(parent, restrict_to_workspace=False)
+        token = bind_workspace_scope(scope)
+        try:
+            tool2 = WriteFileTool(workspace=workspace)
+            result2 = await tool2.execute(path=str(live), content="owned\n")
+        finally:
+            reset_workspace_scope(token)
+        assert "Skills you write are drafts" in str(result2)
+        assert live.read_text(encoding="utf-8") == before
+
+    def test_skills_tool_config_defaults_and_camel_alias(self):
+        from nanobot.config.schema import ToolsConfig
+
+        cfg = ToolsConfig()
+        assert cfg.skills.drafts is True
+        assert cfg.skills.allow_install is True
+        off = ToolsConfig(skills={"drafts": False, "allowInstall": False})
+        assert off.skills.drafts is False
+        assert off.skills.allow_install is False
