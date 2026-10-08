@@ -25,6 +25,7 @@ from nanobot.agent.context_governance import (
     ProviderCompactionConsolidator,
     TranscriptBuilder,
 )
+from nanobot.agent.handoff import HandoffRequested
 from nanobot.agent.hook import AgentHook, AgentHookContext, AgentRunHookContext
 from nanobot.agent.reasoning_policy import escalation_profile
 from nanobot.agent.tools.ask import AskUserInterrupt
@@ -376,6 +377,16 @@ class AgentRunner:
         except asyncio.CancelledError as exc:
             context.messages = deepcopy(messages)
             context.stop_reason = "cancelled"
+            context.error = None
+            context.exception = exc
+            raise
+        except HandoffRequested as exc:
+            # MIT-1855 (OA-12): a hand-off is a recognised stop, not a failure.
+            # The pending tool batch never ran, so nothing here is an error:
+            # no ``on_error`` and no error text — the loop turns the raised
+            # stop into the fixed chat reply and the Work task.
+            context.messages = deepcopy(messages)
+            context.stop_reason = "handoff"
             context.error = None
             context.exception = exc
             raise
