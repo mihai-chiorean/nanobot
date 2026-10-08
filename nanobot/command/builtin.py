@@ -170,8 +170,10 @@ BUILTIN_COMMAND_SPECS: tuple[BuiltinCommandSpec, ...] = (
     BuiltinCommandSpec(
         "/skill",
         "List skills",
-        "List all enabled skills available to the agent.",
+        "List enabled skills, or manage drafts: drafts, diff/accept/reject <name>.",
         "wrench",
+        "[drafts|diff <name>|accept <name>|reject <name>]",
+        accepts_args=True,
     ),
     BuiltinCommandSpec(
         "/help",
@@ -961,24 +963,87 @@ async def cmd_pairing(ctx: CommandContext) -> OutboundMessage:
     )
 
 
-async def cmd_skill(ctx: CommandContext) -> OutboundMessage:
-    """List all enabled skills (name and description only)."""
-    loop = ctx.loop
-    skills = loop.context.skills.list_skills(filter_unavailable=False)
-    if not skills:
-        content = "No skills available."
-    else:
-        lines = [f"Available skills ({len(skills)}):", ""]
-        for entry in skills:
-            desc = loop.context.skills.get_skill_description(entry["name"])
-            lines.append(f"- **{entry['name']}** — {desc}")
-        content = "\n".join(lines)
+_SKILL_USAGE = (
+    "Usage: /skill [drafts | diff <name> | accept <name> | reject <name>]\n\n"
+    "Without arguments, lists the enabled skills."
+)
+
+
+def _skill_reply(ctx: CommandContext, content: str, *, as_text: bool = False) -> OutboundMessage:
+    metadata = dict(ctx.msg.metadata or {})
+    if as_text:
+        metadata["render_as"] = "text"
     return OutboundMessage(
         channel=ctx.msg.channel,
         chat_id=ctx.msg.chat_id,
         content=content,
-        metadata=dict(ctx.msg.metadata or {}),
+        metadata=metadata,
     )
+
+
+async def cmd_skill(ctx: CommandContext) -> OutboundMessage:
+    """List skills, or manage the draft overlays (drafts/diff/accept/reject)."""
+    from nanobot.agent import skill_drafts
+
+    loop = ctx.loop
+    args = ctx.args.strip()
+    if not args:
+        skills = loop.context.skills.list_skills(filter_unavailable=False)
+        if not skills:
+            return _skill_reply(ctx, "No skills available.")
+        lines = [f"Available skills ({len(skills)}):", ""]
+        for entry in skills:
+            desc = loop.context.skills.get_skill_description(entry["name"])
+            lines.append(f"- **{entry['name']}** — {desc}")
+        return _skill_reply(ctx, "\n".join(lines))
+
+    sub, _, rest = args.partition(" ")
+    sub = sub.lower()
+    name = rest.strip()
+    ws = loop.workspace
+
+    if sub == "drafts":
+        drafts = skill_drafts.list_drafts(ws)
+        if not drafts:
+            return _skill_reply(ctx, "No skill drafts waiting. Send /skill accept <name> after an offer.")
+        lines = [f"Skill drafts ({len(drafts)}):", ""]
+        for draft_name in drafts:
+            merged = skill_drafts.merged_view(ws, draft_name)
+            lines.append(f"- **{draft_name}** — {skill_drafts.skill_description(merged)}")
+        lines.append("")
+        lines.append("Review with /skill diff <name>, then /skill accept <name> or /skill reject <name>.")
+        return _skill_reply(ctx, "\n".join(lines))
+
+    if sub not in {"diff", "accept", "reject"}:
+        return _skill_reply(ctx, _SKILL_USAGE, as_text=True)
+    if not name:
+        return _skill_reply(ctx, f"{sub.capitalize()} needs a skill name.\n\n{_SKILL_USAGE}", as_text=True)
+
+    try:
+        if sub == "diff":
+            try:
+                return _skill_reply(ctx, skill_drafts.diff(ws, name), as_text=True)
+            except skill_drafts.SkillDraftError as exc:
+                return _skill_reply(ctx, str(exc), as_text=True)
+        if sub == "accept":
+            problems = skill_drafts.accept(ws, name)
+            if problems:
+                body = "\n".join(f"- {problem}" for problem in problems)
+                return _skill_reply(
+                    ctx, f"Not accepting draft '{name}' — fix these first:\n{body}"
+                )
+            return _skill_reply(
+                ctx, f"Accepted skill draft '{name}'. It is live now at skills/{name}/."
+            )
+        # reject
+        if skill_drafts.reject(ws, name):
+            return _skill_reply(ctx, f"Rejected skill draft '{name}'. The live skill is unchanged.")
+        return _skill_reply(ctx, f"No draft named '{name}'.")
+    except skill_drafts.SkillDraftError as exc:
+        return _skill_reply(ctx, str(exc), as_text=True)
+    except OSError as exc:
+        logger.exception("skill command: {} {} failed", sub, name)
+        return _skill_reply(ctx, f"Could not {sub} draft '{name}': {exc}", as_text=True)
 
 
 async def cmd_trigger(ctx: CommandContext) -> OutboundMessage:
@@ -1100,6 +1165,7 @@ def register_builtin_commands(router: CommandRouter) -> None:
     router.exact("/evaluator-prompt", cmd_evaluator_prompt)
     router.prefix("/evaluator-prompt ", cmd_evaluator_prompt)
     router.exact("/skill", cmd_skill)
+    router.prefix("/skill ", cmd_skill)
     router.exact("/help", cmd_help)
     router.exact("/pairing", cmd_pairing)
     router.prefix("/pairing ", cmd_pairing)
