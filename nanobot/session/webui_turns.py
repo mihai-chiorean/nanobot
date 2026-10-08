@@ -713,6 +713,8 @@ class WebuiTurnCoordinator:
             failure_kind=event.failure_kind,
             failure_error_kind=event.failure_error_kind,
             failure_attempts=event.failure_attempts,
+            used=event.used,
+            other_steps=event.other_steps,
         )
         if self.recovery is not None:
             await self.recovery.turn_completed(event.context.session_key)
@@ -760,6 +762,8 @@ class WebuiTurnCoordinator:
         failure_kind: str | None = None,
         failure_error_kind: str | None = None,
         failure_attempts: int | None = None,
+        used: list[dict[str, Any]] | None = None,
+        other_steps: int | None = None,
     ) -> None:
         if msg.channel != "websocket":
             return
@@ -787,6 +791,8 @@ class WebuiTurnCoordinator:
                         if outcome == "failed"
                         else None
                     ),
+                    used=used,
+                    other_steps=other_steps,
                 ),
                 metadata=msg.metadata,
             )

@@ -10,5 +10,8 @@
   {"event":"retry_status","chat_id":"chat","state":"waiting","attempt":1,"max_attempts":4,"error_kind":"connection","retry_after_s":2},
   {"event":"retry_status","chat_id":"chat","state":"recovered","attempt":2,"max_attempts":4,"error_kind":"connection"},
   {"event":"retry_status","chat_id":"chat","state":"cleared","attempt":2,"max_attempts":4,"error_kind":"connection"},
-  {"event":"retry_status","chat_id":"chat","state":"exhausted","attempt":4,"max_attempts":4,"error_kind":"connection"}
+  {"event":"retry_status","chat_id":"chat","state":"exhausted","attempt":4,"max_attempts":4,"error_kind":"connection"},
+  {"event":"turn_end","chat_id":"chat","turn_id":"t1","used":[{"family":"gmail","label":"Gmail","private":true,"calls":2,"errors":0},{"family":"web_search","label":"Web search","private":false,"calls":1,"errors":0}],"other_steps":3},
+  {"event":"turn_end","chat_id":"chat","turn_id":"t2"},
+  {"event":"turn_end","chat_id":"chat","latency_ms":900}
 ]

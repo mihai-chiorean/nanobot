@@ -68,6 +68,11 @@ class TurnEndEvent(AgentEvent):
     failure_error_kind: str | None = None
     failure_attempts: int | None = None
     failure_message: str | None = None
+    # TP-09 (MIT-1870): "Used:" source families ({family, label, private,
+    # calls, errors}) in first-use order, plus the count of unlisted
+    # built-in steps, both lifted from the turn's provenance record.
+    used: list[dict[str, Any]] | None = None
+    other_steps: int | None = None
 
 
 @dataclass(frozen=True)

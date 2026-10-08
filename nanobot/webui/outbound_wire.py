@@ -83,6 +83,14 @@ class RetryStatusWirePayload(_ChatWirePayload):
     retry_after_s: NotRequired[float]
 
 
+class TurnEndUsedEntry(TypedDict):
+    family: str
+    label: str
+    private: bool
+    calls: int
+    errors: int
+
+
 class TurnEndWirePayload(_ChatWirePayload):
     event: Literal["turn_end"]
     latency_ms: NotRequired[int]
@@ -95,6 +103,9 @@ class TurnEndWirePayload(_ChatWirePayload):
     failure_error_kind: NotRequired[str]
     failure_attempts: NotRequired[int]
     failure_message: NotRequired[str]
+    # TP-09 (MIT-1870): only present when the turn ran at least one tool.
+    used: NotRequired[list[TurnEndUsedEntry]]
+    other_steps: NotRequired[int]
 
 
 class ContextCompactionWirePayload(_ChatWirePayload):
@@ -228,4 +239,19 @@ def encode_turn_end(
         payload["failure_attempts"] = int(event.failure_attempts)
     if event.failure_message is not None:
         payload["failure_message"] = event.failure_message
+    # TP-09 (MIT-1870): the "Used:" line. Present only when the turn actually
+    # ran tools (a listed family upserted, or an unlisted built-in step).
+    if event.used:
+        payload["used"] = [
+            {
+                "family": str(entry["family"]),
+                "label": str(entry["label"]),
+                "private": bool(entry["private"]),
+                "calls": int(entry["calls"]),
+                "errors": int(entry["errors"]),
+            }
+            for entry in event.used
+        ]
+    if event.other_steps:
+        payload["other_steps"] = int(event.other_steps)
     return payload
