@@ -435,10 +435,11 @@ class WebSearchTool(Tool):
 
     name = "web_search"  # pyright: ignore[reportIncompatibleMethodOverride, reportAssignmentType]
     description = (  # pyright: ignore[reportIncompatibleMethodOverride, reportAssignmentType]
-        "Search the web. Returns titles, URLs, and snippets. "
-        "count defaults to 5 (max 10). "
-        "Some providers support timeRange, authLevel, and queryRewrite. "
-        "Use web_fetch to read a specific page in full."
+        "Search the public web for current facts: prices, fares, news, schedules, docs, "
+        "releases. Start here for anything that isn't in the user's own accounts. "
+        "Returns titles, URLs and snippets (count defaults to 5, max 10); snippets aren't "
+        "live quotes, so use web_fetch on a result to confirm. Some providers support "
+        "timeRange, authLevel and queryRewrite."
     )
 
     config_key = "web"
@@ -1193,9 +1194,10 @@ class WebFetchTool(Tool):
 
     name = "web_fetch"  # pyright: ignore[reportIncompatibleMethodOverride, reportAssignmentType]
     description = (  # pyright: ignore[reportIncompatibleMethodOverride, reportAssignmentType]
-        "Fetch a URL and extract readable content (HTML → markdown/text). "
-        "Output is capped at maxChars (default 50 000). "
-        "Works for most web pages and docs; may fail on login-walled or JS-heavy sites."
+        "Fetch one public URL over HTTP and extract readable content "
+        "(HTML → markdown/text). Output is capped at maxChars (default 50 000). "
+        "Fast; try this before browser_read_page. "
+        "May fail on login-walled or JS-heavy sites."
     )
 
     config_key = "web"
