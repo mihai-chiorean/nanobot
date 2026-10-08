@@ -1,0 +1,48 @@
+{
+  "comment": "Transcript rows as written before TP-10 (MIT-1873) by a pre-TP-01 runtime: no turn_id, no used/other_steps on any row. The events projection must echo these rows unchanged.",
+  "lines": [
+    {
+      "event": "user",
+      "chat_id": "chat_pre_tp10",
+      "text": "what is the capital of France",
+      "created_at_ms": 1790000000000
+    },
+    {
+      "event": "message",
+      "chat_id": "chat_pre_tp10",
+      "text": "Paris.",
+      "latency_ms": 1500,
+      "created_at_ms": 1790000001000
+    },
+    {
+      "event": "turn_end",
+      "chat_id": "chat_pre_tp10",
+      "latency_ms": 1500,
+      "usage": {"input": 10, "output": 5},
+      "created_at_ms": 1790000002000
+    }
+  ],
+  "expected": [
+    {
+      "event": "user_message",
+      "chat_id": "chat_pre_tp10",
+      "created_at_ms": 1790000000000,
+      "text": "what is the capital of France",
+      "starts_turn": true
+    },
+    {
+      "event": "message",
+      "chat_id": "chat_pre_tp10",
+      "created_at_ms": 1790000001000,
+      "text": "Paris.",
+      "latency_ms": 1500
+    },
+    {
+      "event": "turn_end",
+      "chat_id": "chat_pre_tp10",
+      "created_at_ms": 1790000002000,
+      "latency_ms": 1500,
+      "usage": {"input": 10, "output": 5}
+    }
+  ]
+}
