@@ -78,6 +78,11 @@ class WorkStore:
         # brought up on first use instead.
         self._ready = False
         self._has_compat_scope = False
+        # Ziggy-local (MIT-1857, OA-15): (task_id, title) pairs the restart
+        # sweep marked ``interrupted`` that owe a work.finished push. The sweep
+        # runs before any MCP credential exists, so the pushes go out later,
+        # once the gateway has connected the connectors server.
+        self._pending_finish_notices: list[tuple[str, str]] = []
 
     def _ensure_ready(self) -> None:
         if self._ready:
@@ -808,11 +813,20 @@ class WorkStore:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT task_id FROM work_tasks
+                SELECT task_id, title, notify_on_finish FROM work_tasks
                 WHERE status IN ('queued', 'running')
                 """
             ).fetchall()
             task_ids = [str(row["task_id"]) for row in rows]
+            # MIT-1857 (OA-15): hand-off tasks owe a work.finished push, but
+            # the sweep runs before any connectors credential exists. Park the
+            # flagged ones; ``pending_finish_notices`` hands them to the
+            # startup hook once the credential is ready.
+            self._pending_finish_notices = [
+                (str(row["task_id"]), str(row["title"]))
+                for row in rows
+                if row["notify_on_finish"]
+            ]
             connection.execute(
                 """
                 UPDATE work_tasks
@@ -832,3 +846,12 @@ class WorkStore:
                 },
             )
         return len(task_ids)
+
+    def pending_finish_notices(self) -> list[tuple[str, str]]:
+        """Consume the ``interrupted`` work.finished notices left by the restart sweep.
+
+        MIT-1857 (OA-15): drained in one go so a later MCP reconnect does not
+        re-push a task that has already been reported.
+        """
+        notices, self._pending_finish_notices = self._pending_finish_notices, []
+        return notices

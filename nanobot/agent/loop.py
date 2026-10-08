@@ -164,6 +164,7 @@ from nanobot.utils.runtime import (
 from nanobot.webui.metadata import WEBUI_TURN_METADATA_KEY
 from nanobot.webui.session_identity import is_valid_webui_chat_id
 from nanobot.work.context import reset_work_context, set_work_context
+from nanobot.work.finish_notify import PUSH_STATUSES as FINISH_NOTIFY_STATUSES
 from nanobot.work.store import WorkStore
 
 if TYPE_CHECKING:
@@ -824,6 +825,9 @@ class AgentLoop:
         # sweep would mark that live task interrupted. Startup calls
         # ``reconcile_work_store`` explicitly, before any channel accepts input.
         self.work_store = WorkStore(workspace, reconcile_on_open=False)
+        # Ziggy-local (MIT-1857, OA-15): strong refs to fire-and-forget
+        # work.finished pushes so the event loop keeps them alive.
+        self._finish_notify_tasks: set[asyncio.Task[bool]] = set()
         # MIT-1401: one audit log per workspace. The default (~/.nanobot/
         # workspace/audit.jsonl) is the owner's workspace whenever tenants share
         # a HOME, which put every tenant's audit rows in front of the owner.
@@ -1199,6 +1203,46 @@ class AgentLoop:
         )
         if event is not None:
             await self.publish_work_event(msg.channel, msg.chat_id, event)
+            # Ziggy-local (MIT-1857, OA-15): the hand-off "done" push. A
+            # successful move to one of the three push statuses on a flagged
+            # task tells the tenant connector once; ``cancelled`` (a tester
+            # stop) and unflagged tasks never report. Scheduled, not awaited:
+            # a slow connector must not hold the turn.
+            if status in FINISH_NOTIFY_STATUSES:
+                await self._schedule_work_finish_notify(task_id, status)
+
+    async def _schedule_work_finish_notify(self, task_id: str, status: str) -> None:
+        """Fire one work.finished push for *task_id* if it is flagged for it."""
+        task = await self.work_store.run_io(self.work_store.get_task, task_id)
+        if task is None or not task.get("notify_on_finish"):
+            return
+        self._spawn_finish_notify(str(task_id), str(task.get("title") or ""), status)
+
+    def _spawn_finish_notify(self, task_id: str, title: str, status: str) -> None:
+        from types import SimpleNamespace
+
+        from nanobot.work.finish_notify import notify_finished
+
+        cfg = SimpleNamespace(tools=self.tools_config, channels=self.channels_config)
+        task = asyncio.create_task(
+            notify_finished(cfg, task_id, title, status),
+            name=f"work-finish-notify:{task_id}:{status}",
+        )
+        self._finish_notify_tasks.add(task)
+        task.add_done_callback(self._finish_notify_tasks.discard)
+
+    async def send_interrupted_finish_notices(self) -> int:
+        """Push ``interrupted`` notices left behind by the restart sweep.
+
+        MIT-1857 (OA-15): the sweep in ``WorkStore.reconcile_interrupted`` runs
+        at store open, before any connectors credential exists; the gateway
+        calls this once the MCP servers (and with them the client-credentials
+        token for the connectors server) are connected.
+        """
+        notices = await self.work_store.run_io(self.work_store.pending_finish_notices)
+        for task_id, title in notices:
+            self._spawn_finish_notify(task_id, title, "interrupted")
+        return len(notices)
 
     def work_artifact_refs(self, msg: InboundMessage) -> list[dict[str, Any]]:
         """Artifact references published during *msg*'s Work turn."""
