@@ -390,12 +390,18 @@ class ToolRegistry:
         if error:
             # Ziggy-local (fork, MIT-203): a rejected call never ran — audit it
             # as a prescreen-class failure (no exit code, no stderr).
-            self._audit(
-                "error", name, params if isinstance(params, dict) else {}, t0, sid, ch,
+            self.record_call(
+                name,
+                params if isinstance(params, dict) else {},
+                "error",
+                (time.monotonic() - t0) * 1000,
                 error=str(error)[:2048],
-                error_type="prescreen",
+                extra={
+                    "session_id": sid,
+                    "channel": ch,
+                    "error_type": "prescreen",
+                },
             )
-            self._prom_observe(name, "error", (time.monotonic() - t0) * 1000)
             return ToolResult.error(str(error) + hint)
 
         try:
@@ -409,17 +415,29 @@ class ToolRegistry:
             if _looks_like_error(result):
                 status = "error"
                 error_type, exit_code, stderr_tail = _classify_tool_error(str(result), name)
-                self._audit(
-                    status, name, params, t0, sid, ch,
+                self.record_call(
+                    name,
+                    params,
+                    status,
+                    duration_ms,
                     error=str(result)[:2048],
-                    error_type=error_type,
-                    exit_code=exit_code,
-                    stderr_tail=stderr_tail,
+                    extra={
+                        "session_id": sid,
+                        "channel": ch,
+                        "error_type": error_type,
+                        "exit_code": exit_code,
+                        "stderr_tail": stderr_tail,
+                    },
                 )
             else:
                 status = "ok"
-                self._audit(status, name, params, t0, sid, ch)
-            self._prom_observe(name, status, duration_ms)
+                self.record_call(
+                    name,
+                    params,
+                    status,
+                    duration_ms,
+                    extra={"session_id": sid, "channel": ch},
+                )
 
             # Ziggy-local (fork, MIT-122/MIT-147): scrub embedded secrets from any
             # string result, on BOTH the success and error paths. Tool authors
@@ -437,51 +455,56 @@ class ToolRegistry:
             return result
         except Exception as e:
             duration_ms = (time.monotonic() - t0) * 1000
-            self._audit(
-                "error", name, params, t0, sid, ch,
+            self.record_call(
+                name,
+                params if isinstance(params, dict) else {},
+                "error",
+                duration_ms,
                 error=str(e),
-                error_type="exception",
+                extra={"session_id": sid, "channel": ch, "error_type": "exception"},
             )
-            self._prom_observe(name, "error", duration_ms)
             # Exception strings can also carry secrets (MIT-147).
             raw = f"Error executing {name}: {str(e)}"
             return ToolResult.error(redact_if_sensitive(raw) + hint)
 
-    def _audit(
+    def record_call(
         self,
+        tool_name: str,
+        params: Any,
         status: str,
-        name: str,
-        params: dict,
-        t0: float,
-        session_id: str = "",
-        channel: str = "",
+        duration_ms: float,
         error: str | None = None,
-        error_type: ErrorType | None = None,
-        exit_code: int | None = None,
-        stderr_tail: str | None = None,
+        extra: dict[str, Any] | None = None,
     ) -> None:
-        """Log a tool execution to the audit logger if attached.
+        """Record one tool call to ``audit.jsonl`` and the Prometheus metrics.
 
-        MIT-203: when *status* is ``"error"``, callers pass ``error_type``
-        / ``exit_code`` / ``stderr_tail`` so downstream dashboards can
-        separate user-painful failures (``timeout``/``nonzero_exit``/
-        ``exception``) from safety-guard rejects (``prescreen``).
+        MIT-1849 (TP-08): this is the single recorder behind *both* execution
+        paths — :meth:`execute` and the live dispatch in ``execution.py``,
+        which calls ``tool.execute`` directly and bypassed the audit layer
+        entirely (design turn-provenance §6). Recording only: it never
+        redacts the result and never changes what the model sees.
+
+        *extra* merges into the :meth:`AuditLogger.log` kwargs
+        (``session_id`` / ``channel`` overrides, MIT-203's ``error_type`` /
+        ``exit_code`` / ``stderr_tail``); unset ``session_id`` / ``channel``
+        are filled from the bound request context in ``audit.py``.
         """
+        self._prom_observe(tool_name, status, duration_ms)
         if self._audit_logger is None:
             return
+        fields: dict[str, Any] = {
+            "tool_name": tool_name,
+            "arguments": params if isinstance(params, dict) else {},
+            "result_status": status,
+            "session_id": self._session_id,
+            "channel": self._channel,
+            "error": error,
+            "duration_ms": duration_ms,
+        }
+        if extra:
+            fields.update(extra)
         try:
-            self._audit_logger.log(
-                tool_name=name,
-                arguments=params,
-                result_status=status,
-                session_id=session_id,
-                channel=channel,
-                error=error,
-                duration_ms=(time.monotonic() - t0) * 1000,
-                error_type=error_type,
-                exit_code=exit_code,
-                stderr_tail=stderr_tail,
-            )
+            self._audit_logger.log(**fields)
         except Exception:
             pass  # Audit must never crash tool execution
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 from collections.abc import Callable
 from contextlib import nullcontext
 from functools import cache
@@ -66,6 +67,45 @@ _WORKSPACE_VIOLATION_MARKERS: tuple[str, ...] = (
     "path outside working dir",
     "path traversal detected",
 )
+# Ziggy-local (MIT-1849 / TP-08, design turn-provenance §6): prepare_call
+# failures that are policy gates, not call failures. Matched against the
+# exact message shapes produced by registry.prepare_call (shared-room,
+# read-only-turn and ask_user denials); the tester Activity endpoint already
+# maps ``refused`` rows (webui/ws_http.py).
+_POLICY_DENIAL_MARKERS: tuple[str, ...] = (
+    "is unavailable in a shared conversation",  # room_denial_message
+    '"code":"shared_room_denied"',              # typed room denial envelope
+    "is unavailable in a read-only turn",       # read_only_denial_message
+    "is unavailable in a scheduled run",        # ask_user_unavailable_message
+)
+
+
+def _is_policy_denial(text: str) -> bool:
+    return any(marker in text for marker in _POLICY_DENIAL_MARKERS)
+
+
+def _record_tool_call(
+    tools: ToolRegistry,
+    tool_call: ToolCallRequest,
+    params: Any,
+    status: str,
+    started_at: float,
+    *,
+    error: str | None = None,
+) -> None:
+    """MIT-1849 (TP-08): write the one audit row + Prometheus sample per
+    live tool call. Record-only — the result the model sees is untouched —
+    and registries without the recorder are skipped."""
+    record = getattr(tools, "record_call", None)
+    if not callable(record):
+        return
+    record(
+        tool_call.name,
+        params if isinstance(params, dict) else {},
+        status,
+        (time.monotonic() - started_at) * 1000,
+        error=error,
+    )
 
 
 def _with_retry_hint(payload: str) -> str:
@@ -211,6 +251,7 @@ async def _execute_tool_call(
         getattr(tools, "prepare_call", None),
     )
     tool, params, prep_error = None, tool_call.arguments, None
+    started_at = time.monotonic()
     if callable(prepare_call):
         prepared = prepare_call(tool_call.name, tool_call.arguments)
         if isinstance(prepared, tuple):
@@ -218,6 +259,17 @@ async def _execute_tool_call(
             if len(prepared_tuple) == 3:
                 tool, params, prep_error = cast(tuple[Any, Any, str | None], prepared_tuple)
     if prep_error:
+        # Ziggy-local (MIT-1849): a call the gates refused still gets its
+        # exactly-one audit row — ``refused`` for the policy gates, ``error``
+        # for schema/not-found style rejections.
+        _record_tool_call(
+            tools,
+            tool_call,
+            params,
+            "refused" if _is_policy_denial(str(prep_error)) else "error",
+            started_at,
+            error=str(prep_error)[:200],
+        )
         payload = _with_retry_hint(prep_error)
         event = {
             "name": tool_call.name,
@@ -236,6 +288,9 @@ async def _execute_tool_call(
         return payload, event, None
 
     await hook.before_execute_tool(context, tool_call, tool, params)
+    # When the registry's own execute dispatches the call it records it
+    # itself (MIT-1849); recording here would double-write that path.
+    dispatched_here = tool is not None
     try:
         # Ziggy-local (fork, MIT-202/MIT-211): nest tool dispatch under the
         # active llm-iteration span so the Langfuse trace shows
@@ -254,6 +309,8 @@ async def _execute_tool_call(
     except asyncio.CancelledError:
         raise
     except AskUserInterrupt as interrupt:
+        if dispatched_here:
+            _record_tool_call(tools, tool_call, params, "waiting", started_at)
         event = {
             "name": tool_call.name,
             "status": "waiting",
@@ -261,6 +318,10 @@ async def _execute_tool_call(
         }
         return "", event, interrupt
     except Exception as exc:
+        if dispatched_here:
+            _record_tool_call(
+                tools, tool_call, params, "error", started_at, error=str(exc)[:200],
+            )
         await hook.on_execute_tool_error(context, tool_call, tool, params, exc)
         event = {
             "name": tool_call.name,
@@ -278,6 +339,16 @@ async def _execute_tool_call(
         if handled is not None:
             return handled + (None,)
         return payload, event, None
+
+    if dispatched_here:
+        _record_tool_call(
+            tools,
+            tool_call,
+            params,
+            "error" if is_tool_error_result(result) else "ok",
+            started_at,
+            error=str(result)[:200] if is_tool_error_result(result) else None,
+        )
 
     if is_tool_error_result(result):
         await hook.on_execute_tool_error(context, tool_call, tool, params, result)
