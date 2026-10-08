@@ -22,6 +22,27 @@ export interface RetryStatus {
   retry_after_s?: number
 }
 
+/** One source family the answer used, in first-use order (TP-09). The server
+ * decides family names and labels, so both apps show the same names. */
+export interface TurnEndUsed {
+  family: string
+  label: string
+  private: boolean
+  calls: number
+  errors: number
+}
+
+/** The frame that closes an assistant turn. ``used`` and ``other_steps`` are
+ * optional: turns that ran no tools omit them, as do older runtimes that
+ * predate the "Used:" line, and clients show no line in those cases. */
+export interface TurnEnd {
+  event: "turn_end"
+  chat_id: string
+  turn_id?: string
+  used?: TurnEndUsed[]
+  other_steps?: number
+}
+
 export type NotificationEvent =
   | ({ event: "retry_status"; chat_id: string; turn_id?: string } & RetryStatus)
   | ({ event: "recovery_state"; chat_id: string; turn_id?: string } & RecoveryState)
@@ -53,6 +74,36 @@ export function isRecoveryState(value: unknown): value is RecoveryState {
     && optional(value.reason, "string")
     && optional(value.attempts, "number")
     && optional(value.can_continue, "boolean")
+}
+
+export function isTurnEndUsed(value: unknown): value is TurnEndUsed {
+  return isRecord(value)
+    && typeof value.family === "string"
+    && typeof value.label === "string"
+    && typeof value.private === "boolean"
+    && typeof value.calls === "number"
+    && Number.isInteger(value.calls)
+    && value.calls >= 1
+    && typeof value.errors === "number"
+    && Number.isInteger(value.errors)
+    && value.errors >= 0
+    && value.errors <= value.calls
+}
+
+/** Validator for the ``turn_end`` frame. Unknown extra fields (usage,
+ * goal_state, …) are tolerated: the frame carries them and clients that do
+ * not care about them must still accept it. */
+export function isTurnEnd(value: unknown): value is TurnEnd {
+  return isRecord(value)
+    && value.event === "turn_end"
+    && typeof value.chat_id === "string"
+    && optional(value.turn_id, "string")
+    && (value.used === undefined
+      || (Array.isArray(value.used) && value.used.length > 0 && value.used.every(isTurnEndUsed)))
+    && (value.other_steps === undefined
+      || (typeof value.other_steps === "number"
+        && Number.isInteger(value.other_steps)
+        && value.other_steps >= 1))
 }
 
 /** Undefined means another protocol family; null means a malformed notification. */
