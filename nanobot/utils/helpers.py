@@ -941,17 +941,15 @@ def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]
         for name in added:
             Console().print(f"  [dim]Created {name}[/dim]")
 
-    # Initialize git for memory version control
+    # Initialize git for memory version control. SM-01 (MIT-1842): bare repo
+    # outside the workspace, wider tracked set; never recreates <ws>/.git.
     try:
-        from nanobot.utils.gitstore import GitStore
+        from nanobot.utils.gitstore import DEFAULT_TRACKED_PATTERNS, GitStore, history_dir_for
 
         gs = GitStore(
             workspace,
-            tracked_files=[
-                "SOUL.md",
-                "USER.md",
-                "memory/MEMORY.md",
-            ],
+            tracked_files=DEFAULT_TRACKED_PATTERNS,
+            git_dir=history_dir_for(workspace) / "workspace.git",
         )
         gs.init()
     except Exception:

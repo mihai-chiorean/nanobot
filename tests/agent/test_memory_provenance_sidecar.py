@@ -175,14 +175,30 @@ def test_record_dream_provenance_from_real_dream_content_diff(tmp_path):
 
 
 def test_provenance_sidecar_is_git_tracked(tmp_path):
-    """The sidecar must ride in the same auto-commit as MEMORY.md: it is a GitStore
-    tracked file, so ``git.init`` creates it even before any fact is recorded."""
+    """The sidecar must ride in the same auto-commit as MEMORY.md: it is part of
+    the GitStore tracked set (SM-01: bare byte commits; init no longer touches —
+    i.e. creates — workspace files, it just commits what exists)."""
     workspace = tmp_path / "tracked" / "workspace"
     workspace.mkdir(parents=True)
     store = MemoryStore(workspace)
     assert not store.provenance_file.exists()
-    store.git.init()  # init only touches tracked files
-    assert store.provenance_file.exists(), "memory/provenance.jsonl is not a tracked file"
+    store.git.init()  # never creates workspace files anymore
+    assert not store.provenance_file.exists()
+
+    store.write_memory(f"# Memory\n\n{FACT}\n")
+    store.provenance_file.write_text('{"line": "seed"}\n', encoding="utf-8")
+    assert store.git.auto_commit("dream: seeded") is not None
+
+    from dulwich.repo import Repo
+
+    from nanobot.utils.gitstore import GitStore, history_dir_for
+
+    with Repo(str(history_dir_for(workspace) / "workspace.git")) as repo:
+        tree = repo[repo[repo.refs[b"HEAD"]].tree]
+        assert GitStore._read_blob_from_tree(repo, tree, "memory/MEMORY.md") is not None
+        sidecar = GitStore._read_blob_from_tree(repo, tree, "memory/provenance.jsonl")
+        assert sidecar is not None, "memory/provenance.jsonl is not a tracked pattern"
+        assert b"seed" in sidecar
 
 
 def test_record_dream_provenance_only_parses_the_memory_hunk(tmp_path):
