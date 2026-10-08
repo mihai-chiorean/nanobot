@@ -582,3 +582,77 @@ def test_change_detection_survives_a_restart(tmp_path):
     # Same content, fresh process-equivalent connection: must short-circuit.
     assert reopened.index_text("USER.md", "Mihai likes trilobites.", kind=KIND_FACT) == 0
     assert reopened.index_text("USER.md", "Mihai likes ammonites.", kind=KIND_FACT) > 0
+
+
+# ---------------------------------------------------------------------------
+# 8. The archive layer (MIT-1874).
+#
+# Dream retires rarely-needed facts out of the injected MEMORY.md into
+# memory/archive.md. It rewrites that file on disk, outside MemoryStore's
+# writers, so recall must also reconcile the curated layer on the read path —
+# and the file must be as visible in `session` scope as MEMORY.md always was.
+# ---------------------------------------------------------------------------
+
+
+def test_archive_md_is_indexed_as_fact(tmp_path):
+    from nanobot.agent.memory import MemoryStore
+
+    manager, indexer = _manager(tmp_path, "owner")
+    store = MemoryStore(manager.workspace)
+    store.set_recall_indexer(indexer)
+    store.write_archive("- Ada's old school was Oakhurst; it shut in 2019.\n")
+
+    hits = indexer.index.search("Oakhurst school", kinds=[KIND_FACT])
+    assert hits, "an archived fact must be searchable as a fact"
+    assert hits[0].kind == KIND_FACT
+    assert hits[0].source == "memory/archive.md"
+    assert "Oakhurst" in hits[0].body
+
+
+def test_archive_reindexed_after_external_edit(tmp_path):
+    """Dream rewrites the file directly; the next search must see the new text."""
+    from nanobot.agent.memory import MemoryStore
+
+    manager, indexer = _manager(tmp_path, "owner")
+    store = MemoryStore(manager.workspace)
+    store.set_recall_indexer(indexer)
+
+    archive = manager.workspace / "memory" / "archive.md"
+    archive.write_text("- The lighthouse fund meets in March.\n", encoding="utf-8")
+    hits = indexer.index.search("lighthouse fund")
+    assert hits and "lighthouse fund" in hits[0].body.lower()
+
+    archive.write_text(
+        "- The lighthouse fund dissolved; the money went to the harbour trust.\n",
+        encoding="utf-8",
+    )
+    hits = indexer.index.search("harbour trust")
+    assert hits and "harbour trust" in hits[0].body.lower()
+    # The replaced text is gone, not merely appended to the old windows:
+    # nothing stored still says the fund "meets".
+    assert all("meets" not in h.body for h in indexer.index.search("meets"))
+
+    # Negative control: a file that is not curated, edited the same way,
+    # stays out of the index.
+    (manager.workspace / "memory" / "scratch.md").write_text(
+        "- octopus survey notes\n", encoding="utf-8"
+    )
+    assert not indexer.index.search("octopus survey")
+
+
+async def test_archive_visible_in_session_scope(tmp_path):
+    """Retired facts reach a conversation exactly like the injected MEMORY.md."""
+    from nanobot.agent.memory import MemoryStore
+
+    manager, indexer = _two_audiences(tmp_path)
+    store = MemoryStore(manager.workspace)
+    store.set_recall_indexer(indexer)
+    store.write_memory("- Mihai's anechoic readings are in the lab binder.\n")
+    store.write_archive("- The anechoic chamber was built in 1974 by Acoustics Ltd.\n")
+
+    with _calling_from("slack:shared-room-42"):
+        out = str(await _tool(manager).execute(query="anechoic chamber"))
+
+    assert "1974" in out, "archive.md is curated: visible in session scope"
+    assert "lab binder" in out, "MEMORY.md behaves as it always did"
+    assert "seat 3A" not in out, "and no other conversation's transcript leaks in"

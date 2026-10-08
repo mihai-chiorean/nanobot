@@ -18,3 +18,11 @@ when nearby entries matter.
 
 Example (replace `<history-log-path>` with the path from the system prompt):
 `grep(pattern="project-name", path="<history-log-path>", output_mode="content", case_insensitive=true, head_limit=20)`
+
+## Archived Facts
+
+Facts moved out of long-term memory (`memory/MEMORY.md`) are kept in
+`memory/archive.md` in the workspace. If a `recall` tool is available, use it —
+archived facts are indexed as facts and found like any other remembered note.
+Where `recall` is not available, `grep` or `read_file` that file (ask for the
+workspace path from the system prompt, as with the history log above).
