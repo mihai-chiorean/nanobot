@@ -129,6 +129,10 @@ class AgentDefaults(Base):
     temperature: float = 0.1
     fallback_models: list[FallbackCandidate] = Field(default_factory=list)
     max_tool_iterations: int = 200
+    # TS-13 experiment: give the first model call of an ``auto``→``fast`` chat
+    # turn the ``think`` generation so tool-family choice gets reasoning; the
+    # rest of the turn stays on ``fast``. Ships off; TS-14 decides.
+    think_first_iteration: bool = False
     max_concurrent_subagents: int = Field(default=4, ge=1)
     max_tool_result_chars: int = 16_000
     provider_retry_mode: Literal["standard", "persistent"] = "standard"
