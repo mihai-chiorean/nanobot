@@ -23,6 +23,7 @@ from nanobot.agent.tools.schema import (
 from nanobot.config_base import Base
 from nanobot.security.workspace_access import current_tool_workspace
 from nanobot.utils.file_edit_events import FileDiff, FileEditResult, display_file_edit_path
+from nanobot.utils.gitstore import history_dir_for
 from nanobot.utils.helpers import build_image_content_blocks, detect_image_mime
 from nanobot.utils.sensitive import is_sensitive_path
 
@@ -59,6 +60,10 @@ class SensitivePathError(PermissionError):
     check, which routed straight around ``edit_file``'s guard. Enforcing at the
     single resolver both fixes that and covers ``write_file`` (which never had
     the check) and any tool added later.
+
+    SM-01 (MIT-1842) reuses it for the workspace history refusal raised at the
+    shared resolver: the same clean error for a path class the agent must
+    never reach.
 
     Subclasses PermissionError because every write tool already funnels that to
     a clean ToolResult.error.
@@ -179,7 +184,7 @@ class _FsTool(Tool):
         allowed_root = self._effective_allowed_root(access.allowed_root)
         if extra_files_require_allowed_root and allowed_root is None:
             extra_allowed_files = None
-        return resolve_workspace_path(
+        resolved = resolve_workspace_path(
             path,
             access.project_path,
             allowed_root,
@@ -187,6 +192,38 @@ class _FsTool(Tool):
             extra_allowed_files,
             include_media_dir=include_media_dir,
         )
+        self._refuse_history_path(resolved, path)
+        return resolved
+
+    def _refuse_history_path(self, resolved: Path, path: str | Path) -> None:
+        """Refuse any resolved path inside the workspace's history directory.
+
+        SM-01 (MIT-1842): the undo history is a bare repo at
+        ``<workspace>/../history`` (``history_dir_for``), derived only from
+        the tool's own workspace path. The containment check the resolver
+        already does is not enough on its own: a conversation's project scope
+        can widen the allowed root to any existing directory (e.g. the tenant
+        root), which would put ``history/`` inside it. This refusal applies
+        whatever the effective allowed root is, so the agent can never read or
+        rewrite its own history. Raises the MIT-121 sensitive-path error
+        (PermissionError), which every file tool already funnels to a clean
+        ToolResult.error.
+        """
+        if self._workspace is None:
+            return
+        try:
+            history = history_dir_for(Path(self._workspace))
+        except (OSError, RuntimeError, ValueError):
+            return
+        try:
+            under_history = resolved == history or history in resolved.parents
+        except (OSError, RuntimeError, ValueError):
+            return
+        if under_history:
+            raise SensitivePathError(
+                f"Access to {path} is blocked (workspace history — the agent "
+                "cannot read or rewrite its own undo history)."
+            )
 
     def _resolve_read(self, path: str) -> Path:
         plugin_skill_dirs: list[Path] = []
