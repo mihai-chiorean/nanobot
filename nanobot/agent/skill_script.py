@@ -160,6 +160,13 @@ async def run_skill_script(
             stdout, stderr = await asyncio.wait_for(reader, timeout=_KILL_REAP_GRACE_S)
         except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
             stdout, stderr = b"", b""
+        if not reader.done():
+            # wait_for does not cancel a Task it was handed (bpo-45984), so a
+            # pipe still held by a descendant that escaped the killed group
+            # would leave communicate() pending forever. Cancel it and wait
+            # out the cancellation instead of leaking the task.
+            reader.cancel()
+            await asyncio.wait([reader])
     duration = time.monotonic() - started
     exit_code = proc.returncode if proc.returncode is not None else -1
     return ScriptResult(

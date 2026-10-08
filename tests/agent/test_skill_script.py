@@ -183,6 +183,59 @@ async def test_timeout_kills_the_whole_process_group(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_timeout_cancels_the_communicate_task_when_the_reap_times_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A survivor holding the stdout pipe must not leave ``communicate()`` pending.
+
+    ``asyncio.wait_for`` does not cancel a Task it is handed on Python 3.10/3.11
+    (bpo-45984) and only does so on 3.12+ as an implementation detail. The shim
+    pins the no-cancel semantics for the reap await so this reproduces the
+    leak on every supported interpreter, and the runner's own cancel — not the
+    stdlib's version-dependent behaviour — is what the test measures.
+    """
+    skill = _skill_dir(tmp_path)
+    # The descendant runs in its own session, so the process-group kill misses
+    # it, and it inherits the stdout/stderr pipes: after the group kill the
+    # pipes never reach EOF and the reader stays pending.
+    (skill / "scripts" / "runaway.py").write_text(
+        "import subprocess, sys, time\n"
+        "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(2)'],\n"
+        "                 start_new_session=True)\n"
+        "time.sleep(60)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("nanobot.agent.skill_script._KILL_REAP_GRACE_S", 0.1)
+
+    real_wait_for = asyncio.wait_for
+    real_ensure_future = asyncio.ensure_future
+    readers: list[asyncio.Task] = []
+
+    async def no_cancel_wait_for(awaitable: Any, *, timeout: float | None = None) -> Any:
+        if isinstance(awaitable, asyncio.Task) and timeout is not None:
+            return await real_wait_for(asyncio.shield(awaitable), timeout=timeout)
+        return await real_wait_for(awaitable, timeout=timeout)
+
+    def spy_ensure_future(coro: Any, **kwargs: Any) -> asyncio.Task:
+        task = real_ensure_future(coro, **kwargs)
+        readers.append(task)
+        return task
+
+    monkeypatch.setattr(asyncio, "wait_for", no_cancel_wait_for)
+    monkeypatch.setattr(asyncio, "ensure_future", spy_ensure_future)
+
+    result = await run_skill_script(skill, "scripts/runaway.py", 1, {})
+
+    assert result.timed_out and result.failed
+    (reader,) = readers
+    assert reader.done(), "communicate() task leaked past the timed-out reap"
+    assert reader.cancelled()
+    # Let the pipe-holding descendant exit so the transport closes its fds
+    # while this loop is still alive (instead of at GC time, loop closed).
+    await asyncio.sleep(2.4)
+
+
+@pytest.mark.asyncio
 async def test_timeout_is_clamped_to_the_executable_band(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
