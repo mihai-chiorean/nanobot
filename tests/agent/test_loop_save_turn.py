@@ -12,6 +12,7 @@ from nanobot.agent.context import ContextBuilder, TranscriptInput
 from nanobot.agent.loop import AgentLoop
 from nanobot.agent.runner import AgentRunResult
 from nanobot.agent.tools.context import RequestContext, request_context
+from nanobot.agent.tools.mcp import _idempotency_key, _idempotency_scope
 from nanobot.bus.events import InboundMessage
 from nanobot.bus.outbound_events import (
     GoalStatusEvent,
@@ -2513,3 +2514,109 @@ def test_save_turn_drops_duplicate_tool_result_ids() -> None:
 
     assert [m["role"] for m in session.messages] == ["assistant", "tool"]
     assert session.messages[1]["content"] == "first"
+
+
+# ---------------------------------------------------------------------------
+# SR-11 (MIT-1820): idempotency scope plumbing on the turn path
+# ---------------------------------------------------------------------------
+
+
+def test_persist_user_message_records_client_message_id(tmp_path: Path) -> None:
+    """The user row keeps client_message_id so recovery can rebuild the turn's
+    idempotency scope after a restart drops the inbound metadata."""
+    loop = _make_full_loop(tmp_path)
+    session = loop.sessions.get_or_create("websocket:chat")
+    session.add_message("assistant", "earlier answer")
+
+    assert (
+        loop._persist_user_message_early(
+            InboundMessage(
+                channel="websocket",
+                sender_id="user",
+                chat_id="chat",
+                content="mail grandma",
+                metadata={"client_message_id": "cm-42"},
+            ),
+            session,
+        )
+        is True
+    )
+    row = session.messages[-1]
+    assert row["role"] == "user"
+    assert row["client_message_id"] == "cm-42"
+    # The caller-visible request metadata keeps exactly what the caller sent.
+    ctx = RequestContext(
+        channel="websocket",
+        chat_id="chat",
+        session_key="websocket:chat",
+        metadata={"client_message_id": "cm-42"},
+    )
+    assert _idempotency_scope(ctx) == "cm-42"
+
+
+def test_persist_user_message_without_client_message_id_leaves_row_clean(
+    tmp_path: Path,
+) -> None:
+    loop = _make_full_loop(tmp_path)
+    session = loop.sessions.get_or_create("websocket:chat")
+
+    assert (
+        loop._persist_user_message_early(
+            InboundMessage(
+                channel="websocket",
+                sender_id="user",
+                chat_id="chat",
+                content="mail grandma",
+                metadata={},
+            ),
+            session,
+        )
+        is True
+    )
+    assert "client_message_id" not in session.messages[-1]
+
+
+@pytest.mark.asyncio
+async def test_run_agent_loop_binds_user_message_index_for_the_turn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The runner binds the turn's persisted-user-row index so MCP write calls
+    get ``session_key#index`` scopes, and distinct turns get distinct scopes."""
+    import nanobot.agent.loop as loop_module
+    from nanobot.agent.tools.context import (
+        bind_turn_user_message_index as real_bind,
+    )
+
+    captured: list[int | None] = []
+
+    def spy_bind(index: int | None):
+        captured.append(index)
+        return real_bind(index)
+
+    monkeypatch.setattr(loop_module, "bind_turn_user_message_index", spy_bind)
+    loop = _make_full_loop(tmp_path)
+    await run_session(loop, InboundMessage(
+        channel="websocket",
+        sender_id="user",
+        chat_id="chat",
+        content="mail grandma",
+        metadata={},
+    ))
+    await run_session(loop, InboundMessage(
+        channel="websocket",
+        sender_id="user",
+        chat_id="chat",
+        content="mail grandpa",
+        metadata={},
+    ))
+
+    session = loop.sessions.get_or_create("websocket:chat")
+    user_rows = [i for i, m in enumerate(session.messages) if m["role"] == "user"]
+    assert captured == user_rows
+    assert len(user_rows) == 2
+    # Negative control: distinct turns share a session but never a scope.
+    first, second = user_rows
+    assert _idempotency_key(f"websocket:chat#{first}", "t", {}) != _idempotency_key(
+        f"websocket:chat#{second}", "t", {}
+    )

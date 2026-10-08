@@ -25,6 +25,7 @@ from nanobot.bus.outbound_events import (
 )
 from nanobot.bus.queue import MessageBus
 from nanobot.session import turn_continuation
+from nanobot.session.history_visibility import is_hidden_history_message
 from nanobot.session.keys import UNIFIED_SESSION_KEY, last_channel_from_metadata
 from nanobot.session.manager import Session, SessionManager
 from nanobot.webui.metadata import WEBUI_TURN_METADATA_KEY
@@ -62,6 +63,26 @@ class RecoveryAdmission(Protocol):
     def register_recovery_task(self, session_key: str, task: asyncio.Task[Any]) -> None: ...
 
     def unregister_recovery_task(self, session_key: str, task: asyncio.Task[Any]) -> None: ...
+
+
+def turn_idempotency_scope(session: Session) -> str | None:
+    """The interrupted turn's idempotency scope, as the live turn computed it.
+
+    Mirrors ``nanobot.agent.tools.mcp._idempotency_scope`` for the last real
+    user row of the session: the persisted ``client_message_id`` when the
+    session manager stored one, else the ``session_key#index`` fallback.  The
+    continuation carries this as ``recovery_origin_scope`` so write calls
+    replayed after the Continue keep the same ``ziggy.dev/idempotency_key``.
+    """
+    for index in range(len(session.messages) - 1, -1, -1):
+        message = session.messages[index]
+        if message.get("role") != "user" or is_hidden_history_message(message):
+            continue
+        client_message_id = message.get("client_message_id")
+        if isinstance(client_message_id, str) and client_message_id.strip():
+            return client_message_id
+        return f"{session.key}#{index}"
+    return None
 
 
 def record_pending_followup(session: Session, message: InboundMessage) -> str | None:
@@ -788,6 +809,20 @@ class RecoveryCoordinator:
         state: Mapping[str, Any],
     ) -> None:
         recovery_id = cast(str, state["recovery_id"])
+        metadata: dict[str, Any] = {
+            "webui": True,
+            "_wants_stream": True,
+            WEBUI_TURN_METADATA_KEY: f"recovery:{recovery_id}",
+            RECOVERY_INBOUND_METADATA_KEY: recovery_id,
+            turn_continuation.INTERNAL_CONTINUATION_META: True,
+            turn_continuation.SKIP_USER_PERSIST_META: True,
+        }
+        # The continuation re-runs the interrupted turn's write calls; carrying
+        # the origin turn's scope keeps their ziggy.dev/idempotency_key equal
+        # across the replay (SR-11).
+        scope = turn_idempotency_scope(session)
+        if scope is not None:
+            metadata[turn_continuation.RECOVERY_ORIGIN_SCOPE_META] = scope
         await self.bus.publish_inbound(
             InboundMessage(
                 channel="websocket",
@@ -797,14 +832,7 @@ class RecoveryCoordinator:
                     "Continue the interrupted request from the saved conversation context. "
                     "Do not repeat completed work or mention the restart unless it affects the answer."
                 ),
-                metadata={
-                    "webui": True,
-                    "_wants_stream": True,
-                    WEBUI_TURN_METADATA_KEY: f"recovery:{recovery_id}",
-                    RECOVERY_INBOUND_METADATA_KEY: recovery_id,
-                    turn_continuation.INTERNAL_CONTINUATION_META: True,
-                    turn_continuation.SKIP_USER_PERSIST_META: True,
-                },
+                metadata=metadata,
                 session_key_override=session.key,
                 require_existing_session=True,
             )
