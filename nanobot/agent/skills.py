@@ -1,5 +1,6 @@
 """Skills loader for agent capabilities."""
 
+import hashlib
 import json
 import os
 import re
@@ -21,6 +22,11 @@ _STRIP_SKILL_FRONTMATTER = re.compile(
 )
 _SKILL_NAME = re.compile(r"^(?!.*--)[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
 _SKILL_REFERENCE = re.compile(r"(?<![\w$])\$([A-Za-z0-9_-]+)")
+
+
+def skill_file_sha(path: Path | str) -> str:
+    """First 16 hex chars of sha256 over a skill file's bytes (TP-06)."""
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()[:16]
 
 
 def parse_skill_metadata(content: str) -> dict[str, object] | None:
@@ -220,14 +226,31 @@ class SkillsLoader:
         Returns:
             Markdown-formatted skills summary.
         """
+        return self.build_skills_summary_with_sha(exclude=exclude, workspace=workspace)[0]
+
+    def build_skills_summary_with_sha(
+        self,
+        exclude: set[str] | None = None,
+        *,
+        workspace: Path | None = None,
+    ) -> tuple[str, str | None]:
+        """As ``build_skills_summary``, plus a content hash of what was listed.
+
+        The second element is ``skills_listed_sha`` (TP-06): the first 16 hex
+        chars of sha256 over the sorted ``name:skill_file_sha(SKILL.md)``
+        lines of the skills actually listed — ``None`` when nothing was. It
+        lets a turn record prove which skill set the summary showed, with the
+        summary text itself unchanged.
+        """
         all_skills = self.list_skills(filter_unavailable=False)
         if not all_skills:
-            return ""
+            return "", None
 
         agent_workspace = self.workspace.expanduser().resolve()
         project_workspace = (workspace or self.workspace).expanduser().resolve()
         use_relative_roots = project_workspace == agent_workspace
         sections: list[str] = []
+        listed_lines: list[str] = []
         groups = (
             ("Workspace skills", "workspace", self.workspace_skills),
             ("Agent Plugin skills", "plugin", self.workspace / "plugins"),
@@ -259,8 +282,14 @@ class SkillsLoader:
                     suffix = f" (unavailable: {missing})" if missing else " (unavailable)"
                 relative_path = Path(entry["path"]).relative_to(root).as_posix()
                 lines.append(f"- **{skill_name}** — {desc}{suffix}  `{relative_path}`")
+                listed_lines.append(f"{skill_name}:{skill_file_sha(entry['path'])}")
             sections.append("\n".join(lines))
-        return "\n\n".join(sections)
+        listed_sha = (
+            hashlib.sha256("\n".join(sorted(listed_lines)).encode("utf-8")).hexdigest()[:16]
+            if listed_lines
+            else None
+        )
+        return "\n\n".join(sections), listed_sha
 
     @staticmethod
     def _requirement_lists(skill_meta: dict[str, Any]) -> tuple[list[str], list[str]]:
