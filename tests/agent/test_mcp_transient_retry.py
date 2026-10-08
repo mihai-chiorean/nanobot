@@ -491,3 +491,39 @@ async def test_prompt_reconnects_on_connection_closed_exception():
     assert output == "fresh prompt"
     assert old_session.get_prompt.call_count == 1
     assert new_session.get_prompt.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_transient_retry_sends_identical_idempotency_key():
+    """SR-11: the key is computed once before the retry loop, so the replayed
+    attempt carries the byte-identical ziggy.dev/idempotency_key."""
+    from nanobot.agent.tools.context import RequestContext, request_context
+
+    session = AsyncMock()
+    result = _make_tool_result("ok")
+    exc = _FakeClosedResourceError("connection lost")
+    session.call_tool = AsyncMock(side_effect=[exc, result])
+
+    wrapper = MCPToolWrapper(
+        session, "gmail", _make_tool_def(name="gmail_send_draft"), tool_timeout=5
+    )
+    ctx = RequestContext(
+        channel="websocket",
+        chat_id="chat-9",
+        session_key="websocket:chat-9",
+        metadata={"client_message_id": "cm-retry-1"},
+    )
+    with patch(
+        "nanobot.agent.tools.mcp.asyncio.sleep", new_callable=AsyncMock
+    ), request_context(ctx):
+        output = await wrapper.execute(to="grandma@example.org")
+
+    assert output == "ok"
+    assert session.call_tool.call_count == 2
+    keys = [
+        call.kwargs["meta"]["ziggy.dev/idempotency_key"]
+        for call in session.call_tool.call_args_list
+    ]
+    assert keys[0] == keys[1]
+    assert keys[0].startswith("idem_")
+    assert "grandma" not in keys[0] and "cm-retry-1" not in keys[0]

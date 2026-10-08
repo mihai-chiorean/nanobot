@@ -27,6 +27,11 @@ INTERNAL_CONTINUATION_PENDING_META = "_internal_continuation_pending"
 INTERNAL_CONTINUATION_RUN_STARTED_AT_META = "_internal_continuation_run_started_at"
 SKIP_USER_PERSIST_META = "_skip_user_persist"
 
+#: ``metadata`` key a recovery continuation carries to keep the scope of the
+#: turn it continues (SR-11), so a write retried after the Continue produces the
+#: same ``ziggy.dev/idempotency_key`` as in the interrupted turn.
+RECOVERY_ORIGIN_SCOPE_META = "recovery_origin_scope"
+
 _GOAL_CONTINUATION_KIND = "sustained_goal"
 _GOAL_CONTINUATION_SENDER = "system:continuation"
 _GOAL_CONTINUATION_ROUNDS_KEY = "_sustained_goal_continuation_rounds"
