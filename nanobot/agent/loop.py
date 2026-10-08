@@ -91,7 +91,6 @@ from nanobot.bus.outbound_events import (
     StreamEndEvent,
 )
 from nanobot.bus.queue import MessageBus
-from nanobot.channels.websocket.work_stream import DEFAULT_REASONING_PROFILE
 from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
 from nanobot.command.router import normalize_command_text
 from nanobot.config.schema import AgentDefaults, ModelPresetConfig
@@ -3396,6 +3395,10 @@ class AgentLoop:
         Mirrors ``WorkEventStream.publish_work_inbound`` (the ``work.create``
         path); the task's session key routes the turn to the seeded history.
         """
+        # Function-level: the channel contract test forbids pulling the
+        # websocket runtime package into non-runtime import graphs.
+        from nanobot.channels.websocket.work_stream import DEFAULT_REASONING_PROFILE
+
         task_id = str(task["task_id"])
         session_key = str(task.get("session_key") or "")
         chat_id = str(task.get("chat_id") or "")
