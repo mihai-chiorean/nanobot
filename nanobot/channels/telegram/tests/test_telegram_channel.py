@@ -361,6 +361,9 @@ async def test_start_creates_separate_pools_with_proxy(monkeypatch) -> None:
     assert any(cmd.command == "dream" for cmd in app.bot.commands)
     assert any(cmd.command == "dream_log" for cmd in app.bot.commands)
     assert any(cmd.command == "dream_restore" for cmd in app.bot.commands)
+    assert any(cmd.command == "changes" for cmd in app.bot.commands)
+    assert any(cmd.command == "undo" for cmd in app.bot.commands)
+    assert any(cmd.command == "restore" for cmd in app.bot.commands)
     assert any(cmd.command == "dream_prompt" for cmd in app.bot.commands)
     assert any(cmd.command == "evaluator_prompt" for cmd in app.bot.commands)
     assert any(cmd.command == "compact" for cmd in app.bot.commands)
@@ -2496,6 +2499,12 @@ def test_telegram_bus_slash_command_regex_matches_agent_loop_commands() -> None:
     assert pat.fullmatch("/goal@nanobot_bot refine objective")
     assert pat.fullmatch("/trigger@nanobot_bot CI summary")
     assert pat.fullmatch("/compact@nanobot_bot")
+    assert pat.fullmatch("/changes")
+    assert pat.fullmatch("/changes deadbeef")
+    assert pat.fullmatch("/undo@nanobot_bot deadbeef")
+    assert pat.fullmatch("/restore deadbeef confirm")
+    assert pat.fullmatch("/restoreme deadbeef") is None
+    assert pat.fullmatch("/undone") is None
     assert pat.fullmatch("/dream_log deadbeef")
     assert pat.fullmatch("/dream_restore deadbeef")
     assert pat.fullmatch("/dream_prompt init")
