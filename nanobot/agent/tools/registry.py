@@ -278,6 +278,23 @@ class ToolRegistry:
         params: Any,
     ) -> tuple[Tool | None, Any, str | None]:
         """Resolve, cast, and validate one tool call."""
+        tool, params, error, _repairs = self.prepare_call_ex(name, params)
+        return tool, params, error
+
+    def prepare_call_ex(
+        self,
+        name: str,
+        params: Any,
+    ) -> tuple[Tool | None, Any, str | None, list[str]]:
+        """``prepare_call`` plus the kinds of silent argument repairs applied.
+
+        TP-07 (docs/design/turn-provenance.md §5): the same checks in the same
+        order, but every repair ``prepare_call`` applies quietly is named in
+        the returned sorted, de-duplicated kind list: ``json_string_parsed``,
+        ``arguments_unwrapped``, ``type_cast``. Only kinds are recorded, never
+        argument values.
+        """
+        repairs: list[str] = []
         tool = self.get(name)
         if not tool:
             suggestion = self._suggest_name(str(name))
@@ -286,7 +303,7 @@ class ToolRegistry:
                 ToolResult.error(
                     f"Error: Tool '{name}' not found.{hint} Available: {', '.join(self.tool_names)}"
                 )
-            )
+            ), repairs
         ctx = current_request_context()
         # Shared-room gate. Denied before parameter coercion so a malformed call
         # to a denied tool still reports the denial, not a schema complaint.
@@ -295,25 +312,26 @@ class ToolRegistry:
             and room_scope(ctx.metadata) is not None
             and room_policy_for(tool.name) is RoomPolicy.DENIED
         ):
-            return tool, params, ToolResult.error(room_denial_message(tool.name))
+            return tool, params, ToolResult.error(room_denial_message(tool.name)), repairs
         if (
             ctx is not None
             and tool.name == ASK_USER_TOOL_NAME
             and ask_user_unanswerable(ctx.metadata, ctx.session_key)
         ):
-            return tool, params, ToolResult.error(ask_user_unavailable_message())
+            return tool, params, ToolResult.error(ask_user_unavailable_message()), repairs
         # Read-only turns expose and accept only tools whose implementation
         # declares itself side-effect free. The check is deliberately before
         # coercion/validation so an injected call cannot probe parameter shapes.
         if ctx is not None and read_only_turn(ctx.metadata) and not tool.read_only:
-            return tool, params, ToolResult.error(read_only_denial_message(tool.name))
+            return tool, params, ToolResult.error(read_only_denial_message(tool.name)), repairs
         # Compatibility for external tools that still implement the legacy
         # setter protocol. Built-ins read the authoritative ContextVar
         # directly and never copy routing state.
         if isinstance(tool, ContextAware) and ctx is not None:
             tool.set_context(ctx)
 
-        params = self._coerce_params(tool, params)
+        params, coerce_repairs = self._coerce_params_ex(tool, params)
+        repairs.extend(coerce_repairs)
         if not isinstance(params, dict):
             return tool, params, (
                 ToolResult.error(
@@ -321,15 +339,17 @@ class ToolRegistry:
                     f"{type(params).__name__}. Use named parameters like "
                     'tool_name(param1="value1", param2="value2") matching the tool schema.'
                 )
-            )
+            ), sorted(set(repairs))
 
         cast_params = tool.cast_params(cast(dict[str, Any], params))
+        if cast_params != params:
+            repairs.append("type_cast")
         errors = tool.validate_params(cast_params)
         if errors:
             return tool, cast_params, (
                 ToolResult.error(f"Error: Invalid parameters for tool '{name}': " + "; ".join(errors))
-            )
-        return tool, cast_params, None
+            ), sorted(set(repairs))
+        return tool, cast_params, None, sorted(set(repairs))
 
     @classmethod
     def _coerce_argument_value(cls, value: Any) -> Any:
@@ -354,8 +374,38 @@ class ToolRegistry:
 
     @classmethod
     def _coerce_params(cls, tool: Tool, params: Any) -> Any:
-        params = cls._coerce_argument_value(params)
-        return cls._unwrap_arguments_payload(tool, params)
+        params, _repairs = cls._coerce_params_ex(tool, params)
+        return params
+
+    @classmethod
+    def _coerce_params_ex(cls, tool: Tool, params: Any) -> tuple[Any, list[str]]:
+        """``_coerce_params`` plus the repair kinds it applied (TP-07).
+
+        Kinds are compared value-wise around each coercion step, so the None/
+        empty-string mapping does not count (the live provider already does it
+        in ``parse_tool_arguments``); only a string that turned into JSON, a
+        lone ``{"arguments": ...}`` envelope and a schema cast are repairs.
+        """
+        repairs: list[str] = []
+        coerced = cls._coerce_argument_value(params)
+        if cls._json_parsed(params, coerced):
+            repairs.append("json_string_parsed")
+        unwrapped = cls._unwrap_arguments_payload(tool, coerced)
+        if unwrapped is not coerced:
+            inner = cast(dict[str, Any], coerced).get("arguments")
+            if cls._json_parsed(inner, cls._coerce_argument_value(inner)):
+                repairs.append("json_string_parsed")
+            repairs.append("arguments_unwrapped")
+        return unwrapped, repairs
+
+    @staticmethod
+    def _json_parsed(before: Any, after: Any) -> bool:
+        """Whether a coercion turned a non-empty JSON string into a container."""
+        return (
+            isinstance(before, str)
+            and bool(before.strip())
+            and isinstance(after, (dict, list))
+        )
 
     @classmethod
     def _unwrap_arguments_payload(cls, tool: Tool, params: Any) -> Any:
