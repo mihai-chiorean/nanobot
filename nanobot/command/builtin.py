@@ -517,7 +517,14 @@ async def cmd_dream(ctx: CommandContext) -> OutboundMessage:
             content = f"Dream failed after {elapsed:.1f}s: {e}"
         finally:
             if store.git.is_initialized():
-                commit_msg = build_dream_commit_message("dream: manual run", diff_body)
+                core_tokens, core_budget = store.core_memory_stats()
+                logger.info("Dream run core: {}/{} tokens", core_tokens, core_budget)
+                commit_msg = build_dream_commit_message(
+                    "dream: manual run",
+                    diff_body,
+                    core_tokens=core_tokens,
+                    core_budget=core_budget,
+                )
                 sha = store.git.auto_commit(commit_msg)
                 if sha:
                     content += f" (commit {sha})"

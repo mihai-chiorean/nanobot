@@ -696,6 +696,7 @@ class AgentLoop:
         preset_catalog_loader: preset_helpers.PresetCatalogLoader | None = None,
         model_preset: str | None = None,
         dream_model_preset: str | None = None,
+        dream_core_memory_tokens: int | None = None,
         preset_snapshot_loader: preset_helpers.PresetSnapshotLoader | None = None,
         turn_delivery_factory: TurnDeliveryFactory | None = None,
         runtime_model_publisher: Callable[[str, str | None], None] | None = None,
@@ -792,6 +793,8 @@ class AgentLoop:
             timezone=timezone,
             disabled_skills=disabled_skills,
         )
+        if dream_core_memory_tokens is not None:
+            self.context.memory.core_memory_tokens = dream_core_memory_tokens
         self.sessions = session_manager or SessionManager(workspace)
         # Ziggy-local (MIT-1402): opened on first use, see
         # ``_mark_chat_message_processed``.
@@ -967,6 +970,7 @@ class AgentLoop:
             model_presets=preset_helpers.configured_model_presets(config),
             model_preset=defaults.model_preset,
             dream_model_preset=defaults.dream.model_override,
+            dream_core_memory_tokens=defaults.dream.core_memory_tokens,
             restart_mode=config.gateway.restart_mode,
             provider_snapshot_loader=provider_snapshot_loader,
             preset_snapshot_loader=preset_snapshot_loader,

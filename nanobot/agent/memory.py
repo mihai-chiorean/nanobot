@@ -73,6 +73,26 @@ def provenance_key(line: str) -> str:
     return hashlib.sha256(line.strip().encode("utf-8")).hexdigest()[:16]
 
 
+def count_tokens(text: str) -> int:
+    """Token count for memory budgeting, matching the model's tokenizer.
+
+    Uses tiktoken ``cl100k_base`` (the encoding file ships in the runtime
+    image via ``TIKTOKEN_CACHE_DIR``). If tiktoken cannot load — offline dev
+    box, missing cache — falls back to a conservative ``len(text) // 4`` so
+    Dream budgeting degrades to an estimate instead of failing.
+    """
+    if not text:
+        return 0
+    try:
+        # Late import keeps the lru_cache lookup monkeypatchable in tests and
+        # mirrors truncate_text_to_tokens' tiktoken-availability handling.
+        from nanobot.utils.helpers import _get_token_encoding
+
+        return len(_get_token_encoding().encode(text))
+    except Exception:
+        return len(text) // 4
+
+
 class MemoryStore:
     """Pure file I/O for memory files: MEMORY.md, archive.md, history.jsonl,
     SOUL.md, USER.md."""
@@ -93,8 +113,14 @@ class MemoryStore:
     )
 
     def __init__(self, workspace: Path, max_history_entries: int = _DEFAULT_MAX_HISTORY):
+        from nanobot.config.schema import DreamConfig
+
         self.workspace = workspace
         self.max_history_entries = max_history_entries
+        # Token budget for the injected core (memory/MEMORY.md). DreamConfig is
+        # the source of truth; the Agent overwrites this from config when the
+        # loop is built (see AgentLoop.from_config wiring).
+        self.core_memory_tokens = DreamConfig().core_memory_tokens
         self.memory_dir = ensure_dir(workspace / "memory")
         self.memory_file = self.memory_dir / "MEMORY.md"
         # Facts Dream retires out of the injected MEMORY.md (MIT-1874). Also a
@@ -591,14 +617,32 @@ class MemoryStore:
         return has_workspace_prompt_override(self.dream_prompt_file)
 
     @staticmethod
-    def default_dream_prompt() -> str:
+    def default_dream_prompt(
+        *,
+        core_tokens: int = 0,
+        core_budget: int | None = None,
+    ) -> str:
         from nanobot.agent.skills import BUILTIN_SKILLS_DIR
+        from nanobot.config.schema import DreamConfig
 
+        if core_budget is None:
+            core_budget = DreamConfig().core_memory_tokens
         return render_template(
             "agent/dream.md",
             strip=True,
             skill_creator_path=str(BUILTIN_SKILLS_DIR / "skill-creator" / "SKILL.md"),
+            core_tokens=core_tokens,
+            core_budget=core_budget,
         )
+
+    def core_memory_stats(self) -> tuple[int, int]:
+        """(current core token count, budget) for memory/MEMORY.md."""
+        return (count_tokens(self.read_memory()), self.core_memory_tokens)
+
+    def core_memory_line(self) -> str:
+        """Budget line for Dream commit bodies and INFO logs."""
+        tokens, budget = self.core_memory_stats()
+        return f"core: {tokens}/{budget} tokens"
 
     def _dream_template(self) -> str:
         text, original_chars = load_workspace_prompt_override(self.dream_prompt_file)
@@ -614,7 +658,10 @@ class MemoryStore:
                     WORKSPACE_PROMPT_MAX_CHARS, original_chars,
                 )
             return text
-        return self.default_dream_prompt()
+        return self.default_dream_prompt(
+            core_tokens=count_tokens(self.read_memory()),
+            core_budget=self.core_memory_tokens,
+        )
 
     def build_dream_prompt(
         self, *, max_entries: int = 20
@@ -931,7 +978,11 @@ class MemoryStore:
         skills_dir.mkdir(parents=True, exist_ok=True)
 
         extra_read = [BUILTIN_SKILLS_DIR] if BUILTIN_SKILLS_DIR.exists() else None
-        editable_files = [self.memory_file, self.soul_file, self.user_file]
+        # Demoted facts land in memory/archive.md; create it empty so Dream's
+        # first demotion is an edit of an existing file, not an unscoped create.
+        if not self.archive_file.exists():
+            self.archive_file.touch()
+        editable_files = [self.memory_file, self.soul_file, self.user_file, self.archive_file]
 
         tools.register(ReadFileTool(
             workspace=workspace,
@@ -1065,7 +1116,13 @@ class MemoryStore:
         return f"dream:{datetime.now():%Y%m%d-%H%M%S}"
 
     @staticmethod
-    def build_dream_commit_message(prefix: str, diff_body: str) -> str:
+    def build_dream_commit_message(
+        prefix: str,
+        diff_body: str,
+        *,
+        core_tokens: int | None = None,
+        core_budget: int | None = None,
+    ) -> str:
         """Build a Dream commit message grounded in the real working-tree diff.
 
         *diff_body* is a structured, machine-derived summary of the actual file
@@ -1074,13 +1131,20 @@ class MemoryStore:
         deliberately excluded so the audit record (``/dream-log``) reflects the
         filesystem's truth, not the model's self-report.
 
+        When *core_tokens* and *core_budget* are given, ``core: n/budget
+        tokens`` is appended to the body so every Dream commit records where
+        the memory core stood against its budget (MIT-1871).
+
         An empty *diff_body* yields the bare *prefix*, which ``auto_commit``
         turns into a no-op when there is nothing to stage.
         """
         diff_body = (diff_body or "").strip()
         if not diff_body:
             return prefix
-        return f"{prefix}\n\n{diff_body}"
+        message = f"{prefix}\n\n{diff_body}"
+        if core_tokens is not None and core_budget is not None:
+            message += f"\n\ncore: {core_tokens}/{core_budget} tokens"
+        return message
 
     @staticmethod
     def prune_dream_sessions(sessions: SessionManager, *, keep: int = 10) -> None:
