@@ -26,6 +26,12 @@ from nanobot.agent import model_presets as preset_helpers
 from nanobot.agent.autocompact import AutoCompact
 from nanobot.agent.context import ContextBuilder, PersistedPromptContextResolver, TranscriptInput
 from nanobot.agent.cron_turns import CronTurnCoordinator
+from nanobot.agent.handoff import (
+    HANDOFF_REPLY,
+    HANDOFF_UNAVAILABLE_REPLY,
+    HandoffHook,
+    HandoffRequested,
+)
 from nanobot.agent.hook import (
     AgentHook,
     AgentHookContext,
@@ -88,6 +94,7 @@ from nanobot.bus.queue import MessageBus
 from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
 from nanobot.command.router import normalize_command_text
 from nanobot.config.schema import AgentDefaults, ModelPresetConfig
+from nanobot.cron.session_turns import cron_trigger
 from nanobot.events import NO_EVENTS, AgentEvent, EventSink
 from nanobot.llm_usage.context import source_from_request
 
@@ -155,6 +162,7 @@ from nanobot.utils.runtime import (
     EMPTY_FINAL_RESPONSE_MESSAGE,
 )
 from nanobot.webui.metadata import WEBUI_TURN_METADATA_KEY
+from nanobot.webui.session_identity import is_valid_webui_chat_id
 from nanobot.work.context import reset_work_context, set_work_context
 from nanobot.work.store import WorkStore
 
@@ -244,6 +252,9 @@ class TurnContext:
 
     outbound: OutboundMessage | None = None
     suppress_response: bool = False
+    # MIT-1855 (OA-12): set when the turn handed its rest to a Work task;
+    # rides the outbound metadata as ``handoff_task_id``.
+    handoff_task_id: str | None = None
 
     events: EventSink = NO_EVENTS
     streaming: bool = False
@@ -702,6 +713,7 @@ class AgentLoop:
         restart_mode: str = "auto",
         local_trigger_store: LocalTriggerStore | None = None,
         idle_compact_check_interval_seconds: int = 0,
+        background_handoff_seconds: int | None = None,
         recovery_admission: RecoveryAdmission | None = None,
         memory_index_enabled: bool = True,
     ):
@@ -755,6 +767,13 @@ class AgentLoop:
         self.tool_hint_max_length = (
             tool_hint_max_length if tool_hint_max_length is not None
             else defaults.tool_hint_max_length
+        )
+        # MIT-1855 (OA-12): hand-off threshold for long private websocket chat
+        # turns; 0 turns the feature off. Read per turn in ``_run_turn``.
+        self.background_handoff_seconds = (
+            background_handoff_seconds
+            if background_handoff_seconds is not None
+            else defaults.background_handoff_seconds
         )
         self.tools_config = _tc
         self.web_config = _tc.web
@@ -963,6 +982,7 @@ class AgentLoop:
             disabled_skills=defaults.disabled_skills,
             session_ttl_minutes=defaults.session_ttl_minutes,
             idle_compact_check_interval_seconds=defaults.idle_compact_check_interval_seconds,
+            background_handoff_seconds=defaults.background_handoff_seconds,
             tools_config=config.tools,
             model_presets=preset_helpers.configured_model_presets(config),
             model_preset=defaults.model_preset,
@@ -3218,26 +3238,39 @@ class AgentLoop:
         await ctx.delivery.running(started_at=ctx.visible_run_started_at)
         assert ctx.transcript_input is not None
         ctx.publish_file_turn = self._publish_file_turn_for_turn(ctx)
+        # MIT-1855 (OA-12): long private websocket chat turns hand their rest
+        # off to Work at a tool boundary. The hook raises HandoffRequested
+        # from ``before_execute_tools``, so the pending batch never runs and
+        # nothing re-executes in Work.
+        handoff_hook = self._handoff_hook_for_turn(ctx)
+        if handoff_hook is not None:
+            ctx.hooks.append(handoff_hook)
         with capture_message_deliveries() as message_sends:
-            result = await self._run_agent_loop(
-                ctx.transcript_input,
-                runtime=runtime,
-                streaming=ctx.streaming,
-                session=ctx.session,
-                pending_queue=ctx.pending_queue,
-                ephemeral=ctx.ephemeral,
-                run_extra_hooks_for_ephemeral=ctx.run_extra_hooks_for_ephemeral,
-                hooks=ctx.hooks,
-                hook_factories=ctx.hook_factories,
-                turn_scopes=ctx.turn_scopes,
-                tools=ctx.tools,
-                request_context=ctx.request_context,
-                provider_state=ctx.provider_state,
-                initial_messages=ctx.initial_messages,
-                events=ctx.events,
-                publish_file_turn=ctx.publish_file_turn,
-                injected_messages_sink=ctx.injected_messages,
-            )
+            try:
+                result = await self._run_agent_loop(
+                    ctx.transcript_input,
+                    runtime=runtime,
+                    streaming=ctx.streaming,
+                    session=ctx.session,
+                    pending_queue=ctx.pending_queue,
+                    ephemeral=ctx.ephemeral,
+                    run_extra_hooks_for_ephemeral=ctx.run_extra_hooks_for_ephemeral,
+                    hooks=ctx.hooks,
+                    hook_factories=ctx.hook_factories,
+                    turn_scopes=ctx.turn_scopes,
+                    tools=ctx.tools,
+                    request_context=ctx.request_context,
+                    provider_state=ctx.provider_state,
+                    initial_messages=ctx.initial_messages,
+                    events=ctx.events,
+                    publish_file_turn=ctx.publish_file_turn,
+                    injected_messages_sink=ctx.injected_messages,
+                )
+            except HandoffRequested:
+                if handoff_hook is None:
+                    raise
+                await self._handle_turn_handoff(ctx, handoff_hook)
+                return
         ctx.final_content = result.final_content
         ctx.all_messages = result.messages
         ctx.summary_checkpoint = result.summary_checkpoint
@@ -3254,6 +3287,145 @@ class AgentLoop:
         ctx.delivery.record_usage(result.round_usages)
         if ctx.kind is TurnKind.USER:
             await turn_continuation.maybe_continue_turn(ctx)
+
+    def _handoff_hook_for_turn(self, ctx: TurnContext) -> HandoffHook | None:
+        """MIT-1855 (OA-12): build the hand-off hook for a qualifying turn only.
+
+        Only private websocket chat turns hand off: not Work turns (they
+        already carry ``work_task_id``), not shared-room turns, not cron, not
+        ephemeral or internal goal-continuation runs, and never when the
+        threshold is 0.
+        """
+        threshold = self.background_handoff_seconds
+        if threshold <= 0 or ctx.kind is not TurnKind.USER or ctx.ephemeral:
+            return None
+        msg = ctx.msg
+        if msg.channel != "websocket":
+            return None
+        if work_task_id(msg.metadata) is not None:
+            return None
+        if self._shared_room_turn(msg):
+            return None
+        if cron_trigger(msg.metadata) is not None:
+            return None
+        if turn_continuation.internal_continuation_inbound(msg.metadata):
+            return None
+        return HandoffHook(threshold=float(threshold))
+
+    async def _handle_turn_handoff(self, ctx: TurnContext, hook: HandoffHook) -> None:
+        """Move the rest of a long chat turn into a Work task (MIT-1855).
+
+        The hand-off fired in ``before_execute_tools``, so the pending batch
+        never ran. The chat session keeps the completed history up to the last
+        tool result plus the fixed assistant reply; the Work task's own
+        session is seeded with that completed history and receives the
+        original user message through ``publish_work_inbound``-shaped inbound
+        metadata. If task creation or the enqueue fails the chat gets the
+        apology reply and nothing re-executes either way.
+        """
+        msg = ctx.msg
+        session = ctx.require_session()
+        assert ctx.transcript_input is not None
+        transcript = hook.transcript if hook.transcript is not None else ctx.all_messages
+        initial_count = ctx.transcript_input.message_count
+        turn_entries = list(transcript[initial_count:])
+        # Keep only completed exchanges: everything up to (and including) the
+        # last tool result drops the assistant message whose tool calls never
+        # ran, which would otherwise leave unanswered calls in both sessions.
+        cut = 0
+        for index, entry in enumerate(turn_entries):
+            if entry.get("role") == "tool":
+                cut = index + 1
+        completed = [dict(entry) for entry in turn_entries[:cut]]
+        user_text = ctx.original_user_text if isinstance(ctx.original_user_text, str) else msg.content
+        task_id: str | None = None
+        try:
+            if not is_valid_webui_chat_id(msg.chat_id):
+                raise ValueError("chat hand-off requires a valid webui chat id")
+            title = user_text.strip().splitlines()[0][:80] if user_text.strip() else None
+            task = await self.work_store.run_io(
+                self.work_store.create_task,
+                chat_id=str(msg.chat_id),
+                content=user_text,
+                mode="background",
+                title=title,
+                model=self.model,
+                notify_on_finish=True,
+            )
+            task_id = str(task["task_id"])
+            work_session_key = str(task.get("session_key") or f"work:{task_id}")
+            seeded = [
+                {
+                    "role": "user",
+                    "content": msg.content,
+                    "timestamp": datetime.now().isoformat(),
+                },
+                *completed,
+            ]
+            work_session = self.sessions.get_or_create(work_session_key)
+            work_session.messages.extend(seeded)
+            work_session.updated_at = datetime.now()
+            await asyncio.to_thread(self.sessions.save, work_session)
+            await self._publish_work_handoff_inbound(ctx, task)
+        except Exception:
+            logger.exception(
+                "Work hand-off failed for turn {} (session {})", ctx.turn_id, ctx.session_key
+            )
+            task_id = None
+        reply = HANDOFF_REPLY if task_id is not None else HANDOFF_UNAVAILABLE_REPLY
+        ctx.handoff_task_id = task_id
+        ctx.final_content = reply
+        ctx.stop_reason = "handoff"
+        # The fixed reply is composed here, after any partial streaming of
+        # model text; it must travel as a fresh message, not as stream content.
+        ctx.streamed_content = False
+        ctx.summary_checkpoint = None
+        ctx.provider_compaction_applied = False
+        # The partial provider continuation predates the dropped batch; the
+        # next turn (chat or Work) must rebuild from text instead.
+        session.provider_state = None
+        ctx.all_messages = [
+            *transcript[: initial_count + cut],
+            {"role": "assistant", "content": reply},
+        ]
+
+    async def _publish_work_handoff_inbound(self, ctx: TurnContext, task: dict[str, Any]) -> None:
+        """Enqueue the original user message into *task*'s own session.
+
+        Mirrors ``WorkEventStream.publish_work_inbound`` (the ``work.create``
+        path); the task's session key routes the turn to the seeded history.
+        """
+        # Function-level: the channel contract test forbids pulling the
+        # websocket runtime package into non-runtime import graphs.
+        from nanobot.channels.websocket.work_stream import DEFAULT_REASONING_PROFILE
+
+        task_id = str(task["task_id"])
+        session_key = str(task.get("session_key") or "")
+        chat_id = str(task.get("chat_id") or "")
+        if not session_key or not is_valid_webui_chat_id(chat_id):
+            raise ValueError("Work task routing is invalid")
+        metadata: dict[str, Any] = {
+            "_wants_stream": True,
+            "work_task_id": task_id,
+            "work_mode": "background",
+            "reasoning_profile": str(
+                task.get("reasoning_profile") or DEFAULT_REASONING_PROFILE
+            ),
+        }
+        remote = (ctx.msg.metadata or {}).get("remote")
+        if remote is not None:
+            metadata["remote"] = remote
+        await self.bus.publish_inbound(
+            InboundMessage(
+                channel="websocket",
+                sender_id=ctx.msg.sender_id,
+                chat_id=chat_id,
+                content=ctx.msg.content,
+                media=list(ctx.msg.media or []),
+                metadata=metadata,
+                session_key_override=session_key,
+            )
+        )
 
     async def _persist_turn(self, ctx: TurnContext) -> None:
         session = ctx.require_session()
@@ -3373,6 +3545,9 @@ class AgentLoop:
         )
         if ctx.ephemeral and ctx.outbound is not None:
             ctx.outbound.metadata["_stop_reason"] = ctx.stop_reason
+        if ctx.handoff_task_id and ctx.outbound is not None:
+            # MIT-1855 (OA-12): the apps link the freed chat to its Work task.
+            ctx.outbound.metadata["handoff_task_id"] = ctx.handoff_task_id
 
     def _sanitize_persisted_blocks(
         self,

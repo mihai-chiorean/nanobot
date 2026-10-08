@@ -156,6 +156,12 @@ class AgentDefaults(Base):
         default=60,
         ge=0,
     )  # Minimum interval in seconds between scans for idle sessions
+    background_handoff_seconds: int = Field(
+        default=45,
+        ge=0,
+        validation_alias=AliasChoices("backgroundHandoffSeconds"),
+        serialization_alias="backgroundHandoffSeconds",
+    )  # Elapsed seconds after which a long private websocket chat turn hands off to Work at the next tool boundary (0 = off)
     dream: DreamConfig = Field(default_factory=DreamConfig)
 
     @model_validator(mode="before")
