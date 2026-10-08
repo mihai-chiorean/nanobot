@@ -108,6 +108,7 @@ def _parking_tool(loop: AgentLoop, *, park: dict[str, Any] | None = PARK) -> Non
     loop.tools.prepare_call = MagicMock(  # type: ignore[method-assign]
         return_value=(None, {"site": "example.com"}, None)
     )
+    loop.tools.prepare_call_ex = MagicMock(return_value=(*loop.tools.prepare_call.return_value, []))
 
     async def _execute(tool: Any, arguments: dict[str, Any], *a: Any, **kw: Any) -> str:
         # Assert the binding exists: it is what makes the carrier testable and

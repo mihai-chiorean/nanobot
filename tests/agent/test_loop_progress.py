@@ -70,6 +70,7 @@ class TestToolEventProgress:
         loop.provider.chat_stream_with_retry = AsyncMock(side_effect=lambda *a, **kw: next(calls))
         loop.tools.get_definitions = MagicMock(return_value=[])
         loop.tools.prepare_call = MagicMock(return_value=(None, {"path": "foo.txt"}, None))
+        loop.tools.prepare_call_ex = MagicMock(return_value=(*loop.tools.prepare_call.return_value, []))
         loop.tools.execute = AsyncMock(return_value="ok")
 
         progress: list[tuple[str, bool, list[dict] | None]] = []
@@ -145,6 +146,7 @@ class TestToolEventProgress:
         loop.tools.prepare_call = MagicMock(
             return_value=(tool, {"path": "foo.txt", "content": "new\nextra\n"}, None),
         )
+        loop.tools.prepare_call_ex = MagicMock(return_value=(*loop.tools.prepare_call.return_value, []))
         file_events: list[dict] = []
 
         async def on_progress(
@@ -215,6 +217,7 @@ class TestToolEventProgress:
         loop.tools.prepare_call = MagicMock(
             return_value=(tool, {"path": "foo.txt", "content": "new\n"}, None),
         )
+        loop.tools.prepare_call_ex = MagicMock(return_value=(*loop.tools.prepare_call.return_value, []))
 
         async def on_progress(
             content: str,
@@ -256,6 +259,7 @@ class TestToolEventProgress:
         loop.tools.prepare_call = MagicMock(
             return_value=(None, {"command": "printf hi > foo.txt"}, None),
         )
+        loop.tools.prepare_call_ex = MagicMock(return_value=(*loop.tools.prepare_call.return_value, []))
         loop.tools.execute = AsyncMock(return_value="ok")
         file_events: list[dict] = []
 
@@ -293,6 +297,7 @@ class TestToolEventProgress:
         loop.provider.chat_stream_with_retry = AsyncMock(side_effect=lambda *a, **kw: next(calls))
         loop.tools.get_definitions = MagicMock(return_value=[])
         loop.tools.prepare_call = MagicMock(return_value=(None, {"command": "ls"}, None))
+        loop.tools.prepare_call_ex = MagicMock(return_value=(*loop.tools.prepare_call.return_value, []))
         loop.tools.execute = AsyncMock(return_value="file.txt")
 
         msg = InboundMessage(
@@ -423,6 +428,7 @@ class TestToolEventProgress:
                 None,
             ),
         )
+        loop.tools.prepare_call_ex = MagicMock(return_value=(*loop.tools.prepare_call.return_value, []))
 
         await run_session(loop, InboundMessage(
             channel="websocket",
@@ -842,6 +848,7 @@ class TestToolEventProgress:
         _attach_webui_runtime_events(loop, bus)
         loop.tools.get_definitions = MagicMock(return_value=[])
         loop.tools.prepare_call = MagicMock(return_value=(None, {}, None))
+        loop.tools.prepare_call_ex = MagicMock(return_value=(*loop.tools.prepare_call.return_value, []))
 
         async def execute_tool(*args, **kwargs):
             request_contexts.append(current_request_context())
@@ -1040,6 +1047,7 @@ class TestToolEventProgress:
         loop.provider.chat_with_retry = AsyncMock()
         loop.tools.get_definitions = MagicMock(return_value=[])
         loop.tools.prepare_call = MagicMock(return_value=(None, {"path": "foo.txt"}, None))
+        loop.tools.prepare_call_ex = MagicMock(return_value=(*loop.tools.prepare_call.return_value, []))
         loop.tools.execute = AsyncMock(return_value="ok")
 
         streamed: list[str] = []

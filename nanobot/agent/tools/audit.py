@@ -160,6 +160,8 @@ class AuditLogger:
         error_type: ErrorType | None = None,
         exit_code: int | None = None,
         stderr_tail: str | None = None,
+        args_repaired: bool | None = None,
+        args_repair_kinds: list[str] | None = None,
     ) -> None:
         """Append one audit entry to the log file (synchronous).
 
@@ -204,6 +206,8 @@ class AuditLogger:
             error_type=error_type,
             exit_code=exit_code,
             stderr_tail=stderr_tail,
+            args_repaired=args_repaired,
+            args_repair_kinds=args_repair_kinds,
         )
         self._append(entry)
 
@@ -324,6 +328,8 @@ class AuditLogger:
         error_type: ErrorType | None = None,
         exit_code: int | None = None,
         stderr_tail: str | None = None,
+        args_repaired: bool | None = None,
+        args_repair_kinds: list[str] | None = None,
     ) -> dict[str, Any]:
         """Construct the dict that will be serialised to one JSONL line.
 
@@ -363,6 +369,10 @@ class AuditLogger:
             entry["exit_code"] = exit_code
         if stderr_tail is not None:
             entry["stderr_tail"] = stderr_tail
+        # MIT-1858 (TP-07): repair kinds only, never the repaired values.
+        if args_repaired:
+            entry["args_repaired"] = True
+            entry["args_repair_kinds"] = list(args_repair_kinds or [])
         turn_id = ctx.turn_id if ctx is not None else None
         if turn_id is not None:
             entry["turn_id"] = turn_id
