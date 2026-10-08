@@ -998,6 +998,15 @@ class ExecTool(Tool):
         owner.release()
         ExecTool._drop_process_tree_owner(process)
 
+    def build_subprocess_env(self) -> dict[str, str]:
+        """Public entry to the exec tool's environment build (SR-18).
+
+        Skill scripts run in a scheduled turn must see exactly what an
+        ``exec`` call would see (same allowlist, same exclusions), so the
+        runner reuses this instead of reimplementing the environment.
+        """
+        return self._build_env()
+
     def _build_env(self) -> dict[str, str]:
         """Build a minimal environment for subprocess execution.
 
