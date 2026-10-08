@@ -831,6 +831,87 @@ async def test_connect_mcp_servers_enabled_tools_supports_limited_wrapped_names(
     assert registry.tool_names == [wrapped_name]
 
 
+def _make_fake_session_annotated(
+    entries: list[tuple[str, object | None]],
+) -> SimpleNamespace:
+    async def initialize() -> None:
+        return None
+
+    async def list_tools() -> SimpleNamespace:
+        return SimpleNamespace(
+            tools=[
+                SimpleNamespace(
+                    name=name,
+                    description=f"{name} tool",
+                    inputSchema={"type": "object", "properties": {}},
+                    annotations=annotations,
+                )
+                for name, annotations in entries
+            ]
+        )
+
+    return SimpleNamespace(initialize=initialize, list_tools=list_tools)
+
+
+def test_mcp_server_config_trust_annotations_defaults_and_camel_alias() -> None:
+    assert MCPServerConfig(command="fake").trust_annotations is False
+    cfg = MCPServerConfig.model_validate({"command": "fake", "trustAnnotations": True})
+    assert cfg.trust_annotations is True
+
+
+@pytest.mark.asyncio
+async def test_connect_mcp_servers_trusted_server_maps_annotations(
+    fake_mcp_runtime: dict[str, object | None],
+) -> None:
+    fake_mcp_runtime["session"] = _make_fake_session_annotated(
+        [
+            ("search", SimpleNamespace(readOnlyHint=True, idempotentHint=None, destructiveHint=None)),
+            ("fill_form", SimpleNamespace(readOnlyHint=False, idempotentHint=None, destructiveHint=True)),
+        ]
+    )
+    registry = ToolRegistry()
+    stacks = await connect_mcp_servers(
+        {"test": MCPServerConfig(command="fake", trust_annotations=True)},
+        registry,
+    )
+    for stack in stacks.values():
+        await stack.aclose()
+
+    search = registry.get("mcp_test_search")
+    assert search is not None
+    assert search.read_only is True
+    assert search.idempotent is True
+    # Read-only must not make the registry batch calls on one server session.
+    assert search.concurrency_safe is False
+
+    fill_form = registry.get("mcp_test_fill_form")
+    assert fill_form is not None
+    assert fill_form.read_only is False
+    assert fill_form.idempotent is False
+
+
+@pytest.mark.asyncio
+async def test_connect_mcp_servers_untrusted_server_ignores_annotations(
+    fake_mcp_runtime: dict[str, object | None],
+) -> None:
+    """Negative control: same readOnlyHint annotations, no operator trust."""
+    fake_mcp_runtime["session"] = _make_fake_session_annotated(
+        [("search", SimpleNamespace(readOnlyHint=True, idempotentHint=True, destructiveHint=None))]
+    )
+    registry = ToolRegistry()
+    stacks = await connect_mcp_servers(
+        {"test": MCPServerConfig(command="fake")},
+        registry,
+    )
+    for stack in stacks.values():
+        await stack.aclose()
+
+    search = registry.get("mcp_test_search")
+    assert search is not None
+    assert search.read_only is False
+    assert search.idempotent is False
+
+
 @pytest.mark.asyncio
 async def test_connect_mcp_servers_enabled_tools_empty_list_registers_none(
     fake_mcp_runtime: dict[str, object | None],

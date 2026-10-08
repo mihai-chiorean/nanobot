@@ -390,6 +390,12 @@ class MCPServerConfig(Base):
     headers: dict[str, str] = Field(default_factory=dict)  # HTTP/SSE: custom headers
     tool_timeout: int = 30  # seconds before a tool call is cancelled
     enabled_tools: list[str] = Field(default_factory=lambda: ["*"])  # Only register these tools; accepts raw MCP names or wrapped mcp_<server>_<tool> names; ["*"] = all capabilities (tools, resources, prompts); any restriction = only listed tools, no resources/prompts
+    # Ziggy-local (MIT-1817): operator opt-in to trust this server's MCP
+    # tool annotations (readOnlyHint/idempotentHint). The spec says these are
+    # hints that must not be trusted from unknown servers, so they only take
+    # effect for servers the operator marked trusted in their own config file
+    # (tenant configs are mounted read-only in the container).
+    trust_annotations: bool = False
     # Ziggy-local (MIT-1405): non-interactive auth for tenant connectors.
     oauth_client_credentials: OAuthClientCredentialsConfig | None = None
     # Ziggy-local (MIT-1405): set only by the MCP provider for entries that
