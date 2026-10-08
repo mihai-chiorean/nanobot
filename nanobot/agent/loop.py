@@ -75,6 +75,7 @@ from nanobot.agent.turn_delivery import (
 )
 from nanobot.agent.turn_delivery import TurnRoute as TurnRoute
 from nanobot.agent.turn_hooks import AgentTurnHookSpec, build_agent_turn_hook
+from nanobot.agent.turn_provenance import TurnProvenance, account_intent
 from nanobot.bus.events import INBOUND_META_USER_SHELL, InboundMessage, OutboundMessage
 from nanobot.bus.outbound_events import (
     ProgressEvent,
@@ -91,7 +92,12 @@ from nanobot.llm_usage.context import source_from_request
 
 # Ziggy-local (fork, MIT-202): Langfuse turn span.
 from nanobot.observability import observe_turn
-from nanobot.providers.base import LLMProvider, LLMUsage, ProviderConversationState
+from nanobot.providers.base import (
+    LLMProvider,
+    LLMUsage,
+    ProviderConversationState,
+    ToolCallRequest,
+)
 from nanobot.providers.factory import ProviderSnapshot
 from nanobot.providers.request_context import (
     reset_scheduling_class,
@@ -383,6 +389,52 @@ class _ZiggyTurnHook(AgentHook):
                 sentence = extract_latest_sentence(rc)
                 if sentence:
                     await self._status(f"{pick_thinking_emoji()} {sentence}")
+
+
+class _TurnProvenanceHook(AgentHook):
+    """TP-09 (MIT-1870): count the turn's "Used:" source families.
+
+    Feeds the turn's :class:`TurnProvenance` record from the executed tool
+    call's tool object. Counting only in ``after_execute_tool`` /
+    ``on_execute_tool_error`` is what keeps calls refused before dispatch
+    (``prepare_call`` denials, the repeated-lookup and browser-budget
+    guards) out of the counts: those never reach either callback because no
+    tool ran. The tool object (not the wire name) decides the family, so a
+    connector wrapper whose wire name embeds another server key still maps
+    correctly.
+    """
+
+    def __init__(self, record: TurnProvenance, tools: ToolRegistry | None) -> None:
+        super().__init__()
+        self._record = record
+        self._tools = tools
+
+    def _tool_object(self, tool_call: ToolCallRequest, tool: Any) -> Any:
+        if tool is not None:
+            return tool
+        # The registry returned no prepared tool (custom registry); resolve
+        # the same object the runner dispatched against by name.
+        return self._tools.get(tool_call.name) if self._tools is not None else None
+
+    async def after_execute_tool(
+        self,
+        context: AgentHookContext,
+        tool_call: ToolCallRequest,
+        tool: Any,
+        params: Any,
+        result: Any,
+    ) -> None:
+        self._record.note_tool_result(self._tool_object(tool_call, tool), "ok")
+
+    async def on_execute_tool_error(
+        self,
+        context: AgentHookContext,
+        tool_call: ToolCallRequest,
+        tool: Any,
+        params: Any,
+        error: Any,
+    ) -> None:
+        self._record.note_tool_result(self._tool_object(tool_call, tool), "error")
 
 
 # Stop reasons that make a Work task ``failed`` rather than ``succeeded``.
@@ -2725,6 +2777,21 @@ class AgentLoop:
             tools=tools,
             attributes=dict(attributes or {}),
         )
+        # Ziggy-local (TP-09 / MIT-1870): one provenance record per turn.
+        # ``account_intent`` is computed here, once, from the user's message
+        # text; only the boolean is stored. The counting hook joins the
+        # turn's explicit hook chain (never the caller-visible turn
+        # attributes, which context providers receive verbatim), and the
+        # record itself rides the runtime event publisher, which lifts the
+        # ``used``/``other_steps`` fields at ``turn_completed`` — the same
+        # per-session lifecycle as turn usage.
+        provenance = TurnProvenance(
+            account_intent=account_intent(ctx.original_user_text or "")
+        )
+        ctx.hooks.append(
+            _TurnProvenanceHook(provenance, tools if tools is not None else self.tools)
+        )
+        self.runtime_event_publisher.record_turn_provenance(key, provenance)
         # A streaming callback may be present even when the final text comes from a
         # non-streaming recovery. Only the last completed segment can suppress the
         # regular outbound message.
