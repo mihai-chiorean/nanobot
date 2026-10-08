@@ -171,6 +171,8 @@ if TYPE_CHECKING:
 _T = TypeVar("_T")
 _SUBAGENT_PROVIDER_TASK_META = "subagent_provider_task_id"
 _SUBAGENT_TERMINAL_WAIT_SECONDS = 300.0
+# MIT-1811: cadence of AgentLoop.wait_idle during the gateway shutdown drain.
+_SHUTDOWN_IDLE_POLL_SECONDS = 0.5
 
 
 class TurnKind(Enum):
@@ -851,6 +853,12 @@ class AgentLoop:
         )
         self._unified_session = unified_session
         self._running = False
+        # MIT-1811: first-SIGTERM drain. While _draining, the dispatch loop
+        # parks messages it already pulled off the bus instead of starting
+        # turns with them; the receipts stay unprocessed so the next gateway
+        # replays them from ChatInboxStore.
+        self._draining = False
+        self._held_messages: list[InboundMessage] = []
         self._runtime_context_providers: list[RuntimeContextProvider] = []
         self._active_tasks: dict[str, set[asyncio.Task[Any]]] = {}
         self._direct_turn_count: int = 0
@@ -2259,6 +2267,14 @@ class AgentLoop:
                     logger.warning("Error consuming inbound message: {}, continuing...", e)
                     continue
 
+                # MIT-1811: during the shutdown drain no new turn may start.
+                # A message already pulled off the bus is parked instead of
+                # processed; its durable receipt stays unprocessed, so the
+                # next gateway start replays it from ChatInboxStore.
+                if self._draining:
+                    self._held_messages.append(msg)
+                    continue
+
                 raw = msg.content.strip()
                 effective_key = self._effective_session_key(msg)
                 if await agent_context.handle_runtime_control(self, msg, self.tools):
@@ -2695,6 +2711,33 @@ class AgentLoop:
         task = asyncio.create_task(coro)
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
+
+    def begin_drain(self) -> None:
+        """Stop starting new turns while letting in-flight ones finish.
+
+        MIT-1811: called on the first SIGTERM. The dispatch loop parks every
+        message it pulls off the bus from now on (never processing it, so
+        durable receipts stay unprocessed for the next gateway to replay);
+        turns already running keep their task groups until they complete.
+        """
+        self._draining = True
+        logger.info("Agent loop draining; {} active turn(s)", self.active_turn_count())
+
+    async def wait_idle(self, timeout: float) -> bool:
+        """Wait until no turn is in flight, up to *timeout* seconds.
+
+        Returns True once ``active_turn_count()`` reaches zero, False at the
+        timeout. Polls every ``_SHUTDOWN_IDLE_POLL_SECONDS``.
+        """
+        event_loop = asyncio.get_running_loop()
+        deadline = event_loop.time() + max(float(timeout), 0.0)
+        while True:
+            if self.active_turn_count() == 0:
+                return True
+            remaining = deadline - event_loop.time()
+            if remaining <= 0:
+                return False
+            await asyncio.sleep(min(_SHUTDOWN_IDLE_POLL_SECONDS, remaining))
 
     def stop(self) -> None:
         """Stop the agent loop."""

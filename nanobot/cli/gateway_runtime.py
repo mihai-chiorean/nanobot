@@ -487,6 +487,59 @@ def _gateway_readiness_payload(
     return ready, payload
 
 
+async def _drain_agent_turns(
+    agent: AgentLoop,
+    runtime_tasks: asyncio.Future[list[Any]],
+    grace_seconds: int,
+) -> bool:
+    """Give in-flight turns a grace period before the gateway cancels them.
+
+    First-SIGTERM path (MIT-1811): stop admitting new turns, then wait up to
+    ``grace_seconds`` for the turns already running. A forced (repeated
+    signal) shutdown cancels the runtime tasks, which ends this wait early;
+    ``grace_seconds <= 0`` disables the drain and keeps today's
+    cancel-immediately behaviour.
+    """
+    if grace_seconds <= 0:
+        return False
+    agent.begin_drain()
+    active = agent.active_turn_count()
+    logger.info(
+        "Gateway draining: waiting up to {}s for {} active turn(s)",
+        grace_seconds,
+        active,
+    )
+    if active == 0:
+        return True
+    drain_task = asyncio.create_task(
+        agent.wait_idle(grace_seconds),
+        name="nanobot-gateway-drain",
+    )
+    drained = False
+    try:
+        done, _pending = await asyncio.wait(
+            {drain_task, runtime_tasks},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if drain_task in done:
+            with suppress(Exception):
+                drained = bool(drain_task.result())
+        else:
+            logger.info("Gateway drain stopped early: forced shutdown")
+    finally:
+        if not drain_task.done():
+            drain_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await drain_task
+    if not drained:
+        logger.warning(
+            "Gateway drain ended after {}s with {} active turn(s)",
+            grace_seconds,
+            agent.active_turn_count(),
+        )
+    return drained
+
+
 async def _close_gateway_runtime(
     agent: AgentLoop,
     mcp_provider: MCPProvider,
@@ -1179,6 +1232,15 @@ def _run_gateway(
             if runtime_tasks in done:
                 await runtime_tasks
             else:
+                # First SIGTERM: let running turns finish for up to the
+                # configured grace before cancelling (MIT-1811). A second
+                # signal cancels the runtime tasks, which ends the drain
+                # early; the timeout path below is unchanged from before.
+                await _drain_agent_turns(
+                    agent,
+                    runtime_tasks,
+                    config.gateway.shutdown_grace_seconds,
+                )
                 runtime_tasks.cancel()
         except KeyboardInterrupt:
             console.print("\nShutting down...")
