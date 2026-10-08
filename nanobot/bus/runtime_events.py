@@ -146,6 +146,15 @@ class RuntimeEventPublisher:
         """Bind the turn's provenance record for ``turn_completed`` to lift."""
         self._turn_provenance[session_key] = provenance
 
+    def current_turn_provenance(self, session_key: str) -> TurnProvenance | None:
+        """Return the active turn's provenance record without consuming it.
+
+        TP-10 (MIT-1873): the save stage reads ``used``/``other_steps`` while
+        the turn is still open; ``turn_completed`` remains the only consumer
+        that lifts (pops) the record.
+        """
+        return self._turn_provenance.get(session_key)
+
     def record_turn_usage(
         self,
         session_key: str,
