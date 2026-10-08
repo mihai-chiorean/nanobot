@@ -74,7 +74,8 @@ def provenance_key(line: str) -> str:
 
 
 class MemoryStore:
-    """Pure file I/O for memory files: MEMORY.md, history.jsonl, SOUL.md, USER.md."""
+    """Pure file I/O for memory files: MEMORY.md, archive.md, history.jsonl,
+    SOUL.md, USER.md."""
 
     _DEFAULT_MAX_HISTORY = 1000
     # Durable files whose real working-tree delta grounds Dream commit messages.
@@ -96,6 +97,10 @@ class MemoryStore:
         self.max_history_entries = max_history_entries
         self.memory_dir = ensure_dir(workspace / "memory")
         self.memory_file = self.memory_dir / "MEMORY.md"
+        # Facts Dream retires out of the injected MEMORY.md (MIT-1874). Also a
+        # plain file Dream rewrites directly; the recall index catches those
+        # edits with its mtime check at search time.
+        self.archive_file = self.memory_dir / "archive.md"
         self.history_file = self.memory_dir / "history.jsonl"
         self.provenance_file = self.memory_dir / PROVENANCE_FILENAME
         self.legacy_history_file = self.memory_dir / "HISTORY.md"
@@ -276,6 +281,15 @@ class MemoryStore:
 
     def write_memory(self, content: str) -> None:
         self.memory_file.write_text(content, encoding="utf-8")
+        self._reindex_curated()
+
+    # -- memory/archive.md (facts retired from MEMORY.md by Dream) ----------
+
+    def read_archive(self) -> str:
+        return self.read_file(self.archive_file)
+
+    def write_archive(self, content: str) -> None:
+        self.archive_file.write_text(content, encoding="utf-8")
         self._reindex_curated()
 
     # -- SOUL.md -------------------------------------------------------------

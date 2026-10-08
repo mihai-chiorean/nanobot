@@ -89,11 +89,14 @@ UNTRUSTED_BANNER = (
 # not to re-serve a web page someone's assistant read in April.
 INDEXED_ROLES = frozenset({"user", "assistant"})
 
-# The curated layer. These three are the owner's deliberately-written persona
-# and profile, already injected into every system prompt, so recalling them
-# discloses nothing a turn did not already have. They are therefore in scope
-# for every conversation, including a shared room.
-CURATED_SOURCES = ("memory/MEMORY.md", "USER.md", "SOUL.md")
+# The curated layer. The first three are the owner's deliberately-written
+# persona and profile, already injected into every system prompt, so recalling
+# them discloses nothing a turn did not already have. ``memory/archive.md``
+# (MIT-1874) is where Dream retires rarely-needed facts out of ``MEMORY.md``:
+# the same owner-authored content, one injection earlier, never fetched
+# material. All four are therefore in scope for every conversation, including
+# a shared room.
+CURATED_SOURCES = ("memory/MEMORY.md", "USER.md", "SOUL.md", "memory/archive.md")
 
 KIND_CONVERSATION = "conversation"
 KIND_FACT = "fact"
@@ -455,6 +458,9 @@ class MemoryIndex:
         # index is pure FTS5.
         self._vec_ready = False
         self._next_embed_at = 0.0
+        # Optional callable run at the start of every search, before the lock:
+        # set by :meth:`set_curated_refresh_hook`.
+        self._curated_refresh_hook: Callable[[], Any] | None = None
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -702,6 +708,21 @@ class MemoryIndex:
                     Path(str(self.path) + suffix).unlink()
             self._broken = False
 
+    def set_curated_refresh_hook(self, hook: "Callable[[], Any] | None") -> None:
+        """Register a callable run at the start of every :meth:`search`.
+
+        Curated files are not only written through the store's writers: Dream
+        rewrites ``memory/archive.md`` on disk (MIT-1874), so a re-index
+        triggered only by ``write_memory``/``write_user``/``write_soul`` goes
+        stale on exactly the files it must keep current. The hook — in
+        production :meth:`SessionRecallIndexer.refresh_curated_if_stale`, a
+        bounded stat check that re-indexes what moved — is the read-side
+        reconciliation. It runs before the search lock and must not raise;
+        a failing hook is logged and the search proceeds on the last known
+        good index.
+        """
+        self._curated_refresh_hook = hook
+
     # -- write path --------------------------------------------------------
 
     def _cursor_for(self, db: sqlite3.Connection, source: str) -> int:
@@ -825,7 +846,7 @@ class MemoryIndex:
     def index_text(self, source: str, text: str, *, kind: str, ts: str = "") -> int:
         """Replace everything stored for *source* with windows of *text*.
 
-        Used for the curated layer (MEMORY.md, USER.md, SOUL.md) and for
+        Used for the curated layer (MEMORY.md, USER.md, SOUL.md, archive.md) and for
         consolidation history entries, where the whole document is rewritten
         rather than appended to.
         """
@@ -956,6 +977,12 @@ class MemoryIndex:
         is exactly the FTS5-only query it has always been, bm25 scores
         included.
         """
+        hook = self._curated_refresh_hook
+        if hook is not None:
+            try:
+                hook()
+            except Exception:
+                logger.exception("Memory index: curated refresh before search failed")
         limit = max(1, min(int(limit), MAX_RESULTS))
         audience = _audience_filter(sources, source_prefixes)
         if audience is None:
@@ -1410,6 +1437,18 @@ class SessionRecallIndexer:
 
     def __init__(self, index: MemoryIndex) -> None:
         self.index = index
+        # Curated-layer reconciliation (MIT-1874): the last store passed to
+        # index_memory_files and the per-file mtimes it had on disk then.
+        # Curated files are edited outside the store's writers -- Dream
+        # rewrites memory/archive.md directly -- so every search asks the
+        # hook below whether anything moved since. The mtimes are sampled
+        # before the texts are read, so a write racing a pass leaves the
+        # recorded mtime stale and the next search retries, rather than a
+        # torn read being blessed as current.
+        self._curated_store: Any = None
+        self._curated_workspace: Path | None = None
+        self._curated_mtimes: dict[str, int | None] = {}
+        index.set_curated_refresh_hook(self.refresh_curated_if_stale)
 
     # -- SessionIndexer ----------------------------------------------------
 
@@ -1483,11 +1522,20 @@ class SessionRecallIndexer:
 
     def index_memory_files(self, store: Any) -> int:
         """Index the curated layer so recall can surface facts, not just chat."""
+        workspace = getattr(store, "workspace", None)
+        mtimes: dict[str, int | None] = {}
+        if workspace is not None:
+            for source in CURATED_SOURCES:
+                try:
+                    mtimes[source] = (Path(workspace) / source).stat().st_mtime_ns
+                except OSError:
+                    mtimes[source] = None
         written = 0
         for source, reader in (
             ("memory/MEMORY.md", getattr(store, "read_memory", None)),
             ("USER.md", getattr(store, "read_user", None)),
             ("SOUL.md", getattr(store, "read_soul", None)),
+            ("memory/archive.md", getattr(store, "read_archive", None)),
         ):
             if not callable(reader):
                 continue
@@ -1496,6 +1544,30 @@ class SessionRecallIndexer:
             except Exception:
                 logger.exception("Recall could not read {}", source)
                 continue
-            if text.strip():
-                written += self.index.index_text(source, text, kind=KIND_FACT)
+            # Always call index_text, even for empty text: it is what clears the
+            # old chunks when a curated file is emptied or deleted.
+            written += self.index.index_text(source, text, kind=KIND_FACT)
+        if workspace is not None:
+            self._curated_store = store
+            self._curated_workspace = Path(workspace)
+            self._curated_mtimes = mtimes
         return written
+
+    def refresh_curated_if_stale(self) -> int:
+        """Re-index the curated layer if any curated file changed outside the store.
+
+        The read-side half of MIT-1874: cheap (one stat per curated file), safe
+        to call on every search, and a no-op until a store has been attached
+        via :meth:`index_memory_files`. Returns the windows written, 0 when
+        nothing moved.
+        """
+        if self._curated_store is None or self._curated_workspace is None:
+            return 0
+        for source in CURATED_SOURCES:
+            try:
+                mtime = (self._curated_workspace / source).stat().st_mtime_ns
+            except OSError:
+                mtime = None
+            if self._curated_mtimes.get(source) != mtime:
+                return self.index_memory_files(self._curated_store)
+        return 0
