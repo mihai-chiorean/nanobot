@@ -54,6 +54,7 @@ from nanobot.agent.tools.context import (
     ZIGGY_PARK_ATTRIBUTE,
     RequestContext,
     bind_request_context,
+    current_request_context,
     reset_request_context,
 )
 from nanobot.agent.tools.exec_session import ExecSessionManager
@@ -314,6 +315,16 @@ class _ZiggyTurnHook(AgentHook):
         self._metadata = dict(turn.metadata or {})
         self._session_key = turn.session_key
         self._wants_status = bool(self._metadata.get("_wants_stream"))
+        # MIT-1849 (TP-08): the turn's resolved runtime, captured where the
+        # hook is built (inside the turn's bound request context). A session
+        # pinned to a model preset answers under a different model than the
+        # loop default, and the llm_call rows must say which one.
+        request_ctx = current_request_context()
+        self._runtime_model = (
+            request_ctx.runtime.model
+            if request_ctx is not None and request_ctx.runtime is not None
+            else None
+        )
 
     async def _status(self, text: str) -> None:
         if not self._wants_status:
@@ -367,7 +378,7 @@ class _ZiggyTurnHook(AgentHook):
             self._loop._audit_logger.log_llm_call(
                 session_id=self._chat_id,
                 channel=self._channel,
-                model=self._loop.model,
+                model=self._runtime_model or self._loop.model,
                 # 0.3.0's LLMUsage names these input_tokens/output_tokens; the
                 # 0.2.x prompt_tokens/completion_tokens names logged null (MIT-1470).
                 tokens_in=getattr(usage, "input_tokens", None),
@@ -2949,6 +2960,9 @@ class AgentLoop:
                 tool = tools.get(name)
                 if name not in session.policy.disabled_tools and tool:
                     restricted.register(tool)
+            # MIT-1849 (TP-08): this per-turn copy must audit like the main
+            # registry; without the logger its sessions wrote no tool rows.
+            restricted.set_audit_logger(self._audit_logger)
             tools = restricted
         ctx.tools = tools
 
