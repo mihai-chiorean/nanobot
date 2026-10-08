@@ -106,6 +106,12 @@ class _GatewayAgentContractStub:
     def preserve_inflight_turns_on_shutdown(self) -> None:
         return None
 
+    @staticmethod
+    def active_turn_count() -> int:
+        # Ziggy-local (MIT-1804): the health handler reports a bare active
+        # turn count for the deploy's idle check.
+        return 0
+
     async def reconcile_work_store(self) -> int:
         # Ziggy-local (MIT-1010): gateway startup sweeps Work tasks left
         # running by the previous process, before any channel accepts input.
@@ -3834,6 +3840,7 @@ def test_gateway_health_endpoint_binds_and_serves_expected_responses(
         "process": "alive",
         "ready": True,
         "websocket": "disabled",
+        "active_turns": 0,
     }
 
     missing_response, missing_writer = _call_handler("/missing")
