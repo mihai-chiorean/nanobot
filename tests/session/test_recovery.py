@@ -12,6 +12,7 @@ from nanobot.session.manager import Session, SessionManager
 from nanobot.session.recovery import (
     PENDING_FOLLOWUPS_KEY,
     PENDING_USER_TURN_KEY,
+    RECOVERY_INBOUND_METADATA_KEY,
     RECOVERY_METADATA_KEY,
     RUNTIME_CHECKPOINT_KEY,
     RecoveryActionError,
@@ -32,6 +33,45 @@ def _coordinator(workspace: Path) -> tuple[RecoveryCoordinator, MessageBus, Sess
     bus = MessageBus()
     sessions = SessionManager(workspace)
     return RecoveryCoordinator(sessions, bus), bus, sessions
+
+
+def _registry_coordinator(
+    workspace: Path,
+    *,
+    read_only: list[str],
+    write: list[str],
+) -> tuple[RecoveryCoordinator, MessageBus, SessionManager]:
+    """A coordinator whose tool lookup mirrors ToolRegistry.is_read_only."""
+    bus = MessageBus()
+    sessions = SessionManager(workspace)
+    registered = set(read_only) | set(write)
+    read_only_names = set(read_only)
+
+    def lookup(name: str) -> bool:
+        return name in registered and name in read_only_names
+
+    return RecoveryCoordinator(sessions, bus, tool_is_read_only=lookup), bus, sessions
+
+
+def _awaiting_tools_checkpoint(
+    calls: list[tuple[str, str]],
+    *,
+    completed: list[dict] | None = None,
+) -> dict:
+    return {
+        "phase": "awaiting_tools",
+        "assistant_message": {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": call_id, "function": {"name": name}} for call_id, name in calls
+            ],
+        },
+        "completed_tool_results": list(completed or []),
+        "pending_tool_calls": [
+            {"id": call_id, "function": {"name": name}} for call_id, name in calls
+        ],
+    }
 
 
 @pytest.mark.asyncio
@@ -343,6 +383,316 @@ async def test_uncertain_tool_is_never_replayed(tmp_path: Path) -> None:
     event = bus.outbound.get_nowait().event
     assert isinstance(event, RecoveryStateEvent)
     assert event.status == "awaiting_user"
+
+
+@pytest.mark.asyncio
+async def test_all_pending_calls_read_only_auto_continues(tmp_path: Path) -> None:
+    sessions = SessionManager(tmp_path)
+    session = sessions.get_or_create("websocket:chat")
+    session.messages.append({"role": "user", "content": "read the logs"})
+    session.metadata[PENDING_USER_TURN_KEY] = True
+    session.metadata[RUNTIME_CHECKPOINT_KEY] = _awaiting_tools_checkpoint(
+        [("call-1", "read_file"), ("call-2", "web_search")]
+    )
+    _persist(sessions, session)
+
+    coordinator, bus, restarted = _registry_coordinator(
+        tmp_path,
+        read_only=["read_file", "web_search"],
+        write=["send_email"],
+    )
+    await coordinator.scan()
+
+    restored = restarted.get_or_create("websocket:chat")
+    state = restored.metadata[RECOVERY_METADATA_KEY]
+    assert state["status"] == "resuming"
+    assert state["reason"] == "read_only_resumed"
+    assert state["attempts"] == 1
+    assert state["resume_message_count"] == len(restored.messages)
+    assert RUNTIME_CHECKPOINT_KEY not in restored.metadata
+    for row in restored.messages[-2:]:
+        assert row["role"] == "tool"
+        assert row["_recovery_interrupted"] is True
+        assert "safe to run it again" in row["content"]
+
+    continuation = bus.inbound.get_nowait()
+    assert bus.inbound.empty()
+    assert continuation.metadata[RECOVERY_INBOUND_METADATA_KEY] == state["recovery_id"]
+    event = bus.outbound.get_nowait().event
+    assert isinstance(event, RecoveryStateEvent)
+    assert event.status == "resuming"
+    assert event.reason == "read_only_resumed"
+
+
+@pytest.mark.asyncio
+async def test_read_only_pending_calls_without_lookup_still_wait(tmp_path: Path) -> None:
+    """The auto-continue is opt-in: no tool lookup means fail closed."""
+    sessions = SessionManager(tmp_path)
+    session = sessions.get_or_create("websocket:chat")
+    session.messages.append({"role": "user", "content": "read the logs"})
+    session.metadata[PENDING_USER_TURN_KEY] = True
+    session.metadata[RUNTIME_CHECKPOINT_KEY] = _awaiting_tools_checkpoint(
+        [("call-1", "read_file")]
+    )
+    _persist(sessions, session)
+
+    coordinator, bus, restarted = _coordinator(tmp_path)
+    await coordinator.scan()
+
+    assert bus.inbound.empty()
+    state = restarted.get_or_create("websocket:chat").metadata[RECOVERY_METADATA_KEY]
+    assert state["status"] == "awaiting_user"
+    assert state["reason"] == "tool_state_unknown"
+
+
+@pytest.mark.asyncio
+async def test_one_pending_write_still_waits_for_user(tmp_path: Path) -> None:
+    sessions = SessionManager(tmp_path)
+    session = sessions.get_or_create("websocket:chat")
+    session.messages.append({"role": "user", "content": "read then send"})
+    session.metadata[PENDING_USER_TURN_KEY] = True
+    session.metadata[RUNTIME_CHECKPOINT_KEY] = _awaiting_tools_checkpoint(
+        [("call-1", "read_file"), ("call-2", "send_email")]
+    )
+    _persist(sessions, session)
+
+    coordinator, bus, restarted = _registry_coordinator(
+        tmp_path,
+        read_only=["read_file"],
+        write=["send_email"],
+    )
+    await coordinator.scan()
+
+    assert bus.inbound.empty()
+    restored = restarted.get_or_create("websocket:chat")
+    state = restored.metadata[RECOVERY_METADATA_KEY]
+    assert state["status"] == "awaiting_user"
+    assert state["reason"] == "tool_state_unknown"
+    assert "safe to run it again" not in restored.messages[-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_earlier_write_in_same_turn_blocks_auto_continue(tmp_path: Path) -> None:
+    sessions = SessionManager(tmp_path)
+    session = sessions.get_or_create("websocket:chat")
+    session.messages.extend(
+        [
+            {"role": "user", "content": "send it then read back"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call-0", "function": {"name": "send_email"}}],
+            },
+            {"role": "tool", "tool_call_id": "call-0", "name": "send_email", "content": "sent"},
+        ]
+    )
+    session.metadata[PENDING_USER_TURN_KEY] = True
+    session.metadata[RUNTIME_CHECKPOINT_KEY] = _awaiting_tools_checkpoint(
+        [("call-1", "read_file")]
+    )
+    _persist(sessions, session)
+
+    coordinator, bus, restarted = _registry_coordinator(
+        tmp_path,
+        read_only=["read_file"],
+        write=["send_email"],
+    )
+    await coordinator.scan()
+
+    assert bus.inbound.empty()
+    state = restarted.get_or_create("websocket:chat").metadata[RECOVERY_METADATA_KEY]
+    assert state["status"] == "awaiting_user"
+    assert state["reason"] == "tool_state_unknown"
+
+
+@pytest.mark.asyncio
+async def test_earlier_read_only_calls_in_turn_do_not_block(tmp_path: Path) -> None:
+    """A completed read-only call earlier in the turn keeps the turn readable."""
+    sessions = SessionManager(tmp_path)
+    session = sessions.get_or_create("websocket:chat")
+    session.messages.extend(
+        [
+            {"role": "user", "content": "read two files"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call-0", "function": {"name": "read_file"}}],
+            },
+            {"role": "tool", "tool_call_id": "call-0", "name": "read_file", "content": "a"},
+        ]
+    )
+    session.metadata[PENDING_USER_TURN_KEY] = True
+    session.metadata[RUNTIME_CHECKPOINT_KEY] = _awaiting_tools_checkpoint(
+        [("call-1", "read_file")]
+    )
+    _persist(sessions, session)
+
+    coordinator, bus, restarted = _registry_coordinator(
+        tmp_path,
+        read_only=["read_file"],
+        write=["send_email"],
+    )
+    await coordinator.scan()
+
+    continuation = bus.inbound.get_nowait()
+    assert bus.inbound.empty()
+    state = restarted.get_or_create("websocket:chat").metadata[RECOVERY_METADATA_KEY]
+    assert state["status"] == "resuming"
+    assert continuation.metadata[RECOVERY_INBOUND_METADATA_KEY] == state["recovery_id"]
+
+
+@pytest.mark.asyncio
+async def test_unknown_tool_name_fails_closed(tmp_path: Path) -> None:
+    sessions = SessionManager(tmp_path)
+    session = sessions.get_or_create("websocket:chat")
+    session.messages.append({"role": "user", "content": "run this"})
+    session.metadata[PENDING_USER_TURN_KEY] = True
+    session.metadata[RUNTIME_CHECKPOINT_KEY] = _awaiting_tools_checkpoint(
+        [("call-1", "mystery_tool")]
+    )
+    _persist(sessions, session)
+
+    coordinator, bus, restarted = _registry_coordinator(
+        tmp_path,
+        read_only=["read_file"],
+        write=["send_email"],
+    )
+    await coordinator.scan()
+
+    assert bus.inbound.empty()
+    state = restarted.get_or_create("websocket:chat").metadata[RECOVERY_METADATA_KEY]
+    assert state["status"] == "awaiting_user"
+    assert state["reason"] == "tool_state_unknown"
+
+
+@pytest.mark.asyncio
+async def test_second_crash_after_auto_continue_parks_loop_guard(tmp_path: Path) -> None:
+    sessions = SessionManager(tmp_path)
+    session = sessions.get_or_create("websocket:chat")
+    session.messages.append({"role": "user", "content": "read the logs"})
+    session.metadata[PENDING_USER_TURN_KEY] = True
+    session.metadata[RUNTIME_CHECKPOINT_KEY] = _awaiting_tools_checkpoint(
+        [("call-1", "read_file")]
+    )
+    _persist(sessions, session)
+
+    coordinator, bus, _restarted = _registry_coordinator(
+        tmp_path,
+        read_only=["read_file"],
+        write=["send_email"],
+    )
+    await coordinator.scan()
+    bus.inbound.get_nowait()
+
+    # Crash again before the continuation appended any messages.
+    coordinator2, bus2, restarted2 = _registry_coordinator(
+        tmp_path,
+        read_only=["read_file"],
+        write=["send_email"],
+    )
+    await coordinator2.scan()
+
+    assert bus2.inbound.empty()
+    state = restarted2.get_or_create("websocket:chat").metadata[RECOVERY_METADATA_KEY]
+    assert state["status"] == "awaiting_user"
+    assert state["reason"] == "loop_guard"
+
+
+@pytest.mark.asyncio
+async def test_restart_after_auto_continued_turn_committed_is_recovered(tmp_path: Path) -> None:
+    sessions = SessionManager(tmp_path)
+    session = sessions.get_or_create("websocket:chat")
+    session.messages.append({"role": "user", "content": "read the logs"})
+    session.metadata[PENDING_USER_TURN_KEY] = True
+    session.metadata[RUNTIME_CHECKPOINT_KEY] = _awaiting_tools_checkpoint(
+        [("call-1", "read_file")]
+    )
+    _persist(sessions, session)
+
+    coordinator, _bus, running = _registry_coordinator(
+        tmp_path,
+        read_only=["read_file"],
+        write=["send_email"],
+    )
+    await coordinator.scan()
+
+    # The continuation ran and committed its answer before the next crash.
+    live = running.get_or_create("websocket:chat")
+    live.messages.append({"role": "assistant", "content": "here are the logs"})
+    running.save(live)
+
+    coordinator2, bus2, restarted2 = _registry_coordinator(
+        tmp_path,
+        read_only=["read_file"],
+        write=["send_email"],
+    )
+    await coordinator2.scan()
+
+    assert bus2.inbound.empty()
+    state = restarted2.get_or_create("websocket:chat").metadata[RECOVERY_METADATA_KEY]
+    assert state["status"] == "recovered"
+    assert state["reason"] == "committed"
+
+
+@pytest.mark.asyncio
+async def test_tool_lookup_leaves_other_checkpoint_paths_unchanged(tmp_path: Path) -> None:
+    sessions = SessionManager(tmp_path)
+    completed_session = sessions.get_or_create("websocket:chat-done")
+    completed_session.messages.append({"role": "user", "content": "inspect"})
+    completed_session.metadata[PENDING_USER_TURN_KEY] = True
+    completed_session.metadata[RUNTIME_CHECKPOINT_KEY] = {
+        "phase": "tools_completed",
+        "assistant_message": {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call-1", "function": {"name": "read_file"}}],
+        },
+        "completed_tool_results": [
+            {
+                "role": "tool",
+                "tool_call_id": "call-1",
+                "name": "read_file",
+                "content": "saved result",
+            }
+        ],
+        "pending_tool_calls": [],
+    }
+    final_session = sessions.get_or_create("websocket:chat-final")
+    final_session.messages.append({"role": "user", "content": "answer"})
+    final_session.metadata[PENDING_USER_TURN_KEY] = True
+    final_session.metadata[RUNTIME_CHECKPOINT_KEY] = {
+        "phase": "final_response",
+        "assistant_message": {"role": "assistant", "content": "the answer"},
+        "completed_tool_results": [],
+        "pending_tool_calls": [],
+    }
+    _persist(sessions, completed_session)
+    _persist(sessions, final_session)
+
+    bus = MessageBus()
+    restarted = SessionManager(tmp_path)
+
+    def lookup(name: str) -> bool:
+        return name == "read_file"
+
+    coordinator = RecoveryCoordinator(
+        restarted,
+        bus,
+        tool_is_read_only=lookup,
+    )
+    await coordinator.scan()
+
+    assert bus.inbound.empty()
+    done_state = restarted.get_or_create("websocket:chat-done").metadata[
+        RECOVERY_METADATA_KEY
+    ]
+    assert done_state["status"] == "awaiting_user"
+    assert done_state["reason"] == "restart_requires_confirmation"
+    final_state = restarted.get_or_create("websocket:chat-final").metadata[
+        RECOVERY_METADATA_KEY
+    ]
+    assert final_state["status"] == "recovered"
+    assert final_state["reason"] == "answer_restored"
 
 
 @pytest.mark.asyncio
