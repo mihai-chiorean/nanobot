@@ -1426,6 +1426,7 @@ def write_session_messages_as_transcript(
                 row["media"] = [
                     str(p) for p in cast(list[Any], media) if isinstance(p, str) and p
                 ]
+            _copy_turn_provenance_fields(msg, row)
         else:
             continue
         rows.append(row)
@@ -1626,6 +1627,72 @@ def _assistant_text_signature(value: Any) -> str:
     return value.strip() if isinstance(value, str) else ""
 
 
+def _normalize_turn_used(value: object) -> list[dict[str, Any]] | None:
+    """Validate a stored ``used`` list, dropping malformed entries."""
+    if not isinstance(value, list) or not value:
+        return None
+    entries: list[dict[str, Any]] = []
+    for item in cast(list[Any], value):
+        if not isinstance(item, dict):
+            continue
+        entry = cast(dict[str, Any], item)
+        family = entry.get("family")
+        label = entry.get("label")
+        private = entry.get("private")
+        calls = entry.get("calls")
+        errors = entry.get("errors")
+        if (
+            not isinstance(family, str)
+            or not family
+            or not isinstance(label, str)
+            or not isinstance(private, bool)
+            or isinstance(calls, bool)
+            or not isinstance(calls, int)
+            or calls < 0
+            or isinstance(errors, bool)
+            or not isinstance(errors, int)
+            or errors < 0
+        ):
+            continue
+        entries.append(
+            {
+                "family": family,
+                "label": label,
+                "private": private,
+                "calls": calls,
+                "errors": errors,
+            }
+        )
+    return entries or None
+
+
+def _normalize_turn_other_steps(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
+def _copy_turn_provenance_fields(message: Mapping[str, Any], row: dict[str, Any]) -> None:
+    """Carry TP-10 turn fields from a session message onto its assistant row.
+
+    ``AgentLoop._save_turn`` stamps ``turn_id`` (the effective turn id),
+    ``used`` and ``other_steps`` on the final assistant message of a turn that
+    ran tools, so a reopened chat renders the same "Used:" line the live
+    ``turn_end`` frame carried (TP-09). Rows for turns without tools never
+    grew these keys and keep their pre-change shape: the keys are copied only
+    when present and valid, never invented.
+    """
+    turn_id = message.get("turn_id")
+    if isinstance(turn_id, str) and turn_id:
+        row["turn_id"] = turn_id
+    used = _normalize_turn_used(message.get("used"))
+    if used is not None:
+        row["used"] = used
+    other_steps = _normalize_turn_other_steps(message.get("other_steps"))
+    if other_steps is not None:
+        row["other_steps"] = other_steps
+
+
 def _session_assistant_event(
     session_key: str,
     message: dict[str, Any],
@@ -1651,6 +1718,7 @@ def _session_assistant_event(
     latency_ms = message.get("latency_ms")
     if isinstance(latency_ms, int | float) and latency_ms >= 0:
         event["latency_ms"] = int(latency_ms)
+    _copy_turn_provenance_fields(message, event)
     return event
 
 
@@ -3390,6 +3458,15 @@ def _client_projection_event(
         latency_ms = record.get("latency_ms")
         if isinstance(latency_ms, int | float) and latency_ms >= 0:
             projected["latency_ms"] = int(latency_ms)
+        # Ziggy-local (TP-10 / MIT-1873): the "Used:" line fields ride the
+        # final assistant row of turns that ran tools. Rows written before
+        # this change carry none of these keys and stay untouched here.
+        used = _normalize_turn_used(record.get("used"))
+        if used:
+            projected["used"] = used
+        other_steps = _normalize_turn_other_steps(record.get("other_steps"))
+        if other_steps is not None:
+            projected["other_steps"] = other_steps
         source = _client_projection_source(record)
         if source:
             projected["source"] = source

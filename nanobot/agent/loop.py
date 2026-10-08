@@ -153,6 +153,7 @@ from nanobot.utils.progress_events import output_events
 from nanobot.utils.runtime import (
     EMPTY_FINAL_RESPONSE_MESSAGE,
 )
+from nanobot.webui.metadata import WEBUI_TURN_METADATA_KEY
 from nanobot.work.context import reset_work_context, set_work_context
 from nanobot.work.store import WorkStore
 
@@ -3243,11 +3244,27 @@ class AgentLoop:
         ctx.turn_latency_ms = max(0, int((time.time() - latency_started_at) * 1000))
         if ctx.usage is not None and not ctx.ephemeral:
             session.metadata["_last_usage"] = ctx.usage.to_dict()
+        # Ziggy-local (TP-10 / MIT-1873): the effective turn id is the wire
+        # turn id the client sent (TP-01 puts it on every frame) and, for
+        # clients that send none, the id minted at turn start -- the same
+        # fallback the provenance record is keyed by (design section 1).
+        wire_turn_id = (ctx.msg.metadata or {}).get(WEBUI_TURN_METADATA_KEY)
+        effective_turn_id = (
+            wire_turn_id
+            if isinstance(wire_turn_id, str) and wire_turn_id
+            else ctx.turn_id
+        )
+        turn_record = self.runtime_event_publisher.current_turn_provenance(
+            ctx.session_key
+        )
         persisted = self._save_turn(
             session, ctx.all_messages, ctx.save_skip,
             turn_latency_ms=ctx.turn_latency_ms,
             summary_checkpoint=ctx.summary_checkpoint,
             input_persisted_early=ctx.input_persisted_early,
+            turn_id=effective_turn_id,
+            used=turn_record.used if turn_record is not None else None,
+            other_steps=turn_record.other_steps if turn_record is not None else 0,
         )
         if ctx.publish_file_turn is not None and not ctx.ephemeral:
             # Grants attach only to publications whose canonical link was
@@ -3382,6 +3399,9 @@ class AgentLoop:
         turn_latency_ms: int | None = None,
         summary_checkpoint: SessionSummaryCheckpoint | None = None,
         input_persisted_early: bool = False,
+        turn_id: str | None = None,
+        used: list[dict[str, Any]] | None = None,
+        other_steps: int = 0,
     ) -> list[dict[str, Any]]:
         """Commit new-turn messages and an optional summary boundary.
 
@@ -3508,8 +3528,21 @@ class AgentLoop:
                 )
         if summary_checkpoint is not None and checkpoint_boundary == len(messages):
             session.commit_summary_checkpoint(summary_checkpoint.summary)
-        if turn_latency_ms is not None and last_assistant_idx is not None:
-            session.messages[last_assistant_idx]["latency_ms"] = int(turn_latency_ms)
+        if last_assistant_idx is not None:
+            final_message = session.messages[last_assistant_idx]
+            if turn_latency_ms is not None:
+                final_message["latency_ms"] = int(turn_latency_ms)
+            # Ziggy-local (TP-10 / MIT-1873): the reopen path rebuilds the
+            # "Used:" line from this message via the webui transcript, so the
+            # final assistant message carries the same fields the live
+            # turn_end frame got in TP-09. Keys are added only when the turn
+            # actually ran tools, so tool-free turns keep their old shape.
+            if isinstance(turn_id, str) and turn_id:
+                final_message["turn_id"] = turn_id
+            if used:
+                final_message["used"] = [dict(entry) for entry in used]
+            if other_steps:
+                final_message["other_steps"] = int(other_steps)
         if saved_followup_ids:
             acknowledge_pending_followups(session, saved_followup_ids)
         session.updated_at = datetime.now()
