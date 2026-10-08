@@ -10,8 +10,12 @@ block the stop.
 import asyncio
 import time
 from contextlib import suppress
+from typing import Any
+
+import pytest
 
 from nanobot.agent.hook import AgentRunHookContext
+from nanobot.agent.loop import AgentLoop
 from nanobot.agent.tools.mcp import MCPProvider
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.cli.gateway_runtime import (
@@ -94,6 +98,120 @@ def test_gateway_readiness_is_degraded_when_required_websocket_is_unavailable() 
         "ready": False,
         "websocket": "starting",
     }
+
+
+# MIT-1804: /health carries a bare active_turns count for the idle-restart
+# deploy (design doc "Safe retries and scheduled work" §1). The field is an
+# integer only -- no session keys or tenant data -- and never changes ready.
+
+
+def _ready_channels() -> Any:
+    return type("Channels", (), {"enabled_channels": [], "get_status": None})()
+
+
+def test_health_payload_reports_active_turns() -> None:
+    ready, payload = _gateway_readiness_payload(_ready_channels(), lambda: 2)
+
+    assert ready is True
+    assert payload["active_turns"] == 2
+    assert isinstance(payload["active_turns"], int)
+
+
+def test_health_payload_active_turns_error_reports_minus_one() -> None:
+    def _boom() -> int:
+        raise RuntimeError("counter exploded")
+
+    ready, payload = _gateway_readiness_payload(_ready_channels(), _boom)
+
+    assert ready is True
+    assert payload["active_turns"] == -1
+
+
+def test_health_payload_without_counter_has_no_field() -> None:
+    ready, payload = _gateway_readiness_payload(_ready_channels())
+
+    assert ready is True
+    assert "active_turns" not in payload
+
+
+class _FakeRuntimeEventPublisher:
+    def __init__(self) -> None:
+        self.idle_calls = 0
+
+    async def run_status_changed(self, *_args: Any, **_kwargs: Any) -> None:
+        self.idle_calls += 1
+
+    def clear_turn(self, *_args: Any, **_kwargs: Any) -> None:
+        return None
+
+
+def _bare_loop() -> AgentLoop:
+    loop = AgentLoop.__new__(AgentLoop)
+    loop._active_tasks = {}
+    loop._direct_turn_count = 0
+    loop._session_locks = {}
+    loop.runtime_event_publisher = _FakeRuntimeEventPublisher()
+    return loop
+
+
+async def test_active_turn_count_counts_undone_tasks_across_sessions() -> None:
+    loop = _bare_loop()
+
+    async def _pend() -> None:
+        await asyncio.Event().wait()
+
+    async def _finish() -> None:
+        return None
+
+    pending_a = asyncio.create_task(_pend())
+    pending_b = asyncio.create_task(_pend())
+    finished = asyncio.create_task(_finish())
+    await finished
+    loop._active_tasks = {
+        "websocket:one": {pending_a, finished},
+        "websocket:two": {pending_b},
+    }
+
+    assert loop.active_turn_count() == 2
+
+    for task in (pending_a, pending_b):
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+
+async def test_process_direct_turn_in_flight_counts_as_one() -> None:
+    loop = _bare_loop()
+    seen: list[int] = []
+
+    async def _process_message(_msg: Any, **_kwargs: Any) -> None:
+        seen.append(loop.active_turn_count())
+        return None
+
+    loop._process_message = _process_message  # type: ignore[method-assign]
+
+    assert loop.active_turn_count() == 0
+    await loop.process_direct("hi")
+
+    assert seen == [1]
+    assert loop.active_turn_count() == 0
+
+
+async def test_process_direct_counter_drops_when_turn_raises() -> None:
+    loop = _bare_loop()
+    seen: list[int] = []
+
+    async def _process_message(_msg: Any, **_kwargs: Any) -> None:
+        seen.append(loop.active_turn_count())
+        raise RuntimeError("turn exploded")
+
+    loop._process_message = _process_message  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError):
+        await loop.process_direct("hi")
+
+    assert seen == [1]
+    assert loop.active_turn_count() == 0
 
 
 async def test_mcp_readiness_hook_delegates_to_application_provider() -> None:

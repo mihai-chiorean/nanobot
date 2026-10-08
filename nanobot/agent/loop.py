@@ -593,6 +593,10 @@ class AgentLoop:
     5. Sends responses back
     """
 
+    # Class-level default so ``process_direct`` also works on bare instances
+    # built without ``__init__`` (``+=``/``-=`` always rebind on the instance).
+    _direct_turn_count: int = 0
+
     @property
     def tool_names(self) -> list[str]:
         return self.tools.tool_names
@@ -837,6 +841,7 @@ class AgentLoop:
         self._running = False
         self._runtime_context_providers: list[RuntimeContextProvider] = []
         self._active_tasks: dict[str, set[asyncio.Task[Any]]] = {}
+        self._direct_turn_count: int = 0
         self._discarding_sessions: set[str] = set()
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._close_lock = asyncio.Lock()
@@ -1515,6 +1520,21 @@ class AgentLoop:
         tasks.discard(task)
         if not tasks and self._active_tasks.get(key) is tasks:
             self._active_tasks.pop(key, None)
+
+    def active_turn_count(self) -> int:
+        """Bare count of turns in flight, safe to expose on /health.
+
+        Counts unfinished tasks across every tracked session plus turns
+        running through ``process_direct`` (Work and cron runs), which are
+        not in ``_active_tasks``. Never leaks session keys or identifiers.
+        """
+        tracked = sum(
+            1
+            for tasks in getattr(self, "_active_tasks", {}).values()
+            for task in tasks
+            if not task.done()
+        )
+        return tracked + self._direct_turn_count
 
     async def _cancel_active_tasks(self, key: str) -> int:
         """Cancel and await all active work for *key*.
@@ -3595,8 +3615,11 @@ class AgentLoop:
             content=content, media=media or [], metadata=metadata,
         )
         # Share the dispatch lock so direct calls serialize with bus turns.
-        lock = self._get_session_lock(session_key)
+        # Direct turns are invisible to ``_active_tasks``, so count them here
+        # for the /health readiness payload (MIT-1804).
+        self._direct_turn_count += 1
         try:
+            lock = self._get_session_lock(session_key)
             async with lock:
                 kwargs: dict[str, Any] = {
                     "session_key": session_key,
@@ -3624,6 +3647,7 @@ class AgentLoop:
                     **kwargs,
                 )
         finally:
+            self._direct_turn_count -= 1
             await self.runtime_event_publisher.run_status_changed(msg, session_key, "idle")
             self.runtime_event_publisher.clear_turn(session_key)
 
