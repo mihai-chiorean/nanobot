@@ -80,6 +80,28 @@ def test_list_skills_skips_non_directories_and_missing_skill_md(tmp_path: Path) 
     assert entries[0]["path"] == str(ok_path)
 
 
+def test_loader_ignores_proposed(tmp_path: Path) -> None:
+    """MIT-1850: the draft overlay skills/_proposed/ is never listed as live."""
+    workspace = tmp_path / "ws"
+    skills_root = workspace / "skills"
+    skills_root.mkdir(parents=True)
+    _write_skill(skills_root, "live", body="# Live")
+    proposed = skills_root / "_proposed" / "x"
+    proposed.mkdir(parents=True)
+    # Fully valid draft content: even then, _proposed must not surface.
+    (proposed / "SKILL.md").write_text(
+        "---\nname: x\ndescription: A drafted skill.\n---\n\n# X draft\n",
+        encoding="utf-8",
+    )
+    builtin = tmp_path / "builtin"
+    builtin.mkdir()
+
+    loader = SkillsLoader(workspace, builtin_skills_dir=builtin)
+    names = {entry["name"] for entry in loader.list_skills(filter_unavailable=False)}
+    assert names == {"live"}
+    assert loader.get_skill_metadata("x") is None
+
+
 def test_list_skills_workspace_shadows_builtin_same_name(tmp_path: Path) -> None:
     workspace = tmp_path / "ws"
     ws_skills = workspace / "skills"

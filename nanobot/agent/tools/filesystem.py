@@ -65,6 +65,25 @@ class SensitivePathError(PermissionError):
     """
 
 
+class SkillDraftRequiredError(PermissionError):
+    """Ziggy-local (fork, MIT-1850): a write would edit a live skill in place.
+
+    Raised from ``_resolve_write`` for any path under ``<agent workspace>/
+    skills/<name>/`` (``_proposed`` excluded) while ``tools.skills.drafts`` is
+    on, so agent and Dream skill edits land as overlays in
+    ``skills/_proposed/<name>/`` and only go live via ``/skill accept``.
+
+    Subclasses PermissionError for the same reason as SensitivePathError:
+    every write tool already funnels that to a clean ToolResult.error.
+    """
+
+
+# Reserved overlay directory: holds draft skills awaiting /skill accept.
+# Safe to special-case because skill names may not contain "_" (see
+# nanobot/agent/skills.py:_SKILL_NAME), so no real skill is ever named this.
+PROPOSED_SKILLS_DIR = "_proposed"
+
+
 class FileToolsConfig(Base):
     """Filesystem tools configuration."""
 
@@ -96,8 +115,10 @@ class _FsTool(Tool):
         restrict_to_workspace: bool | None = None,
         sandbox_restricts_workspace: bool = False,
         extra_read_allowed_files: list[Path] | None = None,
+        skills_drafts: bool = True,
     ):
         self._workspace = workspace
+        self._skills_drafts = bool(skills_drafts)
         self._allowed_dir = allowed_dir
         # Legacy alias: extra_allowed_dirs is read-only. Write-capable tools
         # must opt in via extra_write_allowed_dirs.
@@ -142,6 +163,7 @@ class _FsTool(Tool):
             file_states=ctx.file_state_store,
             restrict_to_workspace=ctx.config.restrict_to_workspace,
             sandbox_restricts_workspace=sandbox_restricts,
+            skills_drafts=ctx.config.skills.drafts,
         )
 
     @property
@@ -233,7 +255,38 @@ class _FsTool(Tool):
             raise SensitivePathError(
                 f"Writing {path} is blocked (sensitive path — credentials or key material)."
             )
+        self._check_skill_draft(resolved)
         return resolved
+
+    def _check_skill_draft(self, resolved: Path) -> None:
+        """MIT-1850: with tools.skills.drafts on, live-skill writes become drafts.
+
+        Checked against this tool's *agent workspace* (self._workspace), never
+        the effective project root, so a project scope covering the workspace's
+        parent cannot route around the overlay. ``skills/_proposed/**`` and
+        paths outside ``skills/`` pass through untouched.
+        """
+        if not self._skills_drafts or self._workspace is None:
+            return
+        try:
+            skills_root = Path(self._workspace).expanduser().resolve(strict=False) / "skills"
+        except (OSError, RuntimeError):
+            return
+        try:
+            rel = resolved.relative_to(skills_root)
+        except ValueError:
+            return
+        # rel.parts == () is the skills root itself; a single part is a loose
+        # file directly under skills/, which the loader can never list (it only
+        # walks <skills>/<name>/SKILL.md), so neither needs the overlay.
+        if len(rel.parts) < 2 or rel.parts[0] == PROPOSED_SKILLS_DIR:
+            return
+        name = rel.parts[0]
+        draft_path = f"skills/{PROPOSED_SKILLS_DIR}/{rel.as_posix()}"
+        raise SkillDraftRequiredError(
+            f"Skills you write are drafts. Write the changed file to {draft_path} "
+            f"instead; the user accepts it with /skill accept {name}."
+        )
 
     def _resolve(self, path: str) -> Path:
         return self._resolve_read(path)

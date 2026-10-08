@@ -5,10 +5,13 @@ Skill Initializer - Creates a new skill from template
 Usage:
     init_skill.py <skill-name> --path <path> [--resources scripts,references,assets] [--examples]
 
+Agent-written skills are drafts: create them under the workspace draft
+overlay, skills/_proposed/, and let the user go live with /skill accept.
+
 Examples:
-    init_skill.py my-new-skill --path skills/public
-    init_skill.py my-new-skill --path skills/public --resources scripts,references
-    init_skill.py my-api-helper --path skills/private --resources scripts --examples
+    init_skill.py my-new-skill --path ./workspace/skills/_proposed
+    init_skill.py my-new-skill --path ./workspace/skills/_proposed --resources scripts,references
+    init_skill.py my-api-helper --path ./workspace/skills/_proposed --resources scripts --examples
     init_skill.py custom-skill --path /custom/location
 """
 
@@ -333,7 +336,11 @@ def main() -> None:
         description="Create a new skill directory with a SKILL.md template.",
     )
     parser.add_argument("skill_name", help="Skill name (normalized to hyphen-case)")
-    parser.add_argument("--path", required=True, help="Output directory for the skill")
+    parser.add_argument(
+        "--path",
+        required=True,
+        help="Output directory for the skill (agent-written skills: ./workspace/skills/_proposed)",
+    )
     parser.add_argument(
         "--resources",
         default="",
