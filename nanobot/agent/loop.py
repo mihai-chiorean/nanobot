@@ -671,6 +671,7 @@ class AgentLoop:
         workspace: Path,
         model: str | None = None,
         max_iterations: int | None = None,
+        think_first_iteration: bool | None = None,
         max_concurrent_subagents: int | None = None,
         context_window_tokens: int | None = None,
         max_tool_result_chars: int | None = None,
@@ -725,6 +726,14 @@ class AgentLoop:
         initial_model = model or provider.get_default_model()
         self.max_iterations = (
             max_iterations if max_iterations is not None else defaults.max_tool_iterations
+        )
+        # TS-13 experiment (agents.defaults.thinkFirstIteration), threaded like
+        # max_tool_iterations: the runner applies it to the iteration-0 request
+        # of an auto->fast chat turn only.
+        self.think_first_iteration = (
+            think_first_iteration
+            if think_first_iteration is not None
+            else defaults.think_first_iteration
         )
         initial_context_window = (
             context_window_tokens
@@ -951,6 +960,7 @@ class AgentLoop:
             workspace=config.workspace_path,
             model=model,
             max_iterations=defaults.max_tool_iterations,
+            think_first_iteration=defaults.think_first_iteration,
             max_concurrent_subagents=defaults.max_concurrent_subagents,
             context_window_tokens=context_window_tokens,
             max_tool_result_chars=defaults.max_tool_result_chars,
@@ -2109,6 +2119,11 @@ class AgentLoop:
                 runtime=turn_runtime,
                 reasoning_profile=turn_reasoning_profile,
                 allow_reasoning_escalation=turn_allow_escalation,
+                # TS-13: only the ``requested auto -> fast`` decision arms the
+                # iteration-0 thinking (turn_allow_escalation is true exactly
+                # there); every other turn and every later iteration is
+                # unaffected, and the flag ships off by default.
+                think_first_iteration=self.think_first_iteration and turn_allow_escalation,
                 max_iterations=self.max_iterations,
                 max_tool_result_chars=self.max_tool_result_chars,
                 transcript_input=None if initial_messages is not None else transcript_input,

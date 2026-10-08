@@ -26,7 +26,11 @@ from nanobot.agent.context_governance import (
     TranscriptBuilder,
 )
 from nanobot.agent.hook import AgentHook, AgentHookContext, AgentRunHookContext
-from nanobot.agent.reasoning_policy import escalation_profile
+from nanobot.agent.reasoning_policy import (
+    ReasoningProfile,
+    escalation_profile,
+    generation_profile,
+)
 from nanobot.agent.tools.ask import AskUserInterrupt
 from nanobot.agent.tools.execution import execute_tool_calls
 from nanobot.agent.tools.registry import ToolRegistry
@@ -202,6 +206,12 @@ class AgentRunSpec:
     # one-shot: the runner clears it on the first ladder step and the policy
     # caps the ladder at one rung, so a turn can never climb past ``think``.
     allow_reasoning_escalation: bool = False
+    # TS-13 experiment (agents.defaults.thinkFirstIteration): run only
+    # iteration 0 of an ``auto``->``fast`` chat turn at the ``think``
+    # generation so the tool-family choice gets reasoning; every later
+    # request keeps the turn's own generation.  The loop sets it only for
+    # that one policy decision and only when the config flag is on.
+    think_first_iteration: bool = False
 
 
 @dataclass(slots=True)
@@ -543,8 +553,11 @@ class AgentRunner:
                 # monotonic (not perf_counter) so provider-timing tests that patch
                 # perf_counter keep their exact call budget.
                 _t0 = time.monotonic()
+                request_spec = self._think_first_iteration_request_spec(
+                    spec, iteration=iteration
+                )
                 response, raw_usage = await self._request_model(
-                    spec,
+                    request_spec,
                     request_messages,
                     hook,
                     context,
@@ -1359,6 +1372,45 @@ class AgentRunner:
             ),
             reasoning_profile=stronger.name.value,
             allow_reasoning_escalation=False,
+        )
+
+    @staticmethod
+    def _think_first_iteration_request_spec(
+        spec: AgentRunSpec,
+        *,
+        iteration: int,
+    ) -> AgentRunSpec:
+        """TS-13: the iteration-0 request spec, thinking on for ``auto``->``fast`` turns.
+
+        The tool family is picked on the first model call, where a ``fast``
+        turn has no reasoning; this gives that one call the ``think``
+        generation (same spec-copy construction as ``_escalate_reasoning``)
+        while every later request in the turn keeps the loop's own
+        generation.  Thinking only changes the generation tail of the prompt,
+        so the cached prefix is byte-stable.  The loop arms this only for the
+        ``requested auto -> fast`` decision and only when
+        ``agents.defaults.thinkFirstIteration`` is on; the escalation ladder
+        (``allow_reasoning_escalation``) is untouched.
+        """
+        if (
+            iteration != 0
+            or not spec.think_first_iteration
+            or spec.reasoning_profile != ReasoningProfile.FAST
+        ):
+            return spec
+        think = generation_profile(ReasoningProfile.THINK)
+        logger.info(
+            "think_first_iteration applied session={} (fast -> {} on iteration 0)",
+            spec.session_key or "default",
+            think.name.value,
+        )
+        return replace(
+            spec,
+            runtime=spec.runtime.with_generation_overrides(
+                temperature=think.temperature,
+                max_tokens=think.max_tokens,
+                reasoning_effort=think.reasoning_effort,
+            ),
         )
 
     async def _request_finalization_retry(
