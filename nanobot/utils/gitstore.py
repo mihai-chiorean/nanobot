@@ -487,7 +487,7 @@ class GitStore:
                 rel = f"{prefix}{name}"
                 if stat.S_ISDIR(entry.mode):
                     stack.append((f"{rel}/", cast("Tree", repo[entry.sha])))
-                elif stat.S_ISREG(entry.mode):
+                elif stat.S_ISREG(entry.mode) or stat.S_ISLNK(entry.mode):
                     paths[rel] = entry.sha
         return paths
 
@@ -541,25 +541,17 @@ class GitStore:
                 skipped: list[str] = []
                 for path in changed:
                     wt_path = self._workspace / path
-                    try:
-                        current = wt_path.read_bytes() if wt_path.exists() else None
-                    except OSError as exc:
-                        logger.warning("Git undo: cannot read {}: {}", path, exc)
-                        skipped.append(path)
-                        continue
-                    at_commit = self._read_blob_bytes_from_tree(repo, commit.tree, path)
+                    current = self._working_state(wt_path, path)
+                    at_commit = self._entry_state(repo, commit.tree, path)
                     if current != at_commit:
                         skipped.append(path)
                         continue
-                    at_parent = self._read_blob_bytes_from_tree(
+                    at_parent = self._entry_state(
                         repo,
                         cast("Commit", repo[commit.parents[0]]).tree,
                         path,
                     )
-                    if at_parent is not None:
-                        self._atomic_write_bytes(wt_path, at_parent)
-                    elif current is not None:
-                        wt_path.unlink()
+                    self._apply_state(wt_path, at_parent)
                     restored.append(path)
 
             if not restored:
@@ -585,11 +577,9 @@ class GitStore:
                 commit, _full_sha = resolved
                 return [
                     path
-                    for path, differs in (
-                        self._tracked_path_differs(repo, commit.tree, path)
-                        for path in self._tracked_files
-                    )
-                    if differs
+                    for path in self._tracked_files
+                    if self._working_state(self._workspace / path, path)
+                    != self._entry_state(repo, commit.tree, path)
                 ]
         except Exception as exc:
             raise GitStoreError(f"Git restore preview failed for {sha}") from exc
@@ -617,14 +607,10 @@ class GitStore:
                 changed: list[str] = []
                 for path in self._tracked_files:
                     wt_path = self._workspace / path
-                    differs = self._tracked_path_differs(repo, commit.tree, path)[1]
-                    if not differs:
+                    desired = self._entry_state(repo, commit.tree, path)
+                    if self._working_state(wt_path, path) == desired:
                         continue
-                    at_sha = self._read_blob_bytes_from_tree(repo, commit.tree, path)
-                    if at_sha is not None:
-                        self._atomic_write_bytes(wt_path, at_sha)
-                    elif wt_path.exists():
-                        wt_path.unlink()
+                    self._apply_state(wt_path, desired)
                     changed.append(path)
 
             if not changed:
@@ -635,16 +621,78 @@ class GitStore:
         except Exception as exc:
             raise GitStoreError(f"Git restore failed for {sha}") from exc
 
-    def _tracked_path_differs(self, repo: "Repo", tree_id: bytes, path: str) -> tuple[str, bool]:
-        """Whether the workspace copy of *path* differs from its state at *tree_id*."""
-        wt_path = self._workspace / path
+    @staticmethod
+    def _working_state(wt_path: Path, path: str) -> tuple[str, object] | None:
+        """State of a workspace path: ('file', bytes), ('symlink', target) or None.
+
+        Returns ('error', None) when the file cannot be read, so comparisons
+        against any tree entry fail and callers refuse to touch the path.
+        """
         try:
-            current = wt_path.read_bytes() if wt_path.exists() else None
+            if wt_path.is_symlink():
+                return "symlink", os.readlink(wt_path)
+            if wt_path.exists():
+                return "file", wt_path.read_bytes()
+            return None
         except OSError as exc:
-            logger.warning("Git restore: cannot read {}: {}", path, exc)
-            return path, True
-        at_sha = self._read_blob_bytes_from_tree(repo, tree_id, path)
-        return path, current != at_sha
+            logger.warning("Git store: cannot read {}: {}", path, exc)
+            return "error", None
+
+    @staticmethod
+    def _entry_state(
+        repo: "Repo",
+        tree_id: bytes,
+        filepath: str,
+    ) -> tuple[str, object] | None:
+        """State of *filepath* in the tree *tree_id*, or None when absent.
+
+        Symlink entries (mode 120000) are compared by their link target so a
+        symlinked tracked file is restored as a symlink, not clobbered into a
+        regular file containing the target path.
+        """
+        parts = Path(filepath).parts
+        current = cast("Tree", repo[tree_id])
+        for index, part in enumerate(parts):
+            try:
+                entry = current[part.encode()]
+            except KeyError:
+                return None
+            mode, sha = entry[0], entry[1]
+            obj = repo[sha]
+            last = index == len(parts) - 1
+            if obj.type_name != b"blob":
+                if obj.type_name == b"tree" and not last:
+                    current = cast("Tree", obj)
+                    continue
+                return None
+            if not last:
+                return None
+            if stat.S_ISLNK(mode):
+                return "symlink", cast("Blob", obj).data.decode("utf-8", errors="replace")
+            return "file", cast("Blob", obj).data
+        return None
+
+    def _apply_state(self, wt_path: Path, state: tuple[str, object] | None) -> None:
+        """Bring a workspace path to *state* (file bytes, symlink target, or absent)."""
+        if state is None:
+            if wt_path.is_symlink() or wt_path.exists():
+                wt_path.unlink()
+            return
+        kind, payload = state
+        if kind == "symlink":
+            wt_path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=str(wt_path.parent), prefix=f".{wt_path.name}.", suffix=".tmplink")
+            os.close(fd)
+            try:
+                os.unlink(tmp)
+                os.symlink(str(payload), tmp)
+                os.replace(tmp, wt_path)
+            except Exception:
+                with suppress(OSError):
+                    os.unlink(tmp)
+                raise
+        else:
+            self._atomic_write_bytes(wt_path, cast(bytes, payload))
 
     @staticmethod
     def _atomic_write_bytes(path: Path, data: bytes) -> None:
@@ -662,29 +710,6 @@ class GitStore:
                 os.unlink(tmp)
             raise
 
-    @staticmethod
-    def _read_blob_bytes_from_tree(
-        repo: "Repo",
-        tree_id: bytes,
-        filepath: str,
-    ) -> bytes | None:
-        """Read a blob's raw bytes from the tree *tree_id* by walking path parts."""
-        parts = Path(filepath).parts
-        current = cast("Tree", repo[tree_id])
-        for part in parts:
-            try:
-                entry = current[part.encode()]
-            except KeyError:
-                return None
-            obj = repo[entry[1]]
-            if obj.type_name == b"blob":
-                return cast("Blob", obj).data
-            if obj.type_name == b"tree":
-                current = cast("Tree", obj)
-            else:
-                return None
-        return None
-
     @classmethod
     def _read_blob_from_tree(
         cls,
@@ -693,7 +718,10 @@ class GitStore:
         filepath: str,
     ) -> str | None:
         """Read a blob's content from a tree object by walking path parts."""
-        data = cls._read_blob_bytes_from_tree(repo, tree.id, filepath)
-        if data is None:
+        state = cls._entry_state(repo, tree.id, filepath)
+        if state is None:
             return None
-        return data.decode("utf-8", errors="replace")
+        payload = state[1]
+        if isinstance(payload, bytes):
+            return payload.decode("utf-8", errors="replace")
+        return str(payload)

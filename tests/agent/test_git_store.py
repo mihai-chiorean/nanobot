@@ -332,6 +332,45 @@ class TestUndo:
         result = git_ready.undo("deadbeef")
         assert (result.restored, result.skipped, result.new_sha) == ([], [], None)
 
+    def test_undo_replaces_symlink_with_parent_state(self, git_ready):
+        """A symlink added over a tracked file is undone to the parent's file."""
+        ws = git_ready._workspace
+        (ws / "SOUL.md").unlink()
+        os.symlink("../link-target.md", ws / "SOUL.md")
+        link_sha = git_ready.auto_commit("symlink soul")
+
+        result = git_ready.undo(link_sha)
+
+        assert result.restored == ["SOUL.md"]
+        assert not (ws / "SOUL.md").is_symlink()
+        assert (ws / "SOUL.md").read_text(encoding="utf-8") == ""
+
+    def test_undo_skips_symlink_edited_later(self, git_ready):
+        ws = git_ready._workspace
+        (ws / "SOUL.md").unlink()
+        os.symlink("../link-target.md", ws / "SOUL.md")
+        link_sha = git_ready.auto_commit("symlink soul")
+        (ws / "SOUL.md").unlink()
+        os.symlink("../elsewhere.md", ws / "SOUL.md")
+
+        result = git_ready.undo(link_sha)
+
+        assert result.skipped == ["SOUL.md"]
+        assert os.readlink(ws / "SOUL.md") == "../elsewhere.md"
+
+    def test_undo_deletes_symlink_added_by_commit(self, git_ready):
+        ws = git_ready._workspace
+        (ws / "SOUL.md").unlink()
+        git_ready.auto_commit("drop soul")
+        os.symlink("../link-target.md", ws / "SOUL.md")
+        add_sha = git_ready.auto_commit("link soul")
+
+        result = git_ready.undo(add_sha)
+
+        assert result.restored == ["SOUL.md"]
+        assert not (ws / "SOUL.md").is_symlink()
+        assert not (ws / "SOUL.md").exists()
+
     def test_undo_uses_parent_of_first_parent_only_for_touched_files(self, git_ready):
         """A commit's undo must not touch tracked files it never modified."""
         ws = git_ready._workspace
@@ -406,6 +445,23 @@ class TestRestore:
     def test_restore_preview_unknown_sha(self, git_ready):
         assert git_ready.restore_preview("deadbeef") == []
         assert git_ready.restore("deadbeef") == []
+
+    def test_restore_recreates_symlink_instead_of_clobbering(self, git_ready):
+        """A symlinked tracked file is restored as a symlink, not as a file
+        whose content is the link target."""
+        ws = git_ready._workspace
+        (ws / "SOUL.md").unlink()
+        os.symlink("../link-target.md", ws / "SOUL.md")
+        snapshot_sha = git_ready.auto_commit("symlink soul")
+        (ws / "SOUL.md").unlink()
+        (ws / "SOUL.md").write_text("clobbered", encoding="utf-8")
+
+        assert git_ready.restore_preview(snapshot_sha) == ["SOUL.md"]
+        changed = git_ready.restore(snapshot_sha)
+
+        assert changed == ["SOUL.md"]
+        assert (ws / "SOUL.md").is_symlink()
+        assert os.readlink(ws / "SOUL.md") == "../link-target.md"
 
 
 class TestHasCommit:
