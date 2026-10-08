@@ -270,9 +270,13 @@ def _commit_dream_changes(memory: Any) -> str | None:
     diff_body = memory.dream_content_diff()
     if not diff_body:
         return None
+    core_tokens, core_budget = memory.core_memory_stats()
+    logger.info("Dream run core: {}/{} tokens", core_tokens, core_budget)
     message = memory.build_dream_commit_message(
         "dream: periodic memory consolidation",
         diff_body,
+        core_tokens=core_tokens,
+        core_budget=core_budget,
     )
     return memory.git.auto_commit(message)
 
