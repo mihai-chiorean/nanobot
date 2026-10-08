@@ -97,6 +97,11 @@ async def run_work_task_cron_job(
     title = str(routing.get("work_title") or job.name or "Scheduled work")
     plan_task_id = _plan_task_id(routing)
     read_only = read_only_value(routing.get(WORK_TASK_ROUTING_READ_ONLY, False))
+    # MIT-1827: a job created for a skill runs scoped to that skill's
+    # ``allowed-tools`` list, with the skill content injected the way an
+    # explicit ``$skill`` invocation injects it.
+    skill = job.payload.skill
+    skill = skill.strip() if isinstance(skill, str) and skill.strip() else None
 
     task = await store.run_io(
         store.create_task,
@@ -146,6 +151,18 @@ async def run_work_task_cron_job(
         }
         if read_only_value(task.get("read_only", False)):
             turn_metadata[WORK_TASK_META_READ_ONLY] = True
+        if skill:
+            from nanobot.agent.skills import SkillsLoader
+
+            loader = SkillsLoader(agent.workspace)
+            if not loader.skill_exists(skill):
+                logger.warning(
+                    "Cron: job '{}' names skill '{}' which is not installed; "
+                    "the run proceeds unscoped",
+                    job.name,
+                    skill,
+                )
+            turn_metadata.update(loader.build_skill_turn_metadata(skill))
         response = await agent.process_direct(
             job.payload.message,
             session_key=session_key,
