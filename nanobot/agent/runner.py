@@ -30,17 +30,20 @@ from nanobot.agent.reasoning_policy import escalation_profile
 from nanobot.agent.tools.ask import AskUserInterrupt
 from nanobot.agent.tools.execution import execute_tool_calls
 from nanobot.agent.tools.registry import ToolRegistry
+from nanobot.agent.turn_provenance import current_turn_provenance
 from nanobot.events import NO_EVENTS, EventSink
 from nanobot.llm_usage.context import (
     LLMUsageSource,
     bind_llm_usage_source,
+    bind_llm_usage_turn_id,
     reset_llm_usage_source,
+    reset_llm_usage_turn_id,
     source_from_session_key,
 )
 
 # Ziggy-local (fork, MIT-202/210/211): Langfuse span helpers. Both are
 # no-ops when Langfuse is not configured.
-from nanobot.observability import observe_llm_iteration
+from nanobot.observability import observe_llm_iteration, update_llm_iteration_metadata
 from nanobot.providers.base import (
     LLMProvider,
     LLMResponse,
@@ -49,6 +52,7 @@ from nanobot.providers.base import (
     ToolCallRequest,
 )
 from nanobot.providers.conversation_state import ProviderConversationStateController
+from nanobot.runtime_release import release_id
 from nanobot.session.summary import SessionSummaryCheckpoint
 from nanobot.utils.helpers import (
     build_assistant_message,
@@ -160,6 +164,23 @@ class _ExecProgress:
         self.count = self.count + 1 if fingerprint == self.fingerprint else 1
         self.fingerprint = fingerprint
         return self.count
+
+
+def tools_offered_fingerprint(defs: list[dict[str, Any]]) -> tuple[int, str]:
+    """(count, 16-hex digest) of the tool set offered on one model call (TP-05).
+
+    The digest is the first 16 hex characters of the sha256 of the definitions
+    sorted by tool name and JSON-dumped canonically, so two turns that offer
+    the same set hash the same regardless of registry insertion order. Computed
+    fresh on every call — a turn's registry can change between iterations
+    (MCP reconnects), and a cache would hide exactly that.
+    """
+    payload = json.dumps(
+        sorted(defs, key=lambda d: d.get("function", d).get("name", "")),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return len(defs), hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
 @dataclass(slots=True)
@@ -376,6 +397,9 @@ class AgentRunner:
         llm_usage_source_token = bind_llm_usage_source(
             spec.llm_usage_source or source_from_session_key(spec.session_key)
         )
+        # TP-05: key llm_usage rows on the same turn id the provenance record
+        # and the wire frames use; read back by LLMProvider._observe_llm_call.
+        llm_usage_turn_id_token = bind_llm_usage_turn_id(spec.turn_id)
 
         try:
             await hook.before_run(context)
@@ -422,6 +446,7 @@ class AgentRunner:
                         )
             finally:
                 reset_llm_usage_source(llm_usage_source_token)
+                reset_llm_usage_turn_id(llm_usage_turn_id_token)
 
     @staticmethod
     def _initial_transcript_and_compaction(
@@ -1075,6 +1100,46 @@ class AgentRunner:
         transcript: list[dict[str, Any]] | None,
     ) -> tuple[LLMResponse, LLMUsage]:
         tool_definitions = spec.tools.get_definitions()
+        # TP-05: every call carries the whole registry, so record which set it
+        # was — count + content-free digest — in the log, the turn's
+        # provenance record and the open Langfuse iteration span (design
+        # section 3). The span opens in _run_core before this point, so its
+        # metadata is attached with an update rather than at creation.
+        tools_n, tools_sha = tools_offered_fingerprint(tool_definitions)
+        release = release_id()
+        logger.info(
+            "model_call turn={} iter={} tools n={} sha={} profile={} model={} release={}",
+            spec.turn_id,
+            context.iteration,
+            tools_n,
+            tools_sha,
+            spec.reasoning_profile,
+            spec.runtime.model,
+            release,
+        )
+        provenance_record = current_turn_provenance()
+        if provenance_record is not None:
+            provenance_record.calls.append(
+                {
+                    "iter": context.iteration,
+                    "tools_n": tools_n,
+                    "tools_sha": tools_sha,
+                    "profile": spec.reasoning_profile,
+                    "model": spec.runtime.model,
+                }
+            )
+        update_llm_iteration_metadata(
+            {
+                "gen_ai.operation.name": "chat",
+                "gen_ai.request.model": spec.runtime.model,
+                "gen_ai.conversation.id": spec.session_key or "",
+                "ziggy.turn_id": spec.turn_id or "",
+                "ziggy.tools.offered.count": tools_n,
+                "ziggy.tools.offered.sha": tools_sha,
+                "ziggy.reasoning.profile": spec.reasoning_profile or "",
+                "ziggy.release": release,
+            }
+        )
         messages, provider_context = await self.context_governor.prepare_request(
             request_state,
             messages,
