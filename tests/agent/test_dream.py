@@ -15,7 +15,10 @@ from nanobot.utils.prompt_templates import render_template
 
 @pytest.fixture
 def store(tmp_path):
-    s = MemoryStore(tmp_path)
+    # SM-01: the history repo lives at <ws>/../history — nest the workspace so
+    # each test gets its own history directory (all tests share the tmp_path
+    # parent within a run).
+    s = MemoryStore(tmp_path / "workspace")
     s.write_soul("# Soul\n- Helpful")
     s.write_memory("# Memory\n- Project X active")
     return s
@@ -736,7 +739,12 @@ class TestDreamCommitMessage:
         """
         import subprocess
 
-        store = MemoryStore(tmp_path)
+        from nanobot.utils.gitstore import history_dir_for
+
+        # SM-01: bare repo outside the workspace; the git CLI reads it via
+        # --git-dir (independent evidence of the real commit message).
+        workspace = tmp_path / "workspace"
+        store = MemoryStore(workspace)
         store.write_soul("# Soul")
         store.write_memory("# Memory")
         store.git.init()
@@ -761,8 +769,11 @@ class TestDreamCommitMessage:
         sha = store.git.auto_commit(msg)
         assert sha is not None
         log = subprocess.check_output(
-            ["git", "log", "-1", "--format=%B"],
-            cwd=str(tmp_path), text=True,
+            [
+                "git", "--git-dir", str(history_dir_for(workspace) / "workspace.git"),
+                "log", "-1", "--format=%B",
+            ],
+            text=True,
         ).strip()
         assert "dream: periodic memory consolidation" in log
         assert "DMSO research notes" in log
@@ -770,7 +781,7 @@ class TestDreamCommitMessage:
 
     def test_commit_message_is_bare_prefix_when_no_changes(self, tmp_path):
         """A no-op Dream run yields only the prefix — never a narrated summary."""
-        store = MemoryStore(tmp_path)
+        store = MemoryStore(tmp_path / "workspace")
         store.write_soul("# Soul")
         store.write_memory("# Memory")
         store.git.init()
@@ -804,36 +815,33 @@ class TestDreamContentDiff:
         store.git.auto_commit("initial")
         assert store.dream_content_diff() == ""
 
-    def test_ignores_platform_line_ending_normalization(self, store, monkeypatch):
+    def test_ignores_platform_line_ending_normalization(self, store):
+        """CRLF files are neither a pending change nor rewritten on commit.
+
+        SM-01: the bare store has no working tree, so the old ``git status``
+        probe (which exercised autocrlf in the legacy repo) is replaced by a
+        byte-fidelity check with the git CLI against the bare repo; the
+        tolerance itself now lives in summarize_working_tree's CRLF
+        normalization.
+        """
         import subprocess
 
-        system_config = store.workspace / "system.gitconfig"
-        global_config = store.workspace / "global.gitconfig"
-        system_config.touch()
-        global_config.touch()
-        subprocess.run(
-            [
-                "git", "config", "--file", str(system_config),
-                "core.autocrlf", "false",
-            ],
-            check=True,
-            capture_output=True,
-        )
-        monkeypatch.delenv("GIT_CONFIG_NOSYSTEM", raising=False)
-        monkeypatch.setenv("GIT_CONFIG_SYSTEM", str(system_config))
-        monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_config))
+        from nanobot.utils.gitstore import history_dir_for
 
         store.soul_file.write_bytes(b"# Soul\r\n- Helpful")
         store.memory_file.write_bytes(b"# Memory\r\n- Project X active")
         store.git.init()
 
-        status = subprocess.check_output(
-            ["git", "status", "--porcelain", "--", "SOUL.md", "memory/MEMORY.md"],
-            cwd=store.workspace,
-            text=True,
-        )
-        assert status == ""
         assert store.dream_content_diff() == ""
+
+        stored = subprocess.check_output(
+            [
+                "git", "--git-dir",
+                str(history_dir_for(store.workspace) / "workspace.git"),
+                "cat-file", "blob", "HEAD:SOUL.md",
+            ],
+        )
+        assert stored == b"# Soul\r\n- Helpful"
 
     @pytest.mark.parametrize(
         ("before", "after", "changed"),
