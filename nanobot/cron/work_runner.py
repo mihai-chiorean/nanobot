@@ -48,8 +48,9 @@ WORK_TASK_META_MODE = "work_mode"
 WORK_TASK_META_CRON_JOB_ID = "cron_job_id"
 WORK_TASK_META_READ_ONLY = READ_ONLY_META_KEY
 WORK_TASK_ROUTING_READ_ONLY = "work_read_only"
-# SR-18: a skill-scripted run interprets the script's output, so it needs far
-# fewer tool iterations than an open-ended scheduled turn.
+# SR-18: a run whose skill_script result was injected only interprets output,
+# so it needs far fewer tool iterations than an open-ended scheduled turn.
+# Runs with no script (none configured, or exec disabled) stay open-ended.
 SKILL_RUN_MAX_ITERATIONS = 6
 EXEC_TOOL_NAME = "exec"
 
@@ -130,7 +131,6 @@ async def _prepare_skill_turn(
     setup = _SkillTurnSetup(
         content=job.payload.message,
         metadata={RUNTIME_CONTEXT_INPUT_META: [block]},
-        max_iterations=SKILL_RUN_MAX_ITERATIONS,
     )
     allowed = loader.skill_allowed_tools(skill_name)
     if allowed is not None:
@@ -187,6 +187,11 @@ async def _prepare_skill_turn(
             "skill_script output as the result of this run and stop; do not "
             "redo the job by hand."
         )
+    # The cap belongs to the script-injected turn only: an agent that ignores
+    # the interpret-and-stop result must not spin into the 105-exec failure
+    # mode. A skipped script leaves an open-ended job, which keeps the
+    # loop's default budget.
+    setup.max_iterations = SKILL_RUN_MAX_ITERATIONS
     setup.hooks.append(
         SkillScriptInjectionHook(
             build_skill_script_messages(
