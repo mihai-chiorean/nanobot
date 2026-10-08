@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import io
+import os
+import stat
+import tempfile
 import time
-from dataclasses import dataclass
+from contextlib import suppress
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
@@ -30,6 +34,7 @@ class CommitInfo:
     sha: str  # Short SHA (8 chars)
     message: str
     timestamp: str  # Formatted datetime
+    files: list[str] = field(default_factory=list)  # Paths the commit changed
 
     def subject(self) -> str:
         """First line of the commit message, or a placeholder if empty."""
@@ -42,6 +47,15 @@ class CommitInfo:
         if diff:
             return f"{header}\n```diff\n{diff}\n```"
         return f"{header}\n(no file changes)"
+
+
+@dataclass
+class UndoResult:
+    """Outcome of :meth:`GitStore.undo`."""
+
+    restored: list[str]
+    skipped: list[str]
+    new_sha: str | None
 
 
 class GitStore:
@@ -231,11 +245,13 @@ class GitStore:
         self,
         max_entries: int = 20,
         message_prefix: str | None = None,
+        include_files: bool = False,
     ) -> list[CommitInfo]:
         """Return simplified commit log, optionally filtered by message prefix.
 
         When filtering, *max_entries* counts matching commits rather than every
-        commit traversed in the repository.
+        commit traversed in the repository. When *include_files* is set, each
+        entry also lists the paths the commit changed against its first parent.
         """
         if not self.is_initialized():
             return []
@@ -266,6 +282,9 @@ class GitStore:
                             sha=sha.decode()[:8],
                             message=msg,
                             timestamp=ts,
+                            files=(
+                                self._changed_paths(repo, commit) if include_files else []
+                            ),
                         ))
                     sha = commit.parents[0] if commit.parents else None
 
@@ -439,82 +458,219 @@ class GitStore:
         except Exception as exc:
             raise GitStoreError(f"Git commit display failed for {short_sha}") from exc
 
-    # -- restore ---------------------------------------------------------------
+    # -- history navigation ------------------------------------------------------
 
-    def revert(self, commit: str, *, message_prefix: str | None = None) -> str | None:
-        """Revert (undo) the changes introduced by the given commit.
-
-        Restores all tracked memory files to the state at the commit's parent,
-        then creates a new commit recording the revert. When *message_prefix*
-        is provided, commits outside that history are rejected before any files
-        are changed.
-
-        Returns the new commit SHA, or ``None`` when the commit cannot be reverted.
-        Repository and filesystem failures raise :class:`GitStoreError`.
-        """
+    def has_commit(self, sha: str) -> bool:
+        """Return whether *sha* resolves to a commit reachable from HEAD."""
         if not self.is_initialized():
+            return False
+        return self._resolve_sha(sha) is not None
+
+    def _resolve_commit(self, repo: "Repo", sha: str) -> tuple["Commit", bytes] | None:
+        """Resolve *sha* to (commit object, full SHA), or None if it does not resolve."""
+        full_sha = self._resolve_sha(sha)
+        if not full_sha:
             return None
+        commit_obj = repo[full_sha]
+        if commit_obj.type_name != b"commit":
+            return None
+        return cast("Commit", commit_obj), full_sha
+
+    def _tree_blob_ids(self, repo: "Repo", tree: "Tree") -> dict[str, bytes]:
+        """Map every path in *tree* to its blob SHA (recursive walk)."""
+        paths: dict[str, bytes] = {}
+        stack: list[tuple[str, "Tree"]] = [("", tree)]
+        while stack:
+            prefix, current = stack.pop()
+            for entry in current.items():
+                name = entry.path.decode("utf-8", errors="replace")
+                rel = f"{prefix}{name}"
+                if stat.S_ISDIR(entry.mode):
+                    stack.append((f"{rel}/", cast("Tree", repo[entry.sha])))
+                elif stat.S_ISREG(entry.mode):
+                    paths[rel] = entry.sha
+        return paths
+
+    def _changed_paths(self, repo: "Repo", commit: "Commit") -> list[str]:
+        """Paths the commit changed compared with its first parent."""
+        after = self._tree_blob_ids(repo, cast("Tree", repo[commit.tree]))
+        if commit.parents:
+            parent = cast("Commit", repo[commit.parents[0]])
+            before = self._tree_blob_ids(repo, cast("Tree", repo[parent.tree]))
+        else:
+            before = {}
+        return sorted(
+            path
+            for path in set(before) | set(after)
+            if before.get(path) != after.get(path)
+        )
+
+    # -- undo / restore ----------------------------------------------------------
+
+    def undo(self, sha: str) -> UndoResult:
+        """Undo the changes a single commit introduced, per file.
+
+        For each path the commit changed compared with its first parent: if the
+        workspace file still matches the commit's version, write the parent's
+        version back (or delete the file when the parent did not have it);
+        otherwise report the path as skipped so later edits are never discarded.
+
+        Commits the result as ``undo <sha>`` when anything was restored. Root
+        commits are refused. Repository and filesystem failures raise
+        :class:`GitStoreError`.
+        """
+        empty = UndoResult(restored=[], skipped=[], new_sha=None)
+        if not self.is_initialized():
+            return empty
 
         try:
             from dulwich.repo import Repo
 
-            full_sha = self._resolve_sha(commit)
-            if not full_sha:
-                logger.warning("Git revert: SHA not found: {}", commit)
-                return None
-
             with Repo(str(self._workspace)) as repo:
-                commit_obj = repo[full_sha]
-                if commit_obj.type_name != b"commit":
-                    return None
-                typed_commit = cast("Commit", commit_obj)
+                resolved = self._resolve_commit(repo, sha)
+                if resolved is None:
+                    logger.warning("Git undo: SHA not found: {}", sha)
+                    return empty
+                commit, full_sha = resolved
+                if not commit.parents:
+                    logger.warning("Git undo: cannot undo root commit {}", sha)
+                    return empty
 
-                commit_message = typed_commit.message.decode(
-                    "utf-8",
-                    errors="replace",
-                ).strip()
-                if message_prefix is not None and not commit_message.startswith(message_prefix):
-                    logger.warning(
-                        "Git revert: commit {} does not match message prefix {!r}",
-                        commit,
-                        message_prefix,
-                    )
-                    return None
-
-                if not typed_commit.parents:
-                    logger.warning("Git revert: cannot revert root commit {}", commit)
-                    return None
-
-                # Use the parent's tree — this undoes the commit's changes
-                parent_obj = cast("Commit", repo[typed_commit.parents[0]])
-                tree = cast("Tree", repo[parent_obj.tree])
-
+                changed = self._changed_paths(repo, commit)
                 restored: list[str] = []
-                for filepath in self._tracked_files:
-                    content = self._read_blob_from_tree(repo, tree, filepath)
-                    if content is not None:
-                        dest = self._workspace / filepath
-                        dest.write_text(content, encoding="utf-8")
-                        restored.append(filepath)
+                skipped: list[str] = []
+                for path in changed:
+                    wt_path = self._workspace / path
+                    try:
+                        current = wt_path.read_bytes() if wt_path.exists() else None
+                    except OSError as exc:
+                        logger.warning("Git undo: cannot read {}: {}", path, exc)
+                        skipped.append(path)
+                        continue
+                    at_commit = self._read_blob_bytes_from_tree(repo, commit.tree, path)
+                    if current != at_commit:
+                        skipped.append(path)
+                        continue
+                    at_parent = self._read_blob_bytes_from_tree(
+                        repo,
+                        cast("Commit", repo[commit.parents[0]]).tree,
+                        path,
+                    )
+                    if at_parent is not None:
+                        self._atomic_write_bytes(wt_path, at_parent)
+                    elif current is not None:
+                        wt_path.unlink()
+                    restored.append(path)
 
             if not restored:
-                return None
+                return UndoResult(restored=[], skipped=skipped, new_sha=None)
 
-            # Commit the restored state
-            msg = f"revert: undo {commit}"
-            return self.auto_commit(msg)
+            new_sha = self.auto_commit(f"undo {full_sha.decode()[:8]}")
+            return UndoResult(restored=restored, skipped=skipped, new_sha=new_sha)
         except Exception as exc:
-            raise GitStoreError(f"Git revert failed for {commit}") from exc
+            raise GitStoreError(f"Git undo failed for {sha}") from exc
+
+    def restore_preview(self, sha: str) -> list[str]:
+        """Tracked paths whose current state differs from their state at *sha*."""
+        if not self.is_initialized():
+            return []
+
+        try:
+            from dulwich.repo import Repo
+
+            with Repo(str(self._workspace)) as repo:
+                resolved = self._resolve_commit(repo, sha)
+                if resolved is None:
+                    return []
+                commit, _full_sha = resolved
+                return [
+                    path
+                    for path, differs in (
+                        self._tracked_path_differs(repo, commit.tree, path)
+                        for path in self._tracked_files
+                    )
+                    if differs
+                ]
+        except Exception as exc:
+            raise GitStoreError(f"Git restore preview failed for {sha}") from exc
+
+    def restore(self, sha: str) -> list[str]:
+        """Set every tracked path to its state at *sha*, then commit.
+
+        Tracked files that did not exist at *sha* are deleted. Returns the
+        paths that changed; Repository and filesystem failures raise
+        :class:`GitStoreError`.
+        """
+        if not self.is_initialized():
+            return []
+
+        try:
+            from dulwich.repo import Repo
+
+            with Repo(str(self._workspace)) as repo:
+                resolved = self._resolve_commit(repo, sha)
+                if resolved is None:
+                    logger.warning("Git restore: SHA not found: {}", sha)
+                    return []
+                commit, full_sha = resolved
+
+                changed: list[str] = []
+                for path in self._tracked_files:
+                    wt_path = self._workspace / path
+                    differs = self._tracked_path_differs(repo, commit.tree, path)[1]
+                    if not differs:
+                        continue
+                    at_sha = self._read_blob_bytes_from_tree(repo, commit.tree, path)
+                    if at_sha is not None:
+                        self._atomic_write_bytes(wt_path, at_sha)
+                    elif wt_path.exists():
+                        wt_path.unlink()
+                    changed.append(path)
+
+            if not changed:
+                return []
+
+            self.auto_commit(f"restore {full_sha.decode()[:8]}")
+            return changed
+        except Exception as exc:
+            raise GitStoreError(f"Git restore failed for {sha}") from exc
+
+    def _tracked_path_differs(self, repo: "Repo", tree_id: bytes, path: str) -> tuple[str, bool]:
+        """Whether the workspace copy of *path* differs from its state at *tree_id*."""
+        wt_path = self._workspace / path
+        try:
+            current = wt_path.read_bytes() if wt_path.exists() else None
+        except OSError as exc:
+            logger.warning("Git restore: cannot read {}: {}", path, exc)
+            return path, True
+        at_sha = self._read_blob_bytes_from_tree(repo, tree_id, path)
+        return path, current != at_sha
 
     @staticmethod
-    def _read_blob_from_tree(
+    def _atomic_write_bytes(path: Path, data: bytes) -> None:
+        """Write *data* to *path* atomically via a temp file in the same dir."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, path)
+        except Exception:
+            with suppress(OSError):
+                os.unlink(tmp)
+            raise
+
+    @staticmethod
+    def _read_blob_bytes_from_tree(
         repo: "Repo",
-        tree: "Tree",
+        tree_id: bytes,
         filepath: str,
-    ) -> str | None:
-        """Read a blob's content from a tree object by walking path parts."""
+    ) -> bytes | None:
+        """Read a blob's raw bytes from the tree *tree_id* by walking path parts."""
         parts = Path(filepath).parts
-        current = tree
+        current = cast("Tree", repo[tree_id])
         for part in parts:
             try:
                 entry = current[part.encode()]
@@ -522,10 +678,22 @@ class GitStore:
                 return None
             obj = repo[entry[1]]
             if obj.type_name == b"blob":
-                blob = cast("Blob", obj)
-                return blob.data.decode("utf-8", errors="replace")
+                return cast("Blob", obj).data
             if obj.type_name == b"tree":
                 current = cast("Tree", obj)
             else:
                 return None
         return None
+
+    @classmethod
+    def _read_blob_from_tree(
+        cls,
+        repo: "Repo",
+        tree: "Tree",
+        filepath: str,
+    ) -> str | None:
+        """Read a blob's content from a tree object by walking path parts."""
+        data = cls._read_blob_bytes_from_tree(repo, tree.id, filepath)
+        if data is None:
+            return None
+        return data.decode("utf-8", errors="replace")
