@@ -1096,6 +1096,35 @@ class GatewayHTTPHandler:
             extra_headers=_NO_STORE_HEADERS,
         )
 
+    async def _handle_memory_items(self, request: WsRequest) -> Response:
+        """``GET /api/memory/items`` -- owner-only "what Ziggy knows about you" (MIT-1880).
+
+        The workspace's own ``USER.md`` and ``memory/MEMORY.md``, rendered as
+        section-grouped items with the stable ``provenance_key`` id
+        ``memory_explain`` already uses, each fact optionally annotated with
+        its ``provenance.jsonl`` source (design section 6). The route takes no
+        parameters: each tester's runtime is its own container and the store
+        is always this runtime's own workspace, so there is nothing to select
+        and no path for a caller-supplied one.
+
+        Auth is the owner API token itself (``tokens.check_api_token``), never
+        the trusted-proxy shortcut in ``check_api_token``: a proxied request
+        with no owner token gets 401 (repo rule for owner routes). Room
+        credentials (``nbrt_``, a distinct audience) are refused the same way
+        -- what Ziggy remembers about the owner is not a room guest's reading
+        matter. Same posture as ``/api/activity/audit`` (MIT-1450).
+        """
+        if not self.tokens.check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        from nanobot.agent.memory import MemoryStore
+        from nanobot.webui.memory_api import list_items, make_session_title_reader
+
+        store = MemoryStore(self.skills_workspace_path)
+        payload = await asyncio.to_thread(
+            list_items, store, title_for=make_session_title_reader(self.session_manager)
+        )
+        return _http_json_response(payload, extra_headers=_NO_STORE_HEADERS)
+
     async def _handle_webui_thread_get_async(self, request: WsRequest, key: str) -> Response:
         diagnostics = _WebUIThreadDiagnostics()
         loop = asyncio.get_running_loop()
@@ -1831,6 +1860,10 @@ class GatewayHTTPHandler:
             if getattr(request, "method", "GET") != "GET":
                 return _http_error(405, "Method Not Allowed")
             return await self._handle_activity_audit(request)
+        if got == "/api/memory/items":
+            if getattr(request, "method", "GET") != "GET":
+                return _http_error(405, "Method Not Allowed")
+            return await self._handle_memory_items(request)
         if got == "/api/commands":
             return self._handle_commands(request)
         if got == "/api/workspaces/pick-folder":
