@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from nanobot.llm_usage.models import LLMCallRecord
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 MAX_DAYS_RETAINED = 400
 MAX_CALLS_RETAINED = 100_000
 
@@ -214,7 +214,8 @@ class LLMUsageStore:
                 ttft_ms INTEGER,
                 timed_requests INTEGER,
                 error_status_code INTEGER,
-                error_kind TEXT
+                error_kind TEXT,
+                turn_id TEXT
             );
             CREATE INDEX IF NOT EXISTS llm_calls_started_at_idx
                 ON llm_calls(started_at_ms);
@@ -222,6 +223,12 @@ class LLMUsageStore:
                 ON llm_calls(provider, model, started_at_ms);
             """
         )
+        # SCHEMA_VERSION 2 (TP-05): files created under v1 lack turn_id; ADD
+        # COLUMN is in-place and instant, and rows written before it read
+        # back NULL ("recorded before turns were tracked").
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(llm_calls)")}
+        if "turn_id" not in columns:
+            connection.execute("ALTER TABLE llm_calls ADD COLUMN turn_id TEXT")
         connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         self._connection = connection
         self._connection_pid = pid
@@ -285,6 +292,7 @@ class LLMUsageStore:
             ),
             _clean_status_code(call.error_status_code),
             _clean_error_kind(call.error_kind),
+            call.turn_id,
         )
         with self._lock:
             connection = self._connect()
@@ -295,9 +303,10 @@ class LLMUsageStore:
                     finish_reason, input_tokens, output_tokens, total_tokens,
                     cache_read_tokens, cache_write_tokens, reported_tokens,
                     estimated_tokens, generation_ms, measured_output_tokens,
-                    ttft_ms, timed_requests, error_status_code, error_kind
+                    ttft_ms, timed_requests, error_status_code, error_kind,
+                    turn_id
                 ) VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )
                 """,
                 values,
