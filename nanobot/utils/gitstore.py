@@ -41,7 +41,7 @@ DEFAULT_TRACKED_PATTERNS: list[str] = [
 ]
 
 # Tracked files over this size are skipped (skill assets are the realistic
-# way; anything this big in the instruction set is an accident).
+# case; anything this big in the instruction set is an accident).
 _MAX_TRACKED_FILE_BYTES = 1024 * 1024
 
 # Commit identity for bare (outside-the-workspace) history commits.
