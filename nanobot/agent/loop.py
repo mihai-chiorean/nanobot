@@ -260,6 +260,9 @@ class TurnContext:
     hook_factories: list[AgentTurnHookFactory] = field(default_factory=list)
     turn_scopes: list[AbstractContextManager[Any]] = field(default_factory=list)
     tools: ToolRegistry | None = None
+    # Ziggy-local (SR-18): per-run cap override (skill-scripted scheduled
+    # turns); None means use the loop's configured ``max_iterations``.
+    max_iterations: int | None = None
 
     turn_wall_started_at: float = field(default_factory=time.time)
     visible_run_started_at: float | None = None
@@ -1670,8 +1673,12 @@ class AgentLoop:
         publish_file_turn: PublishFileTurn | None = None,
         initial_messages: list[dict[str, Any]] | None = None,
         injected_messages_sink: list[InboundMessage] | None = None,
+        max_iterations: int | None = None,
     ) -> AgentRunResult:
         """Run the agent iteration loop.
+
+        *max_iterations* overrides the loop-wide cap for this run only
+        (SR-18 skill-scripted scheduled turns); ``None`` keeps the default.
 
         *events*: scoped operation and output events.
         *streaming*: request incremental output from the runner.
@@ -2025,7 +2032,9 @@ class AgentLoop:
                 runtime=turn_runtime,
                 reasoning_profile=turn_reasoning_profile,
                 allow_reasoning_escalation=turn_allow_escalation,
-                max_iterations=self.max_iterations,
+                max_iterations=(
+                    self.max_iterations if max_iterations is None else max_iterations
+                ),
                 max_tool_result_chars=self.max_tool_result_chars,
                 transcript_input=None if initial_messages is not None else transcript_input,
                 transcript_builder=transcript_builder,
@@ -2672,6 +2681,7 @@ class AgentLoop:
         on_runtime_admitted: Callable[[LLMRuntime], Awaitable[None]] | None = None,
         attributes: Mapping[str, Any] | None = None,
         injected_messages: list[InboundMessage] | None = None,
+        max_iterations: int | None = None,
     ) -> OutboundMessage | None:
         """Process a single inbound message and return the response."""
         kind = TurnKind.USER if msg.is_user_input else TurnKind.SYSTEM
@@ -2724,6 +2734,7 @@ class AgentLoop:
             hook_factories=list(hook_factories or []),
             tools=tools,
             attributes=dict(attributes or {}),
+            max_iterations=max_iterations,
         )
         # A streaming callback may be present even when the final text comes from a
         # non-streaming recovery. Only the last completed segment can suppress the
@@ -3135,6 +3146,7 @@ class AgentLoop:
                 events=ctx.events,
                 publish_file_turn=ctx.publish_file_turn,
                 injected_messages_sink=ctx.injected_messages,
+                max_iterations=ctx.max_iterations,
             )
         ctx.final_content = result.final_content
         ctx.all_messages = result.messages
@@ -3513,6 +3525,7 @@ class AgentLoop:
         on_runtime_admitted: Callable[[LLMRuntime], Awaitable[None]] | None = None,
         attributes: Mapping[str, Any] | None = None,
         metadata: Mapping[str, Any] | None = None,
+        max_iterations: int | None = None,
     ) -> OutboundMessage | None:
         """Process an external message directly and return the outbound payload."""
         if channel == "system":
@@ -3552,6 +3565,8 @@ class AgentLoop:
                     kwargs["on_runtime_admitted"] = on_runtime_admitted
                 if attributes is not None:
                     kwargs["attributes"] = dict(attributes)
+                if max_iterations is not None:
+                    kwargs["max_iterations"] = max_iterations
                 return await self._process_message(
                     msg,
                     **kwargs,
