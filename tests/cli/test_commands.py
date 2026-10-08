@@ -117,6 +117,11 @@ class _GatewayAgentContractStub:
         # running by the previous process, before any channel accepts input.
         return 0
 
+    async def send_interrupted_finish_notices(self) -> int:
+        # Ziggy-local (MIT-1857): after the MCP connect, gateway startup pushes
+        # the work.finished notices the sweep parked for the connectors bearer.
+        return 0
+
 
 class _EmptyGatewaySessionManager:
     """Minimal session-manager contract for gateway assembly tests."""
