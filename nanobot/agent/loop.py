@@ -13,7 +13,7 @@ import weakref
 from collections.abc import Coroutine, Iterable, Mapping
 from contextlib import AbstractContextManager, ExitStack, nullcontext, suppress
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum, auto
 from functools import partial
 from pathlib import Path
@@ -65,6 +65,7 @@ from nanobot.agent.tools.publish_file import (
     bind_publish_file_turn,
     reset_publish_file_turn,
 )
+from nanobot.agent.skills import skill_file_sha
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.runtime_control import AgentRuntimeControl
 
@@ -76,7 +77,15 @@ from nanobot.agent.turn_delivery import (
 )
 from nanobot.agent.turn_delivery import TurnRoute as TurnRoute
 from nanobot.agent.turn_hooks import AgentTurnHookSpec, build_agent_turn_hook
-from nanobot.agent.turn_provenance import TurnProvenance, account_intent
+from nanobot.agent.turn_provenance import (
+    TurnProvenance,
+    account_intent,
+    bind_turn_provenance,
+    current_turn_provenance,
+    release_id,
+    reset_turn_provenance,
+    save_to_session,
+)
 from nanobot.bus.events import INBOUND_META_USER_SHELL, InboundMessage, OutboundMessage
 from nanobot.bus.outbound_events import (
     ProgressEvent,
@@ -1391,6 +1400,74 @@ class AgentLoop:
             ),
         )
 
+    def _build_transcript_for_turn(
+        self,
+        transcript: TranscriptInput,
+        *,
+        channel: str | None = None,
+        workspace: Path | None = None,
+        include_memory: bool = True,
+    ) -> list[dict[str, Any]]:
+        """Runner transcript builder that also records the prompt fingerprint.
+
+        Same output as ``ContextBuilder.build_transcript``; used as the
+        turn's ``transcript_builder`` so every build (first and rebuilds after
+        compaction) notes its fingerprint on the turn's provenance record
+        (TP-06).
+        """
+        fingerprint: list[dict[str, Any]] = []
+        messages = self.context.build_transcript(
+            transcript,
+            channel=channel,
+            workspace=workspace,
+            include_memory=include_memory,
+            fingerprint_out=fingerprint,
+        )
+        self._note_turn_prompt(
+            fingerprint,
+            shared_room=transcript.shared_room,
+            skill_reference_text=transcript.current_message,
+        )
+        return messages
+
+    def _note_turn_prompt(
+        self,
+        sections: list[dict[str, Any]],
+        *,
+        shared_room: bool,
+        skill_reference_text: str | None,
+    ) -> None:
+        """Attach one system-prompt build to the turn's provenance record (TP-06).
+
+        The first build records the fingerprint; a later rebuild with a
+        different list sets ``prompt_rebuilt`` and the last one is kept. The
+        skills bookkeeping mirrors what the prompt actually carried: listed =
+        the summary it showed, loaded = always-on plus ``$name`` invocations.
+        A shared-room prompt carries neither.
+        """
+        provenance = current_turn_provenance()
+        if provenance is None:
+            return
+        provenance.note_prompt(sections)
+        if shared_room:
+            return
+        skills = self.context.skills
+        always_skills = skills.get_always_skills()
+        _summary, listed_sha = skills.build_skills_summary_with_sha(
+            exclude=set(always_skills),
+        )
+        provenance.skills_listed_sha = listed_sha
+        paths = {
+            entry["name"]: entry["path"]
+            for entry in skills.list_skills(filter_unavailable=False)
+        }
+        for name in always_skills + skills.get_explicitly_invoked_skills(
+            skill_reference_text or ""
+        ):
+            path = paths.get(name)
+            if path is not None:
+                provenance.note_skill(name, skill_file_sha(path))
+
     def _request_context_for_turn(self, ctx: TurnContext) -> RequestContext:
         assert ctx.session is not None
         scope = self.workspace_scopes.for_turn(
@@ -2005,7 +2082,7 @@ class AgentLoop:
             session_metadata=session.metadata if session is not None else None,
         )
         transcript_builder = partial(
-            self.context.build_transcript,
+            self._build_transcript_for_turn,
             channel=request_ctx.channel,
             workspace=effective_scope.project_path,
             include_memory=session.policy.persist if session is not None else True,
@@ -2050,6 +2127,13 @@ class AgentLoop:
                 initial_messages,
             )
         )
+        # TP-02: stamp what actually runs this turn onto the record. The
+        # derived (profile-resolved) runtime, not the admitted one.
+        turn_provenance = current_turn_provenance()
+        if turn_provenance is not None:
+            turn_provenance.model = turn_runtime.model
+            turn_provenance.model_preset = turn_runtime.model_preset
+            turn_provenance.reasoning_profile = turn_reasoning_profile
         # The admission gateway caps background concurrency by the
         # ``X-Ziggy-Scheduling-Class`` header, which the provider reads from
         # this contextvar. Bound per turn inside the turn's own task (so a
@@ -2817,9 +2901,29 @@ class AgentLoop:
         # record itself rides the runtime event publisher, which lifts the
         # ``used``/``other_steps`` fields at ``turn_completed`` — the same
         # per-session lifecycle as turn usage.
+        #
+        # TP-02 (MIT-1853) identity fields join the same record: the wire
+        # turn id wins over the minted one so the record matches what the
+        # client sees, and SAVE persists it under ``provenance_v1``; a
+        # command turn that short-circuits never reaches SAVE and is not
+        # recorded, which is intended (it produced no answer).
+        wire_turn_id = msg.metadata.get(WEBUI_TURN_METADATA_KEY)
         provenance = TurnProvenance(
-            account_intent=account_intent(ctx.original_user_text or "")
+            turn_id=(
+                wire_turn_id
+                if isinstance(wire_turn_id, str) and wire_turn_id
+                else ctx.turn_id
+            ),
+            started_at=datetime.now(timezone.utc).isoformat(),
+            source=(
+                "work"
+                if work_task_id(msg.metadata)
+                else source_from_request(key, channel=msg.channel, metadata=msg.metadata)
+            ),
+            release=release_id(),
+            account_intent=account_intent(ctx.original_user_text or ""),
         )
+        provenance_token = bind_turn_provenance(provenance)
         ctx.hooks.append(
             _TurnProvenanceHook(provenance, tools if tools is not None else self.tools)
         )
@@ -2843,24 +2947,27 @@ class AgentLoop:
 
             ctx.events = EventSink(track_output, ctx.events.accepts)
 
-        await self._run_turn_stage(ctx, "restore", self._restore_turn)
-        await self._run_turn_stage(ctx, "compact", self._compact_session)
-        if await self._run_turn_stage(ctx, "command", self._dispatch_command):
-            # Ziggy-local (MIT-1010): a command short-circuits every later
-            # stage, including the one that closes the Work task out. Cancel
-            # is the expected case -- work.cancel publishes "/stop", and
-            # cancel_task has already written the terminal row, so this is a
-            # no-op there and a real close-out for anything else.
+        try:
+            await self._run_turn_stage(ctx, "restore", self._restore_turn)
+            await self._run_turn_stage(ctx, "compact", self._compact_session)
+            if await self._run_turn_stage(ctx, "command", self._dispatch_command):
+                # Ziggy-local (MIT-1010): a command short-circuits every later
+                # stage, including the one that closes the Work task out. Cancel
+                # is the expected case -- work.cancel publishes "/stop", and
+                # cancel_task has already written the terminal row, so this is a
+                # no-op there and a real close-out for anything else.
+                await self._run_turn_stage(ctx, "work", self._record_work_outcome)
+                return ctx.outbound
+            await self._run_turn_stage(ctx, "build", self._build_turn)
+            await self._run_turn_stage(ctx, "run", self._run_turn)
+            await self._run_turn_stage(ctx, "save", self._persist_turn)
+            await self._run_turn_stage(ctx, "respond", self._prepare_outbound)
+            # Ziggy-local (MIT-1010): runs after RESPOND so the artifact refs can be
+            # stamped on the outbound the Work app is about to receive.
             await self._run_turn_stage(ctx, "work", self._record_work_outcome)
             return ctx.outbound
-        await self._run_turn_stage(ctx, "build", self._build_turn)
-        await self._run_turn_stage(ctx, "run", self._run_turn)
-        await self._run_turn_stage(ctx, "save", self._persist_turn)
-        await self._run_turn_stage(ctx, "respond", self._prepare_outbound)
-        # Ziggy-local (MIT-1010): runs after RESPOND so the artifact refs can be
-        # stamped on the outbound the Work app is about to receive.
-        await self._run_turn_stage(ctx, "work", self._record_work_outcome)
-        return ctx.outbound
+        finally:
+            reset_turn_provenance(provenance_token)
 
     async def _run_turn_stage(
         self,
@@ -3176,13 +3283,22 @@ class AgentLoop:
             self.sessions.save(session)
         if ctx.ask_user_resume_id is not None:
             assert ctx.request_context is not None
+            system_prompt, prompt_sections = self.context.build_system_prompt_with_fingerprint(
+                channel=ctx.request_context.channel,
+                session_summary=ctx.pending_summary,
+                workspace=ctx.request_context.workspace,
+                include_memory=session.policy.persist,
+            )
+            # TP-06: this is the turn's only prompt build on the resume path
+            # (the runner gets initial_messages, not the builder), so the
+            # fingerprint is noted here rather than in the builder.
+            self._note_turn_prompt(
+                prompt_sections,
+                shared_room=False,
+                skill_reference_text=ctx.msg.content,
+            )
             ctx.initial_messages = ask_user_tool_result_messages(
-                self.context.build_system_prompt(
-                    channel=ctx.request_context.channel,
-                    session_summary=ctx.pending_summary,
-                    workspace=ctx.request_context.workspace,
-                    include_memory=session.policy.persist,
-                ),
+                system_prompt,
                 ctx.history,
                 ctx.ask_user_resume_id,
                 ctx.msg.content,
@@ -3259,6 +3375,15 @@ class AgentLoop:
         session = ctx.require_session()
         turn_continuation.prepare_save_boundary(ctx)
 
+        # TP-02: answered is about the model's own final text, so it is read
+        # before the empty-response placeholder below turns a blank answer
+        # into non-empty stored content.
+        turn_provenance = current_turn_provenance()
+        if turn_provenance is not None:
+            turn_provenance.answered = (
+                isinstance(ctx.final_content, str) and bool(ctx.final_content.strip())
+            )
+
         if (
             ctx.kind is TurnKind.USER
             and (ctx.final_content is None or not ctx.final_content.strip())
@@ -3291,6 +3416,10 @@ class AgentLoop:
         turn_record = self.runtime_event_publisher.current_turn_provenance(
             ctx.session_key
         )
+        if turn_provenance is not None and not ctx.ephemeral:
+            # TP-02: rides the session save below; newest ``cap`` turns only,
+            # like activity_v1.
+            save_to_session(session, turn_provenance)
         persisted = self._save_turn(
             session, ctx.all_messages, ctx.save_skip,
             turn_latency_ms=ctx.turn_latency_ms,
