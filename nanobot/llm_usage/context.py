@@ -14,6 +14,15 @@ _CURRENT_SOURCE: ContextVar[LLMUsageSource] = ContextVar(
     default="system",
 )
 
+# TP-05: the effective turn id of the running agent turn, bound by the runner
+# next to ``source`` so ``LLMProvider._observe_llm_call`` can key its row on
+# the same id the provenance record and the wire frames use. ``None`` for
+# provider calls made outside an agent turn.
+_CURRENT_TURN_ID: ContextVar[str | None] = ContextVar(
+    "nanobot_llm_usage_turn_id",
+    default=None,
+)
+
 
 def source_from_session_key(session_key: str | None) -> LLMUsageSource:
     """Classify a private session key without persisting that key."""
@@ -58,6 +67,18 @@ def bind_llm_usage_source(source: LLMUsageSource) -> Token[LLMUsageSource]:
 
 def reset_llm_usage_source(token: Token[LLMUsageSource]) -> None:
     _CURRENT_SOURCE.reset(token)
+
+
+def current_llm_usage_turn_id() -> str | None:
+    return _CURRENT_TURN_ID.get()
+
+
+def bind_llm_usage_turn_id(turn_id: str | None) -> Token[str | None]:
+    return _CURRENT_TURN_ID.set(turn_id)
+
+
+def reset_llm_usage_turn_id(token: Token[str | None]) -> None:
+    _CURRENT_TURN_ID.reset(token)
 
 
 @contextmanager
