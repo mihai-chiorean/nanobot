@@ -419,6 +419,21 @@ def _lazy_default(module_path: str, class_name: str) -> Any:
     return getattr(module, class_name)()
 
 
+class SkillsConfig(Base):
+    """Agent-skill policy (Ziggy-local, MIT-1852).
+
+    ``allow_install`` gates the WebUI marketplace install route independently of
+    ``tools.webuiAllowRemotePackageInstall`` and the "is this request local?"
+    bypass it sits behind: inside a tester container the proxied request's source
+    address is not a trustworthy signal, and the SkillHub provider installs over
+    plain HTTP with no ``npx``. Owner provisioning (MIT-1865) turns this off per
+    tenant. Owned field for SM-04 (MIT-1850); default preserves existing
+    behaviour so single-user installs keep working.
+    """
+
+    allow_install: bool = True  # allow public agent-skill installs from the WebUI
+
+
 class ToolsConfig(Base):
     """Tools configuration.
 
@@ -426,6 +441,8 @@ class ToolsConfig(Base):
     at the bottom of this file so tool config classes can stay next to their
     tool implementations.
     """
+
+    skills: SkillsConfig = Field(default_factory=SkillsConfig)
 
     web: WebToolsConfig = Field(default_factory=lambda: _lazy_default("nanobot.agent.tools.web", "WebToolsConfig"))
     exec: ExecToolConfig = Field(default_factory=lambda: _lazy_default("nanobot.agent.tools.shell", "ExecToolConfig"))

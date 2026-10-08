@@ -1939,6 +1939,7 @@ class GatewayHTTPHandler:
             webui_skills_payload(
                 self.skills_workspace_path,
                 disabled_skills=self.disabled_skills,
+                install_supported=self._skills_install_enabled(),
             )
         )
 
@@ -1948,11 +1949,15 @@ class GatewayHTTPHandler:
         params = _parse_query(request.path)
         query = _query_first(params, "q") or ""
         provider = _query_first(params, "provider") or "all"
+        install_kwargs = (
+            {} if self._skills_install_enabled() else {"install_supported": False}
+        )
         try:
             payload = await search_marketplace_skills(
                 query,
                 self.skills_workspace_path,
                 provider=provider,
+                **install_kwargs,
             )
         except SkillsMarketplaceError as exc:
             return _http_error(exc.status, exc.message)
@@ -1965,10 +1970,14 @@ class GatewayHTTPHandler:
         if not self.check_api_token(request):
             return _http_error(401, "Unauthorized")
         provider = _query_first(_parse_query(request.path), "provider") or "all"
+        install_kwargs = (
+            {} if self._skills_install_enabled() else {"install_supported": False}
+        )
         try:
             payload = await trending_marketplace_skills(
                 self.skills_workspace_path,
                 provider=provider,
+                **install_kwargs,
             )
         except SkillsMarketplaceError as exc:
             return _http_error(exc.status, exc.message)
@@ -1995,8 +2004,15 @@ class GatewayHTTPHandler:
     ) -> Response:
         if not self.check_api_token(request):
             return _http_error(401, "Unauthorized")
+        # Workspace-level install kill switch, checked before the local-request
+        # bypass below: inside a tester container the proxied source address is
+        # not a trustworthy signal and SkillHub installs over plain HTTP (no
+        # ``npx``), so "local" must not imply "may install public skills".
+        if not self._skills_install_enabled():
+            return _http_error(403, "skill installation is disabled for this workspace")
         if not self._allow_webui_package_install(connection, request):
             return _http_error(403, "remote skill installation is disabled")
+
         if self._skill_install_lock.locked():
             return _http_error(409, "another skill installation is already in progress")
 
@@ -2023,6 +2039,7 @@ class GatewayHTTPHandler:
             **webui_skills_payload(
                 self.skills_workspace_path,
                 disabled_skills=self.disabled_skills,
+                install_supported=True,
             ),
             "last_action": action,
         })
@@ -2037,6 +2054,20 @@ class GatewayHTTPHandler:
         except Exception:
             self._log.exception("failed to load remote package install policy")
             return False
+
+    def _skills_install_enabled(self) -> bool:
+        """Workspace kill switch for public agent-skill installs (MIT-1852).
+
+        Reads ``tools.skills.allow_install``. An unreadable config falls back to
+        the default (enabled) so a transient load failure never silently blocks
+        the single-user install path; the remote/local policy in
+        :meth:`_allow_webui_package_install` still applies after this gate.
+        """
+        try:
+            return bool(self.settings.config.load().tools.skills.allow_install)
+        except Exception:
+            self._log.exception("failed to load skill install policy")
+            return True
 
     def _handle_webui_skill_update(self, request: WsRequest) -> Response:
         if not self.check_api_token(request):
@@ -2063,6 +2094,7 @@ class GatewayHTTPHandler:
             **webui_skills_payload(
                 self.skills_workspace_path,
                 disabled_skills=self.disabled_skills,
+                install_supported=self._skills_install_enabled(),
             ),
             "last_action": action,
         })
@@ -2093,6 +2125,7 @@ class GatewayHTTPHandler:
             **webui_skills_payload(
                 self.skills_workspace_path,
                 disabled_skills=self.disabled_skills,
+                install_supported=self._skills_install_enabled(),
             ),
             "last_action": action,
         })
