@@ -252,8 +252,31 @@ class TestDreamTools:
         assert "**Name**: Ada" in store.user_file.read_text(encoding="utf-8")
 
     @pytest.mark.asyncio
-    async def test_dream_can_write_workspace_skills(self, store):
+    async def test_dream_can_write_workspace_skills_as_drafts(self, store):
         tools = store.build_dream_tools()
+        live = store.workspace / "skills" / "demo" / "SKILL.md"
+        draft = store.workspace / "skills" / "_proposed" / "demo" / "SKILL.md"
+        content = "---\nname: demo\ndescription: Demo skill.\n---\n\nUse when needed.\n"
+
+        refused = await tools.execute(
+            "write_file",
+            {"path": "skills/demo/SKILL.md", "content": content},
+        )
+        result = await tools.execute(
+            "write_file",
+            {"path": "skills/_proposed/demo/SKILL.md", "content": content},
+        )
+
+        assert "Skills you write are drafts" in refused
+        assert "skills/_proposed/demo/SKILL.md" in refused
+        assert "/skill accept demo" in refused
+        assert not live.exists()
+        assert "Successfully wrote" in result
+        assert draft.read_text(encoding="utf-8").startswith("---\nname: demo")
+
+    @pytest.mark.asyncio
+    async def test_dream_skill_drafts_can_be_disabled(self, store):
+        tools = store.build_dream_tools(skills_drafts=False)
         target = store.workspace / "skills" / "demo" / "SKILL.md"
 
         result = await tools.execute(
@@ -274,7 +297,7 @@ class TestDreamTools:
         outside = store.workspace.parent / f"{store.workspace.name}-outside"
         outside.mkdir()
         outside_target = outside / "escape.txt"
-        skill_target = store.workspace / "skills" / "scoped" / "SKILL.md"
+        skill_target = store.workspace / "skills" / "_proposed" / "scoped" / "SKILL.md"
 
         token = bind_workspace_scope(scope)
         try:
@@ -287,7 +310,7 @@ class TestDreamTools:
                 {
                     "edits": [
                         {
-                            "path": "skills/scoped/SKILL.md",
+                            "path": "skills/_proposed/scoped/SKILL.md",
                             "action": "add",
                             "new_text": "---\nname: scoped\n---\n",
                         }

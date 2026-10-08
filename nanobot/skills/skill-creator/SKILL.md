@@ -268,7 +268,7 @@ Skip this step only if the skill being developed already exists, and iteration o
 
 When creating a new skill from scratch, always run the `init_skill.py` script. The script conveniently generates a new template skill directory that automatically includes everything a skill requires, making the skill creation process much more efficient and reliable.
 
-For `nanobot`, custom skills should live under the active workspace `skills/` directory so they can be discovered automatically at runtime (for example, `<workspace>/skills/my-skill/SKILL.md`).
+For `nanobot`, skills the agent writes are **drafts**: new skills go under the active workspace's draft overlay `<workspace>/skills/_proposed/<name>/` (for example, `<workspace>/skills/_proposed/my-skill/SKILL.md`). The loader ignores `_proposed`; a draft goes live only when the user accepts it in chat with `/skill accept <name>`. Never write into a live `<workspace>/skills/<name>/` directory — the file tools refuse it and point you back at `_proposed`.
 
 Usage:
 
@@ -279,9 +279,9 @@ scripts/init_skill.py <skill-name> --path <output-directory> [--resources script
 Examples:
 
 ```bash
-scripts/init_skill.py my-skill --path ./workspace/skills
-scripts/init_skill.py my-skill --path ./workspace/skills --resources scripts,references
-scripts/init_skill.py my-skill --path ./workspace/skills --resources scripts --examples
+scripts/init_skill.py my-skill --path ./workspace/skills/_proposed
+scripts/init_skill.py my-skill --path ./workspace/skills/_proposed --resources scripts,references
+scripts/init_skill.py my-skill --path ./workspace/skills/_proposed --resources scripts --examples
 ```
 
 The script:
@@ -294,6 +294,8 @@ The script:
 After initialization, customize the SKILL.md and add resources as needed. If you used `--examples`, replace or delete placeholder files.
 
 ### Step 4: Edit the Skill
+
+Edits to an existing skill are also drafts: write only the changed files to `skills/_proposed/<name>/` at the same relative paths as in the live skill (to change `skills/my-skill/SKILL.md`, write `skills/_proposed/my-skill/SKILL.md`). The draft is an overlay — unchanged files stay as they are in the live skill — and `/skill accept <name>` applies it. Never edit the live skill directory in place.
 
 When editing the (newly-generated or existing) skill, remember that the skill is being created for another instance of the agent to use. Include information that would be beneficial and non-obvious to the agent. Consider what procedural knowledge, domain-specific details, or reusable assets would help another agent instance execute these tasks more effectively.
 
@@ -328,7 +330,14 @@ Write the YAML frontmatter with `name` and `description`:
   - Include all "when to use" information here - Not in the body. The body is only loaded after triggering, so "When to Use This Skill" sections in the body are not helpful to the agent.
   - Example description for a `docx` skill: "Comprehensive document creation, editing, and analysis with support for tracked changes, comments, formatting preservation, and text extraction. Use when the agent needs to work with professional documents (.docx files) for: (1) Creating new documents, (2) Modifying or editing content, (3) Working with tracked changes, (4) Adding comments, or any other document tasks"
 
-Keep frontmatter minimal. In `nanobot`, `metadata` and `always` are also supported when needed, but avoid adding extra fields unless they are actually required.
+Every drafted skill's frontmatter must include a `smoke-prompt`: one realistic user request that should trigger the skill. It is run read-only to validate the draft before the user accepts it:
+
+```yaml
+metadata:
+  smoke-prompt: "<one request that should trigger this skill>"
+```
+
+Otherwise keep frontmatter minimal. In `nanobot`, `metadata` and `always` are also supported when needed, but avoid adding extra fields unless they are actually required.
 
 ##### Body
 
