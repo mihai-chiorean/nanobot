@@ -1,20 +1,27 @@
-"""Per-turn source-family accounting for the "Used: ..." line (TP-09).
+"""The per-turn provenance record (TP-02; source families from TP-09).
 
-Design: ``docs/design/turn-provenance.md`` sections 7 and 8. The server
-decides the families and labels so both apps show the same names under each
-answer. Families come from the **tool object**, not from parsing wire names:
-``mcp_ziggy_gmail_browser_open`` cannot be split correctly by name because
-the server key ``ziggy_gmail`` itself contains ``gmail``. MCP wrappers keep
-``_server_name`` and ``_original_name`` (``agent/tools/mcp.py``), so the map
-below matches on the original MCP tool name; built-ins are matched by name.
+Design: ``docs/design/turn-provenance.md`` sections 1, 2 and 7. One record is
+built at turn start, filled as the turn runs (per call by TP-05, prompt by
+TP-06, repairs by TP-07, ``used`` by TP-09) and saved to the session at turn
+end as ``session.metadata["provenance_v1"]``, capped to the newest 100 turns
+— the pattern ``utils/activity_history.py`` sets for ``activity_v1``.
+
+The server decides the families and labels so both apps show the same names
+under each answer. Families come from the **tool object**, not from parsing
+wire names: ``mcp_ziggy_gmail_browser_open`` cannot be split correctly by
+name because the server key ``ziggy_gmail`` itself contains ``gmail``. MCP
+wrappers keep ``_server_name`` and ``_original_name``
+(``agent/tools/mcp.py``), so the map below matches on the original MCP tool
+name; built-ins are matched by name.
 
 Only family names, counts and the single ``account_intent`` boolean are ever
-recorded here — never arguments, queries or results.
+recorded from tool use — never arguments, queries, results or message text.
 """
 
 from __future__ import annotations
 
 import re
+from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -98,18 +105,77 @@ def family_for(tool: Any) -> tuple[str, str, bool] | None:
     return None
 
 
+# Session-metadata key holding the bounded list of turn records, mirroring
+# ``utils/activity_history.py``'s ``activity_v1``.
+PROVENANCE_KEY = "provenance_v1"
+
+# Field order of the stored entry (design section 7). ``None`` values are
+# omitted by ``to_dict``; ``False``/0/[]/{} are kept so consumers can
+# distinguish "decided false" from "not recorded".
+_TO_DICT_FIELDS: tuple[str, ...] = (
+    "turn_id",
+    "started_at",
+    "source",
+    "answered",
+    "release",
+    "model",
+    "model_preset",
+    "reasoning_profile",
+    "account_intent",
+    "prompt",
+    "prompt_rebuilt",
+    "skills_listed_sha",
+    "skills_loaded",
+    "calls",
+    "args_repaired",
+    "used",
+    "other_steps",
+)
+
+
 @dataclass
 class TurnProvenance:
-    """The TP-09 slice of the turn's provenance record.
+    """What produced one turn, as stored in ``provenance_v1``.
 
-    TP-02 owns the full record (turn id, release, prompt fingerprint,
-    per-call entries); this carries only the fields the ``turn_end`` frame
-    and the over-calling metric need, and later TP issues extend it.
+    Built at turn start (turn id, started time, source, release,
+    ``account_intent``) and filled as the turn runs: model, preset and
+    reasoning profile from the turn runtime decision; per-call entries by
+    TP-05; prompt fingerprint by TP-06; argument-repair counters by TP-07
+    (via the ``CURRENT_TURN_PROVENANCE`` contextvar); ``used``/``other_steps``
+    by TP-09. ``answered`` is set by the save stage from the final content.
     """
 
+    turn_id: str | None = None
+    started_at: str | None = None
+    source: str | None = None
+    answered: bool = False
+    release: str | None = None
+    model: str | None = None
+    model_preset: str | None = None
+    reasoning_profile: str | None = None
     account_intent: bool = False
+    prompt: list[dict[str, Any]] = field(default_factory=list)
+    prompt_rebuilt: bool = False
+    skills_listed_sha: str | None = None
+    skills_loaded: list[dict[str, Any]] = field(default_factory=list)
+    calls: list[dict[str, Any]] = field(default_factory=list)
+    args_repaired: dict[str, int] = field(default_factory=dict)
     used: list[dict[str, Any]] = field(default_factory=list)
     other_steps: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        """The stored entry: every field plus the schema tag ``v``, sans ``None``."""
+        entry: dict[str, Any] = {"v": 1}
+        for name in _TO_DICT_FIELDS:
+            value = getattr(self, name)
+            if value is None:
+                continue
+            if isinstance(value, list):
+                value = list(value)
+            elif isinstance(value, dict):
+                value = dict(value)
+            entry[name] = value
+        return entry
 
     def note_tool_result(self, tool: Any, status: str) -> None:
         """Record one executed tool call.
@@ -140,3 +206,42 @@ class TurnProvenance:
                 "errors": 1 if status == "error" else 0,
             }
         )
+
+
+CURRENT_TURN_PROVENANCE: ContextVar[TurnProvenance | None] = ContextVar(
+    "nanobot_turn_provenance",
+    default=None,
+)
+
+
+def current_turn_provenance() -> TurnProvenance | None:
+    """The record for the turn running on this task, or ``None``.
+
+    The turn's tools and per-call observers fill the record through this
+    getter (``agent/tools/execution.py`` counts argument repairs that way),
+    so a call site never needs the session key.
+    """
+    return CURRENT_TURN_PROVENANCE.get()
+
+
+def bind_turn_provenance(record: TurnProvenance) -> Token[TurnProvenance | None]:
+    return CURRENT_TURN_PROVENANCE.set(record)
+
+
+def reset_turn_provenance(token: Token[TurnProvenance | None]) -> None:
+    CURRENT_TURN_PROVENANCE.reset(token)
+
+
+def save_to_session(session: Any, record: TurnProvenance, cap: int = 100) -> None:
+    """Append one turn record to ``session.metadata`` under ``provenance_v1``.
+
+    Keeps only the newest ``cap`` entries, bounded the same way
+    ``utils/activity_history.py`` bounds ``activity_v1``.
+    """
+    entry = record.to_dict()
+    stored: Any = session.metadata.setdefault(PROVENANCE_KEY, [])
+    if not isinstance(stored, list):
+        stored = []
+        session.metadata[PROVENANCE_KEY] = stored
+    stored.append(entry)
+    session.metadata[PROVENANCE_KEY] = stored[-cap:]
