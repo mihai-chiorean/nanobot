@@ -1,10 +1,14 @@
-"""Hand-off of long private websocket chat turns to Work (MIT-1855).
+"""Hand-off of long private websocket chat turns to Work (MIT-1855, MIT-1860).
 
 Design doc ``docs/design/onboarding-and-approval-tuning.md`` §4 (product
 repo): when a private websocket chat turn has run for
 ``agents.defaults.backgroundHandoffSeconds`` (default 45 s) and is about to
 execute another tool batch, the rest of the work moves to a Work task and the
-chat is freed.
+chat is freed. OA-13 adds a second trigger with no time threshold: an
+iteration whose browser tool result is a sign-in the tester must fix outside
+chat (:func:`signin_needs_tester`) hands off at once, from
+``after_iteration``, so it fires even when the model would otherwise answer
+in text.
 
 Three constraints shape the mechanism:
 
@@ -18,18 +22,20 @@ Three constraints shape the mechanism:
   re-run would create a second approval. A turn whose executed tool names
   contain any write tool -- or whose tool results carry an
   ``approval_required`` status -- never hands off.
-* The transcript must stay valid. The raise fires in ``before_execute_tools``,
+* The transcript must stay valid. The time raise fires in ``before_execute_tools``,
   so the pending batch never runs; the loop keeps history only up to the last
   completed tool result and drops the assistant message whose tool calls never
-  executed.
+  executed. The sign-in raise fires in ``after_iteration``, after that batch's
+  results are already complete, so the kept history includes them.
 """
 
 from __future__ import annotations
 
 import json
 import re
+from collections.abc import Iterable
 from time import monotonic
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from nanobot.agent.hook import AgentHook, AgentHookContext
 
@@ -91,6 +97,92 @@ def result_requests_approval(result: Any) -> bool:
     return isinstance(parsed, dict) and parsed.get("status") == "approval_required"
 
 
+# The sign-in states that leave nothing outstanding and need the tester
+# outside chat (design doc §4 "Sign-ins"). ``needs_credential`` is D4's login
+# outcome/reason wording; ``no_credential`` is the contract code D5 puts in
+# the tool result for that same state (connectors' ``LoginHalt``), so
+# matching only D4's word would never fire on a real result.
+_SIGNIN_NEEDS_TESTER: frozenset[str] = frozenset(
+    {"needs_credential", "no_credential", "session_expired"}
+)
+
+# MIT-1349's in-call code wait ends the chat-origin call when nobody relays a
+# code; the sign-in then comes back as a stopped result carrying this code
+# (connectors maps "code/approval not answered in time" to
+# ``interrupt_required``; the issue's wording reports the same wait failure
+# as ``blocked``). Either stop value paired with it means the wait ended
+# without a code and the tester is needed.
+_CODE_WAIT_STOP_CODES: frozenset[str] = frozenset({"interrupt_required"})
+_WAIT_ENDED_STOPS: frozenset[str] = frozenset({"blocked", "needs_user"})
+
+# Fields a browser result carries the login outcome/reason in: the envelope's
+# ``outcome``, ``status`` and ``reason`` (connectors repeats D4's LoginResult
+# status verbatim) and the failure envelope's ``error.code``/``error.reason``.
+_LOGIN_OUTCOME_KEYS: tuple[str, ...] = ("outcome", "status", "reason")
+_LOGIN_ERROR_KEYS: tuple[str, ...] = ("code", "reason")
+
+
+def _login_tokens(result: Any) -> set[str]:
+    """Login outcome/reason tokens of one tool result's JSON envelope.
+
+    Parses like ``_envelope_forbids_retry`` in ``tools/execution.py``: a JSON
+    dict with an optional dict ``error``. Plain-text or non-dict results
+    carry no tokens and never match.
+    """
+    text = result if isinstance(result, str) else str(result or "")
+    try:
+        parsed: object = json.loads(text)
+    except (ValueError, TypeError):
+        return set()
+    if not isinstance(parsed, dict):
+        return set()
+    payload = cast("dict[str, Any]", parsed)
+    tokens: set[str] = set()
+    for key in _LOGIN_OUTCOME_KEYS:
+        value = payload.get(key)
+        if isinstance(value, str):
+            tokens.add(value)
+    error = payload.get("error")
+    if isinstance(error, dict):
+        details = cast("dict[str, Any]", error)
+        for key in _LOGIN_ERROR_KEYS:
+            value = details.get(key)
+            if isinstance(value, str):
+                tokens.add(value)
+    return tokens
+
+
+def signin_needs_tester(tool_results: Iterable[Any]) -> bool:
+    """Whether an iteration's tool results are a sign-in the tester must fix.
+
+    True only for results that leave nothing outstanding and need the tester
+    outside chat (design doc §4): a login outcome/reason of
+    ``needs_credential``/``session_expired`` (or the wire code D5 emits for
+    the first), or a stopped sign-in carrying ``interrupt_required`` --
+    MIT-1349's in-call code wait ended without a code. A sign-in waiting on
+    a ``browser.credential_fill`` approval tap must not hand off, because the
+    chat-origin fill could still run, so any ``approval_required`` result
+    (Gmail/connector style, :func:`result_requests_approval`) or outstanding
+    D5 ``needs_approval`` card in the iteration answers False. Rule-based
+    blocks (``policy_denied``, ``login_blocked``) and successful sign-ins
+    match nothing.
+    """
+    token_sets: list[set[str]] = []
+    for result in tool_results:
+        if result_requests_approval(result):
+            return False
+        tokens = _login_tokens(result)
+        if "needs_approval" in tokens:
+            return False
+        token_sets.append(tokens)
+    for tokens in token_sets:
+        if tokens & _SIGNIN_NEEDS_TESTER:
+            return True
+    return any(
+        tokens & _WAIT_ENDED_STOPS and tokens & _CODE_WAIT_STOP_CODES for tokens in token_sets
+    )
+
+
 class HandoffRequested(Exception):  # noqa: N818
     """Recognised stop: the runner passes it up without error bookkeeping.
 
@@ -104,12 +196,15 @@ class HandoffRequested(Exception):  # noqa: N818
 
 
 class HandoffHook(AgentHook):
-    """Raise ``HandoffRequested`` at a safe tool boundary once the turn is long.
+    """Raise ``HandoffRequested`` at a safe tool boundary on a trigger.
 
-    ``_reraise`` keeps ``CompositeHook`` from swallowing the exception; the
-    runner treats it as a stop, not a failure. The hook also records whether
-    the turn has done any write (or has an approval outstanding), which
-    disqualifies the turn from hand-off permanently.
+    Two triggers: elapsed time at the next tool boundary (reason ``time``)
+    and a sign-in the tester must fix in the finished iteration's results
+    (reason ``signin``, no threshold). ``_reraise`` keeps ``CompositeHook``
+    from swallowing the exception; the runner treats it as a stop, not a
+    failure. The hook also records whether the turn has done any write (or
+    has an approval outstanding), which disqualifies the turn from hand-off
+    permanently.
     """
 
     def __init__(self, *, threshold: float, started_at: float | None = None) -> None:
@@ -130,6 +225,12 @@ class HandoffHook(AgentHook):
             if result_requests_approval(result):
                 self.saw_write = True
                 return
+        # OA-13: a sign-in the tester must fix outside chat ends the turn
+        # here, even when the model would otherwise answer in text. The
+        # write guard above still applies: a turn that wrote earlier or has
+        # an approval outstanding never hands off.
+        if not self.saw_write and signin_needs_tester(context.tool_results):
+            raise HandoffRequested("signin")
 
     async def before_execute_tools(self, context: AgentHookContext) -> None:
         self.transcript = context.messages

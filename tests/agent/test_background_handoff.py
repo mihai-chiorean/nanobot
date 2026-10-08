@@ -1,9 +1,11 @@
-"""Chat-turn -> Work hand-off (MIT-1855 / OA-12).
+"""Chat-turn -> Work hand-off (MIT-1855 / OA-12, MIT-1860 / OA-13).
 
-Covers the three guarantees of ``docs/design/onboarding-and-approval-tuning.md``
+Covers the guarantees of ``docs/design/onboarding-and-approval-tuning.md``
 §4: the hand-off fires at a tool boundary *before* the next batch executes, a
 turn that has written (or has an approval outstanding) is never handed off,
-and both the chat and the seeded Work transcripts stay valid.
+both the chat and the seeded Work transcripts stay valid, and -- OA-13 -- an
+iteration whose browser tool result is a sign-in the tester must fix outside
+chat hands off at once, with no time threshold involved.
 """
 
 from __future__ import annotations
@@ -25,6 +27,7 @@ from nanobot.agent.handoff import (
     HandoffHook,
     HandoffRequested,
     is_write_tool_name,
+    signin_needs_tester,
 )
 from nanobot.agent.hook import AgentHook, AgentRunHookContext, CompositeHook
 from nanobot.agent.loop import AgentLoop, TurnContext, TurnKind
@@ -518,3 +521,273 @@ async def test_failed_task_creation_replies_with_the_apology(
     chat = loop.sessions.get_or_create(f"websocket:{_CHAT_ID}")
     assert chat.messages[-1]["content"] == HANDOFF_UNAVAILABLE_REPLY
     _assert_no_unanswered_tool_calls(chat.messages)
+
+
+# ---------------------------------------------------------------------------
+# Sign-in-triggered hand-off (MIT-1860 / OA-13)
+# ---------------------------------------------------------------------------
+
+# Result shapes copied from connectors' site_login/browser_open outputs
+# (browsertools/credentials.go): D4's login reason wording (needs_credential,
+# session_expired) plus the contract code D5 puts on the wire for the same
+# state (no_credential), the stopped code wait (interrupt_required), the
+# credential_fill approval card and the rule-based blocks that must NOT hand
+# off (policy_denied, login_blocked, needs_approval).
+_NEEDS_CREDENTIAL = (
+    '{"ok": false, "outcome": "needs_user", "source": "auth", "site": "github.com", '
+    '"reason": "needs_credential", '
+    '"error": {"code": "needs_credential", "class": "auth", '
+    '"message": "Add a saved login for github.com in the Ziggy app.", '
+    '"retryable": false, "human": "sign_in", "next": "hand_off"}}'
+)
+_NO_CREDENTIAL = (
+    '{"ok": false, "outcome": "needs_user", "source": "auth", "site": "github.com", '
+    '"status": "no_credential", '
+    '"error": {"code": "no_credential", "class": "auth", '
+    '"message": "No saved login for github.com.", '
+    '"retryable": false, "human": "sign_in", "next": "hand_off"}}'
+)
+_SESSION_EXPIRED = (
+    '{"ok": false, "outcome": "needs_user", "source": "auth", "site": "acme.example", '
+    '"error": {"code": "session_expired", "class": "auth", '
+    '"message": "Session expired; re-run after signing in.", '
+    '"retryable": false, "human": "sign_in", "next": "hand_off"}}'
+)
+_CODE_WAIT_BLOCKED = (
+    '{"ok": false, "outcome": "blocked", "source": "auth", "site": "x.example", '
+    '"status": "blocked", '
+    '"error": {"code": "interrupt_required", "class": "auth", '
+    '"message": "The sign-in code was not answered in time.", '
+    '"retryable": false, "human": "answer", "next": "conclude"}}'
+)
+# connectors' real timeout shape: the in-call wait gave up and the sign-in
+# comes back needs_user with interrupt_required (d5.go maps the failed wait).
+_CODE_WAIT_GAVE_UP = (
+    '{"ok": false, "outcome": "needs_user", "source": "auth", "site": "x.example", '
+    '"status": "needs_user", '
+    '"error": {"code": "interrupt_required", "class": "auth", '
+    '"message": "The sign-in code was not answered in time.", '
+    '"retryable": false, "human": "answer", "next": "conclude"}}'
+)
+_CREDENTIAL_FILL_APPROVAL = (
+    '{"ok": false, "outcome": "needs_approval", "source": "auth", "site": "github.com", '
+    '"status": "needs_approval", "approval_id": "approval_1", '
+    '"error": {"code": "needs_approval", "class": "auth", '
+    '"message": "Approve the credential fill in the Ziggy app.", '
+    '"retryable": false, "human": "approve", "next": "ask_user"}}'
+)
+_APPROVAL_REQUIRED = (
+    '{"status": "approval_required", "approval_id": "approval_1", '
+    '"operation": "browser.credential_fill", "site": "github.com"}'
+)
+_POLICY_DENIED = (
+    '{"ok": false, "outcome": "blocked", "source": "auth", "site": "x.example", '
+    '"status": "blocked", '
+    '"error": {"code": "policy_denied", "class": "input", '
+    '"message": "credential_fill is set to deny for x.example.", '
+    '"retryable": false, "human": "none", "next": "conclude"}}'
+)
+_LOGIN_BLOCKED = (
+    '{"ok": false, "outcome": "blocked", "source": "auth", "site": "x.example", '
+    '"status": "blocked", '
+    '"error": {"code": "login_blocked", "class": "auth", '
+    '"message": "Sign-in blocked: captcha.", '
+    '"retryable": false, "human": "none", "next": "conclude"}}'
+)
+_SIGNED_IN = '{"ok": true, "outcome": "done", "source": "auth", "site": "github.com"}'
+
+
+def test_signin_needs_tester_matches_only_tester_fixable_signins() -> None:
+    assert signin_needs_tester([_NEEDS_CREDENTIAL])
+    assert signin_needs_tester([_NO_CREDENTIAL])
+    assert signin_needs_tester([_SESSION_EXPIRED])
+    assert signin_needs_tester([_CODE_WAIT_BLOCKED])
+    assert signin_needs_tester([_CODE_WAIT_GAVE_UP])
+
+    assert not signin_needs_tester([])
+    assert not signin_needs_tester(["ok", "archived", ""])
+    assert not signin_needs_tester([_SIGNED_IN])
+    # A credential_fill tap still outstanding: the chat-origin fill could run.
+    assert not signin_needs_tester([_CREDENTIAL_FILL_APPROVAL])
+    assert not signin_needs_tester([_APPROVAL_REQUIRED])
+    # Rule-based blocks are conclusions, not tester-fixable sign-ins.
+    assert not signin_needs_tester([_POLICY_DENIED])
+    assert not signin_needs_tester([_LOGIN_BLOCKED])
+    # A blocked sign-in without the code-wait code is not a failed wait.
+    assert not signin_needs_tester(['{"status": "blocked", "error": {"code": "policy_denied"}}'])
+    # Page text merely mentioning a token never matches; only the structured
+    # outcome/status/reason fields do.
+    assert not signin_needs_tester(
+        ['{"ok": true, "outcome": "done", "snapshot": "Sign in: needs_credential first"}']
+    )
+    # An outstanding approval anywhere in the iteration vetoes the hand-off.
+    assert not signin_needs_tester([_NEEDS_CREDENTIAL, _APPROVAL_REQUIRED])
+    assert not signin_needs_tester([_APPROVAL_REQUIRED, _NEEDS_CREDENTIAL])
+    assert not signin_needs_tester([_CODE_WAIT_BLOCKED, _CREDENTIAL_FILL_APPROVAL])
+
+
+def test_after_iteration_raises_signin_reason() -> None:
+    async def scenario() -> HandoffRequested:
+        from nanobot.agent.hook import AgentHookContext
+
+        hook = HandoffHook(threshold=float("inf"))
+        context = AgentHookContext(iteration=0, messages=[{"role": "user", "content": "go"}])
+        context.tool_results = [_NEEDS_CREDENTIAL]
+        with pytest.raises(HandoffRequested) as excinfo:
+            await hook.after_iteration(context)
+        return excinfo.value
+
+    raised = asyncio.run(scenario())
+    assert raised.reason == "signin"
+
+
+@pytest.mark.asyncio
+async def test_needs_credential_result_hands_off_at_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[str] = []
+    tools = [
+        _fake_tool("mcp_ziggy_site_login", result=_NEEDS_CREDENTIAL, calls=calls),
+        _fake_tool("read_b", calls=calls),
+    ]
+    # threshold=inf: the only way this turn can hand off is the sign-in check.
+    loop, outbound = await _handoff_turn(
+        tmp_path,
+        monkeypatch,
+        responses=[
+            _tool_response("call-login", "mcp_ziggy_site_login"),
+            _tool_response("call-b", "read_b"),  # never reached
+        ],
+        tools=tools,
+        threshold=float("inf"),
+    )
+
+    assert calls == ["mcp_ziggy_site_login"], "hand-off must not wait for the next batch"
+    assert outbound is not None
+    assert outbound.content == HANDOFF_REPLY
+    task_id = outbound.metadata.get("handoff_task_id")
+    assert isinstance(task_id, str) and task_id.startswith("work_")
+    tasks = loop.work_store.list_tasks()
+    assert len(tasks) == 1
+    task = loop.work_store.get_task(task_id)
+    assert task is not None
+    assert task["notify_on_finish"] == 1
+    inbound = loop.bus.inbound.get_nowait()
+    assert inbound.session_key_override == f"work:{task_id}"
+    assert inbound.metadata["work_task_id"] == task_id
+
+    # The completed sign-in batch stays in both transcripts; the chat gets
+    # the fixed reply on top.
+    chat = loop.sessions.get_or_create(f"websocket:{_CHAT_ID}")
+    assert chat.messages[-1]["content"] == HANDOFF_REPLY
+    _assert_no_unanswered_tool_calls(chat.messages)
+    persisted_names = [
+        message.get("name") for message in chat.messages if message.get("role") == "tool"
+    ]
+    assert persisted_names == ["mcp_ziggy_site_login"]
+    work = loop.sessions.get_or_create(f"work:{task_id}")
+    assert work.messages[0]["role"] == "user"
+    assert work.messages[-1]["role"] == "tool"
+    _assert_no_unanswered_tool_calls(work.messages)
+
+
+@pytest.mark.asyncio
+async def test_blocked_code_wait_result_hands_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[str] = []
+    tools = [
+        _fake_tool("mcp_ziggy_site_login", result=_CODE_WAIT_BLOCKED, calls=calls),
+        _fake_tool("read_b", calls=calls),
+    ]
+    loop, outbound = await _handoff_turn(
+        tmp_path,
+        monkeypatch,
+        responses=[
+            _tool_response("call-login", "mcp_ziggy_site_login"),
+            _tool_response("call-b", "read_b"),  # never reached
+        ],
+        tools=tools,
+        threshold=float("inf"),
+    )
+
+    assert calls == ["mcp_ziggy_site_login"]
+    assert outbound is not None
+    assert outbound.content == HANDOFF_REPLY
+    assert loop.work_store.list_tasks() != []
+
+
+@pytest.mark.asyncio
+async def test_credential_fill_approval_tap_does_not_hand_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[str] = []
+    tools = [_fake_tool("mcp_ziggy_site_login", result=_CREDENTIAL_FILL_APPROVAL, calls=calls)]
+    loop, outbound = await _handoff_turn(
+        tmp_path,
+        monkeypatch,
+        responses=[
+            _tool_response("call-login", "mcp_ziggy_site_login"),
+            _final_response("waiting for your tap"),
+        ],
+        tools=tools,
+        threshold=float("inf"),
+    )
+
+    assert calls == ["mcp_ziggy_site_login"]
+    assert outbound is not None
+    assert outbound.content == "waiting for your tap"
+    assert "handoff_task_id" not in outbound.metadata
+    assert loop.work_store.list_tasks() == []
+
+
+@pytest.mark.asyncio
+async def test_successful_signin_does_not_hand_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[str] = []
+    tools = [_fake_tool("mcp_ziggy_site_login", result=_SIGNED_IN, calls=calls)]
+    loop, outbound = await _handoff_turn(
+        tmp_path,
+        monkeypatch,
+        responses=[
+            _tool_response("call-login", "mcp_ziggy_site_login"),
+            _final_response("signed in and done"),
+        ],
+        tools=tools,
+        threshold=float("inf"),
+    )
+
+    assert calls == ["mcp_ziggy_site_login"]
+    assert outbound is not None
+    assert outbound.content == "signed in and done"
+    assert "handoff_task_id" not in outbound.metadata
+    assert loop.work_store.list_tasks() == []
+
+
+@pytest.mark.asyncio
+async def test_write_then_needs_credential_does_not_hand_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[str] = []
+    tools = [
+        _fake_tool("mcp_ziggy_gmail_gmail_send_message", result="sent", calls=calls),
+        _fake_tool("mcp_ziggy_site_login", result=_NEEDS_CREDENTIAL, calls=calls),
+    ]
+    loop, outbound = await _handoff_turn(
+        tmp_path,
+        monkeypatch,
+        responses=[
+            _tool_response("call-send", "mcp_ziggy_gmail_gmail_send_message"),
+            _tool_response("call-login", "mcp_ziggy_site_login"),
+            _final_response("sent; sign-in needs you"),
+        ],
+        tools=tools,
+        threshold=float("inf"),
+    )
+
+    assert calls == ["mcp_ziggy_gmail_gmail_send_message", "mcp_ziggy_site_login"]
+    assert outbound is not None
+    assert outbound.content == "sent; sign-in needs you"
+    assert "handoff_task_id" not in outbound.metadata
+    assert loop.work_store.list_tasks() == []
