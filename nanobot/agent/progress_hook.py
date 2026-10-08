@@ -8,6 +8,7 @@ from typing import Any
 from loguru import logger
 
 from nanobot.agent.hook import AgentHook, AgentHookContext
+from nanobot.agent.turn_provenance import note_tool_call
 from nanobot.bus.outbound_events import ProgressEvent, StreamDeltaEvent, StreamEndEvent
 from nanobot.events import NO_EVENTS, EventSink
 from nanobot.providers.base import ToolCallRequest
@@ -141,6 +142,9 @@ class AgentProgressHook(AgentHook):
                 content=tool_hint or "", tool_hint=True, tool_events=tool_events,
             ))
         for tc in context.tool_calls:
+            # TP-06: provenance sees every executed call, with or without a
+            # progress publisher; only skill-file reads are recorded.
+            note_tool_call(tc.name, tc.arguments)
             args_str = json.dumps(tc.arguments, ensure_ascii=False)
             logger.info("Tool call: {}({})", tc.name, args_str[:200])
 
