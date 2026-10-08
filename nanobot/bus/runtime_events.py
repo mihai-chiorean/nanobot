@@ -10,6 +10,7 @@ from nanobot.events import AgentEvent
 from nanobot.providers.base import LLMUsage
 
 if TYPE_CHECKING:
+    from nanobot.agent.turn_provenance import TurnProvenance
     from nanobot.bus.queue import MessageBus
     from nanobot.utils.llm_runtime import LLMRuntime
 
@@ -71,6 +72,10 @@ class TurnCompleted(AgentEvent):
     failure_kind: str | None = None
     failure_error_kind: str | None = None
     failure_attempts: int | None = None
+    # TP-09 (MIT-1870): the turn's "Used:" source families and the count of
+    # unlisted built-in steps, lifted from the turn's provenance record.
+    used: list[dict[str, Any]] | None = None
+    other_steps: int | None = None
 
 
 @dataclass(frozen=True)
@@ -111,6 +116,7 @@ class RuntimeEventPublisher:
         self._turn_runtime: dict[str, LLMRuntime] = {}
         self._turn_usage: dict[str, LLMUsage] = {}
         self._turn_round_usages: dict[str, tuple[LLMUsage, ...]] = {}
+        self._turn_provenance: dict[str, TurnProvenance] = {}
 
     @staticmethod
     def _context(
@@ -136,6 +142,10 @@ class RuntimeEventPublisher:
         if latency_ms is not None:
             self._turn_latency_ms[session_key] = int(latency_ms)
 
+    def record_turn_provenance(self, session_key: str, provenance: TurnProvenance) -> None:
+        """Bind the turn's provenance record for ``turn_completed`` to lift."""
+        self._turn_provenance[session_key] = provenance
+
     def record_turn_usage(
         self,
         session_key: str,
@@ -159,6 +169,7 @@ class RuntimeEventPublisher:
         self._turn_runtime.pop(session_key, None)
         self._turn_usage.pop(session_key, None)
         self._turn_round_usages.pop(session_key, None)
+        self._turn_provenance.pop(session_key, None)
 
     async def user_input_accepted(
         self,
@@ -268,6 +279,7 @@ class RuntimeEventPublisher:
         failure_error_kind: str | None = None,
         failure_attempts: int | None = None,
     ) -> None:
+        provenance = self._turn_provenance.pop(session_key, None)
         await self.bus.publish(
             TurnCompleted(
                 context=self._context(
@@ -280,6 +292,8 @@ class RuntimeEventPublisher:
                 runtime=self._turn_runtime.pop(session_key, None),
                 usage=self._turn_usage.pop(session_key, None),
                 round_usages=self._turn_round_usages.pop(session_key, ()),
+                used=list(provenance.used) if provenance is not None else None,
+                other_steps=provenance.other_steps if provenance is not None else None,
                 outcome=outcome,
                 failure_kind=failure_kind,
                 failure_error_kind=failure_error_kind,
