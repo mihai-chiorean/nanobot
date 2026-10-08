@@ -75,7 +75,7 @@ class SubagentStatus:
     # queued | initializing | awaiting_tools | tools_completed | final_response | done | error
     phase: str = "initializing"
     iteration: int = 0
-    tool_events: list[dict[str, str]] = field(default_factory=list)
+    tool_events: list[dict[str, Any]] = field(default_factory=list)
     usage: LLMUsage | None = None
     stop_reason: str | None = None
     error: str | None = None

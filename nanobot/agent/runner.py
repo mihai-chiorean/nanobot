@@ -218,7 +218,7 @@ class AgentRunResult:
     stop_reason: str = "completed"
     error: str | None = None
     failure_error_kind: str | None = None
-    tool_events: list[dict[str, str]] = field(default_factory=list)
+    tool_events: list[dict[str, Any]] = field(default_factory=list)
     had_injections: bool = False
     # Terminal tail to emit when the preceding final-content prefix was already streamed.
     pending_stream_content: str | None = None
@@ -454,7 +454,7 @@ class AgentRunner:
         error: str | None = None
         failure_error_kind: str | None = None
         stop_reason = "completed"
-        tool_events: list[dict[str, str]] = []
+        tool_events: list[dict[str, Any]] = []
         external_lookup_counts: dict[str, int] = {}
         # Per-turn throttle for repeated attempts against the same outside target.
         workspace_violation_counts: dict[str, int] = {}
