@@ -46,6 +46,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
+# Ziggy-local (MIT-1849 / TP-08): the live execution path never calls
+# ToolRegistry.set_context, so the per-turn RequestContext is the only
+# routing state a tool row can carry. Imported here (not in registry.py)
+# because llm_call and tool rows share it.
+from nanobot.agent.tools.context import current_request_context
+
 # Enum of classified error types, persisted in audit.jsonl when a tool call
 # fails. Kept as a Literal alias so type-checkers enforce the set without
 # pulling an enum class (and its runtime import cost) into the hot path.
@@ -154,6 +160,8 @@ class AuditLogger:
         error_type: ErrorType | None = None,
         exit_code: int | None = None,
         stderr_tail: str | None = None,
+        args_repaired: bool | None = None,
+        args_repair_kinds: list[str] | None = None,
     ) -> None:
         """Append one audit entry to the log file (synchronous).
 
@@ -198,6 +206,8 @@ class AuditLogger:
             error_type=error_type,
             exit_code=exit_code,
             stderr_tail=stderr_tail,
+            args_repaired=args_repaired,
+            args_repair_kinds=args_repair_kinds,
         )
         self._append(entry)
 
@@ -318,6 +328,8 @@ class AuditLogger:
         error_type: ErrorType | None = None,
         exit_code: int | None = None,
         stderr_tail: str | None = None,
+        args_repaired: bool | None = None,
+        args_repair_kinds: list[str] | None = None,
     ) -> dict[str, Any]:
         """Construct the dict that will be serialised to one JSONL line.
 
@@ -325,7 +337,19 @@ class AuditLogger:
         fields are only written when supplied, so older audit consumers
         (Prometheus bridge, Evidence.dev dashboards) keep parsing lines
         that don't carry them.
+
+        MIT-1849 (TP-08): ``session_id`` / ``channel`` fall back to the
+        bound ``RequestContext`` (that is what the live execution path
+        carries; ``ToolRegistry.set_context`` is never called), and the
+        row gains ``turn_id`` from the same context — omitted when the
+        turn has none, so readers must treat it as optional.
         """
+        ctx = current_request_context()
+        if ctx is not None:
+            if not session_id:
+                session_id = ctx.session_key or ""
+            if not channel:
+                channel = ctx.channel or ""
         entry: dict[str, Any] = {
             "timestamp": datetime.now(tz=timezone.utc).isoformat(),
             "tool_name": tool_name,
@@ -345,6 +369,13 @@ class AuditLogger:
             entry["exit_code"] = exit_code
         if stderr_tail is not None:
             entry["stderr_tail"] = stderr_tail
+        # MIT-1858 (TP-07): repair kinds only, never the repaired values.
+        if args_repaired:
+            entry["args_repaired"] = True
+            entry["args_repair_kinds"] = list(args_repair_kinds or [])
+        turn_id = ctx.turn_id if ctx is not None else None
+        if turn_id is not None:
+            entry["turn_id"] = turn_id
         return entry
 
     def _append(self, entry: dict[str, Any]) -> None:

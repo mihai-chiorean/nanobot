@@ -433,8 +433,16 @@ def _print_gateway_health_endpoint(host: str, port: int) -> None:
     )
 
 
-def _gateway_readiness_payload(channels: Any) -> tuple[bool, dict[str, object]]:
-    """Describe process liveness separately from required WebSocket readiness."""
+def _gateway_readiness_payload(
+    channels: Any,
+    active_turns: Callable[[], int] | None = None,
+) -> tuple[bool, dict[str, object]]:
+    """Describe process liveness separately from required WebSocket readiness.
+
+    When ``active_turns`` is given, the payload carries a bare integer
+    ``active_turns`` for the deploy's idle check (MIT-1804); readiness is
+    unaffected by it.
+    """
     channel_status: dict[str, Any] = {}
     get_status = getattr(channels, "get_status", None)
     if callable(get_status):
@@ -463,12 +471,20 @@ def _gateway_readiness_payload(channels: Any) -> tuple[bool, dict[str, object]]:
         ready = False
         websocket_state = "unavailable"
 
-    return ready, {
+    payload: dict[str, object] = {
         "status": "ok" if ready else "degraded",
         "process": "alive",
         "ready": ready,
         "websocket": websocket_state,
     }
+    if active_turns is not None:
+        try:
+            payload["active_turns"] = int(active_turns())
+        except Exception:
+            logger.exception("Gateway readiness could not read the active turn count")
+            payload["active_turns"] = -1
+
+    return ready, payload
 
 
 async def _close_gateway_runtime(
@@ -956,7 +972,10 @@ def _run_gateway(
                         method, path = parts[0], parts[1]
 
                     if method == "GET" and path == "/health":
-                        ready, payload = _gateway_readiness_payload(channels)
+                        ready, payload = _gateway_readiness_payload(
+                            channels,
+                            agent.active_turn_count,
+                        )
                         body = _json.dumps(payload)
                         status = "200 OK" if ready else "503 Service Unavailable"
                         content_type = "application/json"

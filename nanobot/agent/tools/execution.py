@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 from collections.abc import Callable
 from contextlib import nullcontext
 from functools import cache
@@ -12,6 +13,7 @@ from typing import Any, cast
 
 from loguru import logger
 
+from nanobot.agent import turn_provenance
 from nanobot.agent.hook import AgentHook, AgentHookContext
 from nanobot.agent.tools.ask import AskUserInterrupt
 from nanobot.agent.tools.browser_budget import browser_budget_error
@@ -66,6 +68,47 @@ _WORKSPACE_VIOLATION_MARKERS: tuple[str, ...] = (
     "path outside working dir",
     "path traversal detected",
 )
+# Ziggy-local (MIT-1849 / TP-08, design turn-provenance §6): prepare_call
+# failures that are policy gates, not call failures. Matched against the
+# exact message shapes produced by registry.prepare_call (shared-room,
+# read-only-turn and ask_user denials); the tester Activity endpoint already
+# maps ``refused`` rows (webui/ws_http.py).
+_POLICY_DENIAL_MARKERS: tuple[str, ...] = (
+    "is unavailable in a shared conversation",  # room_denial_message
+    '"code":"shared_room_denied"',              # typed room denial envelope
+    "is unavailable in a read-only turn",       # read_only_denial_message
+    "is unavailable in a scheduled run",        # ask_user_unavailable_message
+)
+
+
+def _is_policy_denial(text: str) -> bool:
+    return any(marker in text for marker in _POLICY_DENIAL_MARKERS)
+
+
+def _record_tool_call(
+    tools: ToolRegistry,
+    tool_call: ToolCallRequest,
+    params: Any,
+    status: str,
+    started_at: float,
+    *,
+    error: str | None = None,
+    extra: dict[str, Any] | None = None,
+) -> None:
+    """MIT-1849 (TP-08): write the one audit row + Prometheus sample per
+    live tool call. Record-only — the result the model sees is untouched —
+    and registries without the recorder are skipped."""
+    record = getattr(tools, "record_call", None)
+    if not callable(record):
+        return
+    record(
+        tool_call.name,
+        params if isinstance(params, dict) else {},
+        status,
+        (time.monotonic() - started_at) * 1000,
+        error=error,
+        extra=extra,
+    )
 
 
 def _with_retry_hint(payload: str) -> str:
@@ -102,6 +145,49 @@ def _envelope_forbids_retry(text: str) -> bool:
     return error.get("next") in _NO_RETRY_NEXTS
 
 
+def _repaired_call_extra(repairs: list[str]) -> dict[str, Any] | None:
+    """Audit-extra for a call whose arguments were silently repaired (TP-07)."""
+    if not repairs:
+        return None
+    return {"args_repaired": True, "args_repair_kinds": list(repairs)}
+
+
+def _annotate_repaired_event(event: dict[str, Any], repairs: list[str]) -> dict[str, Any]:
+    """Tag a tool event with the repair kinds, never the repaired values."""
+    extra = _repaired_call_extra(repairs)
+    if extra is not None:
+        event.update(extra)
+    return event
+
+
+def _note_args_repairs(repairs: list[str]) -> None:
+    """Increment the turn provenance record's per-kind repair counters (TP-07).
+
+    ``current_turn_provenance`` is owned by the TP-02 record; it is optional
+    here so a registry running without provenance plumbing pays nothing.
+    """
+    if not repairs:
+        return
+    try:
+        get_current = getattr(turn_provenance, "current_turn_provenance", None)
+        if not callable(get_current):
+            return
+        record = get_current()
+        if record is None:
+            return
+        counters = getattr(record, "args_repaired", None)
+        if not isinstance(counters, dict):
+            counters = {}
+            try:
+                setattr(record, "args_repaired", counters)
+            except Exception:
+                return
+        for kind in repairs:
+            counters[kind] = counters.get(kind, 0) + 1
+    except Exception as exc:
+        logger.debug("turn provenance args_repaired update failed: {}", exc)
+
+
 async def execute_tool_calls(
     tools: ToolRegistry,
     tool_calls: list[ToolCallRequest],
@@ -113,7 +199,7 @@ async def execute_tool_calls(
     context: AgentHookContext,
     model_messages: list[dict[str, Any]] | None = None,
     compacted_tool_results: set[str] | None = None,
-) -> tuple[list[Any], list[dict[str, str]], BaseException | None]:
+) -> tuple[list[Any], list[dict[str, Any]], BaseException | None]:
     """Execute one model response's tool calls in stable result order.
 
     Returns ``(results, events, fatal_error)``. A fatal error is the first
@@ -131,7 +217,7 @@ async def execute_tool_calls(
             and isinstance(message.get("content"), str)
             and message["tool_call_id"] not in (compacted_tool_results or ())
         }
-    tool_results: list[tuple[Any, dict[str, str], BaseException | None]] = []
+    tool_results: list[tuple[Any, dict[str, Any], BaseException | None]] = []
     for batch in _partition_tool_batches(tools, tool_calls, concurrent=concurrent):
         if concurrent and len(batch) > 1:
             batch_results = await asyncio.gather(*(
@@ -148,7 +234,7 @@ async def execute_tool_calls(
             ))
             tool_results.extend(batch_results)
         else:
-            batch_results: list[tuple[Any, dict[str, str], BaseException | None]] = []
+            batch_results: list[tuple[Any, dict[str, Any], BaseException | None]] = []
             for tool_call in batch:
                 result = await _execute_tool_call(
                     tools,
@@ -183,7 +269,7 @@ async def _execute_tool_call(
     hook: AgentHook,
     context: AgentHookContext,
     read_results: Callable[[], dict[str, str]],
-) -> tuple[Any, dict[str, str], BaseException | None]:
+) -> tuple[Any, dict[str, Any], BaseException | None]:
     lookup_error = repeated_external_lookup_error(
         tool_call.name,
         tool_call.arguments,
@@ -206,24 +292,60 @@ async def _execute_tool_call(
         }
         return budget, event, None
 
-    prepare_call = cast(
+    # TP-07: prefer prepare_call_ex, which also reports the silent argument
+    # repairs it applied; registries without it keep the three-tuple contract.
+    tool, params, prep_error, repairs = None, tool_call.arguments, None, []
+    prepared_consumed = False
+    prepare_call_ex = cast(
         Callable[[str, Any], object] | None,
-        getattr(tools, "prepare_call", None),
+        getattr(tools, "prepare_call_ex", None),
     )
-    tool, params, prep_error = None, tool_call.arguments, None
-    if callable(prepare_call):
-        prepared = prepare_call(tool_call.name, tool_call.arguments)
-        if isinstance(prepared, tuple):
-            prepared_tuple = cast(tuple[object, ...], prepared)
-            if len(prepared_tuple) == 3:
-                tool, params, prep_error = cast(tuple[Any, Any, str | None], prepared_tuple)
+    started_at = time.monotonic()
+    if callable(prepare_call_ex):
+        prepared_ex = prepare_call_ex(tool_call.name, tool_call.arguments)
+        if isinstance(prepared_ex, tuple):
+            ex_tuple = cast(tuple[object, ...], prepared_ex)
+            if len(ex_tuple) == 4:
+                tool, params, prep_error, raw_repairs = cast(
+                    tuple[Any, Any, str | None, list[str]], ex_tuple
+                )
+                repairs = sorted({r for r in raw_repairs if isinstance(r, str)})
+                prepared_consumed = True
+    if not prepared_consumed:
+        prepare_call = cast(
+            Callable[[str, Any], object] | None,
+            getattr(tools, "prepare_call", None),
+        )
+        if callable(prepare_call):
+            prepared = prepare_call(tool_call.name, tool_call.arguments)
+            if isinstance(prepared, tuple):
+                prepared_tuple = cast(tuple[object, ...], prepared)
+                if len(prepared_tuple) == 3:
+                    tool, params, prep_error = cast(tuple[Any, Any, str | None], prepared_tuple)
+    if repairs:
+        _note_args_repairs(repairs)
     if prep_error:
+        # Ziggy-local (MIT-1849): a call the gates refused still gets its
+        # exactly-one audit row — ``refused`` for the policy gates, ``error``
+        # for schema/not-found style rejections.
+        _record_tool_call(
+            tools,
+            tool_call,
+            params,
+            "refused" if _is_policy_denial(str(prep_error)) else "error",
+            started_at,
+            error=str(prep_error)[:200],
+            extra=_repaired_call_extra(repairs),
+        )
         payload = _with_retry_hint(prep_error)
-        event = {
-            "name": tool_call.name,
-            "status": "error",
-            "detail": prep_error.split(": ", 1)[-1][:120],
-        }
+        event = _annotate_repaired_event(
+            {
+                "name": tool_call.name,
+                "status": "error",
+                "detail": prep_error.split(": ", 1)[-1][:120],
+            },
+            repairs,
+        )
         handled = _classify_violation(
             raw_text=prep_error,
             soft_payload=payload,
@@ -236,6 +358,16 @@ async def _execute_tool_call(
         return payload, event, None
 
     await hook.before_execute_tool(context, tool_call, tool, params)
+    # When the registry's own execute dispatches the call it records it
+    # itself (MIT-1849); recording here would double-write that path.
+    dispatched_here = tool is not None
+    # TP-07: surface silent argument repairs on the Langfuse tool span too.
+    tool_span_metadata: dict[str, Any] | None = None
+    if repairs:
+        tool_span_metadata = {
+            "ziggy.args_repaired": True,
+            "ziggy.args_repair_kinds": ",".join(repairs),
+        }
     try:
         # Ziggy-local (fork, MIT-202/MIT-211): nest tool dispatch under the
         # active llm-iteration span so the Langfuse trace shows
@@ -243,7 +375,9 @@ async def _execute_tool_call(
         # the arguments before export (MIT-211) and is a no-op when Langfuse
         # is not configured.
         with (
-            observe_tool(tool_name=tool_call.name, arguments=params),
+            observe_tool(
+                tool_name=tool_call.name, arguments=params, metadata=tool_span_metadata,
+            ),
             file_read_context(tool_call.id, read_results)
             if tool_call.name == "read_file" else nullcontext(),
         ):
@@ -254,19 +388,35 @@ async def _execute_tool_call(
     except asyncio.CancelledError:
         raise
     except AskUserInterrupt as interrupt:
-        event = {
-            "name": tool_call.name,
-            "status": "waiting",
-            "detail": interrupt.question.replace("\n", " ").strip()[:120],
-        }
+        if dispatched_here:
+            _record_tool_call(
+                tools, tool_call, params, "waiting", started_at,
+                extra=_repaired_call_extra(repairs),
+            )
+        event = _annotate_repaired_event(
+            {
+                "name": tool_call.name,
+                "status": "waiting",
+                "detail": interrupt.question.replace("\n", " ").strip()[:120],
+            },
+            repairs,
+        )
         return "", event, interrupt
     except Exception as exc:
+        if dispatched_here:
+            _record_tool_call(
+                tools, tool_call, params, "error", started_at, error=str(exc)[:200],
+                extra=_repaired_call_extra(repairs),
+            )
         await hook.on_execute_tool_error(context, tool_call, tool, params, exc)
-        event = {
-            "name": tool_call.name,
-            "status": "error",
-            "detail": str(exc),
-        }
+        event = _annotate_repaired_event(
+            {
+                "name": tool_call.name,
+                "status": "error",
+                "detail": str(exc),
+            },
+            repairs,
+        )
         payload = _with_retry_hint(f"Error: {type(exc).__name__}: {exc}")
         handled = _classify_violation(
             raw_text=str(exc),
@@ -279,14 +429,28 @@ async def _execute_tool_call(
             return handled + (None,)
         return payload, event, None
 
+    if dispatched_here:
+        _record_tool_call(
+            tools,
+            tool_call,
+            params,
+            "error" if is_tool_error_result(result) else "ok",
+            started_at,
+            error=str(result)[:200] if is_tool_error_result(result) else None,
+            extra=_repaired_call_extra(repairs),
+        )
+
     if is_tool_error_result(result):
         await hook.on_execute_tool_error(context, tool_call, tool, params, result)
         payload = str(result) if _envelope_forbids_retry(result) else _with_retry_hint(result)
-        event = {
-            "name": tool_call.name,
-            "status": "error",
-            "detail": result.replace("\n", " ").strip()[:120],
-        }
+        event = _annotate_repaired_event(
+            {
+                "name": tool_call.name,
+                "status": "error",
+                "detail": result.replace("\n", " ").strip()[:120],
+            },
+            repairs,
+        )
         handled = _classify_violation(
             raw_text=result,
             soft_payload=payload,
@@ -306,7 +470,10 @@ async def _execute_tool_call(
         detail = "(empty)"
     elif len(detail) > 120:
         detail = detail[:120] + "..."
-    return result, {"name": tool_call.name, "status": "ok", "detail": detail}, None
+    return result, _annotate_repaired_event(
+        {"name": tool_call.name, "status": "ok", "detail": detail},
+        repairs,
+    ), None
 
 
 def is_unresolvable_host(text: str) -> bool:
@@ -350,10 +517,10 @@ def _classify_violation(
     *,
     raw_text: str,
     soft_payload: str,
-    event: dict[str, str],
+    event: dict[str, Any],
     tool_call: ToolCallRequest,
     workspace_violation_counts: dict[str, int],
-) -> tuple[Any, dict[str, str]] | None:
+) -> tuple[Any, dict[str, Any]] | None:
     if is_unresolvable_host(raw_text):
         # Recoverable: the name does not exist, so the model should fix the URL.
         # Capped two ways. A per-host counter catches a model retrying the same

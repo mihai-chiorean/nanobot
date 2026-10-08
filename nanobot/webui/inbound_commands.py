@@ -51,7 +51,7 @@ from nanobot.webui.cli_apps_api import normalize_cli_app_mentions
 from nanobot.webui.forking import handle_webui_fork_chat
 from nanobot.webui.gateway_services import GatewayServices
 from nanobot.webui.mcp_presets_api import normalize_mcp_preset_mentions
-from nanobot.webui.metadata import WEBSOCKET_TURN_OWNER_METADATA_KEY
+from nanobot.webui.metadata import WEBSOCKET_TURN_OWNER_METADATA_KEY, WEBUI_TURN_METADATA_KEY
 from nanobot.webui.session_access import (
     SessionMention,
     WebuiSessionAccess,
@@ -780,7 +780,11 @@ class WebUICommandRouter:
             metadata["client_message_id"] = client_message_id
         if envelope.get("webui") is True:
             metadata["webui"] = True
-            metadata.update(self._transcripts.client_turn_metadata(envelope.get("turn_id")))
+        # TP-01 (MIT-1840): every ``message`` frame gets a turn id, not just
+        # ``webui`` ones. Keep the client's uuid when it sends one, mint a
+        # uuid4 otherwise, so turn_end / goal_status / transcript rows can tie
+        # an answer to its turn on every channel (design turn-provenance §1).
+        metadata.update(self._transcripts.client_turn_metadata(envelope.get("turn_id")))
         trusted_webui = metadata.get("webui") is True and connection in self._webui_connections
         is_user_shell = (
             trusted_webui
@@ -972,14 +976,17 @@ class WebUICommandRouter:
                 mcp_presets=mcp_presets,
                 session_mentions=session_mentions,
             )
-        if is_webui and turn_id:
+        # TP-01 (MIT-1840): acknowledge on any frame that carried a turn_id,
+        # not only webui frames; announce the normalised id from metadata.
+        accepted_turn_id = metadata.get(WEBUI_TURN_METADATA_KEY)
+        if turn_id and isinstance(accepted_turn_id, str) and accepted_turn_id:
             active_turn_id = websocket_turn_id(chat_id)
             started_at = websocket_turn_wall_started_at(chat_id)
             await self._transport.webui_send_event(
                 connection,
                 "message_accepted",
                 chat_id=chat_id,
-                turn_id=turn_id,
+                turn_id=accepted_turn_id,
                 starts_turn=queued_owner is not None,
                 **(
                     {"active_turn_id": active_turn_id}

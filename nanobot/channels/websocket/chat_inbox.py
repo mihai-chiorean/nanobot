@@ -12,6 +12,7 @@ from pathlib import Path
 
 from nanobot.bus.events import InboundMessage
 from nanobot.utils.helpers import ensure_dir
+from nanobot.webui.metadata import WEBUI_TURN_METADATA_KEY
 
 _MAX_PROCESSED_RECEIPTS = 4_096
 
@@ -161,11 +162,16 @@ class ChatInboxStore:
             sort_keys=True,
             default=str,
         )
+        # The fingerprint covers the user-visible content, not per-dispatch
+        # volatile metadata. ``remote`` varies with the socket; ``webui_turn_id``
+        # is minted per dispatch since MIT-1840 when the client sent none, so a
+        # legitimate resend would otherwise hash differently and be rejected as
+        # a conflict. The id itself is still stored verbatim in metadata_json.
         fingerprint_metadata_json = json.dumps(
             {
                 key: value
                 for key, value in message.metadata.items()
-                if key != "remote"
+                if key not in {"remote", WEBUI_TURN_METADATA_KEY}
             },
             ensure_ascii=False,
             separators=(",", ":"),

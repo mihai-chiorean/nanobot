@@ -54,6 +54,7 @@ from nanobot.agent.tools.context import (
     ZIGGY_PARK_ATTRIBUTE,
     RequestContext,
     bind_request_context,
+    current_request_context,
     reset_request_context,
 )
 from nanobot.agent.tools.exec_session import ExecSessionManager
@@ -75,6 +76,7 @@ from nanobot.agent.turn_delivery import (
 )
 from nanobot.agent.turn_delivery import TurnRoute as TurnRoute
 from nanobot.agent.turn_hooks import AgentTurnHookSpec, build_agent_turn_hook
+from nanobot.agent.turn_provenance import TurnProvenance, account_intent
 from nanobot.bus.events import INBOUND_META_USER_SHELL, InboundMessage, OutboundMessage
 from nanobot.bus.outbound_events import (
     ProgressEvent,
@@ -91,7 +93,12 @@ from nanobot.llm_usage.context import source_from_request
 
 # Ziggy-local (fork, MIT-202): Langfuse turn span.
 from nanobot.observability import observe_turn
-from nanobot.providers.base import LLMProvider, LLMUsage, ProviderConversationState
+from nanobot.providers.base import (
+    LLMProvider,
+    LLMUsage,
+    ProviderConversationState,
+    ToolCallRequest,
+)
 from nanobot.providers.factory import ProviderSnapshot
 from nanobot.providers.request_context import (
     reset_scheduling_class,
@@ -147,6 +154,7 @@ from nanobot.utils.progress_events import output_events
 from nanobot.utils.runtime import (
     EMPTY_FINAL_RESPONSE_MESSAGE,
 )
+from nanobot.webui.metadata import WEBUI_TURN_METADATA_KEY
 from nanobot.work.context import reset_work_context, set_work_context
 from nanobot.work.store import WorkStore
 
@@ -311,6 +319,16 @@ class _ZiggyTurnHook(AgentHook):
         self._metadata = dict(turn.metadata or {})
         self._session_key = turn.session_key
         self._wants_status = bool(self._metadata.get("_wants_stream"))
+        # MIT-1849 (TP-08): the turn's resolved runtime, captured where the
+        # hook is built (inside the turn's bound request context). A session
+        # pinned to a model preset answers under a different model than the
+        # loop default, and the llm_call rows must say which one.
+        request_ctx = current_request_context()
+        self._runtime_model = (
+            request_ctx.runtime.model
+            if request_ctx is not None and request_ctx.runtime is not None
+            else None
+        )
 
     async def _status(self, text: str) -> None:
         if not self._wants_status:
@@ -364,7 +382,7 @@ class _ZiggyTurnHook(AgentHook):
             self._loop._audit_logger.log_llm_call(
                 session_id=self._chat_id,
                 channel=self._channel,
-                model=self._loop.model,
+                model=self._runtime_model or self._loop.model,
                 # 0.3.0's LLMUsage names these input_tokens/output_tokens; the
                 # 0.2.x prompt_tokens/completion_tokens names logged null (MIT-1470).
                 tokens_in=getattr(usage, "input_tokens", None),
@@ -386,6 +404,52 @@ class _ZiggyTurnHook(AgentHook):
                 sentence = extract_latest_sentence(rc)
                 if sentence:
                     await self._status(f"{pick_thinking_emoji()} {sentence}")
+
+
+class _TurnProvenanceHook(AgentHook):
+    """TP-09 (MIT-1870): count the turn's "Used:" source families.
+
+    Feeds the turn's :class:`TurnProvenance` record from the executed tool
+    call's tool object. Counting only in ``after_execute_tool`` /
+    ``on_execute_tool_error`` is what keeps calls refused before dispatch
+    (``prepare_call`` denials, the repeated-lookup and browser-budget
+    guards) out of the counts: those never reach either callback because no
+    tool ran. The tool object (not the wire name) decides the family, so a
+    connector wrapper whose wire name embeds another server key still maps
+    correctly.
+    """
+
+    def __init__(self, record: TurnProvenance, tools: ToolRegistry | None) -> None:
+        super().__init__()
+        self._record = record
+        self._tools = tools
+
+    def _tool_object(self, tool_call: ToolCallRequest, tool: Any) -> Any:
+        if tool is not None:
+            return tool
+        # The registry returned no prepared tool (custom registry); resolve
+        # the same object the runner dispatched against by name.
+        return self._tools.get(tool_call.name) if self._tools is not None else None
+
+    async def after_execute_tool(
+        self,
+        context: AgentHookContext,
+        tool_call: ToolCallRequest,
+        tool: Any,
+        params: Any,
+        result: Any,
+    ) -> None:
+        self._record.note_tool_result(self._tool_object(tool_call, tool), "ok")
+
+    async def on_execute_tool_error(
+        self,
+        context: AgentHookContext,
+        tool_call: ToolCallRequest,
+        tool: Any,
+        params: Any,
+        error: Any,
+    ) -> None:
+        self._record.note_tool_result(self._tool_object(tool_call, tool), "error")
 
 
 # Stop reasons that make a Work task ``failed`` rather than ``succeeded``.
@@ -543,6 +607,10 @@ class AgentLoop:
     4. Executes tool calls
     5. Sends responses back
     """
+
+    # Class-level default so ``process_direct`` also works on bare instances
+    # built without ``__init__`` (``+=``/``-=`` always rebind on the instance).
+    _direct_turn_count: int = 0
 
     @property
     def tool_names(self) -> list[str]:
@@ -788,6 +856,7 @@ class AgentLoop:
         self._running = False
         self._runtime_context_providers: list[RuntimeContextProvider] = []
         self._active_tasks: dict[str, set[asyncio.Task[Any]]] = {}
+        self._direct_turn_count: int = 0
         self._discarding_sessions: set[str] = set()
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._close_lock = asyncio.Lock()
@@ -1353,7 +1422,7 @@ class AgentLoop:
         assert ctx.request_context is not None
         return await self._resolve_runtime_context_for_request(
             ctx.request_context,
-            ctx.tools or self.tools,
+            ctx.tools if ctx.tools is not None else self.tools,
         )
 
     async def _resolve_runtime_context_for_request(
@@ -1466,6 +1535,21 @@ class AgentLoop:
         tasks.discard(task)
         if not tasks and self._active_tasks.get(key) is tasks:
             self._active_tasks.pop(key, None)
+
+    def active_turn_count(self) -> int:
+        """Bare count of turns in flight, safe to expose on /health.
+
+        Counts unfinished tasks across every tracked session plus turns
+        running through ``process_direct`` (Work and cron runs), which are
+        not in ``_active_tasks``. Never leaks session keys or identifiers.
+        """
+        tracked = sum(
+            1
+            for tasks in getattr(self, "_active_tasks", {}).values()
+            for task in tasks
+            if not task.done()
+        )
+        return tracked + self._direct_turn_count
 
     async def _cancel_active_tasks(self, key: str) -> int:
         """Cancel and await all active work for *key*.
@@ -1938,7 +2022,7 @@ class AgentLoop:
                 request_ctx,
                 workspace=effective_scope.project_path,
             )
-        effective_tools = tools or self.tools
+        effective_tools = tools if tools is not None else self.tools
         file_state_token = bind_file_states(self._file_state_store.for_session(active_session_key))
         request_token = bind_request_context(request_ctx)
         workspace_token = bind_workspace_scope(effective_scope)
@@ -2736,6 +2820,21 @@ class AgentLoop:
             attributes=dict(attributes or {}),
             max_iterations=max_iterations,
         )
+        # Ziggy-local (TP-09 / MIT-1870): one provenance record per turn.
+        # ``account_intent`` is computed here, once, from the user's message
+        # text; only the boolean is stored. The counting hook joins the
+        # turn's explicit hook chain (never the caller-visible turn
+        # attributes, which context providers receive verbatim), and the
+        # record itself rides the runtime event publisher, which lifts the
+        # ``used``/``other_steps`` fields at ``turn_completed`` — the same
+        # per-session lifecycle as turn usage.
+        provenance = TurnProvenance(
+            account_intent=account_intent(ctx.original_user_text or "")
+        )
+        ctx.hooks.append(
+            _TurnProvenanceHook(provenance, tools if tools is not None else self.tools)
+        )
+        self.runtime_event_publisher.record_turn_provenance(key, provenance)
         # A streaming callback may be present even when the final text comes from a
         # non-streaming recovery. Only the last completed segment can suppress the
         # regular outbound message.
@@ -2866,13 +2965,16 @@ class AgentLoop:
                 ctx.session = self.sessions.get_or_create(ctx.session_key)
         session = ctx.session
         ctx.ephemeral = ctx.ephemeral or not session.policy.persist
-        tools = ctx.tools or self.tools
+        tools = ctx.tools if ctx.tools is not None else self.tools
         if session.policy.disabled_tools:
             restricted = ToolRegistry()
             for name in tools.tool_names:
                 tool = tools.get(name)
                 if name not in session.policy.disabled_tools and tool:
                     restricted.register(tool)
+            # MIT-1849 (TP-08): this per-turn copy must audit like the main
+            # registry; without the logger its sessions wrote no tool rows.
+            restricted.set_audit_logger(self._audit_logger)
             tools = restricted
         ctx.tools = tools
 
@@ -3188,11 +3290,27 @@ class AgentLoop:
         ctx.turn_latency_ms = max(0, int((time.time() - latency_started_at) * 1000))
         if ctx.usage is not None and not ctx.ephemeral:
             session.metadata["_last_usage"] = ctx.usage.to_dict()
+        # Ziggy-local (TP-10 / MIT-1873): the effective turn id is the wire
+        # turn id the client sent (TP-01 puts it on every frame) and, for
+        # clients that send none, the id minted at turn start -- the same
+        # fallback the provenance record is keyed by (design section 1).
+        wire_turn_id = (ctx.msg.metadata or {}).get(WEBUI_TURN_METADATA_KEY)
+        effective_turn_id = (
+            wire_turn_id
+            if isinstance(wire_turn_id, str) and wire_turn_id
+            else ctx.turn_id
+        )
+        turn_record = self.runtime_event_publisher.current_turn_provenance(
+            ctx.session_key
+        )
         persisted = self._save_turn(
             session, ctx.all_messages, ctx.save_skip,
             turn_latency_ms=ctx.turn_latency_ms,
             summary_checkpoint=ctx.summary_checkpoint,
             input_persisted_early=ctx.input_persisted_early,
+            turn_id=effective_turn_id,
+            used=turn_record.used if turn_record is not None else None,
+            other_steps=turn_record.other_steps if turn_record is not None else 0,
         )
         if ctx.publish_file_turn is not None and not ctx.ephemeral:
             # Grants attach only to publications whose canonical link was
@@ -3327,6 +3445,9 @@ class AgentLoop:
         turn_latency_ms: int | None = None,
         summary_checkpoint: SessionSummaryCheckpoint | None = None,
         input_persisted_early: bool = False,
+        turn_id: str | None = None,
+        used: list[dict[str, Any]] | None = None,
+        other_steps: int = 0,
     ) -> list[dict[str, Any]]:
         """Commit new-turn messages and an optional summary boundary.
 
@@ -3453,8 +3574,21 @@ class AgentLoop:
                 )
         if summary_checkpoint is not None and checkpoint_boundary == len(messages):
             session.commit_summary_checkpoint(summary_checkpoint.summary)
-        if turn_latency_ms is not None and last_assistant_idx is not None:
-            session.messages[last_assistant_idx]["latency_ms"] = int(turn_latency_ms)
+        if last_assistant_idx is not None:
+            final_message = session.messages[last_assistant_idx]
+            if turn_latency_ms is not None:
+                final_message["latency_ms"] = int(turn_latency_ms)
+            # Ziggy-local (TP-10 / MIT-1873): the reopen path rebuilds the
+            # "Used:" line from this message via the webui transcript, so the
+            # final assistant message carries the same fields the live
+            # turn_end frame got in TP-09. Keys are added only when the turn
+            # actually ran tools, so tool-free turns keep their old shape.
+            if isinstance(turn_id, str) and turn_id:
+                final_message["turn_id"] = turn_id
+            if used:
+                final_message["used"] = [dict(entry) for entry in used]
+            if other_steps:
+                final_message["other_steps"] = int(other_steps)
         if saved_followup_ids:
             acknowledge_pending_followups(session, saved_followup_ids)
         session.updated_at = datetime.now()
@@ -3541,8 +3675,11 @@ class AgentLoop:
             content=content, media=media or [], metadata=metadata,
         )
         # Share the dispatch lock so direct calls serialize with bus turns.
-        lock = self._get_session_lock(session_key)
+        # Direct turns are invisible to ``_active_tasks``, so count them here
+        # for the /health readiness payload (MIT-1804).
+        self._direct_turn_count += 1
         try:
+            lock = self._get_session_lock(session_key)
             async with lock:
                 kwargs: dict[str, Any] = {
                     "session_key": session_key,
@@ -3572,6 +3709,7 @@ class AgentLoop:
                     **kwargs,
                 )
         finally:
+            self._direct_turn_count -= 1
             await self.runtime_event_publisher.run_status_changed(msg, session_key, "idle")
             self.runtime_event_publisher.clear_turn(session_key)
 

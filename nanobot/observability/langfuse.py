@@ -256,12 +256,17 @@ def observe_tool(
     *,
     tool_name: str,
     arguments: dict[str, Any] | None = None,
+    metadata: dict[str, Any] | None = None,
 ) -> Iterator[Any]:
     """Wrap a tool invocation as a child span.
 
     Meant to be opened inside ``observe_llm_iteration`` so tool spans
     nest under their owning generation — not as siblings under the
     turn root.
+
+    *metadata* carries non-payload span annotations (TP-07 uses it for
+    ``ziggy.args_repaired`` / ``ziggy.args_repair_kinds``); it is passed
+    through untouched, so callers must keep it flag-and-kind only.
     """
     client = _safe_get_client()
     if client is None:
@@ -278,6 +283,7 @@ def observe_tool(
             # file bodies — all bypass the audit-sink redactor unless
             # we apply it here.
             input=_prepare_input(arguments),
+            metadata=metadata,
         )
     except Exception as exc:
         logger.debug("Langfuse tool span failed for {}: {}", tool_name, exc)

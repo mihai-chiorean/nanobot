@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import fixtures from "../../../packages/client-events/fixtures.json";
-import { acceptsCompactionPhase, decodeNotification } from "../../../packages/client-events/notifications";
+import { acceptsCompactionPhase, decodeNotification, isTurnEnd } from "../../../packages/client-events/notifications";
 
 describe("shared notification contract", () => {
   it("rejects malformed retry counters and relative delays", () => {
@@ -11,11 +11,34 @@ describe("shared notification contract", () => {
       { retry_after_s: -1 }, { retry_after_s: Infinity }, { state: "unknown" },
     ]) expect(decodeNotification({ ...retry, ...invalid })).toBeNull();
   });
-  it.each(fixtures)("accepts the Python wire fixture %#", (event) => {
+  it.each(fixtures.filter((event) => event.event !== "turn_end"))("accepts the Python wire fixture %#", (event) => {
     expect(decodeNotification(event)).toEqual(event);
     expect(decodeNotification({ ...event, turn_id: "turn" })).toMatchObject(event);
     expect(decodeNotification({ ...event, chat_id: 42 })).toBeNull();
     expect(decodeNotification({ ...event, turn_id: 42 })).toBeNull();
+  });
+
+  it.each(fixtures.filter((event) => event.event === "turn_end"))("accepts the Python turn_end fixture %#", (event) => {
+    expect(isTurnEnd(event)).toBe(true);
+    expect(isTurnEnd({ ...event, turn_id: "turn" })).toBe(true);
+    expect(isTurnEnd({ ...event, chat_id: 42 })).toBe(false);
+    expect(isTurnEnd({ ...event, turn_id: 42 })).toBe(false);
+    expect(decodeNotification(event)).toBeUndefined();
+  });
+
+  it("rejects malformed used lines and other-step counters on turn_end", () => {
+    const turnEnd = fixtures.find((event) => event.event === "turn_end" && "used" in event)!;
+    for (const invalid of [
+      { used: [] },
+      { used: "gmail" },
+      { used: [{ family: "gmail", label: "Gmail", private: true, calls: 0, errors: 0 }] },
+      { used: [{ family: "gmail", label: "Gmail", private: true, calls: 2, errors: 3 }] },
+      { used: [{ family: "gmail", label: "Gmail", private: "yes", calls: 1, errors: 0 }] },
+      { used: [{ family: "gmail", calls: 1, errors: 0 }] },
+      { other_steps: 0 },
+      { other_steps: 1.5 },
+      { other_steps: "3" },
+    ]) expect(isTurnEnd({ ...turnEnd, ...invalid })).toBe(false);
   });
 
   it("does not mistake other event families for invalid notifications", () => {

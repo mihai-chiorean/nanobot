@@ -105,19 +105,39 @@ def _tool_event_summary(tool_call: Any) -> str:
     return summary or name
 
 
-def build_tool_event_start_payload(tool_call: Any) -> dict[str, Any]:
-    return {
-        "version": 1,
-        "phase": "start",
-        "call_id": str(getattr(tool_call, "id", "") or ""),
-        "name": getattr(tool_call, "name", ""),
-        "summary": _tool_event_summary(tool_call),
-        "arguments": _tool_event_arguments(tool_call),
-        "result": None,
-        "error": None,
-        "files": [],
-        "embeds": [],
-    }
+def _attach_args_repaired(
+    payload: dict[str, Any],
+    repairs: Any,
+) -> dict[str, Any]:
+    """Add the TP-07 repair flag to a payload; add nothing when there is none.
+
+    Carries only the flag and the kind names — never the argument values.
+    """
+    if isinstance(repairs, (list, tuple)) and repairs:
+        payload["args_repaired"] = True
+        payload["args_repair_kinds"] = [str(kind) for kind in repairs]
+    return payload
+
+
+def build_tool_event_start_payload(
+    tool_call: Any,
+    repairs: list[str] | None = None,
+) -> dict[str, Any]:
+    return _attach_args_repaired(
+        {
+            "version": 1,
+            "phase": "start",
+            "call_id": str(getattr(tool_call, "id", "") or ""),
+            "name": getattr(tool_call, "name", ""),
+            "summary": _tool_event_summary(tool_call),
+            "arguments": _tool_event_arguments(tool_call),
+            "result": None,
+            "error": None,
+            "files": [],
+            "embeds": [],
+        },
+        repairs,
+    )
 
 
 def tool_event_result_extras(result: Any) -> tuple[list[Any], list[Any]]:
@@ -160,5 +180,7 @@ def build_tool_event_finish_payloads(context: AgentHookContext) -> list[dict[str
                 payload["error"] = result.strip()
             else:
                 payload["error"] = str(event.get("detail") or "Tool execution failed")
+        if event.get("args_repaired") is True:
+            _attach_args_repaired(payload, event.get("args_repair_kinds"))
         payloads.append(payload)
     return payloads
