@@ -152,6 +152,30 @@ BUILTIN_COMMAND_SPECS: tuple[BuiltinCommandSpec, ...] = (
         accepts_args=True,
     ),
     BuiltinCommandSpec(
+        "/changes",
+        "Show memory history",
+        "List recent workspace memory changes, or show one commit's diff.",
+        "history",
+        "[sha]",
+        accepts_args=True,
+    ),
+    BuiltinCommandSpec(
+        "/undo",
+        "Undo one change",
+        "Undo one memory commit without discarding later edits to other files.",
+        "undo-2",
+        "<sha>",
+        accepts_args=True,
+    ),
+    BuiltinCommandSpec(
+        "/restore",
+        "Restore memory state",
+        "Set all memory files to an earlier version (requires confirm).",
+        "rotate-ccw",
+        "<sha> [confirm]",
+        accepts_args=True,
+    ),
+    BuiltinCommandSpec(
         "/dream-prompt",
         "Dream memory",
         "Tell Dream how to organize this workspace's memory.",
@@ -820,20 +844,228 @@ async def cmd_dream_restore(ctx: CommandContext) -> OutboundMessage:
                 "Use `/dream-restore` to list recent versions."
             )
         else:
-            changed_files = _format_changed_files(result[1])
-            new_sha = git.revert(sha, message_prefix=_DREAM_COMMIT_PREFIX)
-            if new_sha:
-                content = (
-                    f"Restored Dream memory to the state before `{sha}`.\n\n"
-                    f"- New safety commit: `{new_sha}`\n"
-                    f"- Restored files: {changed_files}\n\n"
-                    f"Use `/dream-log {new_sha}` to inspect the restore diff."
-                )
+            undo = git.undo(sha)
+            if undo.restored or undo.skipped:
+                lines = [
+                    f"Restored Dream memory to the state before `{sha}`.",
+                    "",
+                ]
+                if undo.new_sha:
+                    lines.append(f"- New safety commit: `{undo.new_sha}`")
+                if undo.restored:
+                    lines.append(f"- Restored files: {_format_file_paths(undo.restored)}")
+                for path in undo.skipped:
+                    lines.append(
+                        f"- Skipped `{path}` — changed again later; "
+                        f"use `/restore {sha}`"
+                    )
+                if undo.new_sha:
+                    lines.extend([
+                        "",
+                        f"Use `/dream-log {undo.new_sha}` to inspect the restore diff.",
+                    ])
+                content = "\n".join(lines)
             else:
                 content = (
                     f"Couldn't restore Dream change `{sha}`.\n\n"
                     "It may be the first saved version with no earlier state to restore."
                 )
+    return OutboundMessage(
+        channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
+        content=content, metadata={"render_as": "text"},
+    )
+
+
+_CHANGES_MAX_COMMITS = 15
+_CHANGES_DIFF_MAX_CHARS = 6000
+
+
+def _format_file_paths(paths: list[str]) -> str:
+    if not paths:
+        return "No tracked memory files changed."
+    return ", ".join(f"`{path}`" for path in paths)
+
+
+def _history_git(ctx: CommandContext) -> Any:
+    return ctx.loop.consolidator.store.git
+
+
+async def cmd_changes(ctx: CommandContext) -> OutboundMessage:
+    """Show workspace memory history.
+
+    Usage:
+        /changes         — the last commits, one line each
+        /changes <sha>   — the diff introduced by that commit
+    """
+    git = _history_git(ctx)
+    if not git.is_initialized():
+        return OutboundMessage(
+            channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
+            content=(
+                "Memory history is not available because memory versioning "
+                "is not initialized."
+            ),
+            metadata={"render_as": "text"},
+        )
+
+    args = ctx.args.split()
+    if args:
+        sha = args[0]
+        result = git.show_commit_diff(sha)
+        if not result:
+            content = (
+                f"Couldn't find change `{sha}`.\n\n"
+                "Use `/changes` to list recent changes."
+            )
+        else:
+            commit, diff = result
+            if len(diff) > _CHANGES_DIFF_MAX_CHARS:
+                diff = diff[:_CHANGES_DIFF_MAX_CHARS] + "\n...[diff truncated]"
+            content = commit.format(diff=diff)
+    else:
+        commits = git.log(max_entries=_CHANGES_MAX_COMMITS, include_files=True)
+        if not commits:
+            content = "Memory history has no saved versions yet."
+        else:
+            lines = ["## Memory history", ""]
+            for c in commits:
+                files = ", ".join(c.files) if c.files else "no files"
+                lines.append(f"`{c.sha}` · {c.timestamp} · {c.subject()} · {files}")
+            lines.extend([
+                "",
+                "Show a diff with `/changes <sha>`, undo one change with `/undo <sha>`.",
+            ])
+            content = "\n".join(lines)
+
+    return OutboundMessage(
+        channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
+        content=content, metadata={"render_as": "text"},
+    )
+
+
+async def cmd_undo(ctx: CommandContext) -> OutboundMessage:
+    """Undo the changes a single commit introduced, per file.
+
+    Usage:
+        /undo <sha> — undo one commit's changes, keeping later edits intact
+    """
+    git = _history_git(ctx)
+    if not git.is_initialized():
+        return OutboundMessage(
+            channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
+            content=(
+                "Memory history is not available because memory versioning "
+                "is not initialized."
+            ),
+            metadata={"render_as": "text"},
+        )
+
+    args = ctx.args.split()
+    if not args:
+        return OutboundMessage(
+            channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
+            content="Usage: `/undo <sha>` — list recent changes with `/changes`.",
+            metadata={"render_as": "text"},
+        )
+
+    sha = args[0]
+    undo = git.undo(sha)
+    if not undo.restored and not undo.skipped:
+        if git.has_commit(sha):
+            content = (
+                f"Nothing to undo from `{sha}`.\n\n"
+                "It may be the first saved version, or it changed no memory files."
+            )
+        else:
+            content = (
+                f"Couldn't find change `{sha}`.\n\n"
+                "Use `/changes` to list recent changes."
+            )
+    else:
+        lines = [f"## Undo `{sha}`", ""]
+        if undo.restored:
+            lines.append(f"- Restored: {_format_file_paths(undo.restored)}")
+        for path in undo.skipped:
+            lines.append(
+                f"- Skipped `{path}` — changed again later; use `/restore {sha}`"
+            )
+        content = "\n".join(lines)
+
+    return OutboundMessage(
+        channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
+        content=content, metadata={"render_as": "text"},
+    )
+
+
+async def cmd_restore(ctx: CommandContext) -> OutboundMessage:
+    """Restore all memory files to an earlier commit (two-step confirm).
+
+    Usage:
+        /restore <sha>            — preview the files that would change
+        /restore <sha> confirm    — do the restore
+    """
+    git = _history_git(ctx)
+    if not git.is_initialized():
+        return OutboundMessage(
+            channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
+            content=(
+                "Memory history is not available because memory versioning "
+                "is not initialized."
+            ),
+            metadata={"render_as": "text"},
+        )
+
+    args = ctx.args.split()
+    if not args:
+        return OutboundMessage(
+            channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
+            content="Usage: `/restore <sha> confirm` — list recent changes with `/changes`.",
+            metadata={"render_as": "text"},
+        )
+
+    sha = args[0]
+    if not git.has_commit(sha):
+        return OutboundMessage(
+            channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
+            content=(
+                f"Couldn't find change `{sha}`.\n\n"
+                "Use `/changes` to list recent changes."
+            ),
+            metadata={"render_as": "text"},
+        )
+
+    confirmed = len(args) > 1 and args[1].lower() == "confirm"
+    if not confirmed:
+        preview = git.restore_preview(sha)
+        if not preview:
+            content = f"Nothing to restore: memory already matches `{sha}`."
+        else:
+            lines = [
+                f"## Restore `{sha}`",
+                "",
+                "This would overwrite or delete every later change to:",
+                "",
+            ]
+            lines.extend(f"- `{path}`" for path in preview)
+            lines.extend([
+                "",
+                f"Confirm with `/restore {sha} confirm`.",
+            ])
+            content = "\n".join(lines)
+    else:
+        changed = git.restore(sha)
+        if not changed:
+            content = f"Nothing to restore: memory already matches `{sha}`."
+        else:
+            lines = [
+                f"Restored memory to `{sha}`.",
+                "",
+                f"- Changed files: {_format_file_paths(changed)}",
+                "",
+                f"Use `/changes {sha}` to inspect the version you restored.",
+            ]
+            content = "\n".join(lines)
+
     return OutboundMessage(
         channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
         content=content, metadata={"render_as": "text"},
@@ -1095,6 +1327,12 @@ def register_builtin_commands(router: CommandRouter) -> None:
     router.prefix("/dream-log ", cmd_dream_log)
     router.exact("/dream-restore", cmd_dream_restore)
     router.prefix("/dream-restore ", cmd_dream_restore)
+    router.exact("/changes", cmd_changes)
+    router.prefix("/changes ", cmd_changes)
+    router.exact("/undo", cmd_undo)
+    router.prefix("/undo ", cmd_undo)
+    router.exact("/restore", cmd_restore)
+    router.prefix("/restore ", cmd_restore)
     router.exact("/dream-prompt", cmd_dream_prompt)
     router.prefix("/dream-prompt ", cmd_dream_prompt)
     router.exact("/evaluator-prompt", cmd_evaluator_prompt)
