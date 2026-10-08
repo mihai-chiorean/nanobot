@@ -36,8 +36,8 @@ import os
 import re
 import shutil
 import tempfile
-from contextlib import suppress
 from collections.abc import Callable, Iterable, Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
@@ -402,7 +402,6 @@ def commit_message_for(ws: Path | str, sha: str) -> str | None:
         if not git_dir.exists():
             continue
         try:
-            from dulwich.objects import Commit
             from dulwich.repo import Repo
 
             with Repo(str(git_dir)) as repo:
