@@ -640,6 +640,27 @@ def test_archive_reindexed_after_external_edit(tmp_path):
     assert not indexer.index.search("octopus survey")
 
 
+def test_archive_stale_rows_cleared_when_emptied_or_deleted(tmp_path):
+    """Emptying or deleting archive.md must drop its old facts from recall."""
+    from nanobot.agent.memory import MemoryStore
+
+    manager, indexer = _manager(tmp_path, "owner")
+    store = MemoryStore(manager.workspace)
+    store.set_recall_indexer(indexer)
+
+    archive = manager.workspace / "memory" / "archive.md"
+    archive.write_text("- The quarry lease ends in May.\n", encoding="utf-8")
+    assert indexer.index.search("quarry lease")
+
+    archive.write_text("", encoding="utf-8")
+    assert not indexer.index.search("quarry lease")
+
+    archive.write_text("- The orchard permit renews yearly.\n", encoding="utf-8")
+    assert indexer.index.search("orchard permit")
+    archive.unlink()
+    assert not indexer.index.search("orchard permit")
+
+
 async def test_archive_visible_in_session_scope(tmp_path):
     """Retired facts reach a conversation exactly like the injected MEMORY.md."""
     from nanobot.agent.memory import MemoryStore

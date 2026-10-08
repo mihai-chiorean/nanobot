@@ -1544,8 +1544,9 @@ class SessionRecallIndexer:
             except Exception:
                 logger.exception("Recall could not read {}", source)
                 continue
-            if text.strip():
-                written += self.index.index_text(source, text, kind=KIND_FACT)
+            # Always call index_text, even for empty text: it is what clears the
+            # old chunks when a curated file is emptied or deleted.
+            written += self.index.index_text(source, text, kind=KIND_FACT)
         if workspace is not None:
             self._curated_store = store
             self._curated_workspace = Path(workspace)
