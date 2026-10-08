@@ -81,19 +81,38 @@ async def trending_marketplace_skills(
     *,
     limit: int = 8,
     provider: str = _PROVIDER_ALL,
+    install_supported: bool = True,
 ) -> dict[str, Any]:
     """Return provider-aware marketplace rankings without mixing metric semantics."""
     selected = _valid_provider(provider)
+    allowed = bool(install_supported)
     if selected == _PROVIDER_SKILLHUB:
-        return await _trending_skillhub_skills(workspace_path, limit=limit)
+        return await _trending_skillhub_skills(
+            workspace_path,
+            limit=limit,
+            install_supported=allowed,
+        )
     if selected == _PROVIDER_SKILLS_SH:
-        return await _trending_skills_sh_skills(workspace_path, limit=limit)
+        return await _trending_skills_sh_skills(
+            workspace_path,
+            limit=limit,
+            install_supported=allowed,
+        )
 
     results = await asyncio.gather(
-        _trending_skills_sh_skills(workspace_path, limit=limit),
-        _trending_skillhub_skills(workspace_path, limit=limit),
+        _trending_skills_sh_skills(
+            workspace_path,
+            limit=limit,
+            install_supported=allowed,
+        ),
+        _trending_skillhub_skills(
+            workspace_path,
+            limit=limit,
+            install_supported=allowed,
+        ),
         return_exceptions=True,
     )
+
     payloads = [result for result in results if isinstance(result, dict)]
     if not payloads:
         raise SkillsMarketplaceError(
@@ -117,6 +136,7 @@ async def _trending_skills_sh_skills(
     workspace_path: Path,
     *,
     limit: int,
+    install_supported: bool = True,
 ) -> dict[str, Any]:
     """Return a source-diverse snapshot of skills.sh's real 24-hour leaderboard."""
     try:
@@ -130,6 +150,7 @@ async def _trending_skills_sh_skills(
             status=502,
         ) from exc
 
+    supported = bool(skills_install_supported()) and bool(install_supported)
     installed = _installed_skill_names(workspace_path)
     rows = payload.get("skills", [])
     skills: list[dict[str, Any]] = []
@@ -141,7 +162,12 @@ async def _trending_skills_sh_skills(
         source = row_payload.get("source")
         if not isinstance(source, str) or source in seen_sources:
             continue
-        skill = _marketplace_skill(row_payload, installed, rank=rank)
+        skill = _marketplace_skill(
+            row_payload,
+            installed,
+            rank=rank,
+            install_supported=supported,
+        )
         if skill is None:
             continue
         seen_sources.add(source)
@@ -153,7 +179,7 @@ async def _trending_skills_sh_skills(
         "skills": skills,
         "period": "24h",
         "provider": _PROVIDER_SKILLS_SH,
-        "install_supported": skills_install_supported(),
+        "install_supported": supported,
     }
 
 
@@ -163,6 +189,7 @@ async def search_marketplace_skills(
     *,
     limit: int = 20,
     provider: str = _PROVIDER_ALL,
+    install_supported: bool = True,
 ) -> dict[str, Any]:
     """Search one or all catalogs and annotate locally installed results."""
     normalized = " ".join(query.split())
@@ -172,14 +199,35 @@ async def search_marketplace_skills(
         raise SkillsMarketplaceError("search query is too long")
 
     selected = _valid_provider(provider)
+    allowed = bool(install_supported)
     if selected == _PROVIDER_SKILLHUB:
-        return await _search_skillhub_skills(normalized, workspace_path, limit=limit)
+        return await _search_skillhub_skills(
+            normalized,
+            workspace_path,
+            limit=limit,
+            install_supported=allowed,
+        )
     if selected == _PROVIDER_SKILLS_SH:
-        return await _search_skills_sh_skills(normalized, workspace_path, limit=limit)
+        return await _search_skills_sh_skills(
+            normalized,
+            workspace_path,
+            limit=limit,
+            install_supported=allowed,
+        )
 
     results = await asyncio.gather(
-        _search_skills_sh_skills(normalized, workspace_path, limit=limit),
-        _search_skillhub_skills(normalized, workspace_path, limit=limit),
+        _search_skills_sh_skills(
+            normalized,
+            workspace_path,
+            limit=limit,
+            install_supported=allowed,
+        ),
+        _search_skillhub_skills(
+            normalized,
+            workspace_path,
+            limit=limit,
+            install_supported=allowed,
+        ),
         return_exceptions=True,
     )
     payloads = [result for result in results if isinstance(result, dict)]
@@ -206,6 +254,7 @@ async def _search_skills_sh_skills(
     workspace_path: Path,
     *,
     limit: int,
+    install_supported: bool = True,
 ) -> dict[str, Any]:
     try:
         async with _skills_client() as client:
@@ -221,13 +270,18 @@ async def _search_skills_sh_skills(
             status=502,
         ) from exc
 
+    supported = bool(skills_install_supported()) and bool(install_supported)
     installed = _installed_skill_names(workspace_path)
     rows = payload.get("skills", [])
     skills: list[dict[str, Any]] = []
     for row in rows:
         if not isinstance(row, dict):
             continue
-        skill = _marketplace_skill(cast(dict[str, Any], row), installed)
+        skill = _marketplace_skill(
+            cast(dict[str, Any], row),
+            installed,
+            install_supported=supported,
+        )
         if skill is not None:
             skills.append(skill)
 
@@ -235,7 +289,7 @@ async def _search_skills_sh_skills(
         "query": normalized,
         "skills": skills,
         "provider": _PROVIDER_SKILLS_SH,
-        "install_supported": skills_install_supported(),
+        "install_supported": supported,
     }
 
 
@@ -244,6 +298,7 @@ async def _search_skillhub_skills(
     workspace_path: Path,
     *,
     limit: int,
+    install_supported: bool = True,
 ) -> dict[str, Any]:
     try:
         async with _skillhub_client() as client:
@@ -259,19 +314,27 @@ async def _search_skillhub_skills(
             status=502,
         ) from exc
 
+    supported = bool(install_supported)
     installed = _installed_skill_names(workspace_path)
     rows = payload.get("results", [])
     skills = [
         skill
         for row in rows
         if isinstance(row, dict)
-        if (skill := _skillhub_skill(cast(dict[str, Any], row), installed)) is not None
+        if (
+            skill := _skillhub_skill(
+                cast(dict[str, Any], row),
+                installed,
+                install_supported=supported,
+            )
+        )
+        is not None
     ]
     return {
         "query": normalized,
         "skills": skills,
         "provider": _PROVIDER_SKILLHUB,
-        "install_supported": True,
+        "install_supported": supported,
     }
 
 
@@ -279,6 +342,7 @@ async def _trending_skillhub_skills(
     workspace_path: Path,
     *,
     limit: int,
+    install_supported: bool = True,
 ) -> dict[str, Any]:
     try:
         async with _skillhub_client() as client:
@@ -291,13 +355,19 @@ async def _trending_skillhub_skills(
             status=502,
         ) from exc
 
+    supported = bool(install_supported)
     installed = _installed_skill_names(workspace_path)
     rows = payload.get("skills", [])
     skills: list[dict[str, Any]] = []
     for rank, row in enumerate(rows, start=1):
         if not isinstance(row, dict):
             continue
-        skill = _skillhub_skill(cast(dict[str, Any], row), installed, rank=rank)
+        skill = _skillhub_skill(
+            cast(dict[str, Any], row),
+            installed,
+            rank=rank,
+            install_supported=supported,
+        )
         if skill is not None:
             skills.append(skill)
         if len(skills) >= min(max(limit, 1), 20):
@@ -306,7 +376,7 @@ async def _trending_skillhub_skills(
         "skills": skills,
         "period": "trending",
         "provider": _PROVIDER_SKILLHUB,
-        "install_supported": True,
+        "install_supported": supported,
     }
 
 
@@ -752,6 +822,7 @@ def _marketplace_skill(
     installed: set[str],
     *,
     rank: int | None = None,
+    install_supported: bool | None = None,
 ) -> dict[str, Any] | None:
     source = row.get("source")
     skill_id = row.get("skillId")
@@ -763,6 +834,9 @@ def _marketplace_skill(
     if not isinstance(display_name, str) or not display_name.strip():
         display_name = skill_id
     installs = row.get("installs")
+    supported = (
+        bool(skills_install_supported()) if install_supported is None else bool(install_supported)
+    )
     skill: dict[str, Any] = {
         "id": f"{source}/{skill_id}",
         "skill_id": skill_id,
@@ -772,9 +846,10 @@ def _marketplace_skill(
         "installs": installs if isinstance(installs, int) and installs >= 0 else 0,
         "url": f"https://skills.sh/{source}/{skill_id}",
         "installed": skill_id in installed,
-        "install_supported": skills_install_supported(),
+        "install_supported": supported,
         "metric": "installs_24h" if rank is not None else "installs_total",
     }
+
     if rank is not None:
         skill["rank"] = rank
     return skill
@@ -785,6 +860,7 @@ def _skillhub_skill(
     installed: set[str],
     *,
     rank: int | None = None,
+    install_supported: bool | None = None,
 ) -> dict[str, Any] | None:
     skill_id = row.get("slug")
     if not isinstance(skill_id, str) or not _valid_skill_id(skill_id):
@@ -813,6 +889,7 @@ def _skillhub_skill(
     if not isinstance(version, str) or _VERSION_RE.fullmatch(version) is None:
         version = ""
 
+    supported = True if install_supported is None else bool(install_supported)
     skill: dict[str, Any] = {
         "id": f"{_PROVIDER_SKILLHUB}:{skill_id}",
         "skill_id": skill_id,
@@ -824,7 +901,7 @@ def _skillhub_skill(
         "url": f"{_SKILLHUB_PAGE_BASE_URL}/{quote(handle.strip(), safe='')}/"
         f"{quote(skill_id, safe='')}",
         "installed": skill_id in installed,
-        "install_supported": True,
+        "install_supported": supported,
         "metric": "installs_total",
         "version": version,
         "verified": verified,
