@@ -68,6 +68,11 @@ class CronPayload:
     origin_channel: str | None = None
     origin_chat_id: str | None = None
     origin_metadata: dict[str, Any] = field(default_factory=dict)
+    # Ziggy-local (SR-17/SR-18): the skill a ``work_task`` run executes as. The
+    # skill scopes the turn's tools (``allowed-tools``), supplies its script
+    # (``metadata.ziggy.script``), and injects its content like an explicit
+    # ``$skill`` invocation.
+    skill: str | None = None
 
     @classmethod
     def from_store_dict(cls, data: dict[str, Any]) -> CronPayload:
@@ -86,6 +91,7 @@ class CronPayload:
             origin_metadata=dict(
                 get_camel_snake(data, "originMetadata", "origin_metadata", {}) or {}
             ),
+            skill=get_camel_snake(data, "skill", "skill"),
         )
 
 
