@@ -31,8 +31,11 @@ from urllib.parse import unquote
 
 from loguru import logger
 
+from nanobot.agent.skills import SkillsLoader
+from nanobot.agent.tools.allowed_tools import ALLOWED_TOOLS_META_KEY
 from nanobot.agent.tools.read_only import READ_ONLY_META_KEY, read_only_value
 from nanobot.bus.events import InboundMessage
+from nanobot.runtime_context import RUNTIME_CONTEXT_INPUT_META
 from nanobot.webui.session_identity import is_valid_webui_chat_id
 from nanobot.work.store import ACTIVE_STATUSES, MAX_EVENT_PAGE, WorkStore
 
@@ -288,6 +291,10 @@ class WorkStreamHub:
             return
         title = envelope.get("title")
         read_only = read_only_value(envelope.get("read_only", False))
+        skill, skill_error = self._validated_skill(envelope.get("skill"))
+        if skill_error is not None:
+            await self._error(connection, skill_error)
+            return
         task = await self._store.run_io(
             self._store.create_task,
             chat_id=str(chat_id),
@@ -298,6 +305,7 @@ class WorkStreamHub:
             reasoning_profile=profile,
             read_only=read_only,
             request_id=request_id,
+            skill=skill,
         )
         was_created = bool(task.pop("_was_created", True))
         was_dispatched = bool(task.pop("_was_dispatched", False))
@@ -465,6 +473,50 @@ class WorkStreamHub:
 
     # -- shared task operations --------------------------------------------
 
+    def _validated_skill(self, raw_skill: Any) -> tuple[str | None, str | None]:
+        """Validate the optional ``skill`` of a ``work.create`` envelope (SR-17).
+
+        Returns ``(name, None)`` for a usable skill name, ``(None, None)`` when
+        absent, and ``(None, detail)`` for input that must be rejected with an
+        error event. Existence means the name resolves to a loadable skill,
+        the same truth the scheduled path and ``$skill`` invocations use.
+        """
+        if raw_skill is None:
+            return None, None
+        if not isinstance(raw_skill, str) or not raw_skill.strip():
+            return None, "invalid skill"
+        name = raw_skill.strip()
+        if SkillsLoader(self._store.workspace).build_skill_runtime_context(name) is None:
+            return None, f"unknown skill: {name}"
+        return name, None
+
+    def _stamp_skill_turn_metadata(self, task: dict[str, Any], metadata: dict[str, Any]) -> None:
+        """Scope a skill-bound Work turn like an explicit ``$skill`` invocation.
+
+        The skill content rides in through the trusted runtime-context block
+        path and the skill's ``allowed-tools`` becomes the turn's tool
+        allowlist. A skill deleted since the task was created degrades to an
+        unscoped turn with a warning: a follow-up message must not fail
+        outright because the skill directory moved.
+        """
+        skill = task.get("skill")
+        if not isinstance(skill, str) or not skill.strip():
+            return
+        name = skill.strip()
+        loader = SkillsLoader(self._store.workspace)
+        block = loader.build_skill_runtime_context(name)
+        if block is None:
+            logger.warning(
+                "Work task {} names unknown skill '{}'; running unscoped",
+                task.get("task_id"),
+                name,
+            )
+            return
+        metadata[RUNTIME_CONTEXT_INPUT_META] = [block]
+        allowed = loader.skill_allowed_tools(name)
+        if allowed is not None:
+            metadata[ALLOWED_TOOLS_META_KEY] = allowed
+
     async def publish_work_inbound(
         self,
         task: dict[str, Any],
@@ -490,6 +542,7 @@ class WorkStreamHub:
         }
         if read_only_value(task.get("read_only", False)):
             metadata[READ_ONLY_META_KEY] = True
+        self._stamp_skill_turn_metadata(task, metadata)
         if remote is not None:
             metadata["remote"] = remote
         await self._bus.publish_inbound(
