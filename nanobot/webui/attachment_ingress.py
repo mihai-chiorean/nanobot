@@ -105,7 +105,7 @@ def store_inbound_attachments(
             image_count += 1
         elif mime in _DOCUMENT_MIME_ALLOWED:
             document_count += 1
-    if image_count > limits.max_count:
+    if image_count > min(4, limits.max_count):
         return [], "too_many_images"
     if video_count > _MAX_VIDEOS_PER_MESSAGE:
         return [], "too_many_videos"

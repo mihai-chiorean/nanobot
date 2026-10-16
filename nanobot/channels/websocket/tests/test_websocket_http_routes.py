@@ -254,8 +254,8 @@ async def test_bootstrap_returns_token_for_localhost(
             },
             "message": {"max_text_bytes": 65_536},
             "attachments": {
-                "max_count": 4,
-                "max_file_bytes": 6_291_456,
+                "max_count": 6,
+                "max_file_bytes": 10_485_760,
                 "max_total_bytes": 25_165_824,
             },
         }

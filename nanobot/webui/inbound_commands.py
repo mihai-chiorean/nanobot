@@ -45,7 +45,6 @@ from nanobot.session.webui_turns import (
     websocket_turn_id,
     websocket_turn_wall_started_at,
 )
-from nanobot.utils.helpers import safe_filename
 from nanobot.utils.prompt_templates import render_template
 from nanobot.webui.cli_apps_api import normalize_cli_app_mentions
 from nanobot.webui.forking import handle_webui_fork_chat
@@ -278,6 +277,8 @@ class WebUICommandRouter:
         cli_apps: list[dict[str, Any]],
         mcp_presets: list[dict[str, Any]],
         session_mentions: list[SessionMention],
+        attachment_statuses: list[dict[str, Any]] | None = None,
+        client_message_id: str | None = None,
     ) -> None:
         body: dict[str, Any] = {
             "event": "user_message",
@@ -291,8 +292,14 @@ class WebUICommandRouter:
         for attachment, name in zip(media, media_names, strict=False):
             if name:
                 attachment["name"] = name
+        if attachment_statuses:
+            media = [{**(media[index] if index < len(media)
+                         and str(media[index].get("name", "")).endswith(str(status.get("name", ""))) else {}), **status}
+                     for index, status in enumerate(attachment_statuses)]
         if media:
             body["media_urls"] = media
+        if client_message_id is not None:
+            body["client_message_id"] = client_message_id
         if cli_apps:
             body["cli_apps"] = cli_apps
         if mcp_presets:
@@ -695,7 +702,12 @@ class WebUICommandRouter:
             ):
                 return
 
-        message_rejection = self._ingress.validate_text(content)
+        display_content = envelope.get("display_content")
+        has_document_input = isinstance(envelope.get("attachment_cards"), list) and isinstance(display_content, str)
+        visible_content = display_content if isinstance(display_content, str) and has_document_input else content
+        message_rejection = self._ingress.validate_text(visible_content)
+        if has_document_input and len(content.encode("utf-8")) > 1024 * 1024:
+            message_rejection = "text_too_large"
         if message_rejection is not None:
             await reject(
                 "message_rejected",
@@ -716,6 +728,14 @@ class WebUICommandRouter:
         raw_media = envelope.get("media")
         media_paths: list[str] = []
         media_names: list[str | None] = []
+        from nanobot.webui.pdf_attachments import (
+            AttachmentStatus,
+            attachment_name,
+            parse_attachment_cards,
+            prepare_pdfs,
+        )
+        attachment_statuses: list[AttachmentStatus] = []
+        attachment_note = ""
         if raw_media is not None:
             if not isinstance(raw_media, list):
                 await reject(
@@ -726,20 +746,30 @@ class WebUICommandRouter:
             media_paths, reason = self._media.store_inbound_attachments(
                 cast(list[Any], raw_media)
             )
+            upload_names = [attachment_name(item) for item in cast(list[Any], raw_media)]
+            media_names = list(upload_names)
             if reason is not None:
-                await reject(
-                    "attachment_rejected",
-                    reason=reason,
-                )
-                return
-            for item in cast(list[Any], raw_media):
-                attachment = cast(dict[str, Any], item) if isinstance(item, dict) else {}
-                name = attachment.get("name")
-                media_names.append((safe_filename(name) or None) if isinstance(name, str) else None)
+                explanations = {
+                    "size": "The file exceeds the 10 MB upload limit; try a smaller file.",
+                    "total_size": "Attachments exceed the 24 MB total limit; send fewer files.",
+                    "mime": "This file type is not supported; try a text PDF or a screenshot.",
+                    "too_many_images": "You can attach up to 4 images; send fewer files.",
+                    "too_many_attachments": "You can attach up to 6 files; send fewer files.",
+                }
+                detail = explanations.get(reason, "The upload could not be read; try attaching the file again.")
+                attachment_statuses = [{"name": name, "error": detail} for name in upload_names[:6]]
+                attachment_note = "\n".join(
+                    f"Attachment read failure for {item['name']}: {detail}" for item in attachment_statuses
+                ) + "\nExplain these failures to the user in plain language."
+            else:
+                attachment_note, attachment_statuses = await prepare_pdfs(media_paths, upload_names)
             if temporary_policy is not None:
                 self._temporary_chats.register_media(connection, chat_id, media_paths)
 
-        if not content.strip() and not media_paths:
+        if has_document_input:
+            attachment_statuses = parse_attachment_cards(envelope.get("attachment_cards"))
+
+        if not content.strip() and not media_paths and not attachment_statuses:
             await reject("missing content")
             return
         self._transport.webui_attach(connection, chat_id)
@@ -772,6 +802,8 @@ class WebUICommandRouter:
         metadata: dict[str, Any] = {
             "remote": getattr(connection, "remote_address", None)
         }
+        if attachment_statuses:
+            metadata["attachments"] = attachment_statuses
         # Ziggy-local (MIT-1404): the ziggy-worker asks for a final ``message``
         # frame after a streamed reply; the agent loop reads this flag.
         if envelope.get("explicit_final_message") is True:
@@ -796,6 +828,8 @@ class WebUICommandRouter:
         dispatch_content = (
             f"{USER_SHELL_COMMAND} {content[1:].lstrip()}" if is_user_shell else content
         )
+        if attachment_note:
+            dispatch_content += "\n\n[Attachment processing note]\n" + attachment_note
         cli_apps = normalize_cli_app_mentions(envelope.get("cli_apps"))
         if cli_apps:
             metadata["cli_apps"] = cli_apps
@@ -891,15 +925,22 @@ class WebUICommandRouter:
             ):
                 self._transcripts.append_user_message(
                     chat_id,
-                    content,
+                    visible_content,
                     metadata=metadata,
                     media_paths=media_paths or None,
                     cli_apps=cli_apps or None,
                     mcp_presets=mcp_presets or None,
                     session_mentions=session_mentions or None,
                 )
+            if attachment_statuses:
+                metadata[RUNTIME_CONTEXT_INPUT_META] = [RuntimeContextBlock(
+                    source="attachment_processing",
+                    content="Use the attached document text when available. For other documents use read_file. "
+                    "Explain attachment read failures in plain language, naming the file and suggesting "
+                    "a text PDF or screenshot. Never claim to have read unavailable contents.",
+                )]
             if trusted_webui:
-                context_blocks: list[RuntimeContextBlock] = []
+                context_blocks: list[RuntimeContextBlock] = list(metadata.get(RUNTIME_CONTEXT_INPUT_META, []))
                 if not is_user_shell and envelope.get("intent") == "create_automation":
                     context_blocks.append(RuntimeContextBlock(
                         source="webui_automation_creation",
@@ -943,6 +984,11 @@ class WebUICommandRouter:
             if not accepted and prepared is not None and client_message_id is not None:
                 await self._release_client_message(chat_id, client_message_id)
 
+        if attachment_statuses and (attachment_note or any(item.get("error") for item in attachment_statuses)):
+            await self._transport.webui_send_event(
+                connection, "attachment.status", chat_id=chat_id,
+                client_message_id=client_message_id, attachments=attachment_statuses,
+            )
         if client_message_id is not None:
             await self._transport.send_message_ack(
                 connection,
@@ -972,6 +1018,8 @@ class WebUICommandRouter:
                 starts_turn=queued_owner is not None,
                 media_paths=media_paths,
                 media_names=media_names,
+                attachment_statuses=[dict(item) for item in attachment_statuses],
+                client_message_id=client_message_id,
                 cli_apps=cli_apps,
                 mcp_presets=mcp_presets,
                 session_mentions=session_mentions,
