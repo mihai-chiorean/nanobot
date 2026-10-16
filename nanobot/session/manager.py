@@ -190,6 +190,9 @@ class Session:
     last_consolidated: int = 0
     provider_state: ProviderConversationState | None = field(default=None, repr=False)
     policy: SessionPolicy = field(default_factory=SessionPolicy, repr=False, compare=False)
+    # A background caller may retain this object beyond cache eviction/delete.
+    # Never let that old object recreate a deleted conversation on its next save.
+    deleted: bool = field(default=False, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if not isinstance(cast(object, self.metadata), dict):
@@ -1407,11 +1410,8 @@ class JsonlSessionStore:
         for path in paths:
             if not path.exists():
                 continue
-            try:
-                path.unlink()
-                deleted = True
-            except OSError as e:
-                logger.warning("Failed to delete session file {}: {}", path, e)
+            path.unlink()
+            deleted = True
         return deleted
 
     def read(self, key: str) -> SessionPayload | None:
@@ -1801,30 +1801,31 @@ class SessionManager:
         return self._jsonl_store.repair(key, path=path)
 
     def save(self, session: Session, *, fsync: bool = False) -> None:
-        """Persist a session and retain it in the cache."""
-        if not session.policy.persist:
-            return
-
-        self._store.save(session, fsync=fsync)
-        self._remember(session)
-        if self._indexer is not None:
-            # Indexing is derived bookkeeping: it must never fail a turn.
-            try:
-                self._indexer.on_session_saved(session)
-            except Exception:
-                logger.exception("Recall index update failed for {}", session.key)
+        """Persist a live session and retain it in the cache."""
+        with self.locked_session_files():
+            if not session.policy.persist or session.deleted:
+                return
+            self._store.save(session, fsync=fsync)
+            self._remember(session)
+            if self._indexer is not None:
+                # Indexing is derived bookkeeping: it must never fail a turn.
+                try:
+                    self._indexer.on_session_saved(session)
+                except Exception:
+                    logger.exception("Recall index update failed for {}", session.key)
 
     def save_runtime_checkpoint(self, session: Session) -> None:
         """Persist volatile recovery state without rewriting long history."""
-        if not session.policy.persist:
-            return
-        if self._store is self._jsonl_store:
-            self._jsonl_store.save_runtime_checkpoint(session)
-            self._remember(session)
-            return
-        # Third-party stores keep their existing all-or-nothing semantics until
-        # they opt into a dedicated checkpoint primitive.
-        self.save(session)
+        with self.locked_session_files():
+            if not session.policy.persist or session.deleted:
+                return
+            if self._store is self._jsonl_store:
+                self._jsonl_store.save_runtime_checkpoint(session)
+                self._remember(session)
+                return
+            # Third-party stores keep their existing all-or-nothing semantics until
+            # they opt into a dedicated checkpoint primitive.
+            self.save(session)
 
     def rename_model_preset(self, old_name: str, new_name: str) -> int:
         """Rename a session-scoped model preset across durable and live sessions."""
@@ -1891,17 +1892,23 @@ class SessionManager:
         self._overflow_cache.pop(key, None)
 
     def delete_session(self, key: str) -> bool:
-        """Delete a persisted session and invalidate its cache entry."""
-        self.invalidate(key)
-        deleted = self._store.delete(key)
-        if self._delete_observer is not None:
-            self._delete_observer(key)
-        if self._indexer is not None:
-            try:
-                self._indexer.on_session_deleted(key)
-            except Exception:
-                logger.exception("Recall index delete failed for {}", key)
-        return deleted
+        """Delete persisted state and retire any object held by a background caller."""
+        with self.locked_session_files():
+            # Serialize the retirement with save/checkpoint, including a save
+            # already queued on the file lock. Cache invalidation alone leaves
+            # the caller's Session reference able to recreate the file.
+            if session := self.get_cached(key):
+                session.deleted = True
+            self.invalidate(key)
+            deleted = self._store.delete(key)
+            if self._delete_observer is not None:
+                self._delete_observer(key)
+            if self._indexer is not None:
+                try:
+                    self._indexer.on_session_deleted(key)
+                except Exception:
+                    logger.exception("Recall index delete failed for {}", key)
+            return deleted
 
     def restore_sessions_to_workspace(self) -> SessionRestoreResult:
         """Restore session files to the pre-relocation path for an explicit rollback."""

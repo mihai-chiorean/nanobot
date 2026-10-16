@@ -240,3 +240,49 @@ def test_invalid_runtime_checkpoint_is_discarded(tmp_path) -> None:
 
     assert "runtime_checkpoint" not in restored.metadata
     assert not checkpoint_path.exists()
+
+
+def test_session_delete_does_not_swallow_file_failure(tmp_path, monkeypatch) -> None:
+    from pathlib import Path
+
+    import pytest
+
+    manager = SessionManager(tmp_path)
+    session = manager.get_or_create("websocket:partial-delete")
+    session.add_message("user", "keep until removed")
+    manager.save(session)
+    path = manager._get_session_path(session.key)
+    unlink = Path.unlink
+
+    def fail_session(target, *args, **kwargs):
+        if target == path:
+            raise PermissionError("cannot unlink session")
+        return unlink(target, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_session)
+    with pytest.raises(PermissionError, match="cannot unlink session"):
+        manager.delete_session(session.key)
+    assert path.exists()
+
+
+def test_retained_session_cannot_recreate_deleted_file_or_checkpoint(tmp_path) -> None:
+    manager = SessionManager(tmp_path)
+    retained = manager.get_or_create("websocket:deleted")
+    retained.add_message("user", "original")
+    manager.save(retained)
+    assert manager.delete_session(retained.key)
+    # A delayed background/flush caller still owns this Python object.
+    retained.add_message("assistant", "late write")
+    manager.save(retained)
+    manager.save_runtime_checkpoint(retained)
+    assert not manager._get_session_path(retained.key).exists()
+    assert not manager._get_runtime_checkpoint_path(retained.key).exists()
+    assert manager.get_cached(retained.key) is None
+    assert manager.list_sessions() == []
+    # An intentional new conversation may reuse the key; the retired object
+    # must not overwrite it even after a replacement is cached.
+    replacement = manager.get_or_create(retained.key)
+    replacement.add_message("user", "new conversation")
+    manager.save(replacement)
+    manager.save(retained)
+    assert manager.read_session_file(retained.key)["messages"][0]["content"] == "new conversation"

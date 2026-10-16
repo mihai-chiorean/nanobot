@@ -4549,3 +4549,44 @@ async def test_webui_thread_recovered_call_survives_a_later_completed_turn(
     finally:
         await channel.stop()
         await server_task
+
+
+@pytest.mark.asyncio
+async def test_session_delete_reports_partial_cleanup_failure(
+    bus: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("nanobot.config.paths.get_data_dir", lambda: tmp_path)
+    key = "websocket:partial-cleanup"
+    sm = _seed_session(tmp_path, key=key)
+    from nanobot.webui.transcript import append_transcript_object, webui_transcript_path
+
+    append_transcript_object(key, {"event": "user", "chat_id": "partial-cleanup", "text": "x"})
+    transcript = webui_transcript_path(key)
+    original_unlink = Path.unlink
+
+    def fail_transcript(path, *args, **kwargs):
+        if path == transcript:
+            raise PermissionError("cannot remove transcript")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_transcript)
+    channel = _ch(bus, session_manager=sm, port=_free_port())
+    server_task = asyncio.create_task(channel.start())
+    try:
+        # The session file is removed first. The surviving transcript would
+        # rediscover the conversation, so deleted:true would be incorrect.
+        response = await _webui_mutate(channel, "session.delete", {"key": key})
+        assert response.status_code == 500
+        assert not sm._get_session_path(key).exists()
+        assert transcript.exists()
+        monkeypatch.setattr(Path, "unlink", original_unlink)
+        retry = await _webui_mutate(channel, "session.delete", {"key": key})
+        assert retry.status_code == 200
+        assert retry.json()["deleted"] is True
+        assert not transcript.exists()
+        from nanobot.webui.session_list_index import list_webui_sessions
+
+        assert list_webui_sessions(sm) == []
+    finally:
+        await channel.stop()
+        await server_task

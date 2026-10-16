@@ -824,3 +824,48 @@ def test_session_manager_list_sessions_fallback_time_when_missing(tmp_path: Path
     assert sessions[0]["updated_at"] is not None
     datetime.fromisoformat(sessions[0]["created_at"])
     datetime.fromisoformat(sessions[0]["updated_at"])
+
+
+def test_session_activity_compares_instants_and_rejects_corrupt_clocks(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path)
+    for key, timestamp in (
+        ("offset", "2026-06-01T10:00:00-07:00"),
+        ("utc", "2026-06-01T15:00:00Z"),
+        ("invalid", "not-a-date"),
+        ("future", "2099-01-01T00:00:00Z"),
+    ):
+        path = manager._get_session_path(f"websocket:{key}")
+        path.write_text(json.dumps({
+            "_type": "metadata", "key": f"websocket:{key}",
+            "created_at": "2026-01-01T00:00:00", "updated_at": timestamp,
+        }) + "\n", encoding="utf-8")
+    rows = list_webui_sessions(manager)
+    assert [row["key"] for row in rows[:2]] == ["websocket:offset", "websocket:utc"]
+    assert all(row["updated_at"] == "" for row in rows[2:])
+
+
+@pytest.mark.parametrize("canonical_session", [False, True])
+def test_transcript_rewrite_does_not_count_as_activity(tmp_path: Path, canonical_session: bool) -> None:
+    manager = SessionManager(tmp_path)
+    key = "websocket:rewritten"
+    if canonical_session:
+        session = manager.get_or_create(key)
+        session.add_message("user", "original turn")
+        session.messages[-1]["timestamp"] = "2026-06-01T10:00:00"
+        manager.save(session)
+    transcript = tmp_path / "webui" / f"{SessionManager.safe_key(key)}.jsonl"
+    activity = datetime(2026, 6, 1, 11)
+    transcript.write_text(json.dumps({
+        "event": "user", "chat_id": "rewritten", "text": "original turn",
+        "created_at_ms": int(activity.timestamp() * 1000),
+    }) + "\n", encoding="utf-8")
+    newer = manager.get_or_create("websocket:newer-turn")
+    newer.add_message("user", "actually newer")
+    newer.messages[-1]["timestamp"] = "2026-06-02T10:00:00"
+    manager.save(newer)
+    # Simulate a migration / backfill that touches the older transcript today.
+    os.utime(transcript, None)
+    for _ in range(2):  # including the cached list
+        rows = list_webui_sessions(manager)
+        assert rows[0]["key"] == newer.key
+        assert rows[1]["updated_at"] == activity.isoformat()
