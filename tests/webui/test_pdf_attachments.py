@@ -142,7 +142,7 @@ async def test_password_round_trip_and_persistent_attempt_cap(tmp_path: Path, al
     _, capped_cards = await prepare_pdfs([str(path)])
     vault.register("chat", "original-user", capped_cards, [str(path)], tmp_path)
     capped_id = capped_cards[0]["attachment_id"]
-    for _ in range(5):
+    for _ in range(3):  # Both earlier decrypt calls consumed the shared budget.
         assert "wrong" in await vault.unlock("chat", capped_id, "incorrect")
     reloaded = AttachmentVault(tmp_path / "tenant-a")
     assert "5 password attempts" in await reloaded.unlock("chat", capped_id, "password")
@@ -158,6 +158,13 @@ async def test_worker_rpc_matches_connection_and_returns_text(tmp_path: Path) ->
     cards = [{"name": "protected.pdf", "attachment_id": "att_" + "a" * 32,
               "locked_reason": "password_required"}]
     vault.register("chat", "user", cards, [], tmp_path)
+    assert not vault.records  # An envelope claim alone grants no capability.
+    append_transcript_object("websocket:chat", {
+        "event": "user", "chat_id": "chat", "client_message_id": "user",
+        "attachments": cards,
+    })
+    vault.register_history("chat", "websocket:chat")
+    vault = AttachmentVault(tmp_path)
     connection = object()
     async def send(event, **fields):
         assert event == "attachment.unlock"
@@ -165,9 +172,156 @@ async def test_worker_rpc_matches_connection_and_returns_text(tmp_path: Path) ->
         vault.resolve(object(), response)
         assert not vault.pending[fields["request_id"]][1].done()
         vault.resolve(connection, response)
-    vault.bridges["chat"] = (connection, send)
+    vault.bridges[("chat", "websocket:chat")] = (connection, send)
+    assert "not found" in await vault.unlock("other-chat", cards[0]["attachment_id"], "password")
+    assert "not found" in await vault.unlock("chat", cards[0]["attachment_id"], "password",
+                                             session="temporary:chat")
     result = await asyncio.wait_for(vault.unlock("chat", cards[0]["attachment_id"], "password"), 1)
     assert "Unlocked text" in result
+
+
+@pytest.mark.asyncio
+async def test_reuploads_share_five_attempts_across_chats_and_restarts(tmp_path: Path) -> None:
+    from nanobot.webui.attachment_unlock import AttachmentVault
+
+    first = tmp_path / "first.pdf"
+    second = tmp_path / "renamed.pdf"
+    make_pdf(first, "Private text", encrypted=True)
+    second.write_bytes(first.read_bytes())
+    vault = AttachmentVault(tmp_path / "tenant")
+    _, cards = await prepare_pdfs([str(first)])
+    vault.register("chat", "user", cards, [str(first)], tmp_path)
+    for _ in range(3):
+        assert "wrong" in await vault.unlock("chat", cards[0]["attachment_id"], "incorrect")
+
+    vault = AttachmentVault(tmp_path / "tenant")
+    _, reuploaded = await prepare_pdfs([str(second)])
+    vault.register("another-chat", "user", reuploaded, [str(second)], tmp_path)
+    assert cards[0]["attachment_id"] != reuploaded[0]["attachment_id"]
+    for _ in range(2):
+        assert "wrong" in await vault.unlock("another-chat", reuploaded[0]["attachment_id"], "incorrect")
+
+    vault = AttachmentVault(tmp_path / "tenant")
+    with patch("nanobot.webui.attachment_unlock.pdf_text", new_callable=AsyncMock) as parser:
+        assert "5 password attempts" in await vault.unlock("chat", cards[0]["attachment_id"], "password")
+        assert "5 password attempts" in await vault.unlock("another-chat", reuploaded[0]["attachment_id"], "password")
+        parser.assert_not_awaited()
+    foreign = AttachmentVault(tmp_path / "other-tenant")
+    _, foreign_cards = await prepare_pdfs([str(second)])
+    foreign.register("chat", "user", foreign_cards, [str(second)], tmp_path)
+    assert "Private text" in await foreign.unlock("chat", foreign_cards[0]["attachment_id"], "password")
+
+
+@pytest.mark.asyncio
+async def test_original_registry_attempts_are_migrated(tmp_path: Path) -> None:
+    import json
+
+    from nanobot.webui.attachment_unlock import AttachmentVault
+
+    path = tmp_path / "protected.pdf"
+    make_pdf(path, encrypted=True)
+    registry = tmp_path / "attachment-locks.json"
+    registry.write_text(json.dumps({f"local_{i}": {
+        "chat": "chat", "origin": "user", "name": "protected.pdf", "path": str(path),
+        "attempts": attempts, "locked": True,
+    } for i, attempts in enumerate([3, 2])}))
+    vault = AttachmentVault(tmp_path)
+    _, cards = await prepare_pdfs([str(path)])
+    vault.register("chat", "user", cards, [str(path)], tmp_path)
+    assert "5 password attempts" in await vault.unlock("chat", cards[0]["attachment_id"], "password")
+    assert "5 password attempts" in await AttachmentVault(tmp_path).unlock("chat", "local_0", "password")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("forgery", ["unknown_id", "lock_reason", "other_chat", "local_reason"])
+async def test_client_cards_cannot_authorize_unlocks(tmp_path: Path, forgery: str) -> None:
+    from nanobot.channels.websocket.tests.test_websocket_envelope_media import _make_channel
+    from nanobot.session.manager import SessionManager
+    from nanobot.webui.attachment_unlock import attachment_vault
+
+    sessions = SessionManager(tmp_path / "workspace", sessions_root=tmp_path / "sessions")
+    channel = _make_channel(sessions)
+    vault = attachment_vault(sessions.sessions_dir)
+    attachment_id = "att_" + "a" * 32
+    card = {"name": "protected.pdf", "attachment_id": attachment_id, "error": None,
+            "locked_reason": "password_required"}
+    if forgery in {"lock_reason", "other_chat"}:
+        historical = dict(card)
+        historical_chat = "another-chat" if forgery == "other_chat" else "chat"
+        if forgery == "lock_reason":
+            historical.pop("locked_reason")
+        append_transcript_object(f"websocket:{historical_chat}", {
+            "event": "user", "chat_id": historical_chat, "attachments": [historical],
+        })
+        vault.register_history(historical_chat, f"websocket:{historical_chat}")
+    if forgery == "local_reason":
+        card.pop("attachment_id")
+    connection = AsyncMock()
+    await channel._dispatch_envelope(connection, "client", {
+        "type": "message", "chat_id": "chat", "content": "Read this PDF",
+        "display_content": "Read this PDF", "webui": True,
+        "attachment_cards": [card], "attachment_unlock_bridge": True,
+    })
+    connection.send.reset_mock()
+    assert "not found" in await vault.unlock("chat", attachment_id, "password")
+    assert not vault.note("chat")
+    connection.send.assert_not_awaited()
+    if forgery == "other_chat":
+        assert vault.records[attachment_id]["chat"] == "another-chat"
+
+
+@pytest.mark.asyncio
+async def test_password_only_turn_registers_work_attachment_from_prior_history(tmp_path: Path) -> None:
+    from nanobot.channels.websocket.tests.test_websocket_envelope_media import _make_channel
+    from nanobot.runtime_context import RUNTIME_CONTEXT_INPUT_META
+    from nanobot.session.manager import SessionManager
+    from nanobot.webui.attachment_unlock import attachment_vault
+
+    sessions = SessionManager(tmp_path / "workspace", sessions_root=tmp_path / "sessions")
+    channel = _make_channel(sessions)
+    attachment_id = "att_" + "a" * 32
+    await channel._dispatch_envelope(AsyncMock(), "client", {
+        "type": "message", "chat_id": "chat", "content": "Read the PDF",
+        "display_content": "Read the PDF", "webui": True, "attachment_cards": [{
+            "name": "protected.pdf", "attachment_id": attachment_id,
+            "error": "Password protected", "locked_reason": "password_required",
+        }],
+    })
+    assert not attachment_vault(sessions.sessions_dir).records
+    await channel._dispatch_envelope(AsyncMock(), "client", {
+        "type": "message", "chat_id": "chat", "content": "Here is the password",
+        "attachment_unlock_bridge": True,
+    })
+    record = attachment_vault(sessions.sessions_dir).records[attachment_id]
+    assert record["session"] == "websocket:chat"
+    note = channel._handle_message.call_args.kwargs["metadata"][RUNTIME_CONTEXT_INPUT_META][0].content
+    assert attachment_id in note
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("chat,session,channel,metadata,allowed", [
+    ("chat", "websocket:chat", "websocket", {}, True),
+    ("other-chat", "websocket:other-chat", "websocket", {}, False),
+    ("chat", "temporary:chat", "websocket", {}, False),
+    ("chat", "websocket:chat", "telegram", {}, False),
+    ("chat", "websocket:chat", "websocket", {"shared_room": True}, False),
+])
+async def test_unlock_tool_uses_request_chat_and_session(tmp_path, chat, session, channel, metadata, allowed):
+    from nanobot.agent.tools.context import RequestContext, request_context
+    from nanobot.agent.tools.unlock_attachment import UnlockAttachmentTool
+    from nanobot.webui.attachment_unlock import AttachmentVault
+
+    vault = AttachmentVault(tmp_path)
+    vault.records["local_test"] = {
+        "chat": "chat", "session": "websocket:chat", "name": "protected.pdf",
+        "locked": False, "text": "Private text",
+    }
+    with request_context(RequestContext(channel=channel, chat_id=chat, session_key=session,
+                                        metadata=metadata)):
+        result = await UnlockAttachmentTool(vault).execute("local_test", "password")
+    assert ("Private text" in result) == allowed
+    if not allowed:
+        assert "not found" in result
 
 
 @pytest.mark.parametrize("projection", ["messages", "events"])

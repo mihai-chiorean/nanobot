@@ -43,5 +43,6 @@ class UnlockAttachmentTool(Tool):
         ctx = current_request_context()
         if ctx is None or ctx.channel != "websocket" or ctx.metadata.get("shared_room"):
             return ToolResult.error("Error: Attachment not found in this conversation.")
-        result = await self.vault.unlock(ctx.chat_id, attachment_id, password)
+        result = await self.vault.unlock(ctx.chat_id, attachment_id, password,
+                                         session=ctx.session_key)
         return ToolResult.error(result) if result.startswith("Error:") else result

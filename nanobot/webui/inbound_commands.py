@@ -747,6 +747,7 @@ class WebUICommandRouter:
             prepare_pdfs,
         )
         attachment_statuses: list[AttachmentStatus] = []
+        local_attachment_statuses: list[AttachmentStatus] = []
         attachment_note = ""
         if raw_media is not None:
             if not isinstance(raw_media, list):
@@ -775,6 +776,7 @@ class WebUICommandRouter:
                 ) + "\nExplain these failures to the user in plain language."
             else:
                 attachment_note, attachment_statuses = await prepare_pdfs(media_paths, upload_names)
+                local_attachment_statuses = attachment_statuses
             if temporary_policy is not None:
                 self._temporary_chats.register_media(connection, chat_id, media_paths)
 
@@ -811,15 +813,20 @@ class WebUICommandRouter:
             await reject("access_denied")
             return
 
+        attachment_session = (temporary_policy.session_key if temporary_policy is not None
+                              else webui_session_key(chat_id))
         if self._attachment_vault:
             from nanobot.config.paths import get_media_dir
             if envelope.get("attachment_unlock_bridge") is True:
                 async def send_unlock(event: str, **fields: Any) -> None:
                     await self._transport.webui_send_event(connection, event, **fields)
-                self._attachment_vault.bridges[chat_id] = (connection, send_unlock)
+                self._attachment_vault.bridges[(chat_id, attachment_session)] = (connection, send_unlock)
             self._attachment_vault.register(chat_id, client_message_id or "",
-                                            attachment_statuses, media_paths,
-                                            get_media_dir("websocket"))
+                                            local_attachment_statuses, media_paths,
+                                            get_media_dir("websocket"), session=attachment_session)
+            # Envelope cards are display metadata. Only prior server history
+            # can establish a Work capability with the current transport.
+            self._attachment_vault.register_history(chat_id, attachment_session)
 
         metadata: dict[str, Any] = {
             "remote": getattr(connection, "remote_address", None)
@@ -954,7 +961,8 @@ class WebUICommandRouter:
                     mcp_presets=mcp_presets or None,
                     session_mentions=session_mentions or None,
                 )
-            password_note = self._attachment_vault.note(chat_id) if self._attachment_vault else ""
+            password_note = (self._attachment_vault.note(chat_id, session=attachment_session)
+                             if self._attachment_vault else "")
             if attachment_statuses or password_note:
                 metadata[RUNTIME_CONTEXT_INPUT_META] = [RuntimeContextBlock(
                     source="attachment_processing",

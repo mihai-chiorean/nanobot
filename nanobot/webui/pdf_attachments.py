@@ -47,6 +47,7 @@ def attachment_name(item: object) -> str:
 
 
 def parse_attachment_cards(raw: object) -> list[AttachmentStatus]:
+    """Parse display metadata; these client-supplied fields grant no unlock access."""
     if not isinstance(raw, list):
         return []
     cards: list[AttachmentStatus] = []
