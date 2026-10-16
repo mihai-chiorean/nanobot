@@ -141,7 +141,10 @@ class AgentProgressHook(AgentHook):
                 content=tool_hint or "", tool_hint=True, tool_events=tool_events,
             ))
         for tc in context.tool_calls:
-            args_str = json.dumps(tc.arguments, ensure_ascii=False)
+            arguments = tc.arguments
+            if tc.name == "unlock_attachment" and isinstance(arguments, dict):
+                arguments = {**arguments, "password": "[REDACTED]"}
+            args_str = json.dumps(arguments, ensure_ascii=False)
             logger.info("Tool call: {}({})", tc.name, args_str[:200])
 
     async def emit_reasoning(self, reasoning_content: str | None) -> None:

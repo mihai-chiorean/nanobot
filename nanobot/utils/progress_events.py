@@ -86,6 +86,8 @@ def output_events(
 
 def _tool_event_arguments(tool_call: Any) -> dict[str, Any]:
     arguments = getattr(tool_call, "arguments", {}) or {}
+    if getattr(tool_call, "name", "") == "unlock_attachment" and isinstance(arguments, dict):
+        arguments = {**arguments, "password": "[REDACTED]"}
     return cast(dict[str, Any], arguments) if isinstance(arguments, dict) else {}
 
 
@@ -97,6 +99,8 @@ def _tool_event_summary(tool_call: Any) -> str:
     bare tool name.
     """
     name = getattr(tool_call, "name", "")
+    if name == "unlock_attachment":
+        return "Unlocking PDF"
     name = name if isinstance(name, str) else ""
     try:
         summary = format_tool_hints([tool_call])

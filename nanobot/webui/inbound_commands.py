@@ -179,6 +179,11 @@ class WebUICommandRouter:
     def __init__(self, transport: WebUICommandTransport, gateway: GatewayServices) -> None:
         self._transport = transport
         self.gateway = gateway
+        from nanobot.webui.attachment_unlock import attachment_vault
+        self._attachment_vault = (attachment_vault(gateway.session_manager.sessions_dir)
+                                  if gateway.session_manager else None)
+        if self._attachment_vault:
+            self._attachment_vault.notify = self._attachment_unlocked
         self._http_router = gateway.http
         self._media = gateway.media
         self._ingress = gateway.ingress
@@ -248,6 +253,8 @@ class WebUICommandRouter:
 
     async def cleanup_connection(self, connection: ServerConnection) -> None:
         """Release command-owned state associated with one transport connection."""
+        if self._attachment_vault:
+            self._attachment_vault.disconnect(connection)
         chat_ids = self._transport.webui_connection_chats(connection)
         for chat_id in chat_ids:
             if self._temporary_chats.owns(connection, chat_id):
@@ -413,6 +420,11 @@ class WebUICommandRouter:
                 )
                 return
             await work.dispatch(connection, client_id, envelope)
+            return
+
+        if command_type == "attachment.unlock.result":
+            if self._attachment_vault:
+                self._attachment_vault.resolve(connection, envelope)
             return
 
         if command_type == "webui_request":
@@ -735,6 +747,7 @@ class WebUICommandRouter:
             prepare_pdfs,
         )
         attachment_statuses: list[AttachmentStatus] = []
+        local_attachment_statuses: list[AttachmentStatus] = []
         attachment_note = ""
         if raw_media is not None:
             if not isinstance(raw_media, list):
@@ -763,6 +776,7 @@ class WebUICommandRouter:
                 ) + "\nExplain these failures to the user in plain language."
             else:
                 attachment_note, attachment_statuses = await prepare_pdfs(media_paths, upload_names)
+                local_attachment_statuses = attachment_statuses
             if temporary_policy is not None:
                 self._temporary_chats.register_media(connection, chat_id, media_paths)
 
@@ -798,6 +812,21 @@ class WebUICommandRouter:
         if not self._transport.is_allowed(client_id):
             await reject("access_denied")
             return
+
+        attachment_session = (temporary_policy.session_key if temporary_policy is not None
+                              else webui_session_key(chat_id))
+        if self._attachment_vault:
+            from nanobot.config.paths import get_media_dir
+            if envelope.get("attachment_unlock_bridge") is True:
+                async def send_unlock(event: str, **fields: Any) -> None:
+                    await self._transport.webui_send_event(connection, event, **fields)
+                self._attachment_vault.bridges[(chat_id, attachment_session)] = (connection, send_unlock)
+            self._attachment_vault.register(chat_id, client_message_id or "",
+                                            local_attachment_statuses, media_paths,
+                                            get_media_dir("websocket"), session=attachment_session)
+            # Envelope cards are display metadata. Only prior server history
+            # can establish a Work capability with the current transport.
+            self._attachment_vault.register_history(chat_id, attachment_session)
 
         metadata: dict[str, Any] = {
             "remote": getattr(connection, "remote_address", None)
@@ -932,12 +961,16 @@ class WebUICommandRouter:
                     mcp_presets=mcp_presets or None,
                     session_mentions=session_mentions or None,
                 )
-            if attachment_statuses:
+            password_note = (self._attachment_vault.note(chat_id, session=attachment_session)
+                             if self._attachment_vault else "")
+            if attachment_statuses or password_note:
                 metadata[RUNTIME_CONTEXT_INPUT_META] = [RuntimeContextBlock(
                     source="attachment_processing",
-                    content="Use the attached document text when available. For other documents use read_file. "
-                    "Explain attachment read failures in plain language, naming the file and suggesting "
-                    "a text PDF or screenshot. Never claim to have read unavailable contents.",
+                    content="Use the attached document text when available. For password protected PDFs, "
+                    "ask for the password and call unlock_attachment; never put passwords in shell commands. "
+                    "For other documents use read_file. Explain damaged/unreadable files in plain language, "
+                    "naming the file and suggesting a text PDF or screenshot. Never claim to have read "
+                    "unavailable contents. " + password_note,
                 )]
             if trusted_webui:
                 context_blocks: list[RuntimeContextBlock] = list(metadata.get(RUNTIME_CONTEXT_INPUT_META, []))
@@ -1046,6 +1079,15 @@ class WebUICommandRouter:
                     if active_turn_id is not None and started_at is not None
                     else {}
                 ),
+            )
+
+    async def _attachment_unlocked(self, chat_id: str, origin: str, attachment_id: str) -> None:
+        from nanobot.webui.transcript import update_attachment_display_state
+        update_attachment_display_state(webui_session_key(chat_id), attachment_id)
+        for connection in self._transport.webui_subscribers(chat_id):
+            await self._transport.webui_send_event(
+                connection, "attachment.status", chat_id=chat_id,
+                client_message_id=origin, attachment_id=attachment_id, unlocked=True,
             )
 
     async def _claim_client_message(

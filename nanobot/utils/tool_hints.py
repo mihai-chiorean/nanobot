@@ -47,6 +47,9 @@ def format_tool_hints(tool_calls: list[ToolCallRequest], max_length: int = 40) -
             # Degenerate/malformed tool call (e.g. a model emits name=None);
             # skip it instead of raising AttributeError on the whole turn.
             continue
+        if name == "unlock_attachment":
+            formatted.append("Unlocking PDF")
+            continue
         if name == "briefing":
             formatted.append({
                 "inspect": "Checking your briefing", "create": "Creating your briefing",

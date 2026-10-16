@@ -553,11 +553,14 @@ class _WorkHook(AgentHook):
     async def before_execute_tools(self, context: AgentHookContext) -> None:
         store = self._loop.work_store
         for tool_call in context.tool_calls:
+            arguments = tool_call.arguments or {}
+            if tool_call.name == "unlock_attachment" and isinstance(arguments, dict):
+                arguments = {**arguments, "password": "[REDACTED]"}
             event = await store.run_io(
                 store.append_event,
                 self._task_id,
                 "tool.started",
-                {"name": tool_call.name, "arguments": tool_call.arguments or {}},
+                {"name": tool_call.name, "arguments": arguments},
                 actor="main_agent",
             )
             await self._publish(event)

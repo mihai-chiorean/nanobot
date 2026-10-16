@@ -457,6 +457,8 @@ class TestExtractText:
                 return "should not be reached"
 
         class _Reader:
+            is_encrypted = False
+
             def __init__(self, *_args, **_kwargs):
                 self.pages = [_Page()]
 
