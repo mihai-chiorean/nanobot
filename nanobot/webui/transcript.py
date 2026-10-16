@@ -1439,18 +1439,12 @@ def delete_webui_transcript(session_key: str) -> bool:
     for path in (webui_transcript_path(session_key), _legacy_webui_thread_path(session_key)):
         if not path.is_file():
             continue
-        try:
-            path.unlink()
-            removed = True
-        except OSError as e:
-            logger.warning("Failed to delete webui transcript {}: {}", path, e)
+        path.unlink()
+        removed = True
     segments_dir = webui_transcript_segments_dir(session_key)
     if segments_dir.is_dir():
-        try:
-            shutil.rmtree(segments_dir)
-            removed = True
-        except OSError as e:
-            logger.warning("Failed to delete webui transcript segments {}: {}", segments_dir, e)
+        shutil.rmtree(segments_dir)
+        removed = True
     return removed
 
 
