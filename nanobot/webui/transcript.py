@@ -1284,8 +1284,13 @@ class WebUITranscriptRecorder:
             mcp_presets=mcp_presets,
             session_mentions=session_mentions,
         )
+        attachments = metadata.get("attachments")
+        if payload is None and attachments:
+            payload = {"event": "user", "chat_id": chat_id, "text": text}
         if payload is None:
             return False
+        if attachments:
+            payload["attachments"] = attachments
         client_message_id = _normalized_client_message_id(
             (metadata or {}).get("client_message_id")
         )
@@ -2808,7 +2813,9 @@ def replay_transcript_to_ui_messages(
             client_message_id = _normalized_client_message_id(rec.get("client_message_id"))
             if client_message_id is not None:
                 row["client_message_id"] = client_message_id
-            if media_att:
+            if isinstance(rec.get("attachments"), list):
+                row["media"] = _attachment_display_media(rec["attachments"], media_att or [])
+            elif media_att:
                 row["media"] = media_att
                 if all(m.get("kind") == "image" for m in media_att):
                     row["images"] = [{"url": m.get("url"), "name": m.get("name")} for m in media_att]
@@ -3352,6 +3359,20 @@ def _client_projection_source(record: dict[str, Any]) -> dict[str, Any] | None:
     return projected
 
 
+def _attachment_display_media(raw: object, signed: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    from nanobot.webui.pdf_attachments import parse_attachment_cards
+
+    result: list[dict[str, Any]] = []
+    for index, status in enumerate(parse_attachment_cards(raw)):
+        # A worker may send derived page PNGs alongside a PDF card. Only
+        # retain a signed URL when it belongs to that card's original file.
+        media = signed[index] if index < len(signed) else {}
+        if not str(media.get("name", "")).endswith(status["name"]):
+            media = {}
+        result.append({**media, **status})
+    return result
+
+
 def _client_projection_event(
     record: dict[str, Any],
     *,
@@ -3374,10 +3395,13 @@ def _client_projection_event(
             for path in cast(list[Any], raw_paths)
             if path
         ] if isinstance(raw_paths, list) else []
+        media: list[dict[str, Any]] = []
         if paths and augment_user_media is not None:
             media = augment_user_media(paths)
             if media:
                 projected["media_urls"] = media
+        if isinstance(record.get("attachments"), list):
+            projected["media_urls"] = _attachment_display_media(record["attachments"], media)
         for source_key, target_key in (
             ("cli_apps", "cli_apps"),
             ("mcp_presets", "mcp_presets"),

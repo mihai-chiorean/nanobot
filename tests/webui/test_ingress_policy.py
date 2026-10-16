@@ -21,8 +21,8 @@ def test_bootstrap_keeps_transport_and_business_limits_separate() -> None:
     }
     assert payload["message"] == {"max_text_bytes": 65_536}
     assert payload["attachments"] == {
-        "max_count": 4,
-        "max_file_bytes": 6_291_456,
+        "max_count": 6,
+        "max_file_bytes": 10_485_760,
         "max_total_bytes": 25_165_824,
     }
     assert policy.minimum_full_policy_frame_bytes() < 36 * 1024 * 1024
