@@ -198,6 +198,7 @@ def webui_transcript_revision(
     snapshots: list[tuple[str, int, int]] = []
     artifacts = (
         ("active", active_path),
+        ("attachment_states", active_path.with_suffix(".attachments.json")),
         ("legacy", _legacy_webui_thread_path(session_key)),
         ("manifest", segment_dir / "manifest.json"),
         ("segments", segment_dir),
@@ -290,7 +291,7 @@ def _read_transcript_file(path: Path) -> list[dict[str, Any]]:
                     logger.warning("bad jsonl at {} line {}", path, line_no)
                     continue
                 if isinstance(obj, dict):
-                    lines_out.append(cast(dict[str, Any], obj))
+                    lines_out.append(_apply_attachment_display_state(cast(dict[str, Any], obj)))
     except OSError as e:
         logger.warning("read transcript failed {}: {}", path, e)
         return []
@@ -3357,6 +3358,41 @@ def _client_projection_source(record: dict[str, Any]) -> dict[str, Any] | None:
     if isinstance(label, str) and label.strip():
         projected["label"] = label.strip()
     return projected
+
+
+def update_attachment_display_state(session_key: str, attachment_id: str) -> None:
+    """Persist a display overlay so paginated/archived history shows unlocked chips."""
+    path = webui_transcript_path(session_key).with_suffix(".attachments.json")
+    states: dict[str, Any] = json.loads(path.read_text()) if path.exists() else {}
+    states[attachment_id] = {"error": None, "locked_reason": None}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    with tmp.open("w") as f:
+        json.dump(states, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def _apply_attachment_display_state(row: dict[str, Any]) -> dict[str, Any]:
+    cards = row.get("attachments")
+    chat = row.get("chat_id")
+    if not isinstance(cards, list) or not isinstance(chat, str):
+        return row
+    from nanobot.webui.session_identity import webui_session_key
+    path = webui_transcript_path(webui_session_key(chat)).with_suffix(".attachments.json")
+    if not path.exists():
+        return row
+    states = json.loads(path.read_text())
+    updated: list[object] = []
+    for raw_card in cast(list[object], cards):
+        if isinstance(raw_card, dict):
+            card = cast(dict[str, Any], raw_card)
+            updated.append({**card, **states.get(card.get("attachment_id"), {})})
+        else:
+            updated.append(raw_card)
+    row["attachments"] = updated
+    return row
 
 
 def _attachment_display_media(raw: object, signed: list[dict[str, Any]]) -> list[dict[str, Any]]:

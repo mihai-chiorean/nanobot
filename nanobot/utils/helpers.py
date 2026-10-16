@@ -5,11 +5,11 @@ from __future__ import annotations
 import base64
 import json
 import os
+import random as _random
 import re
 import shutil
 import stat
 import time
-import random as _random
 import uuid
 from contextlib import suppress
 from datetime import datetime
@@ -996,6 +996,8 @@ def pick_tool_emoji(*, _rng: "_random.Random | None" = None) -> str:
 
 def summarize_tool_call(name: str, args: dict[str, Any]) -> str:
     """Build a one-line tool status string, capped at _STATUS_MAX chars."""
+    if name == "unlock_attachment":
+        return "Unlocking PDF"
     if "path" in args:
         detail = str(args["path"])
     elif "command" in args:

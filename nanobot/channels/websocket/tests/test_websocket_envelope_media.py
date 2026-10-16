@@ -710,3 +710,44 @@ async def test_non_string_content_still_rejected() -> None:
     channel._handle_message.assert_not_awaited()
     err = json.loads(mock_conn.send.call_args[0][0])
     assert err["detail"] == "missing content"
+
+
+@pytest.mark.asyncio
+async def test_protected_pdf_registers_an_unlock_capability_across_turns(tmp_path, monkeypatch):
+    import io
+
+    from pypdf import PdfWriter
+
+    from nanobot.webui.attachment_unlock import attachment_vault
+
+    sessions = SessionManager(tmp_path / "workspace", sessions_root=tmp_path / "sessions")
+    channel = _make_channel(sessions)
+    media = tmp_path / "media"
+    media.mkdir()
+    monkeypatch.setattr("nanobot.webui.media_gateway.get_media_dir", lambda *_: media)
+    monkeypatch.setattr("nanobot.config.paths.get_media_dir", lambda *_: media)
+    writer = PdfWriter()
+    writer.add_blank_page(width=100, height=100)
+    writer.encrypt("fixture-password", algorithm="AES-256")
+    pdf = io.BytesIO()
+    writer.write(pdf)
+    connection = AsyncMock()
+    await channel._dispatch_envelope(connection, "client-1", {
+        "type": "message", "chat_id": "protected-chat", "content": "Review this PDF",
+        "client_message_id": "11111111-1111-4111-8111-111111111111", "turn_id": "protected-turn-1",
+        "media": [{"name": "protected.pdf", "data_url": _data_url("application/pdf", pdf.getvalue())}],
+    })
+    first = channel.bus.publish_inbound.call_args.args[0]
+    card = first.metadata["attachments"][0]
+    assert card["locked_reason"] == "password_required"
+    assert card["attachment_id"].startswith("local_")
+    vault = attachment_vault(sessions.sessions_dir)
+    assert vault.records[card["attachment_id"]]["chat"] == "protected-chat"
+    await channel._dispatch_envelope(connection, "client-1", {
+        "type": "message", "chat_id": "protected-chat", "content": "Here is the password",
+        "client_message_id": "22222222-2222-4222-8222-222222222222", "turn_id": "protected-turn-2",
+    })
+    second = channel.bus.publish_inbound.call_args.args[0]
+    note = second.metadata[RUNTIME_CONTEXT_INPUT_META][0].content
+    assert "unlock_attachment" in note
+    assert card["attachment_id"] in note

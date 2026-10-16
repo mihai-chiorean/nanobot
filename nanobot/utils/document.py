@@ -54,6 +54,14 @@ class _TextCollector:
         return text
 
 
+class PdfPasswordRequiredError(Exception):
+    """The PDF requires an opening password."""
+
+
+class PdfWrongPasswordError(Exception):
+    """The supplied PDF password did not authenticate."""
+
+
 class PdfSafetyError(Exception):
     """Raised when a PDF exceeds a parser safety boundary."""
 
@@ -452,11 +460,18 @@ def extract_pdf_pages(
     pages: str | None = None,
     max_pages: int = _MAX_PDF_ATTACHMENT_PAGES,
     max_chars: int = _MAX_TEXT_LENGTH,
+    password: str | None = None,
 ) -> PdfExtraction:
     """Extract a bounded PDF page range using the bundled pypdf reader."""
     from pypdf import PdfReader
 
     reader = PdfReader(path, strict=False)
+    if reader.is_encrypted:
+        if password is None:
+            if not reader.decrypt(""):
+                raise PdfPasswordRequiredError()
+        elif not reader.decrypt(password):
+            raise PdfWrongPasswordError()
     total_pages = len(reader.pages)
     if total_pages == 0:
         return PdfExtraction("", 0, 0, -1)
