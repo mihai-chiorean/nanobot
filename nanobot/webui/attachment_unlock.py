@@ -101,8 +101,8 @@ class AttachmentVault:
             return ""
         return ("Password protected PDFs remain attached: " + "; ".join(ids) +
                 ". Ask the user for the password (or use one they already supplied), then call "
-                "unlock_attachment(attachment_id, password). Never echo the password or put it "
-                "in shell commands. If incorrect ask again; after 5 attempts request an unlocked copy.")
+                "unlock_attachment(attachment_id, password). Never repeat, quote, or reveal the password "
+                "in replies, examples, or shell commands. Only pass it to unlock_attachment. If incorrect ask again; after 5 attempts request an unlocked copy.")
 
     def disconnect(self, connection: object) -> None:
         self.bridges = {k: v for k, v in self.bridges.items() if v[0] is not connection}

@@ -86,6 +86,9 @@ async def prepare_pdfs(paths: list[str], names: list[str] | None = None) -> tupl
         if error == "This PDF is password protected. Ask the user for its password.":
             status["locked_reason"] = "password_required"
         statuses.append(status)
+    if any(item.get("locked_reason") for item in statuses):
+        notes.append("Use unlock_attachment for a supplied PDF password. Never repeat, quote, or "
+                     "reveal it in replies, examples, or shell commands.")
     if any(item["error"] for item in statuses):
         notes.append("Explain each attachment read failure to the user in plain language. "
                      "Do not claim to have read unreadable contents.")

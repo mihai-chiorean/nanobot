@@ -38,6 +38,7 @@ class AgentTurnHookSpec:
     ephemeral: bool = False
     run_extra_hooks_for_ephemeral: bool = False
     attributes: dict[str, Any] | None = None
+    pdf_passwords: set[str] | None = None
 
 
 def build_agent_turn_hook(spec: AgentTurnHookSpec) -> AgentHook:
@@ -47,6 +48,7 @@ def build_agent_turn_hook(spec: AgentTurnHookSpec) -> AgentHook:
         streaming=spec.streaming,
         session_key=spec.session_key,
         tool_hint_max_length=spec.tool_hint_max_length,
+        pdf_passwords=spec.pdf_passwords,
     )
     if spec.ephemeral and not spec.run_extra_hooks_for_ephemeral:
         return progress_hook
