@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import json
+import re
+import time
+from collections import OrderedDict
+from pathlib import Path
 from typing import Any
 
 from loguru import logger
@@ -19,6 +23,31 @@ from nanobot.utils.progress_events import (
 from nanobot.utils.tool_hints import format_tool_hints
 
 
+class PDFPasswordStore:
+    """Bounded, memory-only passwords keyed by tenant workspace and session."""
+
+    def __init__(self, max_sessions: int = 128, ttl: float = 3600) -> None:
+        self._max_sessions = max_sessions
+        self._ttl = ttl
+        self._sessions: OrderedDict[tuple[Path, str], tuple[float, set[str]]] = OrderedDict()
+
+    def for_session(self, tenant: Path, session_key: str | None) -> set[str]:
+        now = time.monotonic()
+        for key, (expires, _) in list(self._sessions.items()):
+            if expires <= now:
+                del self._sessions[key]
+        if session_key is None:
+            return set()
+        key = (tenant.resolve(), session_key)
+        if key not in self._sessions:
+            self._sessions[key] = (now + self._ttl, set())
+        self._sessions.move_to_end(key)
+        passwords = self._sessions[key][1]
+        while len(self._sessions) > self._max_sessions:
+            self._sessions.popitem(last=False)
+        return passwords
+
+
 class AgentProgressHook(AgentHook):
     """Translate runner lifecycle events into user-visible progress signals."""
 
@@ -29,6 +58,7 @@ class AgentProgressHook(AgentHook):
         streaming: bool = False,
         session_key: str | None = None,
         tool_hint_max_length: int = 40,
+        pdf_passwords: set[str] | None = None,
     ) -> None:
         super().__init__(reraise=True)
         self._publish = events.publish
@@ -38,7 +68,7 @@ class AgentProgressHook(AgentHook):
         self._stream_buf = ""
         self._think_extractor = IncrementalThinkExtractor()
         self._reasoning_open = False
-        self._pdf_passwords: set[str] = set()
+        self._pdf_passwords: set[str] = pdf_passwords if pdf_passwords is not None else set()
         self._visible_stream = ""
 
     def wants_streaming(self) -> bool:
@@ -59,10 +89,10 @@ class AgentProgressHook(AgentHook):
         # Hold only a possible password prefix across delta boundaries.
         hold = max((size for password in self._pdf_passwords
                     for size in range(1, min(len(password), len(new_clean)) + 1)
-                    if new_clean.endswith(password[:size])), default=0)
-        if hold:
-            new_clean = new_clean[:-hold]
-        new_clean = self._redact_pdf_passwords(new_clean)
+                    if new_clean.endswith(password[:size])
+                    and (size == len(new_clean) or not new_clean[-size - 1].isalnum())),
+                   default=0)
+        new_clean = self._redact_pdf_passwords(new_clean, pending=hold)
         incremental = new_clean[len(self._visible_stream):]
         self._visible_stream = new_clean
 
@@ -146,7 +176,9 @@ class AgentProgressHook(AgentHook):
         for call in context.tool_calls:
             if call.name == "unlock_attachment" and isinstance(call.arguments, dict):
                 password = call.arguments.get("password")
-                if isinstance(password, str) and password and len(password) <= 1024:
+                if isinstance(password, str) and 6 <= len(password) <= 1024:
+                    if password not in self._pdf_passwords and len(self._pdf_passwords) >= 32:
+                        self._pdf_passwords.pop()
                     self._pdf_passwords.add(password)
         if context.response and context.response.content:
             context.response.content = self._redact_pdf_passwords(context.response.content)
@@ -204,7 +236,21 @@ class AgentProgressHook(AgentHook):
         clean = self._strip_think(content)
         return self._redact_pdf_passwords(clean) if clean else clean
 
-    def _redact_pdf_passwords(self, text: str) -> str:
-        for password in sorted(self._pdf_passwords, key=len, reverse=True):
-            text = text.replace(password, "[REDACTED]")
-        return text
+    def _redact_pdf_passwords(self, text: str, *, pending: int = 0) -> str:
+        passwords = sorted(self._pdf_passwords, key=len, reverse=True)
+        if not passwords:
+            return text
+        # Underscores are boundaries; only letters and numbers prevent a match.
+        pattern = r"(?<![^\W_])(?:" + "|".join(re.escape(p) for p in passwords) + r")(?![^\W_])"
+        matches = list(re.finditer(pattern, text))
+        end = len(text) - pending
+        # Check boundaries against the full text, then defer any match that
+        # overlaps a held prefix. Cutting first would create a false boundary.
+        for match in reversed(matches):
+            if match.start() < end < match.end():
+                end = match.start()
+        clean = text[:end]
+        for match in reversed(matches):
+            if match.end() <= end:
+                clean = clean[:match.start()] + "[REDACTED]" + clean[match.end():]
+        return clean

@@ -35,6 +35,7 @@ from nanobot.agent.hook import (
 from nanobot.agent.memory import Consolidator
 from nanobot.agent.memory_index import MemoryIndex, SessionRecallIndexer
 from nanobot.agent.model_runtime import ModelRuntimeResolver
+from nanobot.agent.progress_hook import PDFPasswordStore
 from nanobot.agent.reasoning_policy import (
     ReasoningProfile,
     parse_reasoning_profile,
@@ -816,6 +817,7 @@ class AgentLoop:
         # One file-read/write tracker per logical session. The tool registry is
         # shared by this loop, so tools resolve the active state via contextvars.
         self._file_state_store = FileStateStore(max_sessions=SESSION_CACHE_MAX_SIZE)
+        self._pdf_password_store = PDFPasswordStore()
         # SessionManager owns every durable deletion entrypoint, including the
         # WebUI and fork rollback paths.  Observe that boundary once instead of
         # duplicating cleanup in each consumer.
@@ -2099,6 +2101,9 @@ class AgentLoop:
                 session_key=active_session_key,
                 workspace=effective_scope.project_path,
                 tool_hint_max_length=self.tool_hint_max_length,
+                pdf_passwords=self._pdf_password_store.for_session(
+                    self.workspace, active_session_key,
+                ),
                 registered_hook_factories=self._hook_factories,
                 turn_hook_factories=list(hook_factories or []),
                 registered_hooks=self._extra_hooks,
@@ -3507,6 +3512,27 @@ class AgentLoop:
                 else None
             )
             role, content = entry.get("role"), entry.get("content")
+            if role == "assistant" and entry.get("tool_calls"):
+                # Enforce the history boundary even for resumed/raw transcripts.
+                calls: list[Any] = []
+                for call in entry["tool_calls"]:
+                    if not isinstance(call, dict):
+                        calls.append(call)
+                        continue
+                    call = cast(dict[str, Any], call)
+                    function = call.get("function", {})
+                    if not isinstance(function, dict):
+                        calls.append(call)
+                        continue
+                    function = cast(dict[str, Any], function)
+                    if function.get("name") == "unlock_attachment":
+                        arguments = ToolCallRequest(
+                            id=call.get("id", ""), name="unlock_attachment",
+                            arguments=function.get("arguments"),
+                        ).to_openai_tool_call()["function"]["arguments"]
+                        call = {**call, "function": {**function, "arguments": arguments}}
+                    calls.append(call)
+                entry["tool_calls"] = calls
             if role == "assistant" and not content and not entry.get("tool_calls"):
                 continue  # skip empty assistant messages — they poison session context
             if role == "tool":

@@ -93,7 +93,8 @@ class ToolCallRequest:
         if self.name == "unlock_attachment":
             # Execution uses self.arguments. Serialized calls are replay/audit
             # records and must never retain a PDF password.
-            parsed = cast(dict[str, Any], self.arguments) if isinstance(self.arguments, dict) else {}
+            parsed = parse_tool_arguments(self.arguments)
+            parsed = cast(dict[str, Any], parsed) if isinstance(parsed, dict) else {}
             arguments = json.dumps({**parsed, "password": "[REDACTED]"})
         tool_call: dict[str, Any] = {
             "id": self.id,
