@@ -9,6 +9,13 @@ from nanobot.webui.pdf_attachments import pdf_text, prepare_pdfs
 from nanobot.webui.transcript import append_transcript_object, build_webui_thread_response
 
 
+@pytest.fixture(autouse=True)
+def isolate_attachment_transcripts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Earlier agent tests may select an active config root. Attachment history
+    # fixtures must not inherit that root or authorize a stale test attachment.
+    monkeypatch.setattr("nanobot.config.paths.get_data_dir", lambda: tmp_path / "data")
+
+
 def make_pdf(path: Path, text: str = "", *, encrypted: bool = False, algorithm: str = "AES-256") -> None:
     writer = PdfWriter()
     page = writer.add_blank_page(width=200, height=200)
@@ -351,3 +358,28 @@ def test_unlock_password_redacted_in_tool_records():
     assert "fixture-secret" not in format_tool_hints([call])
     assert "fixture-secret" not in str(_sanitise_arguments(call.arguments))
     assert call.arguments["password"] == "fixture-secret"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("filename", ["rc4-r4.pdf", "rc4-r4-legacy-info.pdf"])
+async def test_rc4_r4_legacy_metadata_subprocess_end_to_end(tmp_path: Path, filename: str) -> None:
+    """Same synthetic encrypted fixture as Work; exercise the real subprocess."""
+    from nanobot.webui.attachment_unlock import AttachmentVault
+
+    path = Path(__file__).parents[1] / "fixtures" / "pdf" / filename
+    note, cards = await prepare_pdfs([str(path)])
+    assert cards[0]["locked_reason"] == "password_required"
+    assert "Never repeat" in note
+    print("ingest: locked_reason=password_required (subprocess)")
+    vault = AttachmentVault(tmp_path / "vault")
+    vault.register("chat", "original", cards, [str(path)], path.parent)
+    attachment_id = cards[0]["attachment_id"]
+    result = await vault.unlock("chat", attachment_id, "incorrect-fixture-password")
+    assert "password was wrong" in result
+    assert vault.records[attachment_id]["locked"]
+    print("wrong password: wrong_password; attachment remains locked (subprocess)")
+    result = await vault.unlock("chat", attachment_id, "fixture-password")
+    assert "RC4 R4 fixture document text" in result
+    assert not vault.records[attachment_id]["locked"]
+    assert "fixture-password" not in vault.path.read_text()
+    print("correct password: ready; extracted_text=verified (subprocess)")

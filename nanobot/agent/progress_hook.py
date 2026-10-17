@@ -38,6 +38,8 @@ class AgentProgressHook(AgentHook):
         self._stream_buf = ""
         self._think_extractor = IncrementalThinkExtractor()
         self._reasoning_open = False
+        self._pdf_passwords: set[str] = set()
+        self._visible_stream = ""
 
     def wants_streaming(self) -> bool:
         return self._streaming
@@ -52,10 +54,17 @@ class AgentProgressHook(AgentHook):
         return format_tool_hints(tool_calls, max_length=self._tool_hint_max_length)
 
     async def on_stream(self, context: AgentHookContext, delta: str) -> None:
-        prev_clean = strip_think(self._stream_buf)
         self._stream_buf += delta
         new_clean = strip_think(self._stream_buf)
-        incremental = new_clean[len(prev_clean) :]
+        # Hold only a possible password prefix across delta boundaries.
+        hold = max((size for password in self._pdf_passwords
+                    for size in range(1, min(len(password), len(new_clean)) + 1)
+                    if new_clean.endswith(password[:size])), default=0)
+        if hold:
+            new_clean = new_clean[:-hold]
+        new_clean = self._redact_pdf_passwords(new_clean)
+        incremental = new_clean[len(self._visible_stream):]
+        self._visible_stream = new_clean
 
         if await self._think_extractor.feed(self._stream_buf, self.emit_reasoning):
             context.streamed_reasoning = True
@@ -69,11 +78,15 @@ class AgentProgressHook(AgentHook):
 
     async def on_stream_end(self, context: AgentHookContext, *, resuming: bool) -> None:
         await self.emit_reasoning_end()
+        tail = self._redact_pdf_passwords(strip_think(self._stream_buf))[len(self._visible_stream):]
+        if tail and self._publish and self._streaming:
+            await self._publish(StreamDeltaEvent(content=tail))
         if self._publish and self._streaming:
             await self._publish(StreamEndEvent(
                 resuming=resuming, merge_next=context.stream_continues_current_message,
             ))
         self._stream_buf = ""
+        self._visible_stream = ""
         self._think_extractor.reset()
 
     async def before_iteration(self, context: AgentHookContext) -> None:
@@ -130,6 +143,13 @@ class AgentProgressHook(AgentHook):
         await self._publish(ProgressEvent(tool_events=[payload]))
 
     async def before_execute_tools(self, context: AgentHookContext) -> None:
+        for call in context.tool_calls:
+            if call.name == "unlock_attachment" and isinstance(call.arguments, dict):
+                password = call.arguments.get("password")
+                if isinstance(password, str) and password and len(password) <= 1024:
+                    self._pdf_passwords.add(password)
+        if context.response and context.response.content:
+            context.response.content = self._redact_pdf_passwords(context.response.content)
         if self._publish:
             if not self._streaming and not context.streamed_content:
                 thought = self._strip_think(context.response.content if context.response else None)
@@ -181,4 +201,10 @@ class AgentProgressHook(AgentHook):
         )
 
     def finalize_content(self, context: AgentHookContext, content: str | None) -> str | None:
-        return self._strip_think(content)
+        clean = self._strip_think(content)
+        return self._redact_pdf_passwords(clean) if clean else clean
+
+    def _redact_pdf_passwords(self, text: str) -> str:
+        for password in sorted(self._pdf_passwords, key=len, reverse=True):
+            text = text.replace(password, "[REDACTED]")
+        return text

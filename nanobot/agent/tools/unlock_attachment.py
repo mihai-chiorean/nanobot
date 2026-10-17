@@ -37,7 +37,7 @@ class UnlockAttachmentTool(Tool):
     def description(self) -> str:
         return ("Unlock an attached password protected PDF with the user's password and return "
                 "its text. Ask for the password first; if wrong ask again. At most 5 attempts "
-                "per attachment. Never use shell commands for PDF passwords or echo passwords.")
+                "per attachment. Never repeat, quote, or reveal the password in replies, examples, or shell commands. Only pass it to this tool.")
 
     async def execute(self, attachment_id: str, password: str, **kwargs: Any) -> str:
         ctx = current_request_context()
