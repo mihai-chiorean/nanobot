@@ -49,6 +49,9 @@ class _FakeStore:
     def build_dream_tools(self):
         return None
 
+    def core_memory_stats(self) -> tuple[int, int]:
+        return (12, 2000)
+
     def set_last_dream_cursor(self, value: int) -> None:
         self._last_dream_cursor = value
 
@@ -73,6 +76,7 @@ class _FakeGit:
         self._diff_map = diff_map or {}
         self._revert_result = revert_result
         self.revert_calls: list[tuple[str, str | None]] = []
+        self.commit_messages: list[str] = []
 
     def is_initialized(self) -> bool:
         return self._initialized
@@ -103,6 +107,7 @@ class _FakeGit:
         return self._revert_result
 
     def auto_commit(self, message: str) -> str | None:
+        self.commit_messages.append(message)
         return None
 
 
@@ -292,6 +297,20 @@ async def test_dream_advances_cursor_when_diff_nonempty(tmp_path) -> None:
     await cmd_dream(ctx)
     await _wait_for_dream_report(ctx)
     assert store._last_dream_cursor == 42
+
+
+@pytest.mark.asyncio
+async def test_dream_manual_commit_reports_core_tokens(tmp_path) -> None:
+    """MIT-1871: the manual /dream commit body carries the core budget line."""
+    ctx, store = _build_runnable_dream(
+        tmp_path, initialized=True, content_diff="memory/MEMORY.md: +1 -0",
+    )
+    await cmd_dream(ctx)
+    await _wait_for_dream_report(ctx)
+
+    assert store.git.commit_messages, "commit path was never reached"
+    assert store.git.commit_messages[-1].startswith("dream: manual run\n\nmemory/MEMORY.md: +1 -0")
+    assert store.git.commit_messages[-1].endswith("\n\ncore: 12/2000 tokens")
 
 
 @pytest.mark.asyncio

@@ -67,6 +67,7 @@ class DreamConfig(Base):
         default=None,
         validation_alias=AliasChoices("modelOverride", "model", "model_override"),
     )  # Model preset name for Dream sessions
+    core_memory_tokens: int = Field(default=2000, ge=1)  # Token budget for the injected memory/MEMORY.md core
 
     def build_schedule(self, timezone: str) -> CronSchedule:
         """Build the runtime schedule, preferring the legacy cron override if present."""

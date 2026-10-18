@@ -281,6 +281,8 @@ def test_commit_dream_changes_commits_real_edits(tmp_path) -> None:
     message = store.git.auto_commit.call_args.args[0]
     assert message.startswith("dream: periodic memory consolidation\n\n")
     assert "Research notes" in message
+    # MIT-1871: the commit body reports the core memory against its budget.
+    assert message.endswith(store.core_memory_line())
 
 
 @pytest.fixture
