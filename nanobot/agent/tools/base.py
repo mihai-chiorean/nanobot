@@ -192,6 +192,11 @@ class Tool(ABC):
         return False
 
     @property
+    def idempotent(self) -> bool:
+        """Whether repeating this tool after a connection error is safe."""
+        return self.read_only
+
+    @property
     def concurrency_safe(self) -> bool:
         """Whether this tool can run alongside other concurrency-safe tools."""
         return self.read_only and not self.exclusive

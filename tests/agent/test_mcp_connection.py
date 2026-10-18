@@ -631,8 +631,17 @@ async def test_mcp_tool_reconnects_after_session_terminated(
                 name="quote",
                 description="quote tool",
                 inputSchema={"type": "object", "properties": {}},
+                # Trusted read-only so the session-refresh retry applies
+                # (MIT-1817: only idempotent calls are retried).
+                annotations=SimpleNamespace(
+                    readOnlyHint=True, idempotentHint=None, destructiveHint=None
+                ),
             )
-            registry.register(MCPToolWrapper(session, name, tool_def, tool_timeout=5))
+            registry.register(
+                MCPToolWrapper(
+                    session, name, tool_def, tool_timeout=5, trust_annotations=True
+                )
+            )
             stack = AsyncExitStack()
             await stack.__aenter__()
             stack.push_async_callback(_mark_closed, name)
@@ -689,8 +698,20 @@ async def test_mcp_reconnect_handler_uses_sanitized_server_prefix(
                 name="quote",
                 description="quote tool",
                 inputSchema={"type": "object", "properties": {}},
+                # Trusted read-only so the session-refresh retry applies
+                # (MIT-1817: only idempotent calls are retried).
+                annotations=SimpleNamespace(
+                    readOnlyHint=True, idempotentHint=None, destructiveHint=None
+                ),
             )
-            registry.register(MCPToolWrapper(_FakeSession(connect_count), name, tool_def))
+            registry.register(
+                MCPToolWrapper(
+                    _FakeSession(connect_count),
+                    name,
+                    tool_def,
+                    trust_annotations=True,
+                )
+            )
             stack = AsyncExitStack()
             await stack.__aenter__()
             stacks[name] = stack

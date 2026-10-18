@@ -90,11 +90,36 @@ def test_is_session_terminated_recognizes_connection_closed_mcp_error():
 # ---------------------------------------------------------------------------
 
 
-def _make_tool_def(name="test_tool"):
+def _annotations(read_only=None, idempotent=None, destructive=None):
+    """Mimic mcp.types.ToolAnnotations (camelCase fields)."""
+    return SimpleNamespace(
+        readOnlyHint=read_only,
+        idempotentHint=idempotent,
+        destructiveHint=destructive,
+    )
+
+
+def _make_tool_def(name="test_tool", annotations=None):
     return SimpleNamespace(
         name=name,
         description="A test tool",
         inputSchema={"type": "object", "properties": {}},
+        annotations=annotations,
+    )
+
+
+def _make_read_only_tool_def(name="test_tool"):
+    """Tool definition as an operator-trusted server would publish it."""
+    return _make_tool_def(name, annotations=_annotations(read_only=True))
+
+
+def _make_read_only_wrapper(session, tool_timeout=5):
+    return MCPToolWrapper(
+        session,
+        "test_server",
+        _make_read_only_tool_def(),
+        tool_timeout=tool_timeout,
+        trust_annotations=True,
     )
 
 
@@ -105,13 +130,13 @@ def _make_tool_result(text):
 
 @pytest.mark.asyncio
 async def test_tool_retries_on_transient_error():
-    """Tool should retry once when a transient error occurs, then succeed."""
+    """A trusted read-only (idempotent) tool retries once, then succeeds."""
     session = AsyncMock()
     result = _make_tool_result("ok")
     exc = _FakeClosedResourceError("connection lost")
     session.call_tool = AsyncMock(side_effect=[exc, result])
 
-    wrapper = MCPToolWrapper(session, "test_server", _make_tool_def(), tool_timeout=5)
+    wrapper = _make_read_only_wrapper(session)
 
     with patch("nanobot.agent.tools.mcp.asyncio.sleep", new_callable=AsyncMock):
         output = await wrapper.execute(foo="bar")
@@ -128,7 +153,7 @@ async def test_tool_fails_after_retry_exhausted():
     exc2 = _FakeClosedResourceError("still dead again")
     session.call_tool = AsyncMock(side_effect=[exc1, exc2])
 
-    wrapper = MCPToolWrapper(session, "test_server", _make_tool_def(), tool_timeout=5)
+    wrapper = _make_read_only_wrapper(session)
 
     with patch("nanobot.agent.tools.mcp.asyncio.sleep", new_callable=AsyncMock):
         output = await wrapper.execute()
@@ -213,7 +238,7 @@ async def test_tool_retry_on_connection_reset():
         side_effect=[ConnectionResetError("reset by peer"), result]
     )
 
-    wrapper = MCPToolWrapper(session, "test_server", _make_tool_def(), tool_timeout=5)
+    wrapper = _make_read_only_wrapper(session)
 
     with patch("nanobot.agent.tools.mcp.asyncio.sleep", new_callable=AsyncMock):
         output = await wrapper.execute()
@@ -229,7 +254,7 @@ async def test_tool_retry_on_end_of_stream():
     result = _make_tool_result("back")
     session.call_tool = AsyncMock(side_effect=[_FakeEndOfStreamError("eof"), result])
 
-    wrapper = MCPToolWrapper(session, "test_server", _make_tool_def(), tool_timeout=5)
+    wrapper = _make_read_only_wrapper(session)
 
     with patch("nanobot.agent.tools.mcp.asyncio.sleep", new_callable=AsyncMock):
         output = await wrapper.execute()
@@ -246,8 +271,8 @@ async def test_tool_reconnects_on_transient_failure():
     new_session = AsyncMock()
     new_session.call_tool = AsyncMock(return_value=_make_tool_result("fresh"))
 
-    wrapper = MCPToolWrapper(old_session, "test_server", _make_tool_def(), tool_timeout=5)
-    replacement = MCPToolWrapper(new_session, "test_server", _make_tool_def(), tool_timeout=5)
+    wrapper = _make_read_only_wrapper(old_session)
+    replacement = _make_read_only_wrapper(new_session)
 
     async def reconnect(server_name: str, tool_name: str, stale_tool):
         assert server_name == "test_server"
@@ -264,6 +289,219 @@ async def test_tool_reconnects_on_transient_failure():
     assert old_session.call_tool.call_count == 1
     assert new_session.call_tool.call_count == 1
     mock_sleep.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# MCP annotations -> read_only/idempotent and the retry gate (MIT-1817)
+# ---------------------------------------------------------------------------
+
+
+def _trusted_wrapper(annotations, server_trusted=True):
+    return MCPToolWrapper(
+        AsyncMock(),
+        "test_server",
+        _make_tool_def(annotations=annotations),
+        tool_timeout=5,
+        trust_annotations=server_trusted,
+    )
+
+
+def test_trusted_read_only_hint_maps_to_read_only_and_idempotent():
+    wrapper = _trusted_wrapper(_annotations(read_only=True))
+    assert wrapper.read_only is True
+    assert wrapper.idempotent is True
+
+
+def test_trusted_idempotent_hint_only_maps_to_idempotent_not_read_only():
+    wrapper = _trusted_wrapper(_annotations(idempotent=True))
+    assert wrapper.read_only is False
+    assert wrapper.idempotent is True
+
+
+def test_untrusted_server_read_only_hint_is_ignored():
+    wrapper = _trusted_wrapper(
+        _annotations(read_only=True, idempotent=True),
+        server_trusted=False,
+    )
+    assert wrapper.read_only is False
+    assert wrapper.idempotent is False
+
+
+def test_trusted_server_without_annotations_is_not_read_only_or_idempotent():
+    wrapper = _trusted_wrapper(None)
+    assert wrapper.read_only is False
+    assert wrapper.idempotent is False
+
+
+def test_untrusted_destructive_annotations_stay_writes():
+    # Negative control: browser_act-style hints change nothing when the
+    # server is not operator-trusted.
+    wrapper = _trusted_wrapper(
+        _annotations(read_only=False, idempotent=False, destructive=True),
+        server_trusted=False,
+    )
+    assert wrapper.read_only is False
+    assert wrapper.idempotent is False
+
+
+def test_trusted_read_only_mcp_tool_is_not_concurrency_safe():
+    wrapper = _trusted_wrapper(_annotations(read_only=True))
+    assert wrapper.read_only is True
+    assert wrapper.concurrency_safe is False
+
+
+def test_default_base_tool_idempotent_follows_read_only():
+    from nanobot.agent.tools.mcp import _MCPWrapperBase
+
+    class _Stub(_MCPWrapperBase):
+        _read_only = False
+
+        @property
+        def name(self):
+            return "stub"
+
+        @property
+        def description(self):
+            return "stub"
+
+        @property
+        def parameters(self):
+            return {}
+
+        @property
+        def read_only(self):
+            return self._read_only
+
+        async def execute(self, **kwargs):
+            return "ok"
+
+    write_stub = _Stub()
+    write_stub._set_mcp_connection(AsyncMock(), "srv")
+    assert write_stub.read_only is False
+    assert write_stub.idempotent is False
+
+    read_stub = _Stub()
+    read_stub._set_mcp_connection(AsyncMock(), "srv")
+    read_stub._read_only = True
+    assert read_stub.read_only is True
+    assert read_stub.idempotent is True
+
+
+@pytest.mark.asyncio
+async def test_non_idempotent_tool_does_not_retry_on_transient_error():
+    """A destructive tool runs once; the outcome may already have taken effect."""
+    session = AsyncMock()
+    exc = _FakeClosedResourceError("connection lost")
+    session.call_tool = AsyncMock(side_effect=[exc, _make_tool_result("twice")])
+
+    wrapper = MCPToolWrapper(
+        session,
+        "test_server",
+        _make_tool_def(
+            "browser_fill_form",
+            annotations=_annotations(read_only=False, idempotent=False, destructive=True),
+        ),
+        tool_timeout=5,
+        trust_annotations=True,
+    )
+
+    logged = []
+    from loguru import logger
+
+    sink_id = logger.add(lambda message: logged.append(str(message)))
+    try:
+        with patch("nanobot.agent.tools.mcp.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            output = await wrapper.execute(form="f")
+    finally:
+        logger.remove(sink_id)
+
+    assert "outcome unknown" in output
+    assert "do not repeat it" in output
+    assert is_tool_error_result(output)
+    assert session.call_tool.call_count == 1
+    mock_sleep.assert_not_called()
+    assert any(
+        "mcp_retry_skipped" in line
+        and "reason=not_idempotent" in line
+        and "browser_fill_form" in line
+        for line in logged
+    )
+
+
+@pytest.mark.asyncio
+async def test_non_idempotent_tool_does_not_refresh_session_on_termination():
+    """Session-refresh retry follows the same idempotency gate."""
+    old_session = AsyncMock()
+    old_session.call_tool = AsyncMock(side_effect=_session_terminated_error())
+    new_session = AsyncMock()
+    new_session.call_tool = AsyncMock(return_value=_make_tool_result("fresh"))
+
+    # Untrusted server -> not idempotent even though the tool has hints.
+    wrapper = MCPToolWrapper(
+        old_session,
+        "test_server",
+        _make_tool_def(annotations=_annotations(read_only=True)),
+        tool_timeout=5,
+    )
+    replacement = _make_read_only_wrapper(new_session)
+
+    async def reconnect(server_name: str, tool_name: str, stale_tool):
+        return replacement
+
+    wrapper.set_reconnect_handler(reconnect)
+
+    output = await wrapper.execute()
+
+    assert "outcome unknown" in output
+    assert is_tool_error_result(output)
+    assert old_session.call_tool.call_count == 1
+    assert new_session.call_tool.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_idempotent_hint_only_tool_retries_on_transient_error():
+    """idempotentHint alone (not read-only) keeps the single transient retry."""
+    session = AsyncMock()
+    result = _make_tool_result("ok")
+    session.call_tool = AsyncMock(side_effect=[_FakeClosedResourceError("gone"), result])
+
+    wrapper = MCPToolWrapper(
+        session,
+        "test_server",
+        _make_tool_def(annotations=_annotations(idempotent=True)),
+        tool_timeout=5,
+        trust_annotations=True,
+    )
+
+    assert wrapper.read_only is False
+    with patch("nanobot.agent.tools.mcp.asyncio.sleep", new_callable=AsyncMock):
+        output = await wrapper.execute()
+
+    assert output == "ok"
+    assert session.call_tool.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_read_only_tool_reconnects_on_session_terminated():
+    """Trusted read-only tools keep the session-refresh retry."""
+    old_session = AsyncMock()
+    old_session.call_tool = AsyncMock(side_effect=_session_terminated_error())
+    new_session = AsyncMock()
+    new_session.call_tool = AsyncMock(return_value=_make_tool_result("fresh"))
+
+    wrapper = _make_read_only_wrapper(old_session)
+    replacement = _make_read_only_wrapper(new_session)
+
+    async def reconnect(server_name: str, tool_name: str, stale_tool):
+        return replacement
+
+    wrapper.set_reconnect_handler(reconnect)
+
+    output = await wrapper.execute()
+
+    assert output == "fresh"
+    assert old_session.call_tool.call_count == 1
+    assert new_session.call_tool.call_count == 1
 
 
 # ---------------------------------------------------------------------------
