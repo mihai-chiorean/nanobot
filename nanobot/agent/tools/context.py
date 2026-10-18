@@ -34,6 +34,40 @@ _CURRENT_REQUEST_CONTEXT: ContextVar["RequestContext | None"] = ContextVar(
 #: key back to end a Work turn in ``waiting`` instead of ``succeeded``.
 ZIGGY_PARK_ATTRIBUTE = "ziggy_park"
 
+#: Turn-scoped index of the turn's persisted user message in
+#: ``session.messages``, bound by ``AgentLoop`` when it persists the turn's
+#: input (SR-11).  It is the last-resort idempotency scope for turns that
+#: carry neither a Work task id nor a client message id, so two turns in one
+#: session still get distinct scopes.  Deliberately a context var, not a
+#: ``RequestContext`` field: the caller-visible metadata/attributes bags stay
+#: exactly what the caller sent (facade contract).
+_CURRENT_TURN_USER_INDEX: ContextVar[int | None] = ContextVar(
+    "nanobot_turn_user_message_index",
+    default=None,
+)
+
+
+def bind_turn_user_message_index(index: int | None) -> Token[int | None]:
+    return _CURRENT_TURN_USER_INDEX.set(index)
+
+
+def reset_turn_user_message_index(token: Token[int | None]) -> None:
+    _CURRENT_TURN_USER_INDEX.reset(token)
+
+
+def current_turn_user_message_index() -> int | None:
+    return _CURRENT_TURN_USER_INDEX.get()
+
+
+@contextmanager
+def turn_user_message_index(index: int | None):
+    """Bind the running turn's persisted-user-message index for tool scope."""
+    token = bind_turn_user_message_index(index)
+    try:
+        yield index
+    finally:
+        reset_turn_user_message_index(token)
+
 
 @dataclass(frozen=True)
 class RequestContext:
