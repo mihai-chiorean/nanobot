@@ -679,6 +679,7 @@ def _run_gateway(
         sessions=session_manager,
         bus=bus,
         unified_session=config.agents.defaults.unified_session,
+        tool_is_read_only=tools.is_read_only,
     )
 
     # Create agent with cron service
