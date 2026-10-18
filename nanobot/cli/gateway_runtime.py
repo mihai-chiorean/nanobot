@@ -307,7 +307,7 @@ async def _run_dream_cron_job(agent: Any, mcp_provider: Any) -> None:
             prompt,
             session_key=key,
             ephemeral=True,
-            tools=store.build_dream_tools(),
+            tools=store.build_dream_tools(skills_drafts=agent.tools_config.skills.drafts),
             on_progress=_silent,
             runtime=dream_runtime,
         )

@@ -486,7 +486,7 @@ async def cmd_dream(ctx: CommandContext) -> OutboundMessage:
                 prompt,
                 session_key=key,
                 ephemeral=True,
-                tools=store.build_dream_tools(),
+                tools=store.build_dream_tools(skills_drafts=loop.tools_config.skills.drafts),
                 on_progress=_silent,
                 runtime=dream_runtime,
             )

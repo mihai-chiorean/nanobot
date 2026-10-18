@@ -427,11 +427,14 @@ async def test_dream_cron_job_records_provenance_off_the_event_loop(tmp_path) ->
             metadata={"_stop_reason": "completed"},
         )
 
+    from nanobot.config.schema import ToolsConfig
+
     agent = SimpleNamespace(
         context=SimpleNamespace(memory=store),
         dream_runtime=lambda: None,
         process_direct=process_direct,
         sessions=SessionManager(workspace, sessions_root=tmp_path / "sessions"),
+        tools_config=ToolsConfig(),
     )
 
     class _Provider:

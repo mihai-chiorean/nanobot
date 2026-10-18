@@ -18,6 +18,7 @@ from nanobot.command.builtin import (
     cmd_dream_restore,
 )
 from nanobot.command.router import CommandContext
+from nanobot.config.schema import ToolsConfig
 from nanobot.session.manager import SessionManager
 from nanobot.utils.gitstore import CommitInfo
 
@@ -46,7 +47,8 @@ class _FakeStore:
     def record_dream_provenance(self, diff_body: str, batch: list[dict]) -> None:
         self.provenance_calls.append((diff_body, batch))
 
-    def build_dream_tools(self):
+    def build_dream_tools(self, skills_drafts: bool = True):
+        assert skills_drafts is True
         return None
 
     def set_last_dream_cursor(self, value: int) -> None:
@@ -135,6 +137,7 @@ def _make_dream_ctx(tmp_path) -> tuple[CommandContext, _FakeBus]:
     loop = SimpleNamespace(
         bus=bus,
         context=SimpleNamespace(memory=store, timezone="UTC"),
+        tools_config=ToolsConfig(),
         sessions=_make_sessions(tmp_path),
     )
     ctx = CommandContext(msg=msg, session=None, key=msg.session_key, raw="/dream", args="", loop=loop)
@@ -188,6 +191,7 @@ async def test_dream_internal_run_silences_progress(tmp_path) -> None:
     loop = SimpleNamespace(
         bus=bus,
         context=SimpleNamespace(memory=store, timezone="UTC"),
+        tools_config=ToolsConfig(),
         sessions=_make_sessions(tmp_path),
         process_direct=process_direct,
         dream_runtime=lambda: dream_runtime,
@@ -240,6 +244,7 @@ def _build_runnable_dream(
     loop = SimpleNamespace(
         bus=bus,
         context=SimpleNamespace(memory=store, timezone="UTC"),
+        tools_config=ToolsConfig(),
         sessions=_make_sessions(tmp_path),
         process_direct=process_direct,
         dream_runtime=lambda: None,
@@ -375,6 +380,7 @@ async def test_dream_run_completes_when_provenance_read_fails(tmp_path, monkeypa
     loop = SimpleNamespace(
         bus=bus,
         context=SimpleNamespace(memory=store, timezone="UTC"),
+        tools_config=ToolsConfig(),
         sessions=_make_sessions(tmp_path),
         process_direct=process_direct,
         dream_runtime=lambda: None,
@@ -434,6 +440,7 @@ async def test_dream_noop_batch_unlocks_following_history(tmp_path) -> None:
     loop = SimpleNamespace(
         bus=bus,
         context=SimpleNamespace(memory=store, timezone="UTC"),
+        tools_config=ToolsConfig(),
         sessions=_make_sessions(tmp_path),
         process_direct=process_direct,
         dream_runtime=lambda: None,
