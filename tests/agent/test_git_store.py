@@ -1,11 +1,19 @@
 """Tests for GitStore — git-backed version control for memory files."""
 
 import os
+import subprocess
 from unittest.mock import patch
 
 import pytest
+from dulwich.repo import Repo
 
-from nanobot.utils.gitstore import CommitInfo, GitStore, GitStoreError
+from nanobot.utils.gitstore import (
+    DEFAULT_TRACKED_PATTERNS,
+    CommitInfo,
+    GitStore,
+    GitStoreError,
+    history_dir_for,
+)
 
 TRACKED = ["SOUL.md", "USER.md", "memory/MEMORY.md"]
 
@@ -297,3 +305,252 @@ class TestMemoryStoreGitProperty:
         from nanobot.agent.memory import MemoryStore
         store = MemoryStore(tmp_path)
         assert store.git is store._git
+
+    def test_memory_store_uses_bare_history_outside_workspace(self, tmp_path):
+        """SM-01: MemoryStore's GitStore points at <ws>/../history/workspace.git."""
+        from nanobot.agent.memory import MemoryStore
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        store = MemoryStore(workspace)
+        assert store.git._git_dir == history_dir_for(workspace) / "workspace.git"
+
+
+class TestBareWorkspaceHistory:
+    """SM-01 (MIT-1842): bare history repo outside the workspace, byte blobs,
+    pattern-tracked files, legacy migration."""
+
+    @pytest.fixture
+    def ws(self, tmp_path):
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        return workspace
+
+    @pytest.fixture
+    def bare(self, ws):
+        return GitStore(
+            ws,
+            tracked_files=DEFAULT_TRACKED_PATTERNS,
+            git_dir=history_dir_for(ws) / "workspace.git",
+        )
+
+    def _tree_at_head(self, store: GitStore) -> tuple[Repo, object]:
+        """Open the bare repo and return (repo, HEAD tree). Caller closes repo."""
+        repo = Repo(str(store._git_dir))
+        return repo, repo[repo[repo.refs[b"HEAD"]].tree]
+
+    def test_history_dir_for_derives_only_from_workspace(self, tmp_path):
+        ws = tmp_path / "tenant" / "workspace"
+        ws.mkdir(parents=True)
+        assert history_dir_for(ws) == ws.resolve().parent / "history"
+
+    def test_bare_store_lives_outside_workspace(self, ws):
+        store = GitStore(
+            ws,
+            tracked_files=DEFAULT_TRACKED_PATTERNS,
+            git_dir=history_dir_for(ws) / "workspace.git",
+        )
+        assert store.init() is True
+        (ws / "SOUL.md").write_text("# soul", encoding="utf-8")
+        assert store.auto_commit("turn t1") is not None
+        assert not (ws / ".git").exists()
+        assert not (ws / ".gitignore").exists()
+        assert (ws.parent / "history" / "workspace.git" / "HEAD").exists()
+
+    def test_bare_is_initialized_checks_git_dir(self, bare, ws):
+        assert not bare.is_initialized()
+        bare.init()
+        assert bare.is_initialized()
+        assert not (ws / ".git").is_dir()
+
+    def test_tracks_skills_and_binary_assets(self, bare, ws):
+        binary = b"\x89PNG\r\n\x1a\n\xff\xfe\x00\x01\x80\x00"
+        (ws / "skills" / "x" / "assets").mkdir(parents=True)
+        (ws / "skills" / "x" / "assets" / "a.bin").write_bytes(binary)
+        (ws / "skills" / "_proposed" / "draft").mkdir(parents=True)
+        (ws / "skills" / "_proposed" / "draft" / "SKILL.md").write_text(
+            "draft skill", encoding="utf-8"
+        )
+        (ws / "prompts").mkdir()
+        (ws / "prompts" / "dream.md").write_text("dream", encoding="utf-8")
+        (ws / "prompts" / "notes.txt").write_text("not tracked", encoding="utf-8")
+        (ws / "memory").mkdir()
+        bare.init()
+
+        repo, tree = self._tree_at_head(bare)
+        try:
+            assert GitStore._read_blob_from_tree(repo, tree, "skills/x/assets/a.bin") == binary
+            assert (
+                GitStore._read_blob_from_tree(
+                    repo, tree, "skills/_proposed/draft/SKILL.md"
+                )
+                == b"draft skill"
+            )
+            assert GitStore._read_blob_from_tree(repo, tree, "prompts/dream.md") == b"dream"
+            # glob is *.md only
+            assert GitStore._read_blob_from_tree(repo, tree, "prompts/notes.txt") is None
+        finally:
+            repo.close()
+
+    def test_untracked_files_are_excluded(self, bare, ws):
+        (ws / "memory").mkdir()
+        (ws / "memory" / "history.jsonl").write_text("append-only", encoding="utf-8")
+        (ws / "memory" / ".dream_cursor").write_text("42", encoding="utf-8")
+        (ws / "scratch.txt").write_text("random", encoding="utf-8")
+        bare.init()
+        repo, tree = self._tree_at_head(bare)
+        try:
+            assert GitStore._read_blob_from_tree(repo, tree, "memory/history.jsonl") is None
+            assert GitStore._read_blob_from_tree(repo, tree, "memory/.dream_cursor") is None
+            assert GitStore._read_blob_from_tree(repo, tree, "scratch.txt") is None
+        finally:
+            repo.close()
+
+    def test_symlinks_and_oversized_files_are_skipped(self, bare, ws):
+        (ws / "skills").mkdir()
+        target = ws / "outside.bin"
+        target.write_bytes(b"real")
+        (ws / "skills" / "link.bin").symlink_to(target)
+        (ws / "skills" / "huge.md").write_bytes(b"x" * (1024 * 1024 + 1))
+        (ws / "SOUL.md").write_text("soul", encoding="utf-8")
+        bare.init()
+        repo, tree = self._tree_at_head(bare)
+        try:
+            assert GitStore._read_blob_from_tree(repo, tree, "skills/link.bin") is None
+            assert GitStore._read_blob_from_tree(repo, tree, "skills/huge.md") is None
+            assert GitStore._read_blob_from_tree(repo, tree, "SOUL.md") == b"soul"
+        finally:
+            repo.close()
+
+    def test_no_commit_when_unchanged(self, bare, ws):
+        (ws / "SOUL.md").write_text("v1", encoding="utf-8")
+        assert bare.init() is True
+        # Same content as the init commit: no second commit.
+        assert bare.auto_commit("nothing 1") is None
+        assert bare.auto_commit("nothing 2") is None
+        assert len(bare.log()) == 1
+        (ws / "SOUL.md").write_text("v2", encoding="utf-8")
+        sha = bare.auto_commit("changed")
+        assert sha is not None and len(sha) == 8
+        assert bare.auto_commit("changed again") is None
+        assert len(bare.log()) == 2
+        assert bare.log()[0].message == "changed"
+
+    def test_same_size_rewrite_with_unchanged_mtime_still_commits(self, bare, ws):
+        path = ws / "SOUL.md"
+        path.write_text("v1", encoding="utf-8")
+        bare.init()
+        previous = path.stat()
+        path.write_text("v2", encoding="utf-8")
+        os.utime(path, ns=(previous.st_atime_ns, previous.st_mtime_ns))
+        assert bare.auto_commit("v2") is not None
+
+    def test_removed_files_drop_out_of_tree(self, bare, ws):
+        (ws / "prompts").mkdir()
+        (ws / "prompts" / "gone.md").write_text("bye", encoding="utf-8")
+        bare.init()
+        (ws / "prompts" / "gone.md").unlink()
+        assert bare.auto_commit("drop prompt") is not None
+        repo, tree = self._tree_at_head(bare)
+        try:
+            assert GitStore._read_blob_from_tree(repo, tree, "prompts/gone.md") is None
+        finally:
+            repo.close()
+
+    def test_log_and_diff_and_show_work_against_bare_repo(self, bare, ws):
+        (ws / "SOUL.md").write_text("original", encoding="utf-8")
+        bare.init()
+        (ws / "SOUL.md").write_text("modified", encoding="utf-8")
+        sha = bare.auto_commit("turn t2")
+        assert isinstance(sha, str)
+
+        commits = bare.log()
+        assert len(commits) == 2
+        assert commits[0].message == "turn t2"
+        assert commits[1].message == "init: workspace history"
+
+        diff = bare.diff_commits(commits[1].sha, commits[0].sha)
+        assert "modified" in diff
+
+        result = bare.show_commit_diff(sha)
+        assert result is not None
+        commit, commit_diff = result
+        assert commit.sha == sha
+        assert "modified" in commit_diff
+
+    def test_bare_history_is_readable_by_git_cli(self, bare, ws):
+        """The design requires the host's git to read the dulwich bare repo."""
+        (ws / "SOUL.md").write_text("# soul", encoding="utf-8")
+        bare.init()
+        out = subprocess.check_output(
+            ["git", "--git-dir", str(bare._git_dir), "log", "--format=%an|%ae|%s"],
+            text=True,
+        )
+        assert "ziggy|ziggy@runtime|init: workspace history" in out
+
+    def test_migrates_legacy_dot_git(self, ws):
+        # A real legacy store (the pre-SM-01 layout) inside the workspace.
+        legacy_store = GitStore(ws, tracked_files=["SOUL.md"])
+        (ws / "SOUL.md").write_text("# old soul", encoding="utf-8")
+        assert legacy_store.init() is True
+        legacy_head = (ws / ".git" / "HEAD").read_text(encoding="utf-8")
+        (ws / ".gitignore").write_text("/*\n", encoding="utf-8")
+        (ws / "SOUL.md").write_text("# soul", encoding="utf-8")
+
+        store = GitStore(
+            ws,
+            tracked_files=DEFAULT_TRACKED_PATTERNS,
+            git_dir=history_dir_for(ws) / "workspace.git",
+        )
+        assert store.init() is True
+
+        assert not (ws / ".git").exists()
+        # Old history parked outside the workspace, still readable.
+        legacy = ws.parent / "history" / "legacy-dot-git"
+        assert (legacy / "HEAD").read_text(encoding="utf-8") == legacy_head
+        out = subprocess.run(
+            ["git", "--git-dir", str(legacy), "log", "--format=%s"],
+            capture_output=True, text=True, check=True,
+        )
+        assert "init: nanobot memory store" in out.stdout
+        # The harmless workspace .gitignore is left alone.
+        assert (ws / ".gitignore").read_text(encoding="utf-8") == "/*\n"
+        # The new bare repo committed the current files.
+        assert store.log()[-1].message == "init: workspace history"
+        repo, tree = self._tree_at_head(store)
+        try:
+            assert GitStore._read_blob_from_tree(repo, tree, "SOUL.md") == b"# soul"
+        finally:
+            repo.close()
+    def test_init_is_noop_when_bare_repo_exists(self, ws):
+        store = GitStore(
+            ws,
+            tracked_files=DEFAULT_TRACKED_PATTERNS,
+            git_dir=history_dir_for(ws) / "workspace.git",
+        )
+        assert store.init() is True
+        # A leftover legacy .git after the bare repo exists is not touched.
+        (ws / ".git").mkdir()
+        assert store.init() is False
+        assert (ws / ".git").is_dir()
+
+    def test_sync_templates_does_not_recreate_dot_git(self, tmp_path):
+        from nanobot.utils.helpers import sync_workspace_templates
+
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        sync_workspace_templates(workspace, silent=True)
+        assert not (workspace / ".git").exists()
+        assert not (workspace / ".gitignore").exists()
+        assert (tmp_path / "history" / "workspace.git" / "HEAD").exists()
+        # And again, simulating every start.
+        sync_workspace_templates(workspace, silent=True)
+        assert not (workspace / ".git").exists()
+
+    def test_auto_commit_failure_is_explicit(self, bare, ws, monkeypatch):
+        bare.init()
+        monkeypatch.setattr(
+            "dulwich.index.commit_tree",
+            lambda *args, **kwargs: (_ for _ in ()).throw(OSError("object store broken")),
+        )
+        with pytest.raises(GitStoreError, match="auto-commit failed"):
+            bare.auto_commit("boom")

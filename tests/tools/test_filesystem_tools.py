@@ -723,3 +723,92 @@ class TestSymlinkTraversalBlocking:
         assert result.startswith("Error:")
         assert "sensitive path" in result.lower()
         assert secret.read_text() == original
+
+
+# ---------------------------------------------------------------------------
+# MIT-1842 (SM-01): the workspace history directory (<ws>/../history) is
+# refused by every filesystem tool, whatever the effective allowed root. A
+# project scope widened to the tenant root must still not reach it.
+# ---------------------------------------------------------------------------
+
+
+class TestHistoryDirRefusal:
+
+    @pytest.fixture
+    def ws_root(self, tmp_path):
+        """Layout: tmp_path is the tenant root, workspace its subdir."""
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        (workspace / "notes.md").write_text("hello", encoding="utf-8")
+        history = tmp_path / "history"
+        (history / "workspace.git").mkdir(parents=True)
+        (history / "workspace.git" / "HEAD").write_text(
+            "ref: refs/heads/master\n", encoding="utf-8"
+        )
+        return tmp_path, workspace
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("tool_cls", [ReadFileTool, WriteFileTool, EditFileTool])
+    async def test_file_tools_refuse_history_dir(self, ws_root, tool_cls):
+        tenant, workspace = ws_root
+        head = tenant / "history" / "workspace.git" / "HEAD"
+        # Effective allowed root is the TENANT ROOT (project-scope widening).
+        tool = tool_cls(workspace=workspace, allowed_dir=tenant)
+        result = await tool.execute(
+            path=str(head),
+            content="x",
+            old_text="ref: refs/heads/master\n",
+            new_text="ref: refs/heads/evil\n",
+        )
+        assert str(result).startswith("Error")
+        assert "history" in str(result).lower()
+        assert head.read_text(encoding="utf-8") == "ref: refs/heads/master\n"
+
+    @pytest.mark.asyncio
+    async def test_history_refused_even_with_no_allowed_root(self, ws_root):
+        tenant, workspace = ws_root
+        marker = tenant / "history" / "workspace.git" / "COMMIT_EDITMSG"
+        marker.write_text("secret", encoding="utf-8")
+        # allowed_dir=None means no containment at all — history still refused.
+        tool = ReadFileTool(workspace=workspace)
+        result = await tool.execute(path=str(marker))
+        assert "Error" in result
+        assert "secret" not in str(result)
+
+    @pytest.mark.asyncio
+    async def test_history_escape_via_traversal_is_refused(self, ws_root):
+        tenant, workspace = ws_root
+        (tenant / "history" / "payload").write_text("boom", encoding="utf-8")
+        tool = WriteFileTool(workspace=workspace, allowed_dir=tenant)
+        result = await tool.execute(
+            path=str(workspace / ".." / "history" / "payload"),
+            content="tampered",
+        )
+        assert str(result).startswith("Error")
+        assert (tenant / "history" / "payload").read_text(encoding="utf-8") == "boom"
+
+    @pytest.mark.asyncio
+    async def test_history_itself_refused_not_only_children(self, ws_root):
+        tenant, workspace = ws_root
+        tool = ReadFileTool(workspace=workspace, allowed_dir=tenant)
+        result = await tool.execute(path=str(tenant / "history"))
+        assert "Error" in result
+
+    @pytest.mark.asyncio
+    async def test_sibling_dirs_still_writable_under_parent_root(self, ws_root):
+        """Negative control: only history/* is refused, not the whole parent."""
+        tenant, workspace = ws_root
+        other = tenant / "other"
+        other.mkdir()
+        tool = WriteFileTool(workspace=workspace, allowed_dir=tenant)
+        result = await tool.execute(path=str(other / "f.md"), content="ok")
+        assert "Successfully wrote" in result
+        assert (other / "f.md").read_text(encoding="utf-8") == "ok"
+
+    @pytest.mark.asyncio
+    async def test_workspace_default_root_still_works(self, ws_root):
+        """Negative control: normal reads inside the workspace are unaffected."""
+        _, workspace = ws_root
+        tool = ReadFileTool(workspace=workspace, allowed_dir=workspace)
+        result = await tool.execute(path="notes.md")
+        assert "hello" in result

@@ -254,7 +254,9 @@ def test_disabled_dream_cursor_only_advances_when_behind(tmp_path) -> None:
 
 
 def test_commit_dream_changes_skips_noop_run(tmp_path) -> None:
-    store = MemoryStore(tmp_path)
+    # SM-01: nest the workspace so the derived history dir (<ws>/../history) is
+    # per-test instead of shared under the tmp_path parent.
+    store = MemoryStore(tmp_path / "workspace")
     store.write_soul("# Soul")
     store.write_memory("# Memory")
     store.git.init()
@@ -266,7 +268,7 @@ def test_commit_dream_changes_skips_noop_run(tmp_path) -> None:
 
 
 def test_commit_dream_changes_commits_real_edits(tmp_path) -> None:
-    store = MemoryStore(tmp_path)
+    store = MemoryStore(tmp_path / "workspace")
     store.write_soul("# Soul")
     store.write_memory("# Memory")
     store.git.init()

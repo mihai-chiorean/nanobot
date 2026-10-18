@@ -29,7 +29,7 @@ from nanobot.providers.conversation_state import ProviderConversationStateContro
 from nanobot.runtime_context import public_history_messages
 from nanobot.session.manager import Session, SessionManager
 from nanobot.session.summary import is_summary_checkpoint, session_summary_from_metadata
-from nanobot.utils.gitstore import GitStore
+from nanobot.utils.gitstore import DEFAULT_TRACKED_PATTERNS, GitStore, history_dir_for
 from nanobot.utils.helpers import (
     build_assistant_message,
     content_with_media_breadcrumbs,
@@ -121,10 +121,15 @@ class MemoryStore:
         # `recall` can surface a remembered fact and not only raw chat. Set by
         # the Agent once the per-workspace index exists; None in plain CLI use.
         self._recall: Any = None
-        self._git = GitStore(workspace, tracked_files=[
-            "SOUL.md", "USER.md", "memory/MEMORY.md", "memory/.dream_cursor",
-            "memory/provenance.jsonl",
-        ])
+        # SM-01 (MIT-1842): bare history repo OUTSIDE the workspace so the
+        # agent's file tools cannot rewrite its own undo history. The derived
+        # path is workspace-only (see history_dir_for); the file-tool resolver
+        # independently refuses it.
+        self._git = GitStore(
+            workspace,
+            tracked_files=DEFAULT_TRACKED_PATTERNS,
+            git_dir=history_dir_for(workspace) / "workspace.git",
+        )
         self._maybe_migrate_legacy_history()
 
     @property
