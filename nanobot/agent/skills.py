@@ -4,12 +4,22 @@ import json
 import os
 import re
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Iterable, cast
 
 import yaml
 
 from nanobot.runtime_context import RuntimeContextBlock
+
+# Ziggy-local (SR-17/SR-18): skill-declared tool allowlist and pre-run script.
+# The script keys live in the Agent Skills spec's free-form ``metadata`` map.
+ALLOWED_TOOLS_FRONTMATTER_KEY = "allowed-tools"
+SKILL_SCRIPT_METADATA_KEY = "ziggy.script"
+SKILL_SCRIPT_TIMEOUT_METADATA_KEY = "ziggy.script-timeout"
+# Running a skill script is equivalent to one ``exec`` call, so its default
+# timeout matches ``ExecToolConfig.timeout``; ``run_skill_script`` clamps to 1..600 s.
+DEFAULT_SKILL_SCRIPT_TIMEOUT_S = 180
 
 # Default builtin skills directory (relative to this file)
 BUILTIN_SKILLS_DIR = Path(__file__).parent.parent / "skills"
@@ -46,6 +56,71 @@ def valid_skill_metadata(metadata: dict[str, object], name: str) -> bool:
         and isinstance(description, str)
         and 1 <= len(description.strip()) <= 1024
     )
+
+
+@dataclass(frozen=True, slots=True)
+class SkillScriptSpec:
+    """A skill's pre-run script: path relative to the skill dir, plus timeout."""
+
+    rel_path: str
+    timeout_s: int
+
+
+def parse_skill_allowed_tools(raw: object) -> frozenset[str] | None:
+    """Parse the Agent Skills ``allowed-tools`` frontmatter value.
+
+    Accepts a space- or comma-separated string, or a list of names. Missing or
+    empty means "no filter" (``None``), not "no tools".
+    """
+    if isinstance(raw, str):
+        tokens = [part.strip() for part in raw.replace(",", " ").split() if part.strip()]
+    elif isinstance(raw, (list, tuple)):
+        tokens = [
+            item.strip() for item in cast(Iterable[object], raw) if isinstance(item, str)
+        ]
+    else:
+        return None
+    names = [token for token in tokens if token]
+    return frozenset(names) if names else None
+
+
+def parse_skill_script_spec(
+    frontmatter: dict[str, object] | None,
+) -> SkillScriptSpec | None:
+    """Extract ``metadata.ziggy.script`` (+ ``ziggy.script-timeout``).
+
+    The ``metadata`` map may already be a dict or a JSON string (the validator
+    tolerates both shapes, see ``_parse_nanobot_metadata``). Missing or blank
+    script path -> ``None``.
+    """
+    if not frontmatter:
+        return None
+    raw = frontmatter.get("metadata")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return None
+    if not isinstance(raw, dict):
+        return None
+    data = cast(dict[Any, Any], raw)
+    rel_path = data.get(SKILL_SCRIPT_METADATA_KEY)
+    if not isinstance(rel_path, str) or not rel_path.strip():
+        return None
+    timeout_s = DEFAULT_SKILL_SCRIPT_TIMEOUT_S
+    raw_timeout = data.get(SKILL_SCRIPT_TIMEOUT_METADATA_KEY)
+    if isinstance(raw_timeout, bool):
+        raw_timeout = None
+    elif isinstance(raw_timeout, str):
+        raw_timeout = raw_timeout.strip() or None
+        if isinstance(raw_timeout, str):
+            try:
+                raw_timeout = int(raw_timeout)
+            except ValueError:
+                raw_timeout = None
+    if isinstance(raw_timeout, int):
+        timeout_s = raw_timeout
+    return SkillScriptSpec(rel_path=rel_path.strip(), timeout_s=timeout_s)
 
 
 class SkillsLoader:
@@ -161,6 +236,46 @@ class SkillsLoader:
             if (markdown := self.load_skill(name))
         ]
         return "\n\n---\n\n".join(parts)
+
+    def _resolve_skill_entry(self, name: str) -> dict[str, str] | None:
+        """Resolve a skill name (or CLI-App alias) to its list entry."""
+        skills = self.list_skills(filter_unavailable=False)
+        available = {entry["name"] for entry in skills}
+        resolved = name if name in available else self._skill_aliases().get(name, name)
+        return next((entry for entry in skills if entry["name"] == resolved), None)
+
+    def skill_dir(self, name: str) -> Path | None:
+        """Directory containing the skill's SKILL.md, or None if unknown."""
+        entry = self._resolve_skill_entry(name)
+        return Path(entry["path"]).parent if entry else None
+
+    def skill_allowed_tools(self, name: str) -> frozenset[str] | None:
+        """Tool allowlist declared by the skill, or None when it declares none."""
+        meta = self.get_skill_metadata(name) or {}
+        return parse_skill_allowed_tools(meta.get(ALLOWED_TOOLS_FRONTMATTER_KEY))
+
+    def skill_script_spec(self, name: str) -> SkillScriptSpec | None:
+        """The skill's pre-run script spec (``metadata.ziggy.script``)."""
+        return parse_skill_script_spec(self.get_skill_metadata(name))
+
+    def build_skill_runtime_context(self, name: str) -> RuntimeContextBlock | None:
+        """Frame one named skill like an explicit ``$skill`` invocation does.
+
+        A scheduled run knows its skill in advance, so it injects the skill
+        content through the same trusted runtime-context path an interactive
+        ``$skill`` mention uses instead of relying on the model to route.
+        """
+        content = self.load_skills_for_context([name])
+        if not content:
+            return None
+        return RuntimeContextBlock(
+            source="explicit_skills",
+            content=(
+                "[Active Skills — instructions for this user turn]\n"
+                f"{content}\n"
+                "[/Active Skills]"
+            ),
+        )
 
     def get_explicitly_invoked_skills(self, text: str) -> list[str]:
         """Resolve ``$skill-name`` references to enabled, available skills."""

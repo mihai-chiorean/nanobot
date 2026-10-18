@@ -556,3 +556,245 @@ def test_a_healthy_work_task_is_never_disabled(tmp_path: Path) -> None:
     assert loaded is not None
     assert all(job.enabled for job in loaded[0])
     assert all(job.state.last_status != "error" for job in loaded[0])
+
+
+# --------------------------------------------------------------------------
+# Skill-scoped scheduled runs (SR-17/SR-18)
+# --------------------------------------------------------------------------
+
+
+from loguru import logger  # noqa: E402
+
+from nanobot.agent.hook import AgentHookContext  # noqa: E402
+from nanobot.agent.tools.allowed_tools import ALLOWED_TOOLS_META_KEY  # noqa: E402
+from nanobot.runtime_context import RUNTIME_CONTEXT_INPUT_META  # noqa: E402
+
+
+class _FakeExecTool:
+    def __init__(self) -> None:
+        self.env_calls = 0
+
+    def build_subprocess_env(self) -> dict[str, str]:
+        self.env_calls += 1
+        return {"PATH": "/usr/bin:/bin"}
+
+
+class _FakeRegistry:
+    def __init__(self, tools: dict[str, Any]) -> None:
+        self._tools = tools
+
+    def get(self, name: str) -> Any:
+        return self._tools.get(name)
+
+
+class _SkillAgent(_FakeAgent):
+    """A ``WorkCronAgent`` with a registry, like the production ``AgentLoop``."""
+
+    def __init__(self, store: _FakeWorkStore, workspace: Path, *, exec_enabled: bool = True) -> None:
+        super().__init__(store, workspace)
+        exec_tool = _FakeExecTool() if exec_enabled else None
+        self.tools = _FakeRegistry({"exec": exec_tool} if exec_enabled else {})
+        self.exec_tool = exec_tool
+
+
+def _skill_job(workspace: Path, *, script: str | None = "scripts/watch.py") -> CronJob:
+    skill_dir = workspace / "skills" / "fare-watch" / "scripts"
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    frontmatter = "allowed-tools: read_file message\n"
+    metadata = ""
+    if script is not None:
+        metadata = f"metadata:\n  ziggy.script: {script}\n  ziggy.script-timeout: 30\n"
+    (workspace / "skills" / "fare-watch" / "SKILL.md").write_text(
+        "---\n"
+        "name: fare-watch\n"
+        "description: watch fares\n"
+        f"{frontmatter}{metadata}"
+        "---\n"
+        "Report the cheapest fares.\n",
+        encoding="utf-8",
+    )
+    return CronJob(
+        id="skill-1",
+        name="fare watch",
+        schedule=CronSchedule(kind="every", every_ms=1000),
+        payload=CronPayload(
+            kind="work_task",
+            message="run the fare watch",
+            session_key="websocket:chat-1",
+            origin_channel="websocket",
+            origin_chat_id="chat-1",
+            skill="fare-watch",
+        ),
+    )
+
+
+async def _injected_rows(call: dict[str, Any]) -> list[dict[str, Any]]:
+    """Drive the injection hook the way iteration 0 of the runner does."""
+    (hook,) = call["hooks"]
+    context = AgentHookContext(
+        iteration=0,
+        messages=[{"role": "user", "content": "run the fare watch"}],
+    )
+    await hook.before_iteration(context)
+    return context.messages
+
+
+@pytest.mark.asyncio
+async def test_skill_run_scopes_tools_and_injects_skill_without_a_cap(
+    tmp_path: Path,
+) -> None:
+    """SR-17 pass-through: allowed-tools and content reach the run.
+
+    The iteration cap is *not* part of SR-17 scoping: a run whose script did
+    not execute still has an open-ended job to finish, so it keeps the loop's
+    default budget.
+    """
+    job = _skill_job(tmp_path, script=None)
+    agent = _SkillAgent(_FakeWorkStore(), tmp_path)
+
+    await run_work_task_cron_job(job, agent=agent)
+
+    (call,) = agent.calls
+    assert call["metadata"][ALLOWED_TOOLS_META_KEY] == frozenset({"read_file", "message"})
+    blocks = call["metadata"][RUNTIME_CONTEXT_INPUT_META]
+    assert [b.source for b in blocks] == ["explicit_skills"]
+    assert "Report the cheapest fares." in blocks[0].content
+    assert "max_iterations" not in call
+    assert "hooks" not in call  # no script configured -> no synthetic rows
+
+
+@pytest.mark.asyncio
+async def test_skill_script_output_reaches_the_turn_as_tool_result(
+    tmp_path: Path,
+) -> None:
+    """The agent sees one skill_script tool row with the script output, not 105 execs."""
+    job = _skill_job(tmp_path)
+    (tmp_path / "skills" / "fare-watch" / "scripts" / "watch.py").write_text(
+        "print('FARE SFO-NRT 312 USD')", encoding="utf-8"
+    )
+    agent = _SkillAgent(_FakeWorkStore(), tmp_path)
+
+    await run_work_task_cron_job(job, agent=agent)
+
+    (call,) = agent.calls
+    assert call["max_iterations"] == 6  # the cap belongs to the script-injected run
+    rows = await _injected_rows(call)
+    assert [row["role"] for row in rows] == ["user", "assistant", "tool"]
+    (tool_call,) = rows[1]["tool_calls"]
+    assert tool_call["function"]["name"] == "skill_script"
+    assert rows[2]["tool_call_id"] == tool_call["id"]
+    assert "FARE SFO-NRT 312 USD" in rows[2]["content"]
+    assert "exit_code=0" in rows[2]["content"]
+    # The env came from the exec tool's own build, not a reimplementation.
+    assert agent.exec_tool.env_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_exec_disabled_skips_the_skill_script(tmp_path: Path) -> None:
+    """Testers run with exec off: the script must not run, and say why."""
+    job = _skill_job(tmp_path)
+    (tmp_path / "skills" / "fare-watch" / "scripts" / "watch.py").write_text(
+        "raise SystemError('must not run')", encoding="utf-8"
+    )
+    agent = _SkillAgent(_FakeWorkStore(), tmp_path, exec_enabled=False)
+
+    logs: list[str] = []
+    sink_id = logger.add(lambda m: logs.append(str(m)), level="INFO")
+    try:
+        await run_work_task_cron_job(job, agent=agent)
+    finally:
+        logger.remove(sink_id)
+
+    (call,) = agent.calls
+    assert "hooks" not in call
+    assert any("skill_script_skipped reason=exec_disabled" in line for line in logs)
+    # The skill still scopes the turn itself, but with no script injected the
+    # job stays open-ended: no cap.
+    assert "max_iterations" not in call
+    assert call["metadata"][ALLOWED_TOOLS_META_KEY] == frozenset({"read_file", "message"})
+
+
+@pytest.mark.asyncio
+async def test_failed_script_adds_the_stop_instruction(tmp_path: Path) -> None:
+    job = _skill_job(tmp_path)
+    (tmp_path / "skills" / "fare-watch" / "scripts" / "watch.py").write_text(
+        "import sys\nsys.exit(4)", encoding="utf-8"
+    )
+    agent = _SkillAgent(_FakeWorkStore(), tmp_path)
+
+    await run_work_task_cron_job(job, agent=agent)
+
+    (call,) = agent.calls
+    assert "report the failure" in call["content"]
+    assert "do not redo the job by hand" in call["content"]
+    assert call["content"].startswith("run the fare watch")
+    assert call["max_iterations"] == 6  # the stop line is only honoured under the cap
+    rows = await _injected_rows(call)
+    assert "exit_code=4" in rows[2]["content"]
+    # The durable Work row keeps the original prompt; only the turn learns
+    # the stop instruction.
+    (task,) = agent.work_store.tasks
+    assert task["content"] == "run the fare watch"
+
+
+@pytest.mark.asyncio
+async def test_script_path_escape_is_refused_and_reported(tmp_path: Path) -> None:
+    job = _skill_job(tmp_path, script="../escape.py")
+    (tmp_path / "escape.py").write_text("print('escaped')", encoding="utf-8")
+    agent = _SkillAgent(_FakeWorkStore(), tmp_path)
+
+    await run_work_task_cron_job(job, agent=agent)
+
+    (call,) = agent.calls
+    assert "do not redo the job by hand" in call["content"]
+    assert call["max_iterations"] == 6  # a refused script still injects its failure row
+    rows = await _injected_rows(call)
+    assert "script path may not contain" in rows[2]["content"]
+    assert "escaped" not in rows[2]["content"]
+
+
+@pytest.mark.asyncio
+async def test_max_iterations_six_only_for_script_injected_runs(tmp_path: Path) -> None:
+    """The cap follows the injected script result, not the mere presence of a skill."""
+    plain = CronJob.from_store_dict(OWNER_WORK_JOBS[0])
+    agent = _FakeAgent(_FakeWorkStore(), tmp_path)
+    await run_work_task_cron_job(plain, agent=agent)
+    (plain_call,) = agent.calls
+    assert "max_iterations" not in plain_call
+    assert "hooks" not in plain_call
+
+    unscripted = _skill_job(tmp_path / "noscript", script=None)
+    unscripted_agent = _SkillAgent(_FakeWorkStore(), tmp_path / "noscript")
+    await run_work_task_cron_job(unscripted, agent=unscripted_agent)
+    assert "max_iterations" not in unscripted_agent.calls[0]
+    assert "hooks" not in unscripted_agent.calls[0]
+
+    scripted = _skill_job(tmp_path / "scripted")
+    (tmp_path / "scripted" / "skills" / "fare-watch" / "scripts" / "watch.py").write_text(
+        "print('ok')", encoding="utf-8"
+    )
+    scripted_agent = _SkillAgent(_FakeWorkStore(), tmp_path / "scripted")
+    await run_work_task_cron_job(scripted, agent=scripted_agent)
+    assert scripted_agent.calls[0]["max_iterations"] == 6
+    assert scripted_agent.calls[0]["hooks"]
+
+
+@pytest.mark.asyncio
+async def test_unknown_skill_degrades_to_a_plain_run(tmp_path: Path) -> None:
+    job = _skill_job(tmp_path, script=None)
+    job.payload.skill = "no-such-skill"
+    agent = _SkillAgent(_FakeWorkStore(), tmp_path)
+
+    await run_work_task_cron_job(job, agent=agent)
+
+    (call,) = agent.calls
+    assert "max_iterations" not in call
+    assert ALLOWED_TOOLS_META_KEY not in call["metadata"]
+
+
+def test_cron_payload_round_trips_the_skill_field(tmp_path: Path) -> None:
+    raw = json.loads(json.dumps(OWNER_WORK_JOBS[0]))
+    raw["payload"]["skill"] = "fare-watch"
+    job = CronJob.from_store_dict(raw)
+    assert job.payload.skill == "fare-watch"
+    assert CronJob.from_store_dict(OWNER_WORK_JOBS[0]).payload.skill is None

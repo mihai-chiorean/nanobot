@@ -212,6 +212,8 @@ class WorkStore:
                 connection.execute(
                     "ALTER TABLE work_tasks ADD COLUMN read_only INTEGER NOT NULL DEFAULT 0"
                 )
+            if "skill" not in task_columns:
+                connection.execute("ALTER TABLE work_tasks ADD COLUMN skill TEXT")
             connection.execute(
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_work_tasks_request_id
@@ -252,6 +254,7 @@ class WorkStore:
         read_only: Any = False,
         status: str = "queued",
         request_id: str | None = None,
+        skill: str | None = None,
     ) -> dict[str, Any]:
         now = utc_now()
         task_id = f"work_{uuid.uuid4().hex}"
@@ -293,6 +296,9 @@ class WorkStore:
         if request_id:
             columns.append("request_id")
             values.append(request_id)
+        if skill and skill.strip():
+            columns.append("skill")
+            values.append(skill.strip())
         # Production builds predating single-tenant Clerk auth stored a scope
         # column. Populate it only to keep those existing databases writable;
         # it is never returned or used for authorization.

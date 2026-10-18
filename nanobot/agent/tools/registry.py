@@ -9,6 +9,11 @@ from typing import TYPE_CHECKING, Any, cast
 
 from loguru import logger
 
+# Ziggy-local (SR-17): skill-scoped tool allowlist, mirrors the read-only gate.
+from nanobot.agent.tools.allowed_tools import (
+    allowed_tools_denial_message,
+    allowed_tools_for_turn,
+)
 from nanobot.agent.tools.ask import (
     ASK_USER_TOOL_NAME,
     ask_user_unanswerable,
@@ -262,6 +267,16 @@ class ToolRegistry:
                 for schema in definitions
                 if self._declares_read_only(self._schema_name(schema))
             ]
+        # Ziggy-local (SR-17): a skill-scoped turn (scheduled runs) exposes only
+        # the skill's ``allowed-tools``. Combines with read-only above: both
+        # filters apply, so the turn sees the intersection.
+        allowed = allowed_tools_for_turn(ctx.metadata)
+        if allowed is not None:
+            definitions = [
+                schema
+                for schema in definitions
+                if self._schema_name(schema) in allowed
+            ]
         # Ziggy-local: a scheduled / cron turn has nobody to answer ask_user,
         # so it is not offered there (prepare_call refuses it as well).
         if not in_room and ask_user_unanswerable(ctx.metadata, ctx.session_key):
@@ -324,6 +339,14 @@ class ToolRegistry:
         # coercion/validation so an injected call cannot probe parameter shapes.
         if ctx is not None and read_only_turn(ctx.metadata) and not tool.read_only:
             return tool, params, ToolResult.error(read_only_denial_message(tool.name)), repairs
+        # Ziggy-local (SR-17): skill tool allowlist, enforced before coercion for
+        # the same reason as the read-only gate above.
+        if (
+            ctx is not None
+            and (allowed := allowed_tools_for_turn(ctx.metadata)) is not None
+            and tool.name not in allowed
+        ):
+            return tool, params, ToolResult.error(allowed_tools_denial_message(tool.name)), repairs
         # Compatibility for external tools that still implement the legacy
         # setter protocol. Built-ins read the authoritative ContextVar
         # directly and never copy routing state.

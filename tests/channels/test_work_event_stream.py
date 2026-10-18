@@ -20,6 +20,7 @@ from typing import Any
 
 import pytest
 
+from nanobot.agent.tools.allowed_tools import ALLOWED_TOOLS_META_KEY
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.websocket.runtime import WebSocketChannel, WebSocketConfig
 from nanobot.channels.websocket.transport import TransportRequest
@@ -28,6 +29,7 @@ from nanobot.channels.websocket.work_stream import (
     WorkStreamHub,
     work_event_fields,
 )
+from nanobot.runtime_context import RUNTIME_CONTEXT_INPUT_META
 from nanobot.session.manager import SessionManager
 from nanobot.webui.gateway_services import build_gateway_services
 from nanobot.webui.work_http import WorkRouter
@@ -390,6 +392,8 @@ async def test_broadcast_reaches_only_the_subscribers_of_that_task(
             {"type": "work.create", "chat_id": CHAT_ID, "content": "x", "idempotency_key": "nope"},
             "invalid idempotency key",
         ),
+        ({"type": "work.create", "chat_id": CHAT_ID, "content": "x", "skill": 42}, "invalid skill"),
+        ({"type": "work.create", "chat_id": CHAT_ID, "content": "x", "skill": "  "}, "invalid skill"),
         ({"type": "work.subscribe", "task_id": "nope"}, "task not found"),
         ({"type": "work.subscribe", "task_id": "work_" + "0" * 32}, "task not found"),
         ({"type": "work.cancel", "task_id": "work_" + "0" * 32}, "task not found"),
@@ -408,6 +412,117 @@ async def test_malformed_frames_are_refused_without_touching_the_store(
     assert [f["event"] for f in frames] == ["error"]
     assert frames[0]["detail"] == detail
     assert bus.inbound == []
+
+
+# --------------------------------------------------------------------------
+# Skill-scoped create (SR-17, MIT-1827 change item 4)
+# --------------------------------------------------------------------------
+
+
+def _make_skill(workspace: Path, name: str = "fare-watch") -> None:
+    skill_dir = workspace / "skills" / name
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\n"
+        f"name: {name}\n"
+        "description: watch fares\n"
+        "allowed-tools: read_file message\n"
+        "---\n"
+        "Report the cheapest fares.\n",
+        encoding="utf-8",
+    )
+
+
+@pytest.mark.asyncio
+async def test_work_create_with_a_known_skill_scopes_the_turn(
+    hub: WorkStreamHub,
+    transport: _Transport,
+    store: WorkStore,
+    bus: _Bus,
+) -> None:
+    """SR-17: a valid ``skill`` is stored and scopes the enqueued turn."""
+    _make_skill(store.workspace)
+    connection = _Connection()
+    task_id = await _create(hub, connection, skill="fare-watch")
+
+    frame = transport.frames()[-1]
+    assert frame["task"]["skill"] == "fare-watch"
+    assert store.get_task(task_id)["skill"] == "fare-watch"
+
+    (inbound,) = bus.inbound
+    assert inbound.metadata[ALLOWED_TOOLS_META_KEY] == frozenset({"read_file", "message"})
+    blocks = inbound.metadata[RUNTIME_CONTEXT_INPUT_META]
+    assert [b.source for b in blocks] == ["explicit_skills"]
+    assert "Report the cheapest fares." in blocks[0].content
+
+
+@pytest.mark.asyncio
+async def test_work_create_without_a_skill_stamps_no_scoping_keys(
+    hub: WorkStreamHub,
+    store: WorkStore,
+    bus: _Bus,
+) -> None:
+    """Negative control: the plain create path is untouched by SR-17."""
+    await _create(hub, _Connection())
+    (inbound,) = bus.inbound
+    assert ALLOWED_TOOLS_META_KEY not in inbound.metadata
+    assert RUNTIME_CONTEXT_INPUT_META not in inbound.metadata
+    assert store.get_task(inbound.metadata["work_task_id"])["skill"] is None
+
+
+@pytest.mark.asyncio
+async def test_work_create_rejects_an_unknown_skill_with_no_task_and_no_turn(
+    hub: WorkStreamHub,
+    transport: _Transport,
+    store: WorkStore,
+    bus: _Bus,
+) -> None:
+    """MIT-1827: an unknown skill is an error event, not a silently plain run."""
+    _make_skill(store.workspace)
+    connection = _Connection()
+    await hub.dispatch(
+        connection,
+        "client-1",
+        {"type": "work.create", "chat_id": CHAT_ID, "content": "x", "skill": "no-such-skill"},
+    )
+    frames = transport.frames()
+    assert [f["event"] for f in frames] == ["error"]
+    assert frames[0]["detail"] == "unknown skill: no-such-skill"
+    assert bus.inbound == []
+    assert store.list_tasks(limit=10) == []
+
+
+@pytest.mark.asyncio
+async def test_skill_scope_rides_followup_messages_and_degrades_when_deleted(
+    hub: WorkStreamHub,
+    transport: _Transport,
+    store: WorkStore,
+    bus: _Bus,
+) -> None:
+    """Follow-up turns re-scope from the row; a vanished skill runs unscoped, not failed."""
+    _make_skill(store.workspace)
+    connection = _Connection()
+    task_id = await _create(hub, connection, skill="fare-watch")
+    bus.inbound.clear()
+
+    await hub.dispatch(
+        connection, "client-1", {"type": "work.message", "task_id": task_id, "content": "again"}
+    )
+    (followup,) = bus.inbound
+    assert followup.metadata[ALLOWED_TOOLS_META_KEY] == frozenset({"read_file", "message"})
+    assert "explicit_skills" in [b.source for b in followup.metadata[RUNTIME_CONTEXT_INPUT_META]]
+
+    (store.workspace / "skills" / "fare-watch" / "SKILL.md").unlink()
+    bus.inbound.clear()
+    transport.events.clear()
+    await hub.dispatch(
+        connection, "client-1", {"type": "work.message", "task_id": task_id, "content": "once more"}
+    )
+    # The message still runs -- scoping degrades, it does not fail the turn.
+    assert [f for f in transport.frames(connection) if f["event"] == "error"] == []
+    (unscoped,) = bus.inbound
+    assert ALLOWED_TOOLS_META_KEY not in unscoped.metadata
+    assert RUNTIME_CONTEXT_INPUT_META not in unscoped.metadata
 
 
 @pytest.mark.asyncio
