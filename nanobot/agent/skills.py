@@ -298,6 +298,46 @@ class SkillsLoader:
             "missing_env": [value for value in env if not os.environ.get(value)],
         }
 
+    def skill_exists(self, name: str) -> bool:
+        """Whether *name* resolves to an installed, non-disabled skill."""
+        return self.load_skill(name) is not None
+
+    def skill_allowed_tools(self, name: str) -> frozenset[str] | None:
+        """Parse the skill's ``allowed-tools`` frontmatter field.
+
+        The Agent Skills spec declares the field as space-separated tool
+        names; comma-separated strings and YAML lists are accepted too.
+        A missing or blank field (or an unknown skill) means no filter.
+        """
+        from nanobot.agent.tools.allowed_tools import normalize_allowed_tools
+
+        metadata = self.get_skill_metadata(name)
+        if not metadata:
+            return None
+        return normalize_allowed_tools(metadata.get("allowed-tools"))
+
+    def build_skill_turn_metadata(self, name: str) -> dict[str, object]:
+        """Turn metadata that scopes a turn to *name*.
+
+        Carries the skill's ``allowed-tools`` filter and, when the skill is
+        available and not already always-on, the same explicit-``$skill``
+        runtime context block an interactive ``$name`` invocation injects.
+        Returns ``{}`` when the skill declares nothing and injects nothing.
+        """
+        from nanobot.agent.tools.allowed_tools import ALLOWED_TOOLS_META_KEY
+        from nanobot.runtime_context import RUNTIME_CONTEXT_INPUT_META
+
+        metadata: dict[str, object] = {}
+        allowed = self.skill_allowed_tools(name)
+        if allowed is not None:
+            # Sorted list, not frozenset: turn metadata stays JSON-safe for
+            # recovery journaling; the registry normalizes it back to a set.
+            metadata[ALLOWED_TOOLS_META_KEY] = sorted(allowed)
+        block = self.build_explicit_skill_runtime_context(f"${name}")
+        if block is not None:
+            metadata[RUNTIME_CONTEXT_INPUT_META] = [block]
+        return metadata
+
     def get_skill_description(self, name: str) -> str:
         """Get the description of a skill from its frontmatter."""
         meta = self.get_skill_metadata(name)

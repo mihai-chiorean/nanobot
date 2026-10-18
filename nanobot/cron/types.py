@@ -59,6 +59,10 @@ class CronPayload:
     """
     kind: Literal["system_event", "agent_turn", "work_task"] = "agent_turn"
     message: str = ""
+    # Ziggy-local (MIT-1827): the skill a scheduled run is scoped to. When set,
+    # the run gets the skill's ``allowed-tools`` filter and the skill content
+    # is injected the way an explicit ``$skill`` invocation injects it.
+    skill: str | None = None
     # Legacy delivery fields used by pre-session-bound cron jobs.
     deliver: bool = False
     channel: str | None = None  # e.g. "whatsapp"
@@ -74,6 +78,7 @@ class CronPayload:
         return cls(
             kind=data.get("kind", "agent_turn"),
             message=data.get("message", ""),
+            skill=data.get("skill"),
             deliver=data.get("deliver", False),
             channel=data.get("channel"),
             to=data.get("to"),

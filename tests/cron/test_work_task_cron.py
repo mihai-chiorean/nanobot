@@ -413,6 +413,94 @@ def test_cron_payload_kind_literal_includes_work_task() -> None:
 
 
 # --------------------------------------------------------------------------
+# Skill-scoped runs (MIT-1827)
+# --------------------------------------------------------------------------
+
+
+def _write_fare_watch_skill(workspace: Path) -> None:
+    skill_dir = workspace / "skills" / "fare-watch"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\n"
+        "name: fare-watch\n"
+        "description: Watch fares.\n"
+        "allowed-tools: read_file message\n"
+        "---\n"
+        "\n"
+        "Check the fare table and report.\n",
+        encoding="utf-8",
+    )
+
+
+def _skill_job_entry() -> dict[str, Any]:
+    entry = json.loads(json.dumps(OWNER_WORK_JOBS[3]))
+    entry["payload"]["skill"] = "fare-watch"
+    return entry
+
+
+def test_cron_payload_skill_round_trips() -> None:
+    job = CronJob.from_store_dict(_skill_job_entry())
+    assert job.payload.skill == "fare-watch"
+    # The store persists jobs via dataclasses.asdict; skill must survive it.
+    from dataclasses import asdict
+
+    assert asdict(job)["payload"]["skill"] == "fare-watch"
+
+    plain = CronJob.from_store_dict(OWNER_WORK_JOBS[3])
+    assert plain.payload.skill is None
+
+
+@pytest.mark.asyncio
+async def test_work_task_job_with_skill_scopes_the_run(tmp_path: Path) -> None:
+    """``payload.skill`` reaches the run as the skill's tool filter + content."""
+    job = CronJob.from_store_dict(_skill_job_entry())
+    store = _FakeWorkStore()
+    agent = _FakeAgent(store, tmp_path)
+    _write_fare_watch_skill(tmp_path)
+
+    await run_work_task_cron_job(job, agent=agent)
+
+    (call,) = agent.calls
+    # Raw keys, not the module constants: the wire shape the registry reads.
+    assert call["metadata"]["allowed_tools"] == ["message", "read_file"]
+    [block] = call["metadata"]["_runtime_context_blocks"]
+    assert block.source == "explicit_skills"
+    assert "Check the fare table and report." in block.content
+    assert "fare-watch" in block.content
+
+
+@pytest.mark.asyncio
+async def test_work_task_job_without_skill_is_unscoped(tmp_path: Path) -> None:
+    job = CronJob.from_store_dict(OWNER_WORK_JOBS[3])
+    store = _FakeWorkStore()
+    agent = _FakeAgent(store, tmp_path)
+
+    await run_work_task_cron_job(job, agent=agent)
+
+    (call,) = agent.calls
+    assert "allowed_tools" not in call["metadata"]
+    assert "_runtime_context_blocks" not in call["metadata"]
+
+
+@pytest.mark.asyncio
+async def test_work_task_skill_also_honours_read_only(tmp_path: Path) -> None:
+    """Both filters reach the same turn; the registry intersects them."""
+    entry = _skill_job_entry()
+    entry["payload"]["channelMeta"]["work_read_only"] = True
+    entry["payload"]["originMetadata"] = entry["payload"]["channelMeta"]
+    job = CronJob.from_store_dict(entry)
+    store = _FakeWorkStore()
+    agent = _FakeAgent(store, tmp_path)
+    _write_fare_watch_skill(tmp_path)
+
+    await run_work_task_cron_job(job, agent=agent)
+
+    (call,) = agent.calls
+    assert call["metadata"]["read_only"] is True
+    assert call["metadata"]["allowed_tools"] == ["message", "read_file"]
+
+
+# --------------------------------------------------------------------------
 # Delivery (tech-lead review, P0-3)
 # --------------------------------------------------------------------------
 
