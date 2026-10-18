@@ -19,7 +19,7 @@ from nanobot.command.builtin import (
 )
 from nanobot.command.router import CommandContext
 from nanobot.session.manager import SessionManager
-from nanobot.utils.gitstore import CommitInfo
+from nanobot.utils.gitstore import CommitInfo, UndoResult
 
 
 class _FakeStore:
@@ -66,13 +66,13 @@ class _FakeGit:
         initialized: bool = True,
         commits: list[CommitInfo] | None = None,
         diff_map: dict[str, tuple[CommitInfo, str] | None] | None = None,
-        revert_result: str | None = None,
+        undo_result: UndoResult | None = None,
     ):
         self._initialized = initialized
         self._commits = commits or []
         self._diff_map = diff_map or {}
-        self._revert_result = revert_result
-        self.revert_calls: list[tuple[str, str | None]] = []
+        self._undo_result = undo_result
+        self.undo_calls: list[str] = []
 
     def is_initialized(self) -> bool:
         return self._initialized
@@ -98,9 +98,12 @@ class _FakeGit:
             return None
         return result
 
-    def revert(self, sha: str, *, message_prefix: str | None = None) -> str | None:
-        self.revert_calls.append((sha, message_prefix))
-        return self._revert_result
+    def undo(self, sha: str) -> UndoResult:
+        self.undo_calls.append(sha)
+        return self._undo_result or UndoResult(restored=[], skipped=[], new_sha=None)
+
+    def has_commit(self, sha: str) -> bool:
+        return any(c.sha.startswith(sha) for c in self._commits) or sha in self._diff_map
 
     def auto_commit(self, message: str) -> str | None:
         return None
@@ -641,7 +644,11 @@ async def test_dream_restore_success_mentions_files_and_followup() -> None:
     )
     git = _FakeGit(
         diff_map={commit.sha: (commit, diff)},
-        revert_result="eeee9999",
+        undo_result=UndoResult(
+            restored=["SOUL.md", "memory/MEMORY.md"],
+            skipped=[],
+            new_sha="eeee9999",
+        ),
     )
 
     out = await cmd_dream_restore(_make_ctx("/dream-restore abcd1234", git, args="abcd1234"))
@@ -650,7 +657,7 @@ async def test_dream_restore_success_mentions_files_and_followup() -> None:
     assert "- New safety commit: `eeee9999`" in out.content
     assert "- Restored files: `SOUL.md`, `memory/MEMORY.md`" in out.content
     assert "Use `/dream-log eeee9999` to inspect the restore diff." in out.content
-    assert git.revert_calls == [("abcd1234", "dream:")]
+    assert git.undo_calls == ["abcd1234"]
 
 
 @pytest.mark.asyncio
@@ -660,11 +667,32 @@ async def test_dream_restore_rejects_non_dream_commit_clearly() -> None:
     )
     git = _FakeGit(
         diff_map={commit.sha: (commit, "unrelated diff")},
-        revert_result="eeee9999",
+        undo_result=UndoResult(restored=["SOUL.md"], skipped=[], new_sha="eeee9999"),
     )
 
     out = await cmd_dream_restore(_make_ctx("/dream-restore cccc3333", git, args="cccc3333"))
 
     assert "Only Dream memory versions can be restored." in out.content
     assert "Use `/dream-restore` to list recent versions." in out.content
-    assert git.revert_calls == []
+    assert git.undo_calls == []
+
+
+@pytest.mark.asyncio
+async def test_dream_restore_uses_per_file_undo() -> None:
+    """/dream-restore must undo per file and report later-changed skips."""
+    commit = CommitInfo(sha="abcd1234", message="dream: latest", timestamp="2026-04-04 12:00")
+    git = _FakeGit(
+        diff_map={commit.sha: (commit, "diff --git a/SOUL.md b/SOUL.md\n")},
+        undo_result=UndoResult(
+            restored=["SOUL.md"],
+            skipped=["USER.md"],
+            new_sha="eeee9999",
+        ),
+    )
+
+    out = await cmd_dream_restore(_make_ctx("/dream-restore abcd1234", git, args="abcd1234"))
+
+    assert git.undo_calls == ["abcd1234"]
+    assert "- Restored files: `SOUL.md`" in out.content
+    assert "`USER.md` — changed again later; use `/restore abcd1234`" in out.content
+    assert "- New safety commit: `eeee9999`" in out.content

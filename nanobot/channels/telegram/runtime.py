@@ -528,6 +528,9 @@ class TelegramChannel(BaseChannel):
         BotCommand("dream", "Run Dream memory consolidation now"),
         BotCommand("dream_log", "Show the latest Dream memory change"),
         BotCommand("dream_restore", "Restore Dream memory to an earlier version"),
+        BotCommand("changes", "List recent memory changes"),
+        BotCommand("undo", "Undo one memory change by commit"),
+        BotCommand("restore", "Restore memory to a commit (needs confirm)"),
         BotCommand("dream_prompt", "Tell Dream how to organize memory"),
         BotCommand("evaluator_prompt", "Customize the heartbeat evaluator prompt"),
         BotCommand("help", "Show available commands"),
@@ -538,7 +541,8 @@ class TelegramChannel(BaseChannel):
     # Canonical hyphenated commands stay on a separate handler (below).
     TELEGRAM_BUS_SLASH_COMMAND_RE = re.compile(
         r"^/(?:new|compact|stop|restart|status|dream|history|goal|trigger|pairing|model|skill"
-        r"|dream_log|dream_restore|dream_prompt|evaluator_prompt|evaluator-prompt)(?:@\w+)?(?:\s+.*)?$"
+        r"|changes|undo|restore|dream_log|dream_restore|dream_prompt|evaluator_prompt"
+        r"|evaluator-prompt)(?:@\w+)?(?:\s+.*)?$"
     )
 
     @classmethod

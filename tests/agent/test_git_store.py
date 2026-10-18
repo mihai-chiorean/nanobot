@@ -247,44 +247,251 @@ class TestCommitInfoFormat:
         assert c.subject() == "(no message)"
 
 
-class TestRevert:
-    def test_returns_none_when_not_initialized(self, git):
-        assert git.revert("abc") is None
+class TestUndo:
+    def test_returns_empty_when_not_initialized(self, git):
+        result = git.undo("abc")
+        assert (result.restored, result.skipped, result.new_sha) == ([], [], None)
 
-    def test_undoes_commit_changes(self, git_ready):
-        """revert(sha) should undo the given commit by restoring to its parent."""
+    def test_undo_keeps_later_edits_to_other_files(self, git_ready):
+        """Undoing a commit must not discard edits from other commits."""
+        ws = git_ready._workspace
+        (ws / "USER.md").write_text("user edit", encoding="utf-8")
+        sha_a = git_ready.auto_commit("edit user")
+        (ws / "SOUL.md").write_text("soul edit", encoding="utf-8")
+        git_ready.auto_commit("edit soul")
+
+        result = git_ready.undo(sha_a)
+
+        assert result.restored == ["USER.md"]
+        assert result.skipped == []
+        assert result.new_sha is not None
+        assert (ws / "USER.md").read_text(encoding="utf-8") == ""
+        # Commit B's later edit must survive undoing commit A.
+        assert (ws / "SOUL.md").read_text(encoding="utf-8") == "soul edit"
+
+    def test_undo_skips_file_changed_later(self, git_ready):
+        ws = git_ready._workspace
+        (ws / "USER.md").write_text("committed value", encoding="utf-8")
+        sha = git_ready.auto_commit("edit user")
+        # Later edit on top of the commit — undo must refuse to clobber it.
+        (ws / "USER.md").write_text("edited again later", encoding="utf-8")
+
+        result = git_ready.undo(sha)
+
+        assert result.restored == []
+        assert result.skipped == ["USER.md"]
+        assert result.new_sha is None
+        assert (ws / "USER.md").read_text(encoding="utf-8") == "edited again later"
+
+    def test_undo_deletes_added_file(self, git_ready):
+        """Undoing a commit that added a file deletes the file again."""
+        ws = git_ready._workspace
+        (ws / "memory" / "MEMORY.md").unlink()
+        git_ready.auto_commit("delete memory file")
+        (ws / "memory" / "MEMORY.md").write_text("new file", encoding="utf-8")
+        add_sha = git_ready.auto_commit("add memory file back")
+
+        result = git_ready.undo(add_sha)
+
+        assert result.restored == ["memory/MEMORY.md"]
+        assert result.new_sha is not None
+        assert not (ws / "memory" / "MEMORY.md").exists()
+
+    def test_undo_restores_deleted_file(self, git_ready):
+        ws = git_ready._workspace
+        (ws / "SOUL.md").write_text("soul", encoding="utf-8")
+        git_ready.auto_commit("write soul")
+        (ws / "SOUL.md").unlink()
+        delete_sha = git_ready.auto_commit("delete soul")
+
+        result = git_ready.undo(delete_sha)
+
+        assert result.restored == ["SOUL.md"]
+        assert (ws / "SOUL.md").read_text(encoding="utf-8") == "soul"
+
+    def test_undo_creates_named_commit(self, git_ready):
         ws = git_ready._workspace
         (ws / "SOUL.md").write_text("v2 content", encoding="utf-8")
-        git_ready.auto_commit("v2")
+        sha = git_ready.auto_commit("v2")
 
-        commits = git_ready.log()
-        # commits[0] = v2 (HEAD), commits[1] = init
-        # Revert v2 → restore to init's state (empty SOUL.md)
-        new_sha = git_ready.revert(commits[0].sha)
-        assert new_sha is not None
+        result = git_ready.undo(sha)
+
+        assert result.new_sha is not None
+        assert git_ready.log()[0].message == f"undo {sha}"
         assert (ws / "SOUL.md").read_text(encoding="utf-8") == ""
 
-    def test_root_commit_returns_none(self, git_ready):
-        """Cannot revert the root commit (no parent to restore to)."""
+    def test_root_commit_is_refused(self, git_ready):
         commits = git_ready.log()
         assert len(commits) == 1
-        assert git_ready.revert(commits[0].sha) is None
 
-    def test_invalid_sha_returns_none(self, git_ready):
-        assert git_ready.revert("deadbeef") is None
+        result = git_ready.undo(commits[0].sha)
 
-    def test_message_prefix_rejects_unrelated_commit_without_changing_files(self, git_ready):
+        assert (result.restored, result.skipped, result.new_sha) == ([], [], None)
+
+    def test_invalid_sha_returns_empty(self, git_ready):
+        result = git_ready.undo("deadbeef")
+        assert (result.restored, result.skipped, result.new_sha) == ([], [], None)
+
+    def test_undo_replaces_symlink_with_parent_state(self, git_ready):
+        """A symlink added over a tracked file is undone to the parent's file."""
         ws = git_ready._workspace
-        (ws / "SOUL.md").write_text("dream v1", encoding="utf-8")
-        git_ready.auto_commit("dream: v1")
-        (ws / "SOUL.md").write_text("backup state", encoding="utf-8")
-        backup_sha = git_ready.auto_commit("backup: workspace")
-        (ws / "SOUL.md").write_text("dream v2", encoding="utf-8")
-        latest_sha = git_ready.auto_commit("dream: v2")
+        (ws / "SOUL.md").unlink()
+        os.symlink("../link-target.md", ws / "SOUL.md")
+        link_sha = git_ready.auto_commit("symlink soul")
 
-        assert git_ready.revert(backup_sha, message_prefix="dream:") is None
-        assert (ws / "SOUL.md").read_text(encoding="utf-8") == "dream v2"
-        assert git_ready.log()[0].sha == latest_sha
+        result = git_ready.undo(link_sha)
+
+        assert result.restored == ["SOUL.md"]
+        assert not (ws / "SOUL.md").is_symlink()
+        assert (ws / "SOUL.md").read_text(encoding="utf-8") == ""
+
+    def test_undo_skips_symlink_edited_later(self, git_ready):
+        ws = git_ready._workspace
+        (ws / "SOUL.md").unlink()
+        os.symlink("../link-target.md", ws / "SOUL.md")
+        link_sha = git_ready.auto_commit("symlink soul")
+        (ws / "SOUL.md").unlink()
+        os.symlink("../elsewhere.md", ws / "SOUL.md")
+
+        result = git_ready.undo(link_sha)
+
+        assert result.skipped == ["SOUL.md"]
+        assert os.readlink(ws / "SOUL.md") == "../elsewhere.md"
+
+    def test_undo_deletes_symlink_added_by_commit(self, git_ready):
+        ws = git_ready._workspace
+        (ws / "SOUL.md").unlink()
+        git_ready.auto_commit("drop soul")
+        os.symlink("../link-target.md", ws / "SOUL.md")
+        add_sha = git_ready.auto_commit("link soul")
+
+        result = git_ready.undo(add_sha)
+
+        assert result.restored == ["SOUL.md"]
+        assert not (ws / "SOUL.md").is_symlink()
+        assert not (ws / "SOUL.md").exists()
+
+    def test_undo_uses_parent_of_first_parent_only_for_touched_files(self, git_ready):
+        """A commit's undo must not touch tracked files it never modified."""
+        ws = git_ready._workspace
+        (ws / "SOUL.md").write_text("soul v1", encoding="utf-8")
+        git_ready.auto_commit("soul v1")
+        (ws / "USER.md").write_text("user v1", encoding="utf-8")
+        user_sha = git_ready.auto_commit("user v1")
+        (ws / "SOUL.md").write_text("soul v2", encoding="utf-8")
+        git_ready.auto_commit("soul v2")
+
+        git_ready.undo(user_sha)
+
+        assert (ws / "SOUL.md").read_text(encoding="utf-8") == "soul v2"
+
+
+class TestRestore:
+    def test_returns_empty_when_not_initialized(self, git):
+        assert git.restore("abc") == []
+        assert git.restore_preview("abc") == []
+
+    def test_restore_sets_every_tracked_path(self, git_ready):
+        ws = git_ready._workspace
+        (ws / "SOUL.md").write_text("soul old", encoding="utf-8")
+        (ws / "USER.md").write_text("user old", encoding="utf-8")
+        snapshot_sha = git_ready.auto_commit("snapshot")
+        (ws / "SOUL.md").write_text("soul new", encoding="utf-8")
+        (ws / "USER.md").write_text("user new", encoding="utf-8")
+        (ws / "memory" / "MEMORY.md").write_text("memory new", encoding="utf-8")
+        git_ready.auto_commit("later edits")
+
+        changed = git_ready.restore(snapshot_sha)
+
+        assert changed == ["SOUL.md", "USER.md", "memory/MEMORY.md"]
+        assert (ws / "SOUL.md").read_text(encoding="utf-8") == "soul old"
+        assert (ws / "USER.md").read_text(encoding="utf-8") == "user old"
+        assert (ws / "memory" / "MEMORY.md").read_text(encoding="utf-8") == ""
+
+    def test_restore_deletes_tracked_files_added_later(self, git_ready):
+        """Files that did not exist at the target commit are removed."""
+        ws = git_ready._workspace
+        (ws / "memory" / "MEMORY.md").unlink()
+        deleted_sha = git_ready.auto_commit("delete memory file")
+        (ws / "memory" / "MEMORY.md").write_text("added later", encoding="utf-8")
+        git_ready.auto_commit("add memory file back")
+
+        changed = git_ready.restore(deleted_sha)
+
+        assert "memory/MEMORY.md" in changed
+        assert not (ws / "memory" / "MEMORY.md").exists()
+
+    def test_restore_creates_commit(self, git_ready):
+        ws = git_ready._workspace
+        (ws / "SOUL.md").write_text("snapshot", encoding="utf-8")
+        snapshot_sha = git_ready.auto_commit("snapshot")
+        (ws / "SOUL.md").write_text("drift", encoding="utf-8")
+        git_ready.auto_commit("drift")
+
+        git_ready.restore(snapshot_sha)
+
+        assert git_ready.log()[0].message == f"restore {snapshot_sha}"
+
+    def test_restore_preview_lists_only_changed_paths(self, git_ready):
+        ws = git_ready._workspace
+        (ws / "SOUL.md").write_text("soul old", encoding="utf-8")
+        snapshot_sha = git_ready.auto_commit("snapshot")
+        (ws / "SOUL.md").write_text("soul new", encoding="utf-8")
+
+        assert git_ready.restore_preview(snapshot_sha) == ["SOUL.md"]
+        assert git_ready.restore(snapshot_sha) == ["SOUL.md"]
+        assert git_ready.restore_preview(snapshot_sha) == []
+
+    def test_restore_preview_unknown_sha(self, git_ready):
+        assert git_ready.restore_preview("deadbeef") == []
+        assert git_ready.restore("deadbeef") == []
+
+    def test_restore_recreates_symlink_instead_of_clobbering(self, git_ready):
+        """A symlinked tracked file is restored as a symlink, not as a file
+        whose content is the link target."""
+        ws = git_ready._workspace
+        (ws / "SOUL.md").unlink()
+        os.symlink("../link-target.md", ws / "SOUL.md")
+        snapshot_sha = git_ready.auto_commit("symlink soul")
+        (ws / "SOUL.md").unlink()
+        (ws / "SOUL.md").write_text("clobbered", encoding="utf-8")
+
+        assert git_ready.restore_preview(snapshot_sha) == ["SOUL.md"]
+        changed = git_ready.restore(snapshot_sha)
+
+        assert changed == ["SOUL.md"]
+        assert (ws / "SOUL.md").is_symlink()
+        assert os.readlink(ws / "SOUL.md") == "../link-target.md"
+
+
+class TestHasCommit:
+    def test_false_when_not_initialized(self, git):
+        assert git.has_commit("abc") is False
+
+    def test_true_for_known_false_for_unknown(self, git_ready):
+        ws = git_ready._workspace
+        (ws / "SOUL.md").write_text("v", encoding="utf-8")
+        sha = git_ready.auto_commit("v")
+        assert git_ready.has_commit(sha) is True
+        assert git_ready.has_commit("deadbeef") is False
+
+
+class TestLogIncludeFiles:
+    def test_files_listed_per_commit(self, git_ready):
+        ws = git_ready._workspace
+        (ws / "SOUL.md").write_text("soul", encoding="utf-8")
+        (ws / "USER.md").write_text("user", encoding="utf-8")
+        git_ready.auto_commit("both")
+
+        commits = git_ready.log(max_entries=1, include_files=True)
+
+        assert commits[0].files == ["SOUL.md", "USER.md"]
+
+    def test_files_empty_by_default(self, git_ready):
+        ws = git_ready._workspace
+        (ws / "SOUL.md").write_text("soul", encoding="utf-8")
+        git_ready.auto_commit("soul")
+        assert git_ready.log(max_entries=1)[0].files == []
 
 
 class TestMemoryStoreGitProperty:
