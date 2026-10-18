@@ -129,6 +129,7 @@ class WorkStore:
                     model TEXT NOT NULL DEFAULT '',
                     reasoning_profile TEXT NOT NULL DEFAULT 'auto',
                     read_only INTEGER NOT NULL DEFAULT 0,
+                    notify_on_finish INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     started_at TEXT,
@@ -212,6 +213,13 @@ class WorkStore:
                 connection.execute(
                     "ALTER TABLE work_tasks ADD COLUMN read_only INTEGER NOT NULL DEFAULT 0"
                 )
+            if "notify_on_finish" not in task_columns:
+                # MIT-1855 (OA-12): hand-off tasks push once when they finish.
+                # Same lazy-migration style as ``read_only`` / ``scope``.
+                connection.execute(
+                    "ALTER TABLE work_tasks "
+                    "ADD COLUMN notify_on_finish INTEGER NOT NULL DEFAULT 0"
+                )
             connection.execute(
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_work_tasks_request_id
@@ -252,6 +260,7 @@ class WorkStore:
         read_only: Any = False,
         status: str = "queued",
         request_id: str | None = None,
+        notify_on_finish: bool = False,
     ) -> dict[str, Any]:
         now = utc_now()
         task_id = f"work_{uuid.uuid4().hex}"
@@ -260,6 +269,7 @@ class WorkStore:
         clean_title = self._preview(title or prompt_preview, 96) or "Untitled task"
         clean_status = status if status in {"scheduled", *ACTIVE_STATUSES} else "queued"
         clean_read_only = 1 if read_only_value(read_only) else 0
+        clean_notify = 1 if notify_on_finish else 0
         columns = [
             "task_id",
             "session_key",
@@ -271,6 +281,7 @@ class WorkStore:
             "model",
             "reasoning_profile",
             "read_only",
+            "notify_on_finish",
             "created_at",
             "updated_at",
             "last_seq",
@@ -286,6 +297,7 @@ class WorkStore:
             model,
             reasoning_profile,
             clean_read_only,
+            clean_notify,
             now,
             now,
             0,
