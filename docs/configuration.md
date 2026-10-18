@@ -2252,6 +2252,7 @@ The heartbeat job is backed by the same cron service as user-created reminders. 
 | `gateway.heartbeat.intervalS` | `1800` | Seconds between heartbeat checks. |
 | `gateway.heartbeat.keepRecentMessages` | `8` | Number of recent heartbeat-session messages to retain after each run. |
 | `gateway.restartMode` | `auto` | Restart strategy for `/restart`: `auto` uses `spawn` on Windows foreground runs and `exec` elsewhere. Use `exit` with Windows service wrappers such as WinSW or nssm so the service manager owns the restart. |
+| `gateway.shutdownGraceSeconds` | `90` | On the first `SIGTERM`/`SIGINT`, stop starting new turns and wait up to this many seconds for running turns to finish before shutting down (max 600). `0` disables the grace and cancels running turns immediately, as before. A second signal always forces the exit. |
 
 ### Custom heartbeat evaluator prompt
 
