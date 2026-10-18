@@ -27,6 +27,28 @@ def test_init_skill_creates_expected_files(tmp_path: Path) -> None:
     assert (skill_dir / "assets" / "example_asset.txt").exists()
 
 
+def test_skill_creator_documents_draft_overlay() -> None:
+    """MIT-1850: the guide sends agent-written skills to skills/_proposed/."""
+    skill_md = Path(
+        "nanobot/skills/skill-creator/SKILL.md"
+    ).resolve().read_text(encoding="utf-8")
+
+    assert "<workspace>/skills/_proposed/<name>/" in skill_md
+    assert "/skill accept" in skill_md
+    assert "smoke-prompt" in skill_md
+
+
+def test_init_skill_documents_proposed_path() -> None:
+    """init_skill.py's documented --path is the draft overlay, not live skills."""
+    doc = init_skill.__doc__ or ""
+
+    assert "./workspace/skills/_proposed" in doc
+    source = (SCRIPT_DIR / "init_skill.py").read_text(encoding="utf-8")
+    assert "--path ./workspace/skills" not in source.replace(
+        "--path ./workspace/skills/_proposed", ""
+    )
+
+
 def test_validate_skill_accepts_existing_skill_creator() -> None:
     valid, message = quick_validate.validate_skill(
         Path("nanobot/skills/skill-creator").resolve()

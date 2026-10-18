@@ -144,3 +144,134 @@ async def test_skill_command_registered_on_router(tmp_path: Path) -> None:
 
     assert out is not None
     assert "No skills available." in out.content
+
+
+# ---------------------------------------------------------------------------
+# draft subcommands (MIT-1856)
+# ---------------------------------------------------------------------------
+
+
+def _ctx_args(loop: AgentLoop, raw: str, args: str) -> CommandContext:
+    msg = InboundMessage(channel="cli", sender_id="user", chat_id="direct", content=raw)
+    return CommandContext(msg=msg, session=None, key=msg.session_key, raw=raw, args=args, loop=loop)
+
+
+def _write_draft(ws: Path, name: str, *, valid: bool = True) -> None:
+    draft = ws / "skills" / "_proposed" / name
+    draft.mkdir(parents=True)
+    if valid:
+        (draft / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: Drafted for you\n---\n\n# {name}\n",
+            encoding="utf-8",
+        )
+    else:
+        (draft / "SKILL.md").write_text("# no frontmatter\n", encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_skill_drafts_lists_pending(tmp_path: Path) -> None:
+    _write_draft(tmp_path, "demo")
+    loop = _make_loop(tmp_path)
+
+    out = await cmd_skill(_ctx_args(loop, "/skill drafts", "drafts"))
+
+    assert "**demo** — Drafted for you" in out.content
+
+
+@pytest.mark.asyncio
+async def test_skill_drafts_empty(tmp_path: Path) -> None:
+    loop = _make_loop(tmp_path)
+
+    out = await cmd_skill(_ctx_args(loop, "/skill drafts", "drafts"))
+
+    assert "No skill drafts" in out.content
+
+
+@pytest.mark.asyncio
+async def test_skill_diff_shows_overlay(tmp_path: Path) -> None:
+    _write_draft(tmp_path, "demo")
+    loop = _make_loop(tmp_path)
+
+    out = await cmd_skill(_ctx_args(loop, "/skill diff demo", "diff demo"))
+
+    assert "+name: demo" in out.content
+    assert out.metadata.get("render_as") == "text"
+
+
+@pytest.mark.asyncio
+async def test_skill_diff_unknown_draft(tmp_path: Path) -> None:
+    loop = _make_loop(tmp_path)
+
+    out = await cmd_skill(_ctx_args(loop, "/skill diff ghost", "diff ghost"))
+
+    assert "No draft named 'ghost'" in out.content
+
+
+@pytest.mark.asyncio
+async def test_skill_accept_refuses_invalid_frontmatter(tmp_path: Path) -> None:
+    _write_draft(tmp_path, "demo", valid=False)
+    loop = _make_loop(tmp_path)
+
+    out = await cmd_skill(_ctx_args(loop, "/skill accept demo", "accept demo"))
+
+    assert "Not accepting draft 'demo'" in out.content
+    assert "frontmatter" in out.content.lower()
+    assert (tmp_path / "skills/_proposed/demo/SKILL.md").exists()
+    assert not (tmp_path / "skills/demo").exists()
+
+
+@pytest.mark.asyncio
+async def test_skill_accept_then_reject_flow(tmp_path: Path) -> None:
+    _write_draft(tmp_path, "demo")
+    loop = _make_loop(tmp_path)
+
+    out = await cmd_skill(_ctx_args(loop, "/skill accept demo", "accept demo"))
+    assert "Accepted skill draft 'demo'" in out.content
+    assert (tmp_path / "skills/demo/SKILL.md").exists()
+    assert not (tmp_path / "skills/_proposed/demo").exists()
+
+    _write_draft(tmp_path, "demo")
+    out = await cmd_skill(_ctx_args(loop, "/skill reject demo", "reject demo"))
+    assert "Rejected skill draft 'demo'" in out.content
+    # The live skill survived the reject.
+    assert (tmp_path / "skills/demo/SKILL.md").exists()
+
+
+@pytest.mark.asyncio
+async def test_skill_reject_missing_draft(tmp_path: Path) -> None:
+    loop = _make_loop(tmp_path)
+
+    out = await cmd_skill(_ctx_args(loop, "/skill reject ghost", "reject ghost"))
+
+    assert "No draft named 'ghost'" in out.content
+
+
+@pytest.mark.asyncio
+async def test_skill_invalid_name_is_refused(tmp_path: Path) -> None:
+    loop = _make_loop(tmp_path)
+
+    out = await cmd_skill(_ctx_args(loop, "/skill accept ../../etc", "accept ../../etc"))
+
+    assert "not a valid skill name" in out.content
+
+
+@pytest.mark.asyncio
+async def test_skill_unknown_subcommand_shows_usage(tmp_path: Path) -> None:
+    loop = _make_loop(tmp_path)
+
+    out = await cmd_skill(_ctx_args(loop, "/skill bogus", "bogus"))
+
+    assert "Usage: /skill" in out.content
+
+
+@pytest.mark.asyncio
+async def test_skill_subcommands_dispatch_via_router(tmp_path: Path) -> None:
+    _write_draft(tmp_path, "demo")
+    router = CommandRouter()
+    register_builtin_commands(router)
+    loop = _make_loop(tmp_path)
+
+    out = await router.dispatch(_ctx(loop, "/skill drafts"))
+
+    assert out is not None
+    assert "**demo** — Drafted for you" in out.content

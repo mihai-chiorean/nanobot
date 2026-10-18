@@ -419,6 +419,20 @@ def _lazy_default(module_path: str, class_name: str) -> Any:
     return getattr(module, class_name)()
 
 
+class SkillsToolConfig(Base):
+    """Ziggy-local (fork, MIT-1850): agent skill tool policy.
+
+    ``drafts`` makes every agent/Dream write under ``skills/<name>/`` land as a
+    draft overlay in ``skills/_proposed/<name>/`` instead of going live (see
+    ``_FsTool._resolve_write``). ``allow_install`` gates the public skill
+    install routes (MIT-1852); the field is declared here so both SM-series
+    issues share one config section.
+    """
+
+    drafts: bool = True  # skill writes become drafts under skills/_proposed/
+    allow_install: bool = True  # allow installing skills from public sources
+
+
 class ToolsConfig(Base):
     """Tools configuration.
 
@@ -430,6 +444,9 @@ class ToolsConfig(Base):
     web: WebToolsConfig = Field(default_factory=lambda: _lazy_default("nanobot.agent.tools.web", "WebToolsConfig"))
     exec: ExecToolConfig = Field(default_factory=lambda: _lazy_default("nanobot.agent.tools.shell", "ExecToolConfig"))
     file: FileToolsConfig = Field(default_factory=lambda: _lazy_default("nanobot.agent.tools.filesystem", "FileToolsConfig"))
+    # Ziggy-local (fork, MIT-1850): skill draft + install policy; defined here
+    # (not next to a tool) because no tool module owns it.
+    skills: SkillsToolConfig = Field(default_factory=SkillsToolConfig)
     cli_apps: CliAppsToolConfig = Field(default_factory=lambda: _lazy_default("nanobot.agent.tools.cli_apps", "CliAppsToolConfig"))
     my: MyToolConfig = Field(default_factory=lambda: _lazy_default("nanobot.agent.tools.self", "MyToolConfig"))
     # Ziggy-local (fork, MIT-1013): a real off-switch for conversation recall.

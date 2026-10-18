@@ -916,8 +916,12 @@ class MemoryStore:
             tmp_path.unlink(missing_ok=True)
             raise
 
-    def build_dream_tools(self) -> ToolRegistry:
-        """Build the restricted tool registry used by Dream runs."""
+    def build_dream_tools(self, skills_drafts: bool = True) -> ToolRegistry:
+        """Build the restricted tool registry used by Dream runs.
+
+        MIT-1850: ``skills_drafts`` (from ``tools.skills.drafts``) makes Dream's
+        skill writes land in ``skills/_proposed/`` instead of going live.
+        """
         from nanobot.agent.skills import BUILTIN_SKILLS_DIR
         from nanobot.agent.tools.apply_patch import ApplyPatchTool
         from nanobot.agent.tools.file_state import FileStates
@@ -944,18 +948,21 @@ class MemoryStore:
             allowed_dir=skills_dir,
             extra_write_allowed_files=editable_files,
             file_states=file_states,
+            skills_drafts=skills_drafts,
         ))
         tools.register(ApplyPatchTool(
             workspace=workspace,
             allowed_dir=skills_dir,
             extra_write_allowed_files=editable_files,
             file_states=file_states,
+            skills_drafts=skills_drafts,
         ))
         tools.register(WriteFileTool(
             workspace=workspace,
             allowed_dir=skills_dir,
             extra_write_allowed_files=editable_files,
             file_states=file_states,
+            skills_drafts=skills_drafts,
         ))
         return tools
 
