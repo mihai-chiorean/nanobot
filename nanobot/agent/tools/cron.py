@@ -57,9 +57,15 @@ _CRON_PARAMETERS = tool_parameters_schema(
 class CronTool(Tool):
     """Tool to schedule reminders and recurring tasks."""
 
-    def __init__(self, cron_service: CronService, default_timezone: str = "UTC"):
+    def __init__(
+        self,
+        cron_service: CronService,
+        default_timezone: str = "UTC",
+        schedule_owner: str = "nanobot",
+    ):
         self._cron = cron_service
         self._default_timezone = default_timezone
+        self._schedule_owner = schedule_owner
 
     @classmethod
     def enabled(cls, ctx: ToolContext) -> bool:
@@ -70,7 +76,11 @@ class CronTool(Tool):
         cron_service = ctx.cron_service
         if cron_service is None:
             raise RuntimeError("CronTool requires an initialized cron service")
-        return cls(cron_service=cron_service, default_timezone=ctx.timezone)
+        return cls(
+            cron_service=cron_service,
+            default_timezone=ctx.timezone,
+            schedule_owner=getattr(ctx, "schedule_owner", "nanobot") or "nanobot",
+        )
 
     @staticmethod
     def _request_route() -> tuple[str, str, str, dict[str, Any]]:
@@ -135,8 +145,26 @@ class CronTool(Tool):
         tz: str | None = None,
         at: str | None = None,
         job_id: str | None = None,
+        as_work: Any = False,
     ) -> str:
         if action == "add":
+            if self._as_work_requested(as_work):
+                # SR-24: ``cron`` never creates ``work_task`` jobs. The legacy
+                # ``as_work`` call shape must not silently degrade into a plain
+                # reminder, and under work.scheduleOwner="ziggy-work" it must not
+                # write the runtime-local cron store either.
+                owner_hint = (
+                    " Schedules are owned by ziggy-work: schedule_work forwards the "
+                    "approved plan to the work_schedule_create connector tool."
+                    if self._schedule_owner == "ziggy-work"
+                    else ""
+                )
+                return ToolResult.error(
+                    "Error: cron cannot create background Work (work_task) jobs. "
+                    "Use schedule_work so workflow intake, confirmation, and the "
+                    "configured scheduler (work.scheduleOwner) handle it."
+                    + owner_hint
+                )
             request = current_request_context()
             if request is not None and is_cron_turn(request.metadata):
                 return ToolResult.error("Error: cannot schedule new jobs from within a cron job execution")
@@ -146,6 +174,13 @@ class CronTool(Tool):
         elif action == "remove":
             return self._remove_job(job_id)
         return f"Unknown action: {action}"
+
+    @staticmethod
+    def _as_work_requested(value: Any) -> bool:
+        """Whether the legacy ``as_work`` flag was truthy (providers vary on bools)."""
+        if isinstance(value, str):
+            return value.strip().lower() in {"true", "1", "yes", "y", "on"}
+        return bool(value)
 
     def _add_job(
         self,

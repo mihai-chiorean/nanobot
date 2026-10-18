@@ -361,6 +361,16 @@ class GatewayConfig(Base):
     heartbeat: HeartbeatConfig = Field(default_factory=HeartbeatConfig)
 
 
+class WorkConfig(Base):
+    """Scheduled Work configuration (SR-24, docs/design/safe-retries-and-scheduled-work.md §5)."""
+
+    # "nanobot": ``schedule_work`` writes a runtime-local cron ``work_task`` job (today's
+    # behaviour).  "ziggy-work": it calls the connector's ``work_schedule_create`` MCP tool
+    # instead and the local cron store is not written.  Per-runtime so the switch-back is a
+    # config edit, not a redeploy.
+    schedule_owner: Literal["nanobot", "ziggy-work"] = "nanobot"
+
+
 class OAuthClientCredentialsConfig(Base):
     """Ziggy-local (MIT-1405): OAuth 2.0 client-credentials grant for an HTTP MCP server.
 
@@ -481,6 +491,7 @@ class Config(BaseSettings):
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     api: ApiConfig = Field(default_factory=ApiConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
+    work: WorkConfig = Field(default_factory=WorkConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
     model_presets: dict[str, ModelPresetConfig] = Field(
         default_factory=dict,

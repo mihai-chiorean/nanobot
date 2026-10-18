@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
-from typing import Any
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
@@ -20,6 +20,13 @@ from nanobot.agent.tools.schema import (
 from nanobot.cron.service import CronService
 from nanobot.cron.types import CronSchedule
 from nanobot.work.store import WorkStore
+
+if TYPE_CHECKING:
+    from nanobot.agent.tools.registry import ToolRegistry
+
+#: MCP tool the connector exposes for creating schedules in ziggy-work (SR-23);
+#: ``schedule_work`` looks it up in the agent's tool registry by original name.
+WORK_SCHEDULE_CONNECTOR_TOOL = "work_schedule_create"
 
 _PARAMETERS = tool_parameters_schema(
     title=StringSchema("Short title for the scheduled Work plan."),
@@ -101,11 +108,15 @@ class ScheduleWorkTool(Tool):
         work_store: WorkStore,
         default_timezone: str = "UTC",
         model_name: str = "",
+        schedule_owner: str = "nanobot",
+        tool_registry: "ToolRegistry | None" = None,
     ) -> None:
         self._cron = cron_service
         self._work_store = work_store
         self._default_timezone = default_timezone
         self._model_name = model_name
+        self._schedule_owner = schedule_owner
+        self._tool_registry = tool_registry
 
     @classmethod
     def enabled(cls, ctx: ToolContext) -> bool:
@@ -120,6 +131,8 @@ class ScheduleWorkTool(Tool):
             work_store=ctx.work_store,
             default_timezone=ctx.timezone,
             model_name=getattr(ctx, "model_name", "") or "",
+            schedule_owner=getattr(ctx, "schedule_owner", "nanobot") or "nanobot",
+            tool_registry=getattr(ctx, "tool_registry", None),
         )
 
     @staticmethod
@@ -280,31 +293,25 @@ class ScheduleWorkTool(Tool):
             "risk_notes": risk_notes,
             "confirmed": bool(confirmed),
         }
-        plan_task = await self._work_store.run_io(
-            self._work_store.create_task,
+        if self._schedule_owner == "ziggy-work":
+            return await self._schedule_via_ziggy_work(
+                plan=plan,
+                schedule=schedule,
+                title=title,
+                label=label,
+                deliverable=deliverable,
+                session_key=session_key,
+                chat_id=chat_id,
+                request_metadata=request_metadata,
+            )
+        plan_task_id = await self._record_plan_task(
+            plan=plan,
+            title=title,
+            instructions=instructions,
+            label=label,
+            deliverable=deliverable,
             session_key=session_key,
             chat_id=chat_id,
-            content=instructions,
-            mode="scheduled_plan",
-            title=title,
-            model=self._model_name,
-            status="scheduled",
-        )
-        plan_task_id = str(plan_task["task_id"])
-        await self._work_store.run_io(
-            self._work_store.append_event,
-            plan_task_id,
-            "plan.created",
-            {"plan": plan},
-            actor="planner",
-        )
-        await self._work_store.run_io(
-            self._work_store.add_artifact,
-            plan_task_id,
-            name="work-plan.md",
-            kind="markdown",
-            content=self._format_plan_markdown(plan),
-            summary=f"{label}; {deliverable}",
         )
         channel_meta = dict(request_metadata)
         channel_meta.update(
@@ -354,6 +361,176 @@ class ScheduleWorkTool(Tool):
             f"Scheduled Work plan '{title}' as job {job.id}. "
             f"Plan task: {plan_task_id}. Schedule: {label}."
         )
+
+    # -- ziggy-work scheduling (SR-24, design doc §5) ------------------------
+
+    async def _schedule_via_ziggy_work(
+        self,
+        *,
+        plan: dict[str, Any],
+        schedule: CronSchedule,
+        title: str,
+        label: str,
+        deliverable: str,
+        session_key: str,
+        chat_id: str,
+        request_metadata: dict[str, Any],
+    ) -> str:
+        """Create the schedule in ziggy-work through the connector tool.
+
+        Nothing is written to the runtime-local cron store; the connector call
+        happens before any Work-store write so a missing or failing connector
+        leaves the runtime untouched.
+        """
+        connector = self._find_work_schedule_connector()
+        if connector is None or self._tool_registry is None:
+            return ToolResult.error(
+                "Error: work.scheduleOwner is 'ziggy-work' but no connector tool "
+                f"'{WORK_SCHEDULE_CONNECTOR_TOOL}' is registered. Enable the "
+                "ziggy-connectors MCP server (SR-23), or set work.scheduleOwner "
+                "back to 'nanobot' to use the runtime-local scheduler. Nothing was scheduled."
+            )
+        args = self._connector_schedule_args(schedule, title=title, plan=plan, request_metadata=request_metadata)
+        try:
+            result = await self._tool_registry.execute(connector.name, args)
+        except Exception:
+            logger.exception("ziggy-work schedule creation failed via {}", connector.name)
+            return ToolResult.error(
+                "Error: failed to create the schedule in ziggy-work. Nothing was scheduled."
+            )
+        if self._is_connector_failure(result):
+            return ToolResult.error(
+                "Error: ziggy-work rejected the schedule: "
+                f"{str(result)[:500]} Nothing was scheduled."
+            )
+        plan_task_id = await self._record_plan_task(
+            plan=plan,
+            title=title,
+            instructions=plan["instructions"],
+            label=label,
+            deliverable=deliverable,
+            session_key=session_key,
+            chat_id=chat_id,
+        )
+        await self._work_store.run_io(
+            self._work_store.append_event,
+            plan_task_id,
+            "schedule.created",
+            {
+                "connector_tool": connector.name,
+                "schedule": plan["schedule"],
+                "connector_response": str(result)[:500],
+            },
+            actor="planner",
+        )
+        await self._work_store.run_io(
+            self._work_store.update_status,
+            plan_task_id,
+            "scheduled",
+            result_summary=f"Scheduled in ziggy-work: {label}. Deliverable: {deliverable}.",
+        )
+        return (
+            f"Scheduled Work plan '{title}' in ziggy-work via {connector.name}. "
+            f"Plan task: {plan_task_id}. Schedule: {label}."
+        )
+
+    def _connector_schedule_args(
+        self,
+        schedule: CronSchedule,
+        *,
+        title: str,
+        plan: dict[str, Any],
+        request_metadata: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Map a validated schedule onto the connector's ``work_schedule_create`` inputs.
+
+        ``at`` becomes a one-shot (``cron`` NULL with a fire time); ``every``
+        becomes robfig's ``@every <n>s`` (design doc §5).
+        """
+        cron: str | None
+        fire_time: str | None = None
+        if schedule.kind == "cron":
+            cron = schedule.expr
+        elif schedule.kind == "every":
+            cron = f"@every {(schedule.every_ms or 0) // 1000}s"
+        else:
+            cron = None
+            fire_time = datetime.fromtimestamp(
+                (schedule.at_ms or 0) / 1000, tz=timezone.utc
+            ).isoformat()
+        skill = request_metadata.get("skill")
+        args: dict[str, Any] = {
+            "title": title,
+            "content": plan["instructions"],
+            "cron": cron,
+            "timezone": schedule.tz or plan["schedule"]["timezone"] or self._default_timezone,
+            "skill": str(skill) if skill else None,
+        }
+        if fire_time is not None:
+            args["fire_time"] = fire_time
+        return args
+
+    def _find_work_schedule_connector(self) -> Tool | None:
+        """Return the registered connector tool whose MCP original name is
+        ``work_schedule_create`` (SR-23), or ``None``."""
+        registry = self._tool_registry
+        if registry is None:
+            return None
+        for name in registry.tool_names:
+            tool = registry.get(name)
+            if tool is not None and getattr(tool, "_original_name", None) == (
+                WORK_SCHEDULE_CONNECTOR_TOOL
+            ):
+                return tool
+        return None
+
+    @staticmethod
+    def _is_connector_failure(result: Any) -> bool:
+        if isinstance(result, ToolResult):
+            return result.is_error
+        text = str(result)
+        return text.startswith("Error") or text.startswith("(MCP")
+
+    async def _record_plan_task(
+        self,
+        *,
+        plan: dict[str, Any],
+        title: str,
+        instructions: str,
+        label: str,
+        deliverable: str,
+        session_key: str,
+        chat_id: str,
+    ) -> str:
+        """Create the runtime-local scheduled-plan Work task with its plan event
+        and ``work-plan.md`` artifact. Returns the plan task id."""
+        plan_task = await self._work_store.run_io(
+            self._work_store.create_task,
+            session_key=session_key,
+            chat_id=chat_id,
+            content=instructions,
+            mode="scheduled_plan",
+            title=title,
+            model=self._model_name,
+            status="scheduled",
+        )
+        plan_task_id = str(plan_task["task_id"])
+        await self._work_store.run_io(
+            self._work_store.append_event,
+            plan_task_id,
+            "plan.created",
+            {"plan": plan},
+            actor="planner",
+        )
+        await self._work_store.run_io(
+            self._work_store.add_artifact,
+            plan_task_id,
+            name="work-plan.md",
+            kind="markdown",
+            content=self._format_plan_markdown(plan),
+            summary=f"{label}; {deliverable}",
+        )
+        return plan_task_id
 
     @staticmethod
     def _clean(value: str | None, limit: int) -> str:

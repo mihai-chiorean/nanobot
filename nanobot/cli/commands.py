@@ -72,6 +72,7 @@ from nanobot.cli.webui_support import (  # noqa: E402
     _prepare_webui_bundle_for_gateway,
     _validate_gateway_startup,
 )
+from nanobot.cli.work_schedules import work_schedules_app  # noqa: E402
 from nanobot.config.paths import get_workspace_path  # noqa: E402
 from nanobot.config.schema import Config  # noqa: E402
 from nanobot.security.network import is_loopback_host  # noqa: E402
@@ -767,6 +768,14 @@ def status(
 # ============================================================================
 
 app.add_typer(provider_app, name="provider")
+
+
+# ============================================================================
+# Work schedules (SR-24): export runtime-local work_task jobs before the
+# ziggy-work scheduler switch.
+# ============================================================================
+
+app.add_typer(work_schedules_app, name="work-schedules")
 
 
 if __name__ == "__main__":

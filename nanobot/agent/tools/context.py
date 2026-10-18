@@ -11,6 +11,7 @@ if TYPE_CHECKING:
     from nanobot.agent.subagent import SubagentManager
     from nanobot.agent.tools.exec_session import ExecSessionManager
     from nanobot.agent.tools.file_state import FileStates
+    from nanobot.agent.tools.registry import ToolRegistry
     from nanobot.agent.tools.runtime_control import RuntimeControl
     from nanobot.bus.queue import MessageBus
     from nanobot.config.schema import ProviderConfig, ToolsConfig
@@ -102,3 +103,8 @@ class ToolContext:
     # Ziggy-local (MIT-1010): durable Work store backing the scheduled-work tools.
     work_store: WorkStore | None = None
     model_name: str = ""
+    # Ziggy-local (SR-24): which scheduler owns new Work plans ("nanobot" writes the
+    # runtime-local cron store, "ziggy-work" calls the connector tool instead) and the
+    # registry the tools are registered in, used to reach the connector MCP tool.
+    schedule_owner: str = "nanobot"
+    tool_registry: ToolRegistry | None = None

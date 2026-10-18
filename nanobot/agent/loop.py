@@ -708,6 +708,7 @@ class AgentLoop:
         idle_compact_check_interval_seconds: int = 0,
         recovery_admission: RecoveryAdmission | None = None,
         memory_index_enabled: bool = True,
+        schedule_owner: str = "nanobot",
     ):
         from nanobot.config.schema import ToolsConfig
 
@@ -715,6 +716,8 @@ class AgentLoop:
         defaults = AgentDefaults()
         self.bus = bus
         self._recovery_admission = recovery_admission
+        # Ziggy-local (SR-24): work.scheduleOwner — who owns newly scheduled Work plans.
+        self.schedule_owner = schedule_owner
         if turn_delivery_factory is not None:
             if turn_delivery_factory.bus is not bus:
                 raise ValueError("turn delivery factory must use the agent message bus")
@@ -950,6 +953,7 @@ class AgentLoop:
             config,
             provider_snapshot_loader,
         )
+        extra.setdefault("schedule_owner", config.work.schedule_owner)
         return cls(
             bus=bus,
             provider=provider,
@@ -1093,6 +1097,8 @@ class AgentLoop:
             runtime_control=AgentRuntimeControl(self),
             work_store=self.work_store,
             model_name=self.model,
+            schedule_owner=self.schedule_owner,
+            tool_registry=self.tools,
         )
         loader = ToolLoader()
         registered = loader.load(ctx, self.tools)
