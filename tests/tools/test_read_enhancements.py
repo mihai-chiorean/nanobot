@@ -1,6 +1,7 @@
 """Tests for ReadFileTool enhancements: description fix, read dedup, PDF support, device blacklist, office docs."""
 
 import os
+import re
 import sys
 from unittest.mock import patch
 
@@ -248,6 +249,94 @@ class TestReadPdf:
         result = await tool.execute(path=str(tmp_path / "nope.pdf"))
         assert "Error" in result
         assert "not found" in result
+
+
+# ---------------------------------------------------------------------------
+# PDF continuation walks (MIT-1967)
+# ---------------------------------------------------------------------------
+
+def _make_paged_pdf(path, pages: int, *, page_chars: int) -> None:
+    """Multi-page PDF with the marker text at the END of each page.
+
+    A silently dropped page tail therefore removes the page's only marker,
+    which the exactly-once walk below catches.
+    """
+    from pypdf import PdfWriter
+    from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
+
+    writer = PdfWriter()
+    filler = "the quick brown fox jumps over the lazy dog clause seventeen "
+    for index in range(1, pages + 1):
+        page = writer.add_blank_page(width=200, height=900)
+        body = (filler * (page_chars // len(filler) + 1))[:page_chars]
+        ops = ["BT /F1 12 Tf 10 860 Td", f"({body}) Tj 0 -14 Td",
+               f"(PAGE-{index:03d}-MARKER) Tj 0 -14 Td", "ET"]
+        stream = DecodedStreamObject()
+        stream.set_data(" ".join(ops).encode())
+        font = DictionaryObject({NameObject("/Type"): NameObject("/Font"),
+                                 NameObject("/Subtype"): NameObject("/Type1"),
+                                 NameObject("/BaseFont"): NameObject("/Helvetica")})
+        page[NameObject("/Resources")] = DictionaryObject({
+            NameObject("/Font"): DictionaryObject({NameObject("/F1"): writer._add_object(font)})})
+        page[NameObject("/Contents")] = writer._add_object(stream)
+    writer.write(path)
+
+
+class TestReadPdfContinuation:
+    """Continuing with the suggested pages= range must return every page exactly once."""
+
+    @pytest.mark.asyncio
+    async def test_walk_returns_every_page_marker_exactly_once(self, tmp_path):
+        tool = ReadFileTool(workspace=tmp_path)
+        pdf_path = tmp_path / "contract.pdf"
+        # ~9k chars per page: the 128k char budget cuts a page mid-way before
+        # the 20-page window ends, and the cut page's tail (its marker) must
+        # come back on the next continuation call.
+        _make_paged_pdf(pdf_path, pages=45, page_chars=8900)
+        collected: list[str] = []
+        pages: str | None = None
+        for _ in range(30):
+            result = str(await tool.execute(path=str(pdf_path), pages=pages))
+            assert not result.startswith("Error"), result
+            collected.append(result)
+            match = re.search(r"Use pages='(\d+-\d+)' to continue\.", result)
+            if match is None:
+                break
+            pages = match.group(1)
+        else:
+            pytest.fail("continuation hints did not terminate")
+        joined = "\n".join(collected)
+        for index in range(1, 46):
+            assert joined.count(f"PAGE-{index:03d}-MARKER") == 1, f"page {index} not returned exactly once"
+
+    @pytest.mark.asyncio
+    async def test_page_larger_than_budget_is_disclosed_not_claimed(self, tmp_path):
+        tool = ReadFileTool(workspace=tmp_path)
+        pdf_path = tmp_path / "monster.pdf"
+        _make_paged_pdf(pdf_path, pages=1, page_chars=200_000)
+        result = str(await tool.execute(path=str(pdf_path)))
+        assert "exceeded the per-call character limit" in result
+
+    @pytest.mark.asyncio
+    async def test_stored_attachment_path_is_readable_and_foreign_is_denied(self, tmp_path, monkeypatch):
+        workspace = tmp_path / "tenant-a-workspace"
+        workspace.mkdir()
+        own_media = tmp_path / "tenant-a-media"
+        own_media.mkdir()
+        foreign_media = tmp_path / "tenant-b-media"
+        foreign_media.mkdir()
+        mine = own_media / "ab12cd34ef56_contract.pdf"
+        theirs = foreign_media / "ff00ff00ff00_private.pdf"
+        _make_paged_pdf(mine, pages=1, page_chars=40)
+        _make_paged_pdf(theirs, pages=1, page_chars=40)
+        from nanobot.agent.tools import path_utils
+        monkeypatch.setattr(path_utils, "get_media_dir", lambda channel=None: own_media)
+        tool = ReadFileTool(workspace=workspace, allowed_dir=workspace)
+        own_result = str(await tool.execute(path=str(mine)))
+        assert "PAGE-001-MARKER" in own_result
+        foreign_result = str(await tool.execute(path=str(theirs)))
+        assert "PAGE-001-MARKER" not in foreign_result
+        assert "outside allowed directory" in foreign_result
 
 
 # ---------------------------------------------------------------------------

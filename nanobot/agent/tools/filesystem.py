@@ -501,6 +501,11 @@ class ReadFileTool(_FsTool):
             return f"(PDF has no extractable text: {fp})"
 
         result = extraction.text
+        if extraction.partial_last_page:
+            result += (
+                f"\n\n(Page {extraction.end_page + 1} exceeded the per-call character limit; "
+                "only its first part is shown, so do not claim to have read its full contents.)"
+            )
         if extraction.end_page < extraction.total_pages - 1:
             next_start = extraction.end_page + 2
             next_end = min(extraction.end_page + 1 + self._MAX_PDF_PAGES, extraction.total_pages)
