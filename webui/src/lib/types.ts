@@ -43,6 +43,8 @@ export interface UIMediaAttachment {
   kind: UIMediaKind;
   url?: string;
   name?: string;
+  /** Non-error server notice, e.g. "Read pages 1–20 of 147; Ziggy will read the rest on request". */
+  partial?: string;
 }
 
 interface UIMessageSource { kind: "cron" | "local_trigger" | "trigger" | string; label?: string; }

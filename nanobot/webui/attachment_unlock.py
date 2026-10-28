@@ -138,7 +138,7 @@ class AttachmentVault:
                 record["attempts"] += 1
                 self.attempts[digest] = attempts + 1
                 self.save()
-                text, error = await pdf_text(Path(record["path"]), password=password)
+                text, error, _ = await pdf_text(Path(record["path"]), password=password)
             else:
                 bridge = self.bridges.get((chat, session or webui_session_key(chat)))
                 if bridge is None:

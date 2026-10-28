@@ -83,6 +83,11 @@ export function AttachmentTile({ attachment, className, inline = false, variant 
     <>
       <Icon className="h-4 w-4 flex-none" aria-hidden />
       <span className="min-w-0 truncate">{attachment.name ?? label}</span>
+      {attachment.partial ? (
+        <span className="ml-auto flex-none text-[10px] text-muted-foreground" title={attachment.partial}>
+          {attachment.partial}
+        </span>
+      ) : null}
     </>
   );
 

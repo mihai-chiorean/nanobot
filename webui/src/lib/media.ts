@@ -55,10 +55,12 @@ export function toMediaAttachment(media: {
   url?: string;
   name?: string;
   kind?: UIMediaKind;
+  partial?: string;
 }): UIMediaAttachment {
   return {
     kind: explicitMediaKind(media) ?? media.kind ?? "file",
     url: media.url,
     name: media.name,
+    ...(typeof media.partial === "string" && media.partial ? { partial: media.partial } : {}),
   };
 }

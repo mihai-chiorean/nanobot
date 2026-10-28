@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -5,7 +6,7 @@ import pytest
 from pypdf import PdfWriter
 from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 
-from nanobot.webui.pdf_attachments import pdf_text, prepare_pdfs
+from nanobot.webui.pdf_attachments import parse_attachment_cards, pdf_text, prepare_pdfs
 from nanobot.webui.transcript import append_transcript_object, build_webui_thread_response
 
 
@@ -31,6 +32,96 @@ def make_pdf(path: Path, text: str = "", *, encrypted: bool = False, algorithm: 
     if encrypted:
         writer.encrypt("password", algorithm=algorithm)
     writer.write(path)
+
+
+def make_long_pdf(path: Path, pages: int, *, page_chars: int) -> None:
+    """Build a multi-page PDF whose marker text sits at the END of each page.
+
+    Marker-last placement makes any silently dropped page tail visible: the
+    page is only counted when its trailing marker was actually returned.
+    """
+    writer = PdfWriter()
+    filler = "the quick brown fox jumps over the lazy dog clause seventeen "
+    for index in range(1, pages + 1):
+        page = writer.add_blank_page(width=200, height=900)
+        body = (filler * (page_chars // len(filler) + 1))[:page_chars]
+        ops = ["BT /F1 12 Tf 10 860 Td", f"({body}) Tj 0 -14 Td",
+               f"(PAGE-{index:03d}-MARKER) Tj 0 -14 Td", "ET"]
+        stream = DecodedStreamObject()
+        stream.set_data(" ".join(ops).encode())
+        font = DictionaryObject({NameObject("/Type"): NameObject("/Font"),
+                                 NameObject("/Subtype"): NameObject("/Type1"),
+                                 NameObject("/BaseFont"): NameObject("/Helvetica")})
+        page[NameObject("/Resources")] = DictionaryObject({
+            NameObject("/Font"): DictionaryObject({NameObject("/F1"): writer._add_object(font)})})
+        page[NameObject("/Contents")] = writer._add_object(stream)
+    writer.write(path)
+
+
+@pytest.mark.asyncio
+async def test_long_pdf_preview_is_labelled_and_points_to_the_full_document(tmp_path: Path) -> None:
+    path = tmp_path / "lease.pdf"
+    make_long_pdf(path, 147, page_chars=3000)
+    note, statuses = await prepare_pdfs([str(path)], ["lease.pdf"])
+    status = statuses[0]
+    assert status["error"] is None
+    notice = re.fullmatch(
+        r"Read pages 1–(\d+) of (\d+); Ziggy will read the rest on request",
+        status.get("partial", ""),
+    )
+    assert notice is not None, status
+    last_full, total = int(notice.group(1)), int(notice.group(2))
+    assert total == 147
+    assert 0 < last_full < 147
+    assert f"the document has {total} pages in total" in note
+    assert f"pages 1–{last_full} of lease.pdf" in note
+    assert str(path) in note
+    page_range = re.search(r"pages='(\d+)-(\d+)'", note)
+    assert page_range is not None
+    assert int(page_range.group(1)) == last_full + 1
+    assert f"PAGE-{last_full:03d}-MARKER" in note
+    assert "read every remaining page range" in note
+    assert "never claim to have read pages" in note
+
+
+@pytest.mark.asyncio
+async def test_short_pdf_has_no_partial_notice_or_path_hint(tmp_path: Path) -> None:
+    path = tmp_path / "short.pdf"
+    make_long_pdf(path, 2, page_chars=100)
+    note, statuses = await prepare_pdfs([str(path)], ["short.pdf"])
+    assert "partial" not in statuses[0]
+    assert statuses[0]["error"] is None
+    assert "read_file" not in note
+    assert "pages=" not in note
+    assert "PAGE-001-MARKER" in note and "PAGE-002-MARKER" in note
+
+
+def test_parse_attachment_cards_keeps_partial_notice_only_when_usable() -> None:
+    cards = parse_attachment_cards([
+        {"name": "a.pdf", "partial": "Read pages 1–9 of 147; Ziggy will read the rest on request"},
+        {"name": "b.pdf", "partial": "x" * 600},
+        {"name": "c.pdf", "partial": 42},
+        {"name": "d.pdf", "partial": ""},
+    ])
+    assert cards[0]["partial"] == "Read pages 1–9 of 147; Ziggy will read the rest on request"
+    assert len(cards[1]["partial"]) == 256
+    assert "partial" not in cards[2]
+    assert "partial" not in cards[3]
+
+
+@pytest.mark.parametrize("projection", ["messages", "events"])
+def test_partial_notice_survives_history(tmp_path, monkeypatch, projection):
+    monkeypatch.setattr("nanobot.config.paths.get_data_dir", lambda: tmp_path)
+    append_transcript_object("websocket:pdf-partial", {
+        "event": "user", "chat_id": "pdf-partial", "text": "",
+        "attachments": [{"name": "lease.pdf", "error": None,
+                         "partial": "Read pages 1–19 of 147; Ziggy will read the rest on request"}],
+    })
+    response = build_webui_thread_response("websocket:pdf-partial", projection=projection)
+    rows = response["events"] if projection == "events" else response["messages"]
+    media = rows[0]["media_urls"] if projection == "events" else rows[0]["media"]
+    assert media[0]["partial"] == "Read pages 1–19 of 147; Ziggy will read the rest on request"
+    assert media[0]["error"] is None
 
 
 @pytest.mark.asyncio
@@ -71,9 +162,10 @@ async def test_stuck_parser_is_killed_and_returns_an_error() -> None:
         await asyncio.sleep(60)
     process.communicate.side_effect = stuck
     with patch("asyncio.create_subprocess_exec", return_value=process):
-        text, error = await pdf_text(Path("report.pdf"), timeout=0.01)
+        text, error, preview = await pdf_text(Path("report.pdf"), timeout=0.01)
     assert text == ""
     assert "too long" in error
+    assert preview is None
     assert process.returncode == -9
     process.wait.assert_awaited_once()
 
