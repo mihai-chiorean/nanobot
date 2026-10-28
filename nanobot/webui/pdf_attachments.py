@@ -24,10 +24,19 @@ class PdfPreview(TypedDict):
     partial_last_page: bool
 
 
+# MIT-1967 follow-up: load the whole document when it fits. The served model
+# has a 262,144-token context, so a ~450k-char 147-page legal PDF fits in full;
+# beyond these caps the partial-preview path (note + read_file paging) applies.
+UPLOAD_MAX_PAGES = 200
+UPLOAD_MAX_CHARS = 600_000
+# 200 pages of pypdf extraction can exceed the old 15 s budget on the Spark.
+PDF_TEXT_TIMEOUT_SECONDS = 60
+
+
 async def pdf_text(
     path: Path,
     *,
-    timeout: float = 15,
+    timeout: float = PDF_TEXT_TIMEOUT_SECONDS,
     password: str | None = None,
 ) -> tuple[str, str | None, PdfPreview | None]:
     # A process, rather than a timed-out thread, lets us stop a stuck parser.
@@ -164,7 +173,8 @@ def main() -> None:
     )
     try:
         request = json.loads(sys.stdin.read() or "{}")
-        result = extract_pdf_pages(Path(sys.argv[1]), max_pages=100, max_chars=60_000,
+        result = extract_pdf_pages(Path(sys.argv[1]), max_pages=UPLOAD_MAX_PAGES,
+                                   max_chars=UPLOAD_MAX_CHARS,
                                    password=request.get("password"))
         text = result.text
         error = None

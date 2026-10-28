@@ -1,3 +1,4 @@
+import json
 import re
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -6,7 +7,14 @@ import pytest
 from pypdf import PdfWriter
 from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 
-from nanobot.webui.pdf_attachments import parse_attachment_cards, pdf_text, prepare_pdfs
+from nanobot.webui.pdf_attachments import (
+    PDF_TEXT_TIMEOUT_SECONDS,
+    UPLOAD_MAX_CHARS,
+    UPLOAD_MAX_PAGES,
+    parse_attachment_cards,
+    pdf_text,
+    prepare_pdfs,
+)
 from nanobot.webui.transcript import append_transcript_object, build_webui_thread_response
 
 
@@ -59,10 +67,30 @@ def make_long_pdf(path: Path, pages: int, *, page_chars: int) -> None:
 
 
 @pytest.mark.asyncio
-async def test_long_pdf_preview_is_labelled_and_points_to_the_full_document(tmp_path: Path) -> None:
+async def test_whole_document_loads_without_partial_notice(tmp_path: Path) -> None:
+    # Owner scope addition: with the raised upload caps the 147-page fixture
+    # (~446k chars) is loaded whole, so no page is hidden and no partial
+    # notice, path hint or paging instruction may appear.
+    assert UPLOAD_MAX_PAGES == 200 and UPLOAD_MAX_CHARS == 600_000
     path = tmp_path / "lease.pdf"
     make_long_pdf(path, 147, page_chars=3000)
     note, statuses = await prepare_pdfs([str(path)], ["lease.pdf"])
+    assert statuses[0]["error"] is None
+    assert "partial" not in statuses[0]
+    assert "read_file" not in note
+    assert "pages=" not in note
+    assert "read every remaining page range" not in note
+    assert "were read" not in note
+    for index in range(1, 148):
+        assert f"PAGE-{index:03d}-MARKER" in note, f"page {index} missing from the whole-document load"
+    assert len(note) > 400_000
+
+
+@pytest.mark.asyncio
+async def test_over_cap_pdf_preview_is_labelled_and_points_to_the_full_document(tmp_path: Path) -> None:
+    path = tmp_path / "statute.pdf"
+    make_long_pdf(path, 250, page_chars=3000)  # ~755k chars: past the 600k cap
+    note, statuses = await prepare_pdfs([str(path)], ["statute.pdf"])
     status = statuses[0]
     assert status["error"] is None
     notice = re.fullmatch(
@@ -71,17 +99,100 @@ async def test_long_pdf_preview_is_labelled_and_points_to_the_full_document(tmp_
     )
     assert notice is not None, status
     last_full, total = int(notice.group(1)), int(notice.group(2))
-    assert total == 147
-    assert 0 < last_full < 147
+    assert total == 250
+    assert 0 < last_full < 250
     assert f"the document has {total} pages in total" in note
-    assert f"pages 1–{last_full} of lease.pdf" in note
+    assert f"pages 1–{last_full} of statute.pdf" in note
     assert str(path) in note
     page_range = re.search(r"pages='(\d+)-(\d+)'", note)
     assert page_range is not None
     assert int(page_range.group(1)) == last_full + 1
+    assert int(page_range.group(2)) == min(total, last_full + 20)
     assert f"PAGE-{last_full:03d}-MARKER" in note
+    assert f"PAGE-{last_full + 1:03d}-MARKER" not in note  # cut page dropped whole, re-read on paging
     assert "read every remaining page range" in note
     assert "never claim to have read pages" in note
+    # The raised budget is the binding constraint (old 60k cap -> ~60k note),
+    # and the framing text never lets the note balloon past the cap.
+    assert 500_000 < len(note) < UPLOAD_MAX_CHARS + 10_000
+
+
+@pytest.mark.asyncio
+async def test_pdf_text_default_timeout_covers_two_hundred_page_extraction() -> None:
+    # 200 pages of pypdf extraction can exceed the old 15 s budget on the
+    # Spark; the default handed to wait_for must be the raised one.
+    process = AsyncMock()
+    process.returncode = 0
+    process.communicate = AsyncMock(
+        return_value=(json.dumps({"text": "ok", "error": None, "preview": None}).encode(), b""))
+    seen: dict[str, object] = {}
+    async def capture_wait_for(awaitable, timeout=None):
+        seen["timeout"] = timeout
+        return await awaitable
+    with patch("asyncio.create_subprocess_exec", return_value=process), \
+            patch("asyncio.wait_for", side_effect=capture_wait_for):
+        text, error, preview = await pdf_text(Path("report.pdf"))
+    assert (text, error, preview) == ("ok", None, None)
+    assert seen["timeout"] == PDF_TEXT_TIMEOUT_SECONDS == 60
+
+
+@pytest.mark.asyncio
+async def test_600k_note_survives_sanitize_and_session_replay(tmp_path: Path) -> None:
+    # Review step 3: the note is appended server-side, after the 64 KB ingress
+    # text check, so the stages it actually crosses are sanitize_input, the
+    # bus, Session persistence and get_history replay. None may cut it.
+    from nanobot.session.manager import SessionManager
+    from nanobot.utils.security import sanitize_input
+
+    path = tmp_path / "legal.pdf"
+    make_long_pdf(path, 147, page_chars=3000)
+    note, statuses = await prepare_pdfs([str(path)], ["legal.pdf"])
+    assert "partial" not in statuses[0]
+    dispatch = "Review the attached document.\n\n[Attachment processing note]\n" + note
+    sanitized, was_injection = sanitize_input(dispatch)
+    assert not was_injection
+    assert sanitized == dispatch  # legal text passes the injection guard byte-identical
+    sessions = SessionManager(tmp_path / "ws", sessions_root=tmp_path / "sessions")
+    session = sessions.get_or_create("websocket:big-pdf")
+    session.add_message("user", dispatch)
+    sessions.save(session)
+    reloaded = SessionManager(tmp_path / "ws", sessions_root=tmp_path / "sessions")
+    replayed = reloaded.get_or_create("websocket:big-pdf").get_history()
+    assert replayed[-1]["content"] == dispatch
+    for index in (1, 74, 147):
+        assert f"PAGE-{index:03d}-MARKER" in replayed[-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_large_pdf_frame_reaches_model_whole_and_stays_out_of_transcript(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from nanobot.channels.websocket.tests.test_websocket_envelope_media import (
+        _data_url,
+        _make_channel,
+    )
+
+    monkeypatch.setattr("nanobot.config.paths.get_data_dir", lambda: tmp_path / "data")
+    media = tmp_path / "media"
+    media.mkdir()
+    path = tmp_path / "lease.pdf"
+    make_long_pdf(path, 147, page_chars=3000)
+    channel = _make_channel()
+    origin = AsyncMock()
+    with patch("nanobot.webui.media_gateway.get_media_dir", return_value=media):
+        await channel._dispatch_envelope(origin, "client", {
+            "type": "message", "chat_id": "big-pdf", "webui": True,
+            "content": "Review the whole document",
+            "media": [{"name": "lease.pdf", "data_url": _data_url("application/pdf", path.read_bytes())}],
+        })
+    content = channel._handle_message.call_args.kwargs["content"]
+    assert len(content) > 400_000  # the pre-scope cut point was ~60k (page ~20)
+    assert "PAGE-147-MARKER" in content
+    # Transcript rows (UI replay) keep only the user-visible text; the model
+    # note never passes through the per-turn transcript byte limits.
+    row = build_webui_thread_response("websocket:big-pdf")["messages"][0]
+    assert row["content"] == "Review the whole document"
+    assert "PAGE-001-MARKER" not in str(row)
 
 
 @pytest.mark.asyncio
