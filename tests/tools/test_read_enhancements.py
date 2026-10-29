@@ -255,11 +255,12 @@ class TestReadPdf:
 # PDF continuation walks (MIT-1967)
 # ---------------------------------------------------------------------------
 
-def _make_paged_pdf(path, pages: int, *, page_chars: int) -> None:
+def _make_paged_pdf(path, pages: int, *, page_chars: int, blank_first: int = 0) -> None:
     """Multi-page PDF with the marker text at the END of each page.
 
     A silently dropped page tail therefore removes the page's only marker,
-    which the exactly-once walk below catches.
+    which the exactly-once walk below catches. ``blank_first`` leaves the
+    given number of leading pages without any content stream at all.
     """
     from pypdf import PdfWriter
     from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
@@ -268,6 +269,8 @@ def _make_paged_pdf(path, pages: int, *, page_chars: int) -> None:
     filler = "the quick brown fox jumps over the lazy dog clause seventeen "
     for index in range(1, pages + 1):
         page = writer.add_blank_page(width=200, height=900)
+        if index <= blank_first:
+            continue
         body = (filler * (page_chars // len(filler) + 1))[:page_chars]
         ops = ["BT /F1 12 Tf 10 860 Td", f"({body}) Tj 0 -14 Td",
                f"(PAGE-{index:03d}-MARKER) Tj 0 -14 Td", "ET"]
@@ -316,6 +319,25 @@ class TestReadPdfContinuation:
         _make_paged_pdf(pdf_path, pages=1, page_chars=200_000)
         result = str(await tool.execute(path=str(pdf_path)))
         assert "exceeded the per-call character limit" in result
+
+    @pytest.mark.asyncio
+    async def test_blank_page_window_reports_range_and_keeps_the_walk_alive(self, tmp_path):
+        # MIT-1967 review item 6: an all-blank requested window in a document
+        # that has text later must not read like an empty PDF; it reports the
+        # window and suggests the next range so later pages stay reachable.
+        tool = ReadFileTool(workspace=tmp_path)
+        pdf_path = tmp_path / "front-matter.pdf"
+        _make_paged_pdf(pdf_path, pages=8, page_chars=50, blank_first=5)
+        result = str(await tool.execute(path=str(pdf_path), pages="1-5"))
+        assert result.startswith(f"(No extractable text on pages 1-5 of {pdf_path})")
+        assert "Later pages may still contain text; use pages='6-8' to continue." in result
+        follow = str(await tool.execute(path=str(pdf_path), pages="6-8"))
+        assert "PAGE-006-MARKER" in follow and "PAGE-008-MARKER" in follow
+        # Negative control: a genuinely textless document keeps the old message.
+        dead_path = tmp_path / "blank.pdf"
+        _make_paged_pdf(dead_path, pages=2, page_chars=50, blank_first=2)
+        dead = str(await tool.execute(path=str(dead_path), pages="1-2"))
+        assert "Later pages" not in dead and "pages=" not in dead
 
     @pytest.mark.asyncio
     async def test_stored_attachment_path_is_readable_and_foreign_is_denied(self, tmp_path, monkeypatch):
