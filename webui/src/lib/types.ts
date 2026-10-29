@@ -1372,6 +1372,16 @@ export type InboundEvent =
       session_mentions?: SessionMention[];
       provenance?: { session_message?: UISessionMessage };
     }
+  | {
+      event: "attachment.status";
+      chat_id: string;
+      client_message_id?: string;
+      turn_id?: string;
+      /** Server-parsed card state per uploaded file, in upload order. */
+      attachments?: Array<{ name?: string; error?: string | null; partial?: string }>;
+      attachment_id?: string;
+      unlocked?: boolean;
+    }
   | ({
       event: "message";
       chat_id: string;

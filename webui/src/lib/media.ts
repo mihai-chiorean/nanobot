@@ -64,3 +64,44 @@ export function toMediaAttachment(media: {
     ...(typeof media.partial === "string" && media.partial ? { partial: media.partial } : {}),
   };
 }
+
+/** One entry of an ``attachment.status`` frame's ``attachments`` array. */
+export interface AttachmentStatusCard {
+  name?: string;
+  error?: string | null;
+  partial?: string;
+}
+
+/**
+ * Merge server ``attachment.status`` cards onto the optimistic upload tiles.
+ * The gateway parses uploads in upload order, so the merge is positional;
+ * the server name is authoritative for the tile label.
+ */
+export function mergeAttachmentStatuses(
+  media: UIMediaAttachment[] | undefined,
+  statuses: AttachmentStatusCard[] | undefined,
+): UIMediaAttachment[] | undefined {
+  if (!statuses || statuses.length === 0) return media;
+  const base = media ?? [];
+  const count = Math.max(base.length, statuses.length);
+  let changed = false;
+  const next: UIMediaAttachment[] = [];
+  for (let index = 0; index < count; index += 1) {
+    const status = statuses[index] ?? {};
+    const current = base[index];
+    const merged: UIMediaAttachment = {
+      ...(current ?? { kind: inferMediaKind({ name: status.name }) }),
+      ...(typeof status.name === "string" && status.name ? { name: status.name } : {}),
+      ...(typeof status.partial === "string" && status.partial ? { partial: status.partial } : {}),
+    };
+    if (
+      current === undefined
+      || current.kind !== merged.kind
+      || current.url !== merged.url
+      || current.name !== merged.name
+      || current.partial !== merged.partial
+    ) changed = true;
+    next.push(merged);
+  }
+  return changed ? next : media;
+}

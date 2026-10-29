@@ -2692,6 +2692,60 @@ describe("useNanobotStream", () => {
     );
   });
 
+  it("attaches server partial cards to the sender's own upload tiles", () => {
+    // MIT-1967 review blocking item 2: the sender must see "Read pages 1–N of
+    // M" on the tile, not only the model. The frame arrives after send with
+    // the turn_id the optimistic row already carries.
+    const fake = fakeClient();
+    const { result } = renderHook(() => useNanobotStream("chat-pdf-status", EMPTY_MESSAGES), {
+      wrapper: wrap(fake.client),
+    });
+    const attachments = [
+      {
+        media: { data_url: "data:application/pdf;base64,AA==", name: "lease.pdf" },
+        preview: { kind: "file" as const, url: "data:application/pdf;base64,AA==", name: "lease.pdf" },
+      },
+      {
+        media: { data_url: "data:application/pdf;base64,BB==", name: "addendum.pdf" },
+        preview: { kind: "file" as const, url: "data:application/pdf;base64,BB==", name: "addendum.pdf" },
+      },
+    ];
+    act(() => {
+      result.current.send("review these", attachments);
+    });
+    const turnId = result.current.messages[0].turnId;
+    expect(turnId).toBeTruthy();
+    const event: InboundEvent = {
+      event: "attachment.status",
+      chat_id: "chat-pdf-status",
+      turn_id: turnId,
+      attachments: [
+        { name: "lease.pdf", error: null, partial: "Read pages 1–19 of 147; Ziggy will read the rest on request" },
+        { name: "addendum.pdf", error: null },
+      ],
+    };
+
+    // Negative control: a frame for a different turn must not touch this row.
+    act(() => {
+      fake.emit("chat-pdf-status", { ...event, turn_id: "other-turn" });
+    });
+    expect(result.current.messages[0].media![0].partial).toBeUndefined();
+
+    act(() => {
+      fake.emit("chat-pdf-status", event);
+    });
+    expect(result.current.messages[0].media![0].partial)
+      .toBe("Read pages 1–19 of 147; Ziggy will read the rest on request");
+    expect(result.current.messages[0].media![1].partial).toBeUndefined();
+
+    // Replaying the same frame must not churn the array identity.
+    const after = result.current.messages[0].media;
+    act(() => {
+      fake.emit("chat-pdf-status", event);
+    });
+    expect(result.current.messages[0].media).toBe(after);
+  });
+
   it("inlines quoted context into the optimistic and outbound user message", () => {
     const fake = fakeClient();
     const { result } = renderHook(() => useNanobotStream("chat-quote", EMPTY_MESSAGES), {
