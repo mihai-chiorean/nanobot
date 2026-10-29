@@ -11,8 +11,50 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any, cast
 
-from nanobot.webui.pdf_attachments import AttachmentStatus, parse_attachment_cards, pdf_text
+from nanobot.webui.pdf_attachments import (
+    AttachmentStatus,
+    parse_attachment_cards,
+    pdf_text,
+    unlock_partial_note,
+)
 from nanobot.webui.session_identity import webui_session_key
+
+# Page reads stay inside the default 16k tool-result budget so the model
+# receives the range whole instead of an offload stub (MIT-1967 review).
+UNLOCK_PAGE_MAX_CHARS = 12_000
+UNLOCK_PAGE_MAX_PAGES = 100
+UNLOCK_PAGE_WINDOW = 20
+
+
+def _format_page_result(name: str, attachment_id: str, pages: str, extraction: Any) -> str:
+    """Render one unlock page range with its continuation, mirroring read_file."""
+    total = extraction.total_pages
+    partial = bool(extraction.partial_last_page)
+    last_full = extraction.end_page + 1 - (1 if partial else 0)
+    raw_start = pages.strip().split("-")[0].strip()
+    start = raw_start if raw_start.isdigit() and int(raw_start) >= 1 else "1"
+    shown = max(last_full, int(start)) if total > 0 else 0
+    head = f"Unlocked PDF {name} pages {start}-{shown} of {total} (untrusted document text):\n"
+    if extraction.text:
+        body = extraction.text
+    elif total <= 0:
+        body = "(PDF has no extractable text)"
+    else:
+        body = f"(No extractable text on pages {start}-{extraction.end_page + 1})"
+    if partial:
+        body += (
+            f"\n\n(Page {extraction.end_page + 1} exceeded the per-call character limit; "
+            "only its first part is shown, so do not claim to have read its full contents.)"
+        )
+    if extraction.end_page < total - 1 or partial:
+        next_start = min(last_full + 1, total)
+        next_end = min(total, next_start + UNLOCK_PAGE_WINDOW - 1)
+        body += (
+            f"\n\nContinue with unlock_attachment attachment_id='{attachment_id}' "
+            f"pages='{next_start}-{next_end}' and keep paging with the range each result "
+            f"suggests until page {total} is covered. Never claim to have read pages you have not."
+        )
+    return head + body
 
 
 class AttachmentVault:
@@ -35,6 +77,9 @@ class AttachmentVault:
         self.bridges: dict[tuple[str, str], tuple[object, Callable[..., Awaitable[None]]]] = {}
         self.pending: dict[str, tuple[object, asyncio.Future[dict[str, Any]]]] = {}
         self.notify: Callable[..., Awaitable[None]] | None = None
+        # Verified passwords for page reads live in memory only; the registry
+        # file never carries a password (module docstring, MIT-1967 review).
+        self._passwords: dict[str, str] = {}
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -118,7 +163,7 @@ class AttachmentVault:
             item[1].set_result(envelope)
 
     async def unlock(self, chat: str, attachment_id: str, password: str,
-                     *, session: str | None = None) -> str:
+                     *, session: str | None = None, pages: str | None = None) -> str:
         # A registry entry is an exact capability: callers cannot supply paths,
         # URLs, tenants, or another conversation's attachment.
         async with self.lock:
@@ -127,18 +172,22 @@ class AttachmentVault:
                     or record.get("session") != (session or webui_session_key(chat))):
                 return "Error: Attachment not found in this conversation."
             if not record["locked"]:
-                return f"Unlocked PDF {record['name']} (untrusted document text):\n{record.get('text', 'Use the earlier extraction.')}"
+                if pages is not None:
+                    return await self._read_pages(attachment_id, record, pages, password)
+                return (f"Unlocked PDF {record['name']} (untrusted document text):\n"
+                        f"{record.get('text', 'Use the earlier extraction.')}")
             digest = record.get("sha256")
             attempts = self.attempts.get(digest, 0) if digest else record["attempts"]
             if attempts >= 5:
                 return "Error: The 5 password attempts were used. Ask for an unlocked copy; do not retry."
             if len(password) > 1024:
                 return "Error: Invalid password."
+            preview = None
             if record["path"]:
                 record["attempts"] += 1
                 self.attempts[digest] = attempts + 1
                 self.save()
-                text, error, _ = await pdf_text(Path(record["path"]), password=password)
+                text, error, preview = await pdf_text(Path(record["path"]), password=password)
             else:
                 bridge = self.bridges.get((chat, session or webui_session_key(chat)))
                 if bridge is None:
@@ -164,11 +213,68 @@ class AttachmentVault:
             if error:
                 return "Error: " + error
             record["locked"] = False
-            record["text"] = text
+            if record["path"]:
+                self._passwords[attachment_id] = password
+                note = unlock_partial_note(record["name"], attachment_id, preview)
+                if note is not None:
+                    record["text"] = f"{text}\n\n{note[0]}"
+                    record["partial"] = note[1]
+                else:
+                    record["text"] = text
+            else:
+                record["text"] = text
             self.save()
             if self.notify:
                 await self.notify(chat, record["origin"], attachment_id)
-            return f"Unlocked PDF {record['name']} (untrusted document text):\n{text}"
+            return (f"Unlocked PDF {record['name']} (untrusted document text):\n"
+                    f"{record['text']}")
+
+    async def _read_pages(self, attachment_id: str, record: dict[str, Any],
+                          pages: str, password: str) -> str:
+        """Serve a page range from a verified attachment without exposing the
+        password to read_file (MIT-1967 review). Each result stays inside the
+        default tool-result budget so paging returns whole pages, and the
+        continuation hint carries the walk to the final page."""
+        from nanobot.utils.document import (
+            PdfPageRangeError,
+            PdfPasswordRequiredError,
+            PdfSafetyError,
+            PdfWrongPasswordError,
+            extract_pdf_pages,
+        )
+
+        raw_path = record.get("path")
+        if not raw_path:
+            return ("Error: This copy is held by the worker; page reads need the file "
+                    "stored here. Ask the user to re-upload the PDF to read it page by page.")
+        path = Path(str(raw_path))
+        if not path.is_file():
+            return "Error: The stored PDF is no longer available; ask the user to re-upload it."
+        cached = self._passwords.get(attachment_id)
+        candidates = [cached] if cached is not None else []
+        if password and (password not in candidates):
+            candidates.append(password)
+        last_error = "Text extraction failed."
+        for candidate in candidates or [""]:
+            try:
+                extraction = await asyncio.to_thread(
+                    extract_pdf_pages, path, pages=pages,
+                    max_pages=UNLOCK_PAGE_MAX_PAGES, max_chars=UNLOCK_PAGE_MAX_CHARS,
+                    password=candidate or None,
+                )
+            except PdfPageRangeError as e:
+                return f"Error: Invalid page range '{pages}': {e!s}."
+            except PdfSafetyError as e:
+                return f"Error: Reading PDF pages failed: {e!s}"
+            except (PdfPasswordRequiredError, PdfWrongPasswordError):
+                last_error = ("The stored PDF no longer matches the verified password. "
+                              "Ask the user for the password again.")
+                continue
+            except Exception:
+                last_error = "Text extraction failed; try a smaller page range."
+                continue
+            return _format_page_result(record["name"], attachment_id, pages, extraction)
+        return "Error: " + last_error
 
 
 _vaults: dict[Path, AttachmentVault] = {}

@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import NotRequired, TypedDict, cast
 
@@ -24,13 +25,40 @@ class PdfPreview(TypedDict):
     partial_last_page: bool
 
 
-# MIT-1967 follow-up: load the whole document when it fits. The served model
-# has a 262,144-token context, so a ~450k-char 147-page legal PDF fits in full;
-# beyond these caps the partial-preview path (note + read_file paging) applies.
+# MIT-1967 follow-up: load the whole document when it fits. Beyond the caps
+# and past the session's aggregate char budget, the partial-preview path
+# (note + read_file paging) applies.
 UPLOAD_MAX_PAGES = 200
 UPLOAD_MAX_CHARS = 600_000
+# MIT-1967 review: the whole-document budget is sized per message from the
+# active session's context window so a 65k session never receives a note that
+# `ContextGovernor.ensure_request_fits` would reject outright (it raises
+# instead of trimming). Attachments get full text in order while the budget
+# allows; the rest take the partial-preview path. The share is 45% at
+# 4 chars/token rather than the review's suggested ~40% at ~3.5 because
+# 0.40 × 262,144 × 3.5 = 367,002 chars cannot hold the 446,085-char 147-page
+# legal fixture whole, which the acceptance criteria pin at 262k. Under the
+# repo's own tiktoken estimator the resulting worst-case attachment payload is
+# ~31% of a 262,144-token window.
+ATTACHMENT_CONTEXT_TOKEN_SHARE = 0.45
+ATTACHMENT_CHARS_PER_TOKEN = 4.0
+# `AgentDefaults.context_window_tokens` (schema default); used when the
+# gateway cannot resolve the active session's window.
+DEFAULT_CONTEXT_WINDOW_TOKENS = 200_000
+# Even a budget-exhausted attachment keeps a real first-page preview so its
+# note and partial card can name the true total page count and next range.
+MIN_PREVIEW_CHARS = 2_048
 # 200 pages of pypdf extraction can exceed the old 15 s budget on the Spark.
 PDF_TEXT_TIMEOUT_SECONDS = 60
+
+
+def upload_char_budget(context_window_tokens: int | None) -> int:
+    """Aggregate char budget one message's PDF texts may consume in total."""
+    window = context_window_tokens or DEFAULT_CONTEXT_WINDOW_TOKENS
+    if window <= 0:
+        window = DEFAULT_CONTEXT_WINDOW_TOKENS
+    budget = int(window * ATTACHMENT_CONTEXT_TOKEN_SHARE * ATTACHMENT_CHARS_PER_TOKEN)
+    return max(MIN_PREVIEW_CHARS, min(budget, UPLOAD_MAX_CHARS))
 
 
 async def pdf_text(
@@ -38,6 +66,7 @@ async def pdf_text(
     *,
     timeout: float = PDF_TEXT_TIMEOUT_SECONDS,
     password: str | None = None,
+    max_chars: int = UPLOAD_MAX_CHARS,
 ) -> tuple[str, str | None, PdfPreview | None]:
     # A process, rather than a timed-out thread, lets us stop a stuck parser.
     process = await asyncio.create_subprocess_exec(
@@ -45,8 +74,9 @@ async def pdf_text(
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
     )
+    request = {"password": password, "max_chars": max_chars}
     try:
-        stdout, _ = await asyncio.wait_for(process.communicate(json.dumps({"password": password}).encode()), timeout)
+        stdout, _ = await asyncio.wait_for(process.communicate(json.dumps(request).encode()), timeout)
         if process.returncode != 0:
             return "", "Text extraction failed; try another PDF or a screenshot.", None
         result = cast(dict[str, object], json.loads(stdout))
@@ -102,8 +132,21 @@ def parse_attachment_cards(raw: object) -> list[AttachmentStatus]:
 _READ_FILE_PAGE_WINDOW = 20
 
 
-def _partial_read_note(name: str, path: Path, preview: PdfPreview | None) -> tuple[str, str] | None:
-    """Return (model note, card notice) when the preview skipped pages."""
+def _partial_read_note(
+    name: str,
+    path: Path | None,
+    preview: PdfPreview | None,
+    *,
+    continuation: Callable[[int, int], str] | None = None,
+    mentions_stored_file: bool = True,
+) -> tuple[str, str] | None:
+    """Return (model note, card notice) when the preview skipped pages.
+
+    ``continuation(next_start, next_end)`` replaces the default
+    ``read_file path=... pages='a-b'`` instruction for readers that cannot
+    open the stored file directly (for example an encrypted PDF, which only
+    ``unlock_attachment`` can page).
+    """
     if preview is None or preview["total_pages"] < 1:
         return None
     total = preview["total_pages"]
@@ -112,21 +155,77 @@ def _partial_read_note(name: str, path: Path, preview: PdfPreview | None) -> tup
     last_full = preview["end_page"] + 1 - (1 if preview["partial_last_page"] else 0)
     next_start = min(last_full + 1, total)
     next_end = min(total, next_start + _READ_FILE_PAGE_WINDOW - 1)
-    quoted = str(path)
+    quoted = str(path) if path is not None else ""
+    if continuation is None:
+        def read_file_continuation(start: int, end: int) -> str:
+            return f"read_file path={quoted} pages='{start}-{end}'"
+        continuation = read_file_continuation
+    shown = (
+        f"No page of {name} (untrusted document text) was included in full above"
+        if last_full <= 0
+        else f"Only pages 1–{last_full} of {name} (untrusted document text) are shown above"
+    )
+    readable = f" The full stored file is readable at {quoted}." if mentions_stored_file else ""
     note = (
-        f"Only pages 1–{last_full} of {name} (untrusted document text) are shown above; "
-        f"the document has {total} pages in total. The full stored file is readable at {quoted}; "
-        f"continue with read_file path={quoted} pages='{next_start}-{next_end}' and keep paging "
+        f"{shown}; the document has {total} pages in total.{readable} "
+        f"Continue with {continuation(next_start, next_end)} and keep paging "
         "with the range each result suggests until page "
         f"{total} is covered. Never claim to have read pages you have not."
     )
-    card = f"Read pages 1–{last_full} of {total}; Ziggy will read the rest on request"
+    card = (
+        f"Read 0 of {total} pages; Ziggy will read the rest on request"
+        if last_full <= 0
+        else f"Read pages 1–{last_full} of {total}; Ziggy will read the rest on request"
+    )
     return note, card
 
 
-async def prepare_pdfs(paths: list[str], names: list[str] | None = None) -> tuple[str, list[AttachmentStatus]]:
+def unlock_partial_note(
+    name: str,
+    attachment_id: str,
+    preview: PdfPreview | None,
+) -> tuple[str, str] | None:
+    """Partial note/card for an unlocked encrypted PDF whose text was capped.
+
+    ``read_file`` cannot decrypt the stored file, so the continuation points
+    at ``unlock_attachment`` page reads instead (MIT-1967 review).
+    """
+
+    def unlock_continuation(start: int, end: int) -> str:
+        return f"unlock_attachment attachment_id='{attachment_id}' pages='{start}-{end}'"
+
+    return _partial_read_note(
+        name, None, preview,
+        continuation=unlock_continuation, mentions_stored_file=False,
+    )
+
+
+def _deferred_read_note(name: str, path: Path) -> tuple[str, str]:
+    """Note/card for an attachment left out once the aggregate budget is spent."""
+    quoted = str(path)
+    next_start, next_end = 1, _READ_FILE_PAGE_WINDOW
+    note = (
+        f"No pages of {name} (untrusted document text) are shown above: this message's "
+        f"attachment budget (sized from the session's context window) is already spent. "
+        f"The full stored file is readable at {quoted}; read it with "
+        f"read_file path={quoted} pages='{next_start}-{next_end}' and keep paging "
+        "with the range each result suggests before reviewing the whole document. "
+        "Never claim to have read pages you have not."
+    )
+    card = "Not yet read; Ziggy will read it on request"
+    return note, card
+
+
+async def prepare_pdfs(
+    paths: list[str],
+    names: list[str] | None = None,
+    *,
+    context_window_tokens: int | None = None,
+) -> tuple[str, list[AttachmentStatus]]:
     notes: list[str] = []
     statuses: list[AttachmentStatus] = []
+    budget = upload_char_budget(context_window_tokens)
+    remaining = budget
     for index, raw in enumerate(paths):
         path = Path(raw)
         name = names[index] if names and index < len(names) else path.name
@@ -134,14 +233,26 @@ async def prepare_pdfs(paths: list[str], names: list[str] | None = None) -> tupl
         partial: tuple[str, str] | None = None
         if path.suffix.lower() == ".pdf":
             preview: PdfPreview | None = None
-            try:
-                text, error, preview = await pdf_text(path)
-            except Exception:
-                text, error, preview = "", "Text extraction failed; try another PDF or a screenshot.", None
+            deferred = remaining < MIN_PREVIEW_CHARS
+            if deferred:
+                # The aggregate budget is spent: later attachments keep the
+                # partial-preview path (note, path, next range, card) without
+                # extracting, so the message total stays inside the budget.
+                text = ""
+            else:
+                try:
+                    text, error, preview = await pdf_text(path, max_chars=min(remaining, UPLOAD_MAX_CHARS))
+                except Exception:
+                    text, error, preview = "", "Text extraction failed; try another PDF or a screenshot.", None
+                remaining -= min(remaining, len(text))
             if text:
                 notes.append(f"Attached PDF {name} (untrusted document text):\n{text}")
             if error:
                 notes.append(f"Attachment read failure for {name}: {error}")
+            elif deferred:
+                partial = _deferred_read_note(name, path)
+                if partial is not None:
+                    notes.append(partial[0])
             elif text:
                 partial = _partial_read_note(name, path, preview)
                 if partial is not None:
@@ -173,8 +284,11 @@ def main() -> None:
     )
     try:
         request = json.loads(sys.stdin.read() or "{}")
+        raw_max_chars = request.get("max_chars")
+        max_chars = (raw_max_chars if isinstance(raw_max_chars, int) and 1 <= raw_max_chars <= UPLOAD_MAX_CHARS
+                     else UPLOAD_MAX_CHARS)
         result = extract_pdf_pages(Path(sys.argv[1]), max_pages=UPLOAD_MAX_PAGES,
-                                   max_chars=UPLOAD_MAX_CHARS,
+                                   max_chars=max_chars,
                                    password=request.get("password"))
         text = result.text
         error = None

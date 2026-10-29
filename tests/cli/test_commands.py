@@ -97,6 +97,10 @@ class _GatewayAgentContractStub:
     def pending_local_trigger_ids_for_session(_session_key: str) -> set[str]:
         return set()
 
+    @staticmethod
+    def session_context_window_tokens(_session_key: str) -> int | None:
+        return None
+
     async def submit_local_trigger_turn(
         self,
         _msg: InboundMessage,

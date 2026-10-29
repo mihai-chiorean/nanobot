@@ -48,6 +48,9 @@ class GatewayServices:
     local_trigger_store: LocalTriggerStore | None
     cron_pending_job_ids: Callable[[str], set[str]] | None
     local_trigger_pending_ids: Callable[[str], set[str]] | None
+    # Active session's context window in tokens, so upload-time PDF sizing can
+    # respect a 65k session instead of assuming the served model's window.
+    session_context_window: Callable[[str], int | None] | None = None
 
 
 def build_gateway_services(
@@ -68,6 +71,7 @@ def build_gateway_services(
     local_trigger_store: LocalTriggerStore | None = None,
     cron_pending_job_ids: Callable[[str], set[str]] | None = None,
     local_trigger_pending_ids: Callable[[str], set[str]] | None = None,
+    session_context_window: Callable[[str], int | None] | None = None,
     channel_feature_action: Callable[..., Any] | None = None,
     channel_runtime_status: Callable[[], dict[str, Any]] | None = None,
     mcp_runtime_status: Callable[[], Mapping[str, str]] | None = None,
@@ -157,4 +161,5 @@ def build_gateway_services(
         local_trigger_store=local_trigger_store,
         cron_pending_job_ids=cron_pending_job_ids,
         local_trigger_pending_ids=local_trigger_pending_ids,
+        session_context_window=session_context_window,
     )

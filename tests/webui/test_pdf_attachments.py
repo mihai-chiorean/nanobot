@@ -8,12 +8,14 @@ from pypdf import PdfWriter
 from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 
 from nanobot.webui.pdf_attachments import (
+    MIN_PREVIEW_CHARS,
     PDF_TEXT_TIMEOUT_SECONDS,
     UPLOAD_MAX_CHARS,
     UPLOAD_MAX_PAGES,
     parse_attachment_cards,
     pdf_text,
     prepare_pdfs,
+    upload_char_budget,
 )
 from nanobot.webui.transcript import append_transcript_object, build_webui_thread_response
 
@@ -42,7 +44,7 @@ def make_pdf(path: Path, text: str = "", *, encrypted: bool = False, algorithm: 
     writer.write(path)
 
 
-def make_long_pdf(path: Path, pages: int, *, page_chars: int) -> None:
+def make_long_pdf(path: Path, pages: int, *, page_chars: int, encrypted: bool = False) -> None:
     """Build a multi-page PDF whose marker text sits at the END of each page.
 
     Marker-last placement makes any silently dropped page tail visible: the
@@ -63,18 +65,20 @@ def make_long_pdf(path: Path, pages: int, *, page_chars: int) -> None:
         page[NameObject("/Resources")] = DictionaryObject({
             NameObject("/Font"): DictionaryObject({NameObject("/F1"): writer._add_object(font)})})
         page[NameObject("/Contents")] = writer._add_object(stream)
+    if encrypted:
+        writer.encrypt("fixture-password")
     writer.write(path)
 
 
 @pytest.mark.asyncio
 async def test_whole_document_loads_without_partial_notice(tmp_path: Path) -> None:
-    # Owner scope addition: with the raised upload caps the 147-page fixture
-    # (~446k chars) is loaded whole, so no page is hidden and no partial
-    # notice, path hint or paging instruction may appear.
+    # Owner scope addition + MIT-1967 review: on the served model's 262k window
+    # the 147-page fixture (~446k chars) is loaded whole, so no page is hidden
+    # and no partial notice, path hint or paging instruction may appear.
     assert UPLOAD_MAX_PAGES == 200 and UPLOAD_MAX_CHARS == 600_000
     path = tmp_path / "lease.pdf"
     make_long_pdf(path, 147, page_chars=3000)
-    note, statuses = await prepare_pdfs([str(path)], ["lease.pdf"])
+    note, statuses = await prepare_pdfs([str(path)], ["lease.pdf"], context_window_tokens=262_144)
     assert statuses[0]["error"] is None
     assert "partial" not in statuses[0]
     assert "read_file" not in note
@@ -89,8 +93,8 @@ async def test_whole_document_loads_without_partial_notice(tmp_path: Path) -> No
 @pytest.mark.asyncio
 async def test_over_cap_pdf_preview_is_labelled_and_points_to_the_full_document(tmp_path: Path) -> None:
     path = tmp_path / "statute.pdf"
-    make_long_pdf(path, 250, page_chars=3000)  # ~755k chars: past the 600k cap
-    note, statuses = await prepare_pdfs([str(path)], ["statute.pdf"])
+    make_long_pdf(path, 250, page_chars=3000)  # ~755k chars: past every budget
+    note, statuses = await prepare_pdfs([str(path)], ["statute.pdf"], context_window_tokens=262_144)
     status = statuses[0]
     assert status["error"] is None
     notice = re.fullmatch(
@@ -112,9 +116,131 @@ async def test_over_cap_pdf_preview_is_labelled_and_points_to_the_full_document(
     assert f"PAGE-{last_full + 1:03d}-MARKER" not in note  # cut page dropped whole, re-read on paging
     assert "read every remaining page range" in note
     assert "never claim to have read pages" in note
-    # The raised budget is the binding constraint (old 60k cap -> ~60k note),
-    # and the framing text never lets the note balloon past the cap.
-    assert 500_000 < len(note) < UPLOAD_MAX_CHARS + 10_000
+    # The session-sized budget is the binding constraint, and the framing text
+    # never lets the note balloon past it. A dropped cut page must not leave
+    # the collector's "... (truncated at N chars)" suffix behind (item 5).
+    assert 400_000 < len(note) <= upload_char_budget(262_144) + 5_000
+    assert "(truncated at" not in note
+
+
+def _assert_request_fits(note: str, window: int) -> None:
+    """The turn's request must survive ensure_request_fits, which raises
+    rather than trims (MIT-1967 review blocking item 1)."""
+    from unittest.mock import MagicMock
+
+    from nanobot.agent.context_governance import ContextGovernanceConfig, ContextGovernor
+
+    config = ContextGovernanceConfig(
+        provider=object(), model="test-model", tools=MagicMock(), workspace=None,
+        session_key="websocket:budget", max_tool_result_chars=16_000,
+        context_window_tokens=window,
+    )
+    ContextGovernor().ensure_request_fits(
+        config,
+        [{"role": "user", "content": "Review the documents.\n\n[Attachment processing note]\n" + note}],
+        tool_definitions=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_budget_sizes_whole_load_on_262k_and_partial_on_65k(tmp_path: Path) -> None:
+    # Review acceptance: a 147-page PDF loads whole at 262k and is partial at
+    # 65k, and neither case may raise ContextWindowExceededError.
+    path = tmp_path / "lease.pdf"
+    make_long_pdf(path, 147, page_chars=3000)
+    note, statuses = await prepare_pdfs([str(path)], ["lease.pdf"], context_window_tokens=65_536)
+    assert upload_char_budget(65_536) == int(65_536 * 0.45 * 4.0)
+    status = statuses[0]
+    assert status["error"] is None
+    notice = re.fullmatch(
+        r"Read pages 1–(\d+) of (\d+); Ziggy will read the rest on request",
+        status.get("partial", ""),
+    )
+    assert notice is not None, status
+    last_full, total = int(notice.group(1)), int(notice.group(2))
+    assert total == 147 and 0 < last_full < 147
+    assert f"pages 1–{last_full} of lease.pdf" in note
+    assert str(path) in note
+    assert f"PAGE-{last_full + 1:03d}-MARKER" not in note
+    assert len(note) <= upload_char_budget(65_536) + 5_000
+    _assert_request_fits(note, 65_536)
+    whole_note, whole_statuses = await prepare_pdfs(
+        [str(path)], ["lease.pdf"], context_window_tokens=262_144,
+    )
+    assert "partial" not in whole_statuses[0]
+    assert "PAGE-147-MARKER" in whole_note
+    _assert_request_fits(whole_note, 262_144)
+
+
+@pytest.mark.asyncio
+async def test_six_large_pdfs_share_the_budget_and_later_ones_are_partial(
+    tmp_path: Path,
+) -> None:
+    # Review acceptance: six attachments together stay inside the one
+    # aggregate budget — the 600k-per-file era let six files add 600k each.
+    paths: list[str] = []
+    names: list[str] = []
+    for index in range(6):
+        path = tmp_path / f"doc{index}.pdf"
+        make_long_pdf(path, 60, page_chars=3000)  # ~182k chars each
+        paths.append(str(path))
+        names.append(f"doc{index}.pdf")
+    note, statuses = await prepare_pdfs(paths, names, context_window_tokens=262_144)
+    budget = upload_char_budget(262_144)
+    assert len(note) <= budget + 6 * 600  # framing is bounded per attachment
+    for status in statuses:
+        assert status["error"] is None
+    # ~182k chars per file against a 471k budget: files 1-2 fit whole, the
+    # rest are budget-cut or deferred, but the message stays inside its budget.
+    assert "partial" not in statuses[0]
+    assert "partial" not in statuses[1]
+    for status, name in zip(statuses[2:], names[2:]):
+        assert status.get("partial"), (status, name)
+    assert "read every remaining page range" in note
+    _assert_request_fits(note, 262_144)
+
+
+@pytest.mark.asyncio
+async def test_page_beyond_budget_reports_zero_pages_not_one_to_zero(tmp_path: Path) -> None:
+    # Review item 4: when even page 1 does not fit, the note/card must not say
+    # "pages 1–0".
+    path = tmp_path / "wide.pdf"
+    make_long_pdf(path, 3, page_chars=3000)
+    note, statuses = await prepare_pdfs([str(path)], ["wide.pdf"], context_window_tokens=100)
+    assert upload_char_budget(100) == MIN_PREVIEW_CHARS
+    notice = statuses[0].get("partial", "")
+    assert notice == "Read 0 of 3 pages; Ziggy will read the rest on request"
+    assert "pages 1–0" not in note
+    assert "No page of wide.pdf (untrusted document text) was included in full above" in note
+    assert "pages='1-3'" in note
+
+
+@pytest.mark.asyncio
+async def test_budget_spent_attachments_get_deferred_note_and_card(tmp_path: Path) -> None:
+    # Once the aggregate budget is spent, later PDFs are not extracted at all;
+    # they still get the note, stored path, next range and partial card.
+    first = tmp_path / "first.pdf"
+    second = tmp_path / "second.pdf"
+    make_long_pdf(first, 160, page_chars=3000)  # ~485k chars: exhausts the 471k budget
+    make_long_pdf(second, 40, page_chars=3000)
+    note, statuses = await prepare_pdfs(
+        [str(first), str(second)], ["first.pdf", "second.pdf"], context_window_tokens=262_144,
+    )
+    assert re.fullmatch(r"Read pages 1–\d+ of 160; Ziggy will read the rest on request",
+                        statuses[0]["partial"])
+    assert statuses[1]["partial"] == "Not yet read; Ziggy will read it on request"
+    assert "No pages of second.pdf (untrusted document text) are shown above" in note
+    assert "attachment budget" in note
+    assert str(second) in note
+    assert "pages='1-20'" in note
+    assert note.count("Attached PDF second.pdf") == 0  # nothing of it was extracted
+    _assert_request_fits(note, 262_144)
+
+
+def test_upload_char_budget_default_and_ceiling() -> None:
+    assert upload_char_budget(None) == int(200_000 * 0.45 * 4.0)
+    assert upload_char_budget(1_048_576) == UPLOAD_MAX_CHARS
+    assert upload_char_budget(-5) == upload_char_budget(None)
 
 
 @pytest.mark.asyncio
@@ -146,7 +272,7 @@ async def test_600k_note_survives_sanitize_and_session_replay(tmp_path: Path) ->
 
     path = tmp_path / "legal.pdf"
     make_long_pdf(path, 147, page_chars=3000)
-    note, statuses = await prepare_pdfs([str(path)], ["legal.pdf"])
+    note, statuses = await prepare_pdfs([str(path)], ["legal.pdf"], context_window_tokens=262_144)
     assert "partial" not in statuses[0]
     dispatch = "Review the attached document.\n\n[Attachment processing note]\n" + note
     sanitized, was_injection = sanitize_input(dispatch)
@@ -177,7 +303,7 @@ async def test_large_pdf_frame_reaches_model_whole_and_stays_out_of_transcript(
     media.mkdir()
     path = tmp_path / "lease.pdf"
     make_long_pdf(path, 147, page_chars=3000)
-    channel = _make_channel()
+    channel = _make_channel(session_context_window=lambda _key: 262_144)
     origin = AsyncMock()
     with patch("nanobot.webui.media_gateway.get_media_dir", return_value=media):
         await channel._dispatch_envelope(origin, "client", {
@@ -586,3 +712,94 @@ async def test_rc4_r4_legacy_metadata_subprocess_end_to_end(tmp_path: Path, file
     assert not vault.records[attachment_id]["locked"]
     assert "fixture-password" not in vault.path.read_text()
     print("correct password: ready; extracted_text=verified (subprocess)")
+
+
+@pytest.mark.asyncio
+async def test_unlocked_encrypted_pdf_walked_to_the_end_returns_every_marker_once(
+    tmp_path: Path,
+) -> None:
+    # MIT-1967 review blocking item 3: paging an unlocked encrypted PDF must
+    # reach the final page, return every marker exactly once, keep each page
+    # read inside the default 16k tool-result budget, and never route the
+    # reader through read_file (which cannot decrypt the stored file).
+    from nanobot.webui.attachment_unlock import UNLOCK_PAGE_MAX_CHARS, AttachmentVault
+
+    path = tmp_path / "sealed.pdf"
+    make_long_pdf(path, 250, page_chars=3000, encrypted=True)
+    _, cards = await prepare_pdfs([str(path)], ["sealed.pdf"])
+    assert cards[0]["locked_reason"] == "password_required"
+    vault = AttachmentVault(tmp_path / "vault")
+    vault.register("chat", "user", cards, [str(path)], tmp_path)
+    attachment_id = cards[0]["attachment_id"]
+
+    result = await vault.unlock("chat", attachment_id, "fixture-password")
+    assert not result.startswith("Error"), result
+    results = [result]
+    assert re.search(
+        r"Read pages 1–\d+ of 250; Ziggy will read the rest on request",
+        vault.records[attachment_id]["partial"],
+    )
+    assert "unlock_attachment attachment_id=" in result
+    assert "read_file" not in result  # it cannot decrypt; the note must not suggest it
+    assert UNLOCK_PAGE_MAX_CHARS <= 12_000  # stays under the default 16k result budget
+
+    guard = 0
+    while "Continue with unlock_attachment" in results[-1]:
+        guard += 1
+        assert guard < 100, "page walk did not terminate"
+        match = re.search(r"pages='(\d+)-(\d+)'", results[-1])
+        assert match is not None
+        result = await vault.unlock(
+            "chat", attachment_id, "fixture-password",
+            pages=f"{match.group(1)}-{match.group(2)}",
+        )
+        assert not result.startswith("Error"), result
+        assert len(result) < 16_000
+        results.append(result)
+    assert "PAGE-250-MARKER" in results[-1]  # the walk ended at the last page
+
+    combined = "\n".join(results)
+    for index in range(1, 251):
+        assert combined.count(f"PAGE-{index:03d}-MARKER") == 1, index
+    assert vault.attempts[next(iter(vault.attempts))] == 1  # page reads never consume attempts
+    assert "fixture-password" not in vault.path.read_text()  # registry never stores it
+
+
+@pytest.mark.asyncio
+async def test_unlock_page_reads_survive_wrong_supplied_password(tmp_path: Path) -> None:
+    # Page reads after verification use the in-memory cached password; a stale
+    # password in a later call must still return the requested range.
+    from nanobot.webui.attachment_unlock import AttachmentVault
+
+    path = tmp_path / "sealed2.pdf"
+    make_long_pdf(path, 30, page_chars=200, encrypted=True)
+    _, cards = await prepare_pdfs([str(path)], ["sealed2.pdf"])
+    vault = AttachmentVault(tmp_path / "vault")
+    vault.register("chat", "user", cards, [str(path)], tmp_path)
+    attachment_id = cards[0]["attachment_id"]
+    first = await vault.unlock("chat", attachment_id, "fixture-password")
+    assert "PAGE-001-MARKER" in first
+    result = await vault.unlock("chat", attachment_id, "not-the-password", pages="25-30")
+    assert not result.startswith("Error"), result
+    assert "PAGE-025-MARKER" in result and "PAGE-030-MARKER" in result
+    assert "PAGE-001-MARKER" not in result  # only the requested range comes back
+
+
+@pytest.mark.asyncio
+async def test_unlock_page_range_error_and_missing_file(tmp_path: Path) -> None:
+    from nanobot.webui.attachment_unlock import AttachmentVault
+
+    path = tmp_path / "sealed3.pdf"
+    make_long_pdf(path, 5, page_chars=200, encrypted=True)
+    _, cards = await prepare_pdfs([str(path)], ["sealed3.pdf"])
+    vault = AttachmentVault(tmp_path / "vault")
+    vault.register("chat", "user", cards, [str(path)], tmp_path)
+    attachment_id = cards[0]["attachment_id"]
+    await vault.unlock("chat", attachment_id, "fixture-password")
+    bad = await vault.unlock("chat", attachment_id, "fixture-password", pages="9-3")
+    assert bad.startswith("Error: Invalid page range")
+    gone = await vault.unlock("chat", attachment_id, "fixture-password", pages="1-2")
+    assert "PAGE-001-MARKER" in gone
+    path.unlink()
+    missing = await vault.unlock("chat", attachment_id, "fixture-password", pages="1-2")
+    assert missing == "Error: The stored PDF is no longer available; ask the user to re-upload it."

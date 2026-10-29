@@ -210,6 +210,16 @@ class WebUICommandRouter:
     def workspace_full_access_available(self, connection: ServerConnection) -> bool:
         return self._http_router.workspace_full_access_available(connection)
 
+    def _session_context_window(self, session_key: str) -> int | None:
+        """Active session's context window; None lets prepare_pdfs decide."""
+        resolver = self.gateway.session_context_window
+        if resolver is None:
+            return None
+        try:
+            return resolver(session_key)
+        except Exception:
+            return None
+
     async def send_webui_protocol_error(
         self,
         connection: ServerConnection,
@@ -749,6 +759,8 @@ class WebUICommandRouter:
         attachment_statuses: list[AttachmentStatus] = []
         local_attachment_statuses: list[AttachmentStatus] = []
         attachment_note = ""
+        attachment_session = (temporary_policy.session_key if temporary_policy is not None
+                              else webui_session_key(chat_id))
         if raw_media is not None:
             if not isinstance(raw_media, list):
                 await reject(
@@ -775,7 +787,10 @@ class WebUICommandRouter:
                     f"Attachment read failure for {item['name']}: {detail}" for item in attachment_statuses
                 ) + "\nExplain these failures to the user in plain language."
             else:
-                attachment_note, attachment_statuses = await prepare_pdfs(media_paths, upload_names)
+                attachment_note, attachment_statuses = await prepare_pdfs(
+                    media_paths, upload_names,
+                    context_window_tokens=self._session_context_window(attachment_session),
+                )
                 local_attachment_statuses = attachment_statuses
             if temporary_policy is not None:
                 self._temporary_chats.register_media(connection, chat_id, media_paths)
@@ -813,8 +828,6 @@ class WebUICommandRouter:
             await reject("access_denied")
             return
 
-        attachment_session = (temporary_policy.session_key if temporary_policy is not None
-                              else webui_session_key(chat_id))
         if self._attachment_vault:
             from nanobot.config.paths import get_media_dir
             if envelope.get("attachment_unlock_bridge") is True:
@@ -1020,7 +1033,9 @@ class WebUICommandRouter:
         if attachment_statuses and (attachment_note or any(item.get("error") for item in attachment_statuses)):
             await self._transport.webui_send_event(
                 connection, "attachment.status", chat_id=chat_id,
-                client_message_id=client_message_id, attachments=attachment_statuses,
+                client_message_id=client_message_id,
+                **({"turn_id": turn_id} if turn_id else {}),
+                attachments=attachment_statuses,
             )
         if client_message_id is not None:
             await self._transport.send_message_ack(
@@ -1083,11 +1098,18 @@ class WebUICommandRouter:
 
     async def _attachment_unlocked(self, chat_id: str, origin: str, attachment_id: str) -> None:
         from nanobot.webui.transcript import update_attachment_display_state
-        update_attachment_display_state(webui_session_key(chat_id), attachment_id)
+        record = (self._attachment_vault.records.get(attachment_id)
+                  if self._attachment_vault else None)
+        partial = record.get("partial") if isinstance(record, dict) else None
+        partial = partial if isinstance(partial, str) and partial else None
+        update_attachment_display_state(webui_session_key(chat_id), attachment_id, partial)
         for connection in self._transport.webui_subscribers(chat_id):
             await self._transport.webui_send_event(
                 connection, "attachment.status", chat_id=chat_id,
                 client_message_id=origin, attachment_id=attachment_id, unlocked=True,
+                **({"attachments": [{"name": str(record["name"]), "error": None,
+                                     "partial": partial}]}
+                   if partial is not None and record else {}),
             )
 
     async def _claim_client_message(

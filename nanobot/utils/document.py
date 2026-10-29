@@ -515,8 +515,11 @@ def extract_pdf_pages(
         if length_before > 0:
             # Drop the page the budget cut so the caller's continuation range
             # re-reads it whole; keeping a prefix would strand its tail.
+            # The remaining pages are all whole, so the truncation marker
+            # belongs to the dropped page too (MIT-1967 review).
             del collector.parts[parts_before:]
             collector.length = length_before
+            collector.truncated = False
             end = index - 1
         else:
             partial_last_page = True

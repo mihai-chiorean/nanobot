@@ -994,6 +994,23 @@ class AgentLoop:
         self._publish_runtime_selection(runtime)
         return runtime
 
+    def session_context_window_tokens(self, session_key: str) -> int | None:
+        """Context window the next turn for ``session_key`` would run with.
+
+        Reads session metadata without creating the session; an unknown or
+        preset-less session gets the default runtime's window. Used to size
+        upload-time attachment payloads (MIT-1967 review).
+        """
+        record = self.sessions.read_session_metadata(session_key)
+        metadata = record.get("metadata") if isinstance(record, dict) else None
+        name = model_preset_from_metadata(metadata if isinstance(metadata, dict) else None)
+        if name is None:
+            return self.runtime_resolver.admit().context_window_tokens
+        try:
+            return self.runtime_resolver.resolve_preset(name).context_window_tokens
+        except KeyError:
+            return self.runtime_resolver.admit().context_window_tokens
+
     def runtime_for_session(
         self,
         session: Session,
@@ -1029,6 +1046,7 @@ class AgentLoop:
         session.metadata[SESSION_MODEL_PRESET_METADATA_KEY] = runtime.model_preset
         self.sessions.save(session)
         return runtime
+
     def _publish_runtime_selection(
         self,
         runtime: LLMRuntime,
