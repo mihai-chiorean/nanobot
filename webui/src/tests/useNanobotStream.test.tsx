@@ -2746,6 +2746,83 @@ describe("useNanobotStream", () => {
     expect(result.current.messages[0].media).toBe(after);
   });
 
+  it("routes the unlock notice to the uploading message by attachment_id", () => {
+    // MIT-1967 re-review item 5: the unlock frame arrives during a later turn
+    // (after the password reply), ignoring turn matching would land its card
+    // on the reply or the wrong tile. The upload frame stamps attachment_id on
+    // the tile; the unlock notice must be matched on that id.
+    const fake = fakeClient();
+    const { result } = renderHook(() => useNanobotStream("chat-unlock-route", EMPTY_MESSAGES), {
+      wrapper: wrap(fake.client),
+    });
+    const attachments = [
+      {
+        media: { data_url: "data:application/pdf;base64,AA==", name: "public.pdf" },
+        preview: { kind: "file" as const, url: "data:application/pdf;base64,AA==", name: "public.pdf" },
+      },
+      {
+        media: { data_url: "data:application/pdf;base64,BB==", name: "sealed.pdf" },
+        preview: { kind: "file" as const, url: "data:application/pdf;base64,BB==", name: "sealed.pdf" },
+      },
+    ];
+    act(() => {
+      result.current.send("review these", attachments);
+    });
+    act(() => {
+      fake.emit("chat-unlock-route", {
+        event: "attachment.status",
+        chat_id: "chat-unlock-route",
+        client_message_id: "upload-1",
+        turn_id: result.current.messages[0].turnId,
+        attachments: [
+          { name: "public.pdf", error: null },
+          { name: "sealed.pdf", error: "Password protected", attachment_id: "local_sealed" },
+        ],
+      });
+    });
+    expect(result.current.messages[0].media![1].attachment_id).toBe("local_sealed");
+
+    // The user replies with the password: a fresh user row becomes newest.
+    act(() => {
+      result.current.send("the password is hunter2");
+    });
+    const passwordRow = result.current.messages.at(-1)!;
+    expect(passwordRow.content).toBe("the password is hunter2");
+
+    act(() => {
+      fake.emit("chat-unlock-route", {
+        event: "attachment.status",
+        chat_id: "chat-unlock-route",
+        client_message_id: "upload-1",
+        attachment_id: "local_sealed",
+        unlocked: true,
+        attachments: [{ name: "sealed.pdf", error: null, partial: "Read pages 1–20 of 250; Ziggy will read the rest on request" }],
+      });
+    });
+
+    const upload = result.current.messages.find((message) =>
+      message.media?.some((tile) => tile.attachment_id === "local_sealed"));
+    expect(upload).toBeDefined();
+    expect(upload!.media![1].partial)
+      .toBe("Read pages 1–20 of 250; Ziggy will read the rest on request");
+    // Negative controls: the password reply and the other tile stay untouched.
+    expect(result.current.messages.at(-1)!.media).toBeUndefined();
+    expect(result.current.messages[0].media![0].partial).toBeUndefined();
+
+    // An id no tile carries must not touch anything.
+    const before = result.current.messages;
+    act(() => {
+      fake.emit("chat-unlock-route", {
+        event: "attachment.status",
+        chat_id: "chat-unlock-route",
+        attachment_id: "local_unknown",
+        unlocked: true,
+        attachments: [{ name: "ghost.pdf", error: null, partial: "Read pages 1–1 of 1" }],
+      });
+    });
+    expect(result.current.messages).toBe(before);
+  });
+
   it("inlines quoted context into the optimistic and outbound user message", () => {
     const fake = fakeClient();
     const { result } = renderHook(() => useNanobotStream("chat-quote", EMPTY_MESSAGES), {

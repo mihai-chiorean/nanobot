@@ -4,7 +4,7 @@ import { useTranslation } from "react-i18next";
 import { useThreadVisibility } from "@/hooks/useThreadVisibility";
 
 import { useClient } from "@/providers/ClientProvider";
-import { mergeAttachmentStatuses } from "@/lib/media";
+import { mergeAttachmentStatusById, mergeAttachmentStatuses } from "@/lib/media";
 import { resolveModelRequestFailureCopy } from "@/lib/model-request-failure";
 import { hasPendingAgentActivity } from "@/lib/activity-timeline";
 import type { StreamError } from "@/lib/nanobot-client";
@@ -113,6 +113,24 @@ function attachStatusToUserMessage(
   event: Extract<InboundEvent, { event: "attachment.status" }>,
 ): UIMessage[] {
   if (!event.attachments || event.attachments.length === 0) return messages;
+  if (event.attachment_id) {
+    // Unlock notices arrive during a later turn (the password reply is the
+    // newest user row), so they must be routed by the server-issued
+    // attachment_id their upload frame stamped on the tile — a positional or
+    // last-user merge lands the card on the wrong message (MIT-1967
+    // re-review item 5). No tile with that id: leave rows untouched.
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      if (message.role !== "user") continue;
+      const media = mergeAttachmentStatusById(
+        message.media, event.attachment_id, event.attachments[0]);
+      if (media === message.media) continue;
+      const next = [...messages];
+      next[index] = { ...message, media };
+      return next;
+    }
+    return messages;
+  }
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const message = messages[index];
     if (message.role !== "user") continue;
