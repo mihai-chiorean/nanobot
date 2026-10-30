@@ -91,9 +91,17 @@ def test_truncate_text_to_tokens_uses_utf8_byte_budget_fallback(monkeypatch) -> 
     assert len(result.encode("utf-8")) <= 40
 
 
-def test_estimate_prompt_tokens_caches_tools_encoding(monkeypatch) -> None:
+def _reset_encoding_caches() -> None:
     helpers._get_token_encoding.cache_clear()
     helpers._TOOLS_TOKEN_CACHE.clear()
+
+
+def test_estimate_prompt_tokens_caches_tools_encoding(monkeypatch, request) -> None:
+    _reset_encoding_caches()
+    # These tests fake tiktoken.get_encoding; _get_token_encoding is cached, so
+    # without this finalizer the fake encoding leaks into every later test in
+    # the session and silently rewrites their token estimates.
+    request.addfinalizer(_reset_encoding_caches)
 
     class FakeEncoding:
         def __init__(self) -> None:
@@ -123,11 +131,9 @@ def test_estimate_prompt_tokens_caches_tools_encoding(monkeypatch) -> None:
     assert get_encoding_calls == 1
     rendered_tools = "\n" + json.dumps(tools, ensure_ascii=False)
     assert fake_encoding.encoded.count(rendered_tools) == 1
-
-
-def test_estimate_prompt_tokens_recomputes_when_tool_items_change(monkeypatch) -> None:
-    helpers._get_token_encoding.cache_clear()
-    helpers._TOOLS_TOKEN_CACHE.clear()
+def test_estimate_prompt_tokens_recomputes_when_tool_items_change(monkeypatch, request) -> None:
+    _reset_encoding_caches()
+    request.addfinalizer(_reset_encoding_caches)
 
     class FakeEncoding:
         def __init__(self) -> None:
