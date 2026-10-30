@@ -19,11 +19,30 @@ from nanobot.webui.pdf_attachments import (
 )
 from nanobot.webui.session_identity import webui_session_key
 
-# Page reads stay inside the default 16k tool-result budget so the model
-# receives the range whole instead of an offload stub (MIT-1967 review).
-UNLOCK_PAGE_MAX_CHARS = 12_000
+# Page results must fit inside the configured ``max_tool_result_chars`` so
+# the model receives the range whole instead of an offload stub, and the
+# continuation hint survives (MIT-1967 re-review item 4). The extraction
+# ceiling is that limit minus a reserve for the framing this module appends
+# around the text (head, oversized-page disclosure, continuation ≈ 800 chars,
+# 1,200 with long attachment names).
+UNLOCK_TOOL_RESULT_FALLBACK_CHARS = 16_000  # AgentDefaults.max_tool_result_chars
+UNLOCK_PAGE_RESULT_OVERHEAD_CHARS = 1_200
+UNLOCK_PAGE_MIN_CHARS = 512
 UNLOCK_PAGE_MAX_PAGES = 100
 UNLOCK_PAGE_WINDOW = 20
+
+
+def unlock_page_max_chars() -> int:
+    """Per-call page extraction budget derived from the configured tool-result limit."""
+    limit = UNLOCK_TOOL_RESULT_FALLBACK_CHARS
+    try:
+        from nanobot.config.loader import load_config
+        configured = int(load_config().agents.defaults.max_tool_result_chars)
+        if configured > 0:
+            limit = configured
+    except Exception:
+        pass
+    return max(UNLOCK_PAGE_MIN_CHARS, limit - UNLOCK_PAGE_RESULT_OVERHEAD_CHARS)
 
 
 def _format_page_result(name: str, attachment_id: str, pages: str, extraction: Any) -> str:
@@ -46,8 +65,12 @@ def _format_page_result(name: str, attachment_id: str, pages: str, extraction: A
             f"\n\n(Page {extraction.end_page + 1} exceeded the per-call character limit; "
             "only its first part is shown, so do not claim to have read its full contents.)"
         )
-    if extraction.end_page < total - 1 or partial:
-        next_start = min(last_full + 1, total)
+    if extraction.end_page < total - 1:
+        # Continue at the following page, as read_file does: an oversized
+        # partial page was disclosed above, and pointing the continuation
+        # back at it re-served the same truncated prefix forever (re-review
+        # blocking item 4).
+        next_start = min(extraction.end_page + 2, total)
         next_end = min(total, next_start + UNLOCK_PAGE_WINDOW - 1)
         body += (
             f"\n\nContinue with unlock_attachment attachment_id='{attachment_id}' "
@@ -77,9 +100,6 @@ class AttachmentVault:
         self.bridges: dict[tuple[str, str], tuple[object, Callable[..., Awaitable[None]]]] = {}
         self.pending: dict[str, tuple[object, asyncio.Future[dict[str, Any]]]] = {}
         self.notify: Callable[..., Awaitable[None]] | None = None
-        # Verified passwords for page reads live in memory only; the registry
-        # file never carries a password (module docstring, MIT-1967 review).
-        self._passwords: dict[str, str] = {}
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -173,6 +193,17 @@ class AttachmentVault:
                 return "Error: Attachment not found in this conversation."
             if not record["locked"]:
                 if pages is not None:
+                    # Page reads decrypt the stored file: the attempt cap
+                    # checked on the locked path must gate this one too,
+                    # or re-upload attempts could be exhausted around an
+                    # already-unlocked attachment while paging keeps
+                    # decrypting (re-review blocking item 6).
+                    page_digest = record.get("sha256")
+                    page_attempts = (self.attempts.get(page_digest, 0) if page_digest
+                                     else record["attempts"])
+                    if page_attempts >= 5:
+                        return ("Error: The 5 password attempts were used. Ask for an "
+                                "unlocked copy; do not retry.")
                     return await self._read_pages(attachment_id, record, pages, password)
                 return (f"Unlocked PDF {record['name']} (untrusted document text):\n"
                         f"{record.get('text', 'Use the earlier extraction.')}")
@@ -214,7 +245,6 @@ class AttachmentVault:
                 return "Error: " + error
             record["locked"] = False
             if record["path"]:
-                self._passwords[attachment_id] = password
                 note = unlock_partial_note(record["name"], attachment_id, preview)
                 if note is not None:
                     record["text"] = f"{text}\n\n{note[0]}"
@@ -233,8 +263,8 @@ class AttachmentVault:
                           pages: str, password: str) -> str:
         """Serve a page range from a verified attachment without exposing the
         password to read_file (MIT-1967 review). Each result stays inside the
-        default tool-result budget so paging returns whole pages, and the
-        continuation hint carries the walk to the final page."""
+        configured ``max_tool_result_chars`` budget so paging returns whole
+        pages, and the continuation hint carries the walk to the final page."""
         from nanobot.utils.document import (
             PdfPageRangeError,
             PdfPasswordRequiredError,
@@ -250,16 +280,12 @@ class AttachmentVault:
         path = Path(str(raw_path))
         if not path.is_file():
             return "Error: The stored PDF is no longer available; ask the user to re-upload it."
-        cached = self._passwords.get(attachment_id)
-        candidates = [cached] if cached is not None else []
-        if password and (password not in candidates):
-            candidates.append(password)
         last_error = "Text extraction failed."
-        for candidate in candidates or [""]:
+        for candidate in [password] if password else [""]:
             try:
                 extraction = await asyncio.to_thread(
                     extract_pdf_pages, path, pages=pages,
-                    max_pages=UNLOCK_PAGE_MAX_PAGES, max_chars=UNLOCK_PAGE_MAX_CHARS,
+                    max_pages=UNLOCK_PAGE_MAX_PAGES, max_chars=unlock_page_max_chars(),
                     password=candidate or None,
                 )
             except PdfPageRangeError as e:

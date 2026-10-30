@@ -8,7 +8,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import NotRequired, TypedDict, cast
 
-from nanobot.utils.helpers import safe_filename
+from nanobot.utils.helpers import estimate_prompt_tokens, safe_filename
 
 
 class AttachmentStatus(TypedDict):
@@ -34,39 +34,49 @@ UPLOAD_MAX_CHARS = 600_000
 # active session's context window so a 65k session never receives a note that
 # `ContextGovernor.ensure_request_fits` would reject outright (it raises
 # instead of trimming). Attachments get full text in order while the budget
-# allows; the rest take the partial-preview path. The share is 45% at
-# 4 chars/token rather than the review's suggested ~40% at ~3.5 because
-# 0.40 × 262,144 × 3.5 = 367,002 chars cannot hold the 446,085-char 147-page
-# legal fixture whole, which the acceptance criteria pin at 262k. Under the
-# repo's own tiktoken estimator the resulting worst-case attachment payload is
-# ~31% of a 262,144-token window.
+# allows; the rest take the partial-preview path. Admission is measured in
+# *estimated tokens* with the very estimator chain the governor uses
+# (`estimate_prompt_tokens`, tiktoken with the conservative byte fallback),
+# never a fixed chars/token ratio: the byte fallback charges ~1 token per
+# byte, so a chars/token budget of 4 let an English PDF admit 4x more text
+# than the governor then accepted (MIT-1967 re-review, blocking item 1).
 ATTACHMENT_CONTEXT_TOKEN_SHARE = 0.45
-ATTACHMENT_CHARS_PER_TOKEN = 4.0
-# `AgentDefaults.context_window_tokens` (schema default); used when the
-# gateway cannot resolve the active session's window.
-DEFAULT_CONTEXT_WINDOW_TOKENS = 200_000
+# Smallest context window the WebUI settings offer (settings_models.py
+# _CONTEXT_WINDOW_TOKEN_OPTIONS). An unresolvable window is treated as this
+# size, never a larger guess: over-assuming a window is what made the
+# governor reject the whole turn (re-review blocking item 2).
+MINIMUM_KNOWN_CONTEXT_WINDOW = 65_536
 # Even a budget-exhausted attachment keeps a real first-page preview so its
 # note and partial card can name the true total page count and next range.
 MIN_PREVIEW_CHARS = 2_048
+# Byte-fallback floor for a MIN_PREVIEW_CHARS ASCII preview: extraction is
+# only attempted while this many estimated tokens remain.
+MIN_PREVIEW_TOKENS = MIN_PREVIEW_CHARS
 # 200 pages of pypdf extraction can exceed the old 15 s budget on the Spark.
 PDF_TEXT_TIMEOUT_SECONDS = 60
 
 
-def upload_char_budget(context_window_tokens: int | None) -> int:
-    """Aggregate char budget one message's PDF texts may consume in total."""
-    window = context_window_tokens or DEFAULT_CONTEXT_WINDOW_TOKENS
-    if window <= 0:
-        window = DEFAULT_CONTEXT_WINDOW_TOKENS
-    budget = int(window * ATTACHMENT_CONTEXT_TOKEN_SHARE * ATTACHMENT_CHARS_PER_TOKEN)
-    return max(MIN_PREVIEW_CHARS, min(budget, UPLOAD_MAX_CHARS))
+def attachment_token_budget(context_window_tokens: int | None) -> int:
+    """Aggregate estimated-token budget one message's PDF texts may share.
+
+    The per-file ``UPLOAD_MAX_CHARS`` ceiling still caps how much any single
+    document contributes; the budget below then admits documents only while
+    their summed *estimated* tokens fit the session's window share.
+    """
+    window = context_window_tokens if context_window_tokens and context_window_tokens > 0 \
+        else MINIMUM_KNOWN_CONTEXT_WINDOW
+    return int(window * ATTACHMENT_CONTEXT_TOKEN_SHARE)
 
 
-async def pdf_text(
+def attachment_token_estimate(text: str) -> int:
+    """Estimated prompt tokens the governor will charge for one note body."""
+    return estimate_prompt_tokens([{"role": "user", "content": text}])
+
+
+async def _run_pdf_request(
     path: Path,
-    *,
-    timeout: float = PDF_TEXT_TIMEOUT_SECONDS,
-    password: str | None = None,
-    max_chars: int = UPLOAD_MAX_CHARS,
+    request: dict[str, object],
+    timeout: float,
 ) -> tuple[str, str | None, PdfPreview | None]:
     # A process, rather than a timed-out thread, lets us stop a stuck parser.
     process = await asyncio.create_subprocess_exec(
@@ -74,7 +84,6 @@ async def pdf_text(
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
     )
-    request = {"password": password, "max_chars": max_chars}
     try:
         stdout, _ = await asyncio.wait_for(process.communicate(json.dumps(request).encode()), timeout)
         if process.returncode != 0:
@@ -96,6 +105,30 @@ async def pdf_text(
         if process.returncode is None:
             process.kill()
             await process.wait()
+
+
+async def pdf_text(
+    path: Path,
+    *,
+    timeout: float = PDF_TEXT_TIMEOUT_SECONDS,
+    password: str | None = None,
+    max_chars: int = UPLOAD_MAX_CHARS,
+) -> tuple[str, str | None, PdfPreview | None]:
+    return await _run_pdf_request(
+        path, {"password": password, "max_chars": max_chars}, timeout)
+
+
+async def pdf_encryption_error(
+    path: Path,
+    *,
+    timeout: float = PDF_TEXT_TIMEOUT_SECONDS,
+) -> str | None:
+    """Run only the encryption check, so a deferred attachment still gets
+    the locked flow (re-review blocking item 3: a deferred encrypted PDF
+    used to miss ``locked_reason`` and its note pointed at ``read_file``,
+    which cannot decrypt)."""
+    _, error, _ = await _run_pdf_request(path, {"check_encrypted": True}, timeout)
+    return error
 
 
 def attachment_name(item: object) -> str:
@@ -153,7 +186,12 @@ def _partial_read_note(
     if not (preview["end_page"] < total - 1 or preview["partial_last_page"]):
         return None
     last_full = preview["end_page"] + 1 - (1 if preview["partial_last_page"] else 0)
-    next_start = min(last_full + 1, total)
+    # Continue at the page after the one the result walked to, mirroring
+    # read_file: an oversized partial page was disclosed by the text itself,
+    # and pointing the continuation back at it would re-serve the same
+    # truncated prefix forever (re-review blocking item 4).
+    has_more = preview["end_page"] < total - 1
+    next_start = min(preview["end_page"] + 2, total)
     next_end = min(total, next_start + _READ_FILE_PAGE_WINDOW - 1)
     quoted = str(path) if path is not None else ""
     if continuation is None:
@@ -166,11 +204,15 @@ def _partial_read_note(
         else f"Only pages 1–{last_full} of {name} (untrusted document text) are shown above"
     )
     readable = f" The full stored file is readable at {quoted}." if mentions_stored_file else ""
+    walk = (
+        f" Continue with {continuation(next_start, next_end)} and keep paging "
+        f"with the range each result suggests until page {total} is covered."
+        if has_more
+        else ""
+    )
     note = (
-        f"{shown}; the document has {total} pages in total.{readable} "
-        f"Continue with {continuation(next_start, next_end)} and keep paging "
-        "with the range each result suggests until page "
-        f"{total} is covered. Never claim to have read pages you have not."
+        f"{shown}; the document has {total} pages in total.{readable}{walk} "
+        "Never claim to have read pages you have not."
     )
     card = (
         f"Read 0 of {total} pages; Ziggy will read the rest on request"
@@ -216,6 +258,31 @@ def _deferred_read_note(name: str, path: Path) -> tuple[str, str]:
     return note, card
 
 
+async def _extract_pdf_within_budget(
+    path: Path,
+    remaining_tokens: int,
+) -> tuple[str, str | None, PdfPreview | None]:
+    """Extract a PDF whose admitted text stays inside the turn's token budget.
+
+    The first pass runs under the per-file char ceiling; when its measured
+    estimate overshoots, one re-extraction takes the slice sized from the
+    document's own tokens-per-char density. Char maths alone cannot size the
+    retry: the byte fallback (and CJK-dense text) charges far more tokens
+    than the char count suggests (re-review blocking item 1).
+    """
+    text, error, preview = await pdf_text(path, max_chars=UPLOAD_MAX_CHARS)
+    if not text or error:
+        return text, error, preview
+    estimated = attachment_token_estimate(text)
+    if estimated <= remaining_tokens:
+        return text, error, preview
+    scaled = int(len(text) * remaining_tokens / max(estimated, 1) * 0.9)
+    scaled = max(MIN_PREVIEW_CHARS, min(UPLOAD_MAX_CHARS, scaled))
+    if scaled >= len(text):
+        return text, error, preview  # Cannot shrink further; the clamp below pays for it.
+    return await pdf_text(path, max_chars=scaled)
+
+
 async def prepare_pdfs(
     paths: list[str],
     names: list[str] | None = None,
@@ -224,8 +291,8 @@ async def prepare_pdfs(
 ) -> tuple[str, list[AttachmentStatus]]:
     notes: list[str] = []
     statuses: list[AttachmentStatus] = []
-    budget = upload_char_budget(context_window_tokens)
-    remaining = budget
+    remaining = attachment_token_budget(context_window_tokens)
+    extracted_any = False
     for index, raw in enumerate(paths):
         path = Path(raw)
         name = names[index] if names and index < len(names) else path.name
@@ -233,18 +300,24 @@ async def prepare_pdfs(
         partial: tuple[str, str] | None = None
         if path.suffix.lower() == ".pdf":
             preview: PdfPreview | None = None
-            deferred = remaining < MIN_PREVIEW_CHARS
+            deferred = extracted_any and remaining < MIN_PREVIEW_TOKENS
             if deferred:
                 # The aggregate budget is spent: later attachments keep the
-                # partial-preview path (note, path, next range, card) without
-                # extracting, so the message total stays inside the budget.
+                # partial-preview path without extracting, so the message
+                # total stays inside the budget. The cheap encryption check
+                # still runs so a protected file gets the normal locked flow
+                # instead of a read_file instruction it cannot follow.
                 text = ""
+                error = await pdf_encryption_error(path)
             else:
                 try:
-                    text, error, preview = await pdf_text(path, max_chars=min(remaining, UPLOAD_MAX_CHARS))
+                    text, error, preview = await _extract_pdf_within_budget(path, remaining)
                 except Exception:
                     text, error, preview = "", "Text extraction failed; try another PDF or a screenshot.", None
-                remaining -= min(remaining, len(text))
+                if text:
+                    note_body = f"Attached PDF {name} (untrusted document text):\n{text}"
+                    remaining -= min(remaining, attachment_token_estimate(note_body))
+                    extracted_any = True
             if text:
                 notes.append(f"Attached PDF {name} (untrusted document text):\n{text}")
             if error:
@@ -284,6 +357,19 @@ def main() -> None:
     )
     try:
         request = json.loads(sys.stdin.read() or "{}")
+        if request.get("check_encrypted") is True:
+            # Deferred attachments (budget spent) need only the encryption
+            # bit, at reader-open cost, to keep the locked flow alive.
+            from pypdf import PdfReader
+            reader = PdfReader(Path(sys.argv[1]), strict=False)
+            locked = reader.is_encrypted and not reader.decrypt("")
+            print(json.dumps({
+                "text": "",
+                "error": ("This PDF is password protected. Ask the user for its password."
+                          if locked else None),
+                "preview": None,
+            }))
+            return
         raw_max_chars = request.get("max_chars")
         max_chars = (raw_max_chars if isinstance(raw_max_chars, int) and 1 <= raw_max_chars <= UPLOAD_MAX_CHARS
                      else UPLOAD_MAX_CHARS)

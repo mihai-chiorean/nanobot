@@ -8,14 +8,15 @@ from pypdf import PdfWriter
 from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 
 from nanobot.webui.pdf_attachments import (
-    MIN_PREVIEW_CHARS,
+    ATTACHMENT_CONTEXT_TOKEN_SHARE,
     PDF_TEXT_TIMEOUT_SECONDS,
     UPLOAD_MAX_CHARS,
     UPLOAD_MAX_PAGES,
+    attachment_token_budget,
+    attachment_token_estimate,
     parse_attachment_cards,
     pdf_text,
     prepare_pdfs,
-    upload_char_budget,
 )
 from nanobot.webui.transcript import append_transcript_object, build_webui_thread_response
 
@@ -25,6 +26,22 @@ def isolate_attachment_transcripts(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     # Earlier agent tests may select an active config root. Attachment history
     # fixtures must not inherit that root or authorize a stale test attachment.
     monkeypatch.setattr("nanobot.config.paths.get_data_dir", lambda: tmp_path / "data")
+
+
+@pytest.fixture(autouse=True)
+def deterministic_tool_result_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Unlock page budget follows the configured max_tool_result_chars; pin the
+    # default so machine-level ~/.nanobot/config.json cannot move the goalposts.
+    from nanobot.config.schema import Config
+
+    monkeypatch.setattr("nanobot.config.loader.load_config", lambda *a, **k: Config())
+    # Admission decisions read real token estimates; a fake encoding left in
+    # the cached _get_token_encoding by another module's tiktoken fakes would
+    # silently change which PDFs fit the budget, so start from the real one.
+    from nanobot.utils import helpers as _helpers
+
+    _helpers._get_token_encoding.cache_clear()
+    _helpers._TOOLS_TOKEN_CACHE.clear()
 
 
 def make_pdf(path: Path, text: str = "", *, encrypted: bool = False, algorithm: str = "AES-256") -> None:
@@ -119,7 +136,8 @@ async def test_over_cap_pdf_preview_is_labelled_and_points_to_the_full_document(
     # The session-sized budget is the binding constraint, and the framing text
     # never lets the note balloon past it. A dropped cut page must not leave
     # the collector's "... (truncated at N chars)" suffix behind (item 5).
-    assert 400_000 < len(note) <= upload_char_budget(262_144) + 5_000
+    assert 400_000 < len(note)
+    assert attachment_token_estimate(note) <= attachment_token_budget(262_144) + 5_000
     assert "(truncated at" not in note
 
 
@@ -145,11 +163,13 @@ def _assert_request_fits(note: str, window: int) -> None:
 @pytest.mark.asyncio
 async def test_budget_sizes_whole_load_on_262k_and_partial_on_65k(tmp_path: Path) -> None:
     # Review acceptance: a 147-page PDF loads whole at 262k and is partial at
-    # 65k, and neither case may raise ContextWindowExceededError.
+    # 65k, and neither case may raise ContextWindowExceededError. Admission is
+    # measured with the governor's own estimator (re-review item 1), so the
+    # budget is expressed in estimated tokens, not chars.
     path = tmp_path / "lease.pdf"
     make_long_pdf(path, 147, page_chars=3000)
     note, statuses = await prepare_pdfs([str(path)], ["lease.pdf"], context_window_tokens=65_536)
-    assert upload_char_budget(65_536) == int(65_536 * 0.45 * 4.0)
+    assert attachment_token_budget(65_536) == int(65_536 * ATTACHMENT_CONTEXT_TOKEN_SHARE)
     status = statuses[0]
     assert status["error"] is None
     notice = re.fullmatch(
@@ -162,7 +182,7 @@ async def test_budget_sizes_whole_load_on_262k_and_partial_on_65k(tmp_path: Path
     assert f"pages 1–{last_full} of lease.pdf" in note
     assert str(path) in note
     assert f"PAGE-{last_full + 1:03d}-MARKER" not in note
-    assert len(note) <= upload_char_budget(65_536) + 5_000
+    assert attachment_token_estimate(note) <= attachment_token_budget(65_536) + 5_000
     _assert_request_fits(note, 65_536)
     whole_note, whole_statuses = await prepare_pdfs(
         [str(path)], ["lease.pdf"], context_window_tokens=262_144,
@@ -170,6 +190,32 @@ async def test_budget_sizes_whole_load_on_262k_and_partial_on_65k(tmp_path: Path
     assert "partial" not in whole_statuses[0]
     assert "PAGE-147-MARKER" in whole_note
     _assert_request_fits(whole_note, 262_144)
+
+
+@pytest.mark.asyncio
+async def test_byte_fallback_estimator_never_over_admits_at_any_preset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Re-review blocking item 1: the budget must use the same estimator the
+    # governor uses in ensure_request_fits, including its byte-count fallback.
+    # With the fallback forced on, an English PDF in a 65,536-token session
+    # used to admit ~118k estimated tokens against a 56k governor budget and
+    # raised ContextWindowExceededError; same at 200k and 262k.
+    import nanobot.utils.helpers as helpers
+
+    def broken_encoding() -> object:
+        raise RuntimeError("estimator fallback forced by test")
+
+    monkeypatch.setattr(helpers, "_get_token_encoding", broken_encoding)
+    path = tmp_path / "lease.pdf"
+    make_long_pdf(path, 147, page_chars=3000)
+    for window in (65_536, 200_000, 262_144):
+        note, statuses = await prepare_pdfs(
+            [str(path)], ["lease.pdf"], context_window_tokens=window)
+        assert statuses[0]["error"] is None
+        assert "partial" in statuses[0], f"byte-estimated 446k payload cannot fit {window}"
+        assert attachment_token_estimate(note) <= attachment_token_budget(window) + 5_000
+        _assert_request_fits(note, window)
 
 
 @pytest.mark.asyncio
@@ -186,15 +232,17 @@ async def test_six_large_pdfs_share_the_budget_and_later_ones_are_partial(
         paths.append(str(path))
         names.append(f"doc{index}.pdf")
     note, statuses = await prepare_pdfs(paths, names, context_window_tokens=262_144)
-    budget = upload_char_budget(262_144)
-    assert len(note) <= budget + 6 * 600  # framing is bounded per attachment
+    budget = attachment_token_budget(262_144)
+    assert attachment_token_estimate(note) <= budget + 6 * 600  # framing bounded per attachment
     for status in statuses:
         assert status["error"] is None
-    # ~182k chars per file against a 471k budget: files 1-2 fit whole, the
-    # rest are budget-cut or deferred, but the message stays inside its budget.
+    # ~33k estimated tokens per file against a ~118k budget: the first files
+    # fit whole in order, then the budget-cut file and the deferred tail carry
+    # the partial card, but the message stays inside its budget.
     assert "partial" not in statuses[0]
     assert "partial" not in statuses[1]
-    for status, name in zip(statuses[2:], names[2:]):
+    assert "partial" not in statuses[2]
+    for status, name in zip(statuses[3:], names[3:]):
         assert status.get("partial"), (status, name)
     assert "read every remaining page range" in note
     _assert_request_fits(note, 262_144)
@@ -203,16 +251,41 @@ async def test_six_large_pdfs_share_the_budget_and_later_ones_are_partial(
 @pytest.mark.asyncio
 async def test_page_beyond_budget_reports_zero_pages_not_one_to_zero(tmp_path: Path) -> None:
     # Review item 4: when even page 1 does not fit, the note/card must not say
-    # "pages 1–0".
+    # "pages 1–0". The continuation starts after the disclosed oversized page,
+    # as read_file's own walk does (re-review item 4).
     path = tmp_path / "wide.pdf"
     make_long_pdf(path, 3, page_chars=3000)
     note, statuses = await prepare_pdfs([str(path)], ["wide.pdf"], context_window_tokens=100)
-    assert upload_char_budget(100) == MIN_PREVIEW_CHARS
+    assert attachment_token_budget(100) == int(100 * ATTACHMENT_CONTEXT_TOKEN_SHARE)
     notice = statuses[0].get("partial", "")
     assert notice == "Read 0 of 3 pages; Ziggy will read the rest on request"
     assert "pages 1–0" not in note
     assert "No page of wide.pdf (untrusted document text) was included in full above" in note
-    assert "pages='1-3'" in note
+    assert "pages='2-3'" in note
+
+
+def test_attachment_token_budget_falls_back_to_smallest_preset() -> None:
+    # Re-review blocking item 2: an unresolvable session window must be
+    # treated as the smallest preset the settings offer (65,536), never the
+    # 200,000 schema default — over-assuming the window is what let the
+    # governor reject the whole turn.
+    assert attachment_token_budget(None) == attachment_token_budget(65_536)
+    assert attachment_token_budget(None) == int(65_536 * ATTACHMENT_CONTEXT_TOKEN_SHARE)
+    assert attachment_token_budget(-5) == attachment_token_budget(None)
+    assert attachment_token_budget(262_144) == int(262_144 * ATTACHMENT_CONTEXT_TOKEN_SHARE)
+
+
+@pytest.mark.asyncio
+async def test_unknown_window_prepares_like_the_smallest_preset(tmp_path: Path) -> None:
+    # The same 147-page fixture that loads whole at 262k must stay partial —
+    # and inside the governor — when the gateway could not resolve the
+    # session's window (context_window_tokens=None).
+    path = tmp_path / "lease.pdf"
+    make_long_pdf(path, 147, page_chars=3000)
+    note, statuses = await prepare_pdfs([str(path)], ["lease.pdf"])
+    assert "partial" in statuses[0]  # a 200k default would have loaded it whole
+    assert attachment_token_estimate(note) <= attachment_token_budget(None) + 5_000
+    _assert_request_fits(note, 65_536)
 
 
 @pytest.mark.asyncio
@@ -221,26 +294,63 @@ async def test_budget_spent_attachments_get_deferred_note_and_card(tmp_path: Pat
     # they still get the note, stored path, next range and partial card.
     first = tmp_path / "first.pdf"
     second = tmp_path / "second.pdf"
-    make_long_pdf(first, 160, page_chars=3000)  # ~485k chars: exhausts the 471k budget
-    make_long_pdf(second, 40, page_chars=3000)
+    third = tmp_path / "third.pdf"
+    make_long_pdf(first, 250, page_chars=3000)  # ~755k chars: exhausts the token budget
+    make_long_pdf(second, 60, page_chars=3000)  # budget-cut continuation candidate
+    make_long_pdf(third, 40, page_chars=3000)   # deferred outright
     note, statuses = await prepare_pdfs(
-        [str(first), str(second)], ["first.pdf", "second.pdf"], context_window_tokens=262_144,
+        [str(first), str(second), str(third)],
+        ["first.pdf", "second.pdf", "third.pdf"],
+        context_window_tokens=262_144,
     )
-    assert re.fullmatch(r"Read pages 1–\d+ of 160; Ziggy will read the rest on request",
+    assert re.fullmatch(r"Read pages 1–\d+ of 250; Ziggy will read the rest on request",
                         statuses[0]["partial"])
-    assert statuses[1]["partial"] == "Not yet read; Ziggy will read it on request"
-    assert "No pages of second.pdf (untrusted document text) are shown above" in note
+    assert re.fullmatch(r"Read pages 1–\d+ of 60; Ziggy will read the rest on request",
+                        statuses[1]["partial"])
+    assert statuses[2]["partial"] == "Not yet read; Ziggy will read it on request"
+    assert "No pages of third.pdf (untrusted document text) are shown above" in note
     assert "attachment budget" in note
-    assert str(second) in note
+    assert str(third) in note
     assert "pages='1-20'" in note
-    assert note.count("Attached PDF second.pdf") == 0  # nothing of it was extracted
+    assert note.count("Attached PDF third.pdf") == 0  # nothing of it was extracted
     _assert_request_fits(note, 262_144)
 
 
-def test_upload_char_budget_default_and_ceiling() -> None:
-    assert upload_char_budget(None) == int(200_000 * 0.45 * 4.0)
-    assert upload_char_budget(1_048_576) == UPLOAD_MAX_CHARS
-    assert upload_char_budget(-5) == upload_char_budget(None)
+@pytest.mark.asyncio
+async def test_deferred_encrypted_attachment_still_gets_locked_flow(tmp_path: Path) -> None:
+    # Re-review blocking item 3: once the budget is spent, a later encrypted
+    # PDF used to skip parsing entirely — no locked_reason, no unlock
+    # registration, and its note sent the model to read_file, which cannot
+    # decrypt. The cheap encryption check must still run for deferred files.
+    from nanobot.webui.attachment_unlock import AttachmentVault
+
+    first = tmp_path / "first.pdf"
+    second = tmp_path / "second.pdf"
+    sealed = tmp_path / "sealed.pdf"
+    make_long_pdf(first, 250, page_chars=3000)  # exhausts the 262k token budget
+    make_long_pdf(second, 60, page_chars=3000)  # budget-cut: drains the remainder
+    make_pdf(sealed, "Deferred secret text", encrypted=True)
+    note, statuses = await prepare_pdfs(
+        [str(first), str(second), str(sealed)],
+        ["first.pdf", "second.pdf", "sealed.pdf"],
+        context_window_tokens=262_144,
+    )
+    assert "partial" not in statuses[2]  # locked flow, not the deferred read_file note
+    assert statuses[2]["error"] == "This PDF is password protected. Ask the user for its password."
+    assert statuses[2]["locked_reason"] == "password_required"
+    assert "No pages of sealed.pdf" not in note  # no read_file pointer for an encrypted file
+    assert f"read_file path={sealed}" not in note
+    assert "Attachment read failure for sealed.pdf" in note
+    assert "Use unlock_attachment for a supplied PDF password" in note
+    # The normal locked flow: registration, note listing, and a real unlock.
+    vault = AttachmentVault(tmp_path / "vault-deferred")
+    vault.register("chat", "user", statuses, [str(first), str(second), str(sealed)], tmp_path)
+    attachment_id = statuses[2].get("attachment_id")
+    assert attachment_id, statuses[2]
+    assert "sealed.pdf" in vault.note("chat")
+    unlocked = await vault.unlock("chat", attachment_id, "password")
+    assert "Deferred secret text" in unlocked
+    _assert_request_fits(note, 262_144)
 
 
 @pytest.mark.asyncio
@@ -722,7 +832,7 @@ async def test_unlocked_encrypted_pdf_walked_to_the_end_returns_every_marker_onc
     # reach the final page, return every marker exactly once, keep each page
     # read inside the default 16k tool-result budget, and never route the
     # reader through read_file (which cannot decrypt the stored file).
-    from nanobot.webui.attachment_unlock import UNLOCK_PAGE_MAX_CHARS, AttachmentVault
+    from nanobot.webui.attachment_unlock import AttachmentVault, unlock_page_max_chars
 
     path = tmp_path / "sealed.pdf"
     make_long_pdf(path, 250, page_chars=3000, encrypted=True)
@@ -741,7 +851,7 @@ async def test_unlocked_encrypted_pdf_walked_to_the_end_returns_every_marker_onc
     )
     assert "unlock_attachment attachment_id=" in result
     assert "read_file" not in result  # it cannot decrypt; the note must not suggest it
-    assert UNLOCK_PAGE_MAX_CHARS <= 12_000  # stays under the default 16k result budget
+    assert unlock_page_max_chars() < 16_000  # leaves room for framing under the 16k config
 
     guard = 0
     while "Continue with unlock_attachment" in results[-1]:
@@ -766,9 +876,10 @@ async def test_unlocked_encrypted_pdf_walked_to_the_end_returns_every_marker_onc
 
 
 @pytest.mark.asyncio
-async def test_unlock_page_reads_survive_wrong_supplied_password(tmp_path: Path) -> None:
-    # Page reads after verification use the in-memory cached password; a stale
-    # password in a later call must still return the requested range.
+async def test_unlock_page_read_with_wrong_password_fails(tmp_path: Path) -> None:
+    # Re-review item 7: the in-memory password cache is gone; the paging call
+    # carries its own password and a wrong one must not silently serve the
+    # range through a cached copy.
     from nanobot.webui.attachment_unlock import AttachmentVault
 
     path = tmp_path / "sealed2.pdf"
@@ -780,9 +891,143 @@ async def test_unlock_page_reads_survive_wrong_supplied_password(tmp_path: Path)
     first = await vault.unlock("chat", attachment_id, "fixture-password")
     assert "PAGE-001-MARKER" in first
     result = await vault.unlock("chat", attachment_id, "not-the-password", pages="25-30")
+    assert result.startswith("Error")
+    assert "no longer matches the verified password" in result
+    assert "PAGE-025-MARKER" not in result
+    good = await vault.unlock("chat", attachment_id, "fixture-password", pages="25-30")
+    assert "PAGE-025-MARKER" in good and "PAGE-030-MARKER" in good
+    assert "PAGE-001-MARKER" not in good  # only the requested range comes back
+
+
+@pytest.mark.asyncio
+async def test_unlock_paging_honours_the_attempt_cap(tmp_path: Path) -> None:
+    # Re-review blocking item 6: a re-upload sharing the file digest can
+    # exhaust the 5 password attempts; the already-unlocked attachment's page
+    # reads must then stop decrypting the stored file, not bypass the cap.
+    from nanobot.webui.attachment_unlock import AttachmentVault
+
+    path = tmp_path / "sealed-cap.pdf"
+    make_long_pdf(path, 30, page_chars=200, encrypted=True)
+    _, cards = await prepare_pdfs([str(path)], ["sealed-cap.pdf"])
+    vault = AttachmentVault(tmp_path / "vault")
+    vault.register("chat", "user", cards, [str(path)], tmp_path)
+    attachment_id = cards[0]["attachment_id"]
+    assert "PAGE-001-MARKER" in await vault.unlock("chat", attachment_id, "fixture-password")
+    assert await vault.unlock("chat", attachment_id, "fixture-password", pages="3-4")
+    digest = vault.records[attachment_id]["sha256"]
+    vault.attempts[digest] = 5
+    vault.save()
+    blocked = await vault.unlock("chat", attachment_id, "fixture-password", pages="5-6")
+    assert blocked.startswith("Error: The 5 password attempts were used")
+    # The whole-document path (no pages) keeps serving the stored extraction.
+    assert "Unlocked PDF" in await vault.unlock("chat", attachment_id, "fixture-password")
+    # A fresh vault sees the persisted cap too.
+    assert "5 password attempts" in await AttachmentVault(tmp_path / "vault").unlock(
+        "chat", attachment_id, "fixture-password", pages="5-6")
+
+
+@pytest.mark.asyncio
+async def test_unlock_page_walk_survives_oversized_pages(tmp_path: Path) -> None:
+    # Re-review blocking item 4 (reviewer's case): 30 pages of 14,000 chars.
+    # Under the hard-coded 12k page budget every page was truncated to a
+    # prefix (marker lost) whose continuation re-read the same page forever.
+    # With the budget derived from the configured max_tool_result_chars the
+    # walk reaches page 30, returns every marker exactly once, and each call
+    # discloses exactly the pages it delivered inside the result budget.
+    from nanobot.webui.attachment_unlock import AttachmentVault
+
+    path = tmp_path / "wide-pages.pdf"
+    make_long_pdf(path, 30, page_chars=14_000, encrypted=True)
+    _, cards = await prepare_pdfs([str(path)], ["wide-pages.pdf"], context_window_tokens=262_144)
+    vault = AttachmentVault(tmp_path / "vault")
+    vault.register("chat", "user", cards, [str(path)], tmp_path)
+    attachment_id = cards[0]["attachment_id"]
+    await vault.unlock("chat", attachment_id, "fixture-password")
+    results: list[str] = []
+    pages = "1-20"
+    guard = 0
+    while True:
+        guard += 1
+        assert guard < 40, f"page walk did not terminate after {guard} calls: {results[-1][-200:] if results else pages}"
+        start = pages.split("-")[0]
+        result = await vault.unlock("chat", attachment_id, "fixture-password", pages=pages)
+        assert not result.startswith("Error"), result
+        assert len(result) < 16_000  # configured tool-result budget
+        # Disclose what was actually delivered: the head names the requested
+        # start page and the walk never re-reads the page it just served.
+        assert re.search(rf"pages {start}-\d+ of 30 ", result), result[:120]
+        results.append(result)
+        match = re.search(r"Continue with unlock_attachment attachment_id='[^']+' pages='(\d+)-(\d+)'", result)
+        if match is None:
+            break
+        pages = f"{match.group(1)}-{match.group(2)}"
+    assert "PAGE-030-MARKER" in results[-1]
+    combined = "\n".join(results)
+    for index in range(1, 31):
+        assert combined.count(f"PAGE-{index:03d}-MARKER") == 1, index
+
+
+@pytest.mark.asyncio
+async def test_unlock_page_walk_advances_past_truncated_pages(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The livelock case proper: a page larger than the page budget is
+    # disclosed as truncated and the continuation points at the FOLLOWING
+    # page, never back at the truncated one.
+    from types import SimpleNamespace
+
+    from nanobot.webui.attachment_unlock import AttachmentVault
+
+    monkeypatch.setattr(
+        "nanobot.config.loader.load_config",
+        lambda *a, **k: SimpleNamespace(agents=SimpleNamespace(
+            defaults=SimpleNamespace(max_tool_result_chars=8_000))))  # page budget 6,800
+    path = tmp_path / "huge-pages.pdf"
+    make_long_pdf(path, 5, page_chars=14_000, encrypted=True)
+    _, cards = await prepare_pdfs([str(path)], ["huge-pages.pdf"], context_window_tokens=262_144)
+    vault = AttachmentVault(tmp_path / "vault")
+    vault.register("chat", "user", cards, [str(path)], tmp_path)
+    attachment_id = cards[0]["attachment_id"]
+    await vault.unlock("chat", attachment_id, "fixture-password")
+    result = await vault.unlock("chat", attachment_id, "fixture-password", pages="1-4")
+    assert "exceeded the per-call character limit" in result
+    assert "Page 1 exceeded" in result
+    match = re.search(r"pages='(\d+)-(\d+)'", result)
+    assert match is not None, result
+    assert match.group(1) == "2"  # advance past the disclosed page, do not repeat it
+
+
+@pytest.mark.asyncio
+async def test_unlock_page_budget_follows_configured_max_tool_result_chars(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Re-review item 4: the page budget derives from the configured
+    # max_tool_result_chars, not the hard-coded 12k, so the continuation hint
+    # is not cut off when the setting is lowered (e.g. to 8,000).
+    from types import SimpleNamespace
+
+    from nanobot.webui.attachment_unlock import unlock_page_max_chars
+
+    monkeypatch.setattr(
+        "nanobot.config.loader.load_config",
+        lambda *a, **k: SimpleNamespace(agents=SimpleNamespace(
+            defaults=SimpleNamespace(max_tool_result_chars=8_000))),
+    )
+    assert unlock_page_max_chars() == 6_800
+
+    from nanobot.webui.attachment_unlock import AttachmentVault
+
+    path = tmp_path / "tight-budget.pdf"
+    make_long_pdf(path, 3, page_chars=6_000, encrypted=True)
+    _, cards = await prepare_pdfs([str(path)], ["tight-budget.pdf"], context_window_tokens=262_144)
+    vault = AttachmentVault(tmp_path / "vault")
+    vault.register("chat", "user", cards, [str(path)], tmp_path)
+    attachment_id = cards[0]["attachment_id"]
+    await vault.unlock("chat", attachment_id, "fixture-password")
+    result = await vault.unlock("chat", attachment_id, "fixture-password", pages="2-3")
     assert not result.startswith("Error"), result
-    assert "PAGE-025-MARKER" in result and "PAGE-030-MARKER" in result
-    assert "PAGE-001-MARKER" not in result  # only the requested range comes back
+    assert "Continue with unlock_attachment" in result
+    assert len(result) < 8_000  # hint survives inside the lowered result budget
 
 
 @pytest.mark.asyncio
