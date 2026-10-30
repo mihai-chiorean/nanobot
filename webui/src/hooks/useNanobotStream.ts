@@ -4,6 +4,7 @@ import { useTranslation } from "react-i18next";
 import { useThreadVisibility } from "@/hooks/useThreadVisibility";
 
 import { useClient } from "@/providers/ClientProvider";
+import { mergeAttachmentStatusById, mergeAttachmentStatuses } from "@/lib/media";
 import { resolveModelRequestFailureCopy } from "@/lib/model-request-failure";
 import { hasPendingAgentActivity } from "@/lib/activity-timeline";
 import type { StreamError } from "@/lib/nanobot-client";
@@ -105,6 +106,42 @@ function transitionTurnDelivery(
     return { ...message, deliveryStatus: status };
   });
   return changed ? next : messages;
+}
+
+function attachStatusToUserMessage(
+  messages: UIMessage[],
+  event: Extract<InboundEvent, { event: "attachment.status" }>,
+): UIMessage[] {
+  if (!event.attachments || event.attachments.length === 0) return messages;
+  if (event.attachment_id) {
+    // Unlock notices arrive during a later turn (the password reply is the
+    // newest user row), so they must be routed by the server-issued
+    // attachment_id their upload frame stamped on the tile — a positional or
+    // last-user merge lands the card on the wrong message (MIT-1967
+    // re-review item 5). No tile with that id: leave rows untouched.
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      if (message.role !== "user") continue;
+      const media = mergeAttachmentStatusById(
+        message.media, event.attachment_id, event.attachments[0]);
+      if (media === message.media) continue;
+      const next = [...messages];
+      next[index] = { ...message, media };
+      return next;
+    }
+    return messages;
+  }
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message.role !== "user") continue;
+    if (event.turn_id && message.turnId && message.turnId !== event.turn_id) continue;
+    const media = mergeAttachmentStatuses(message.media, event.attachments);
+    if (media === message.media) return messages;
+    const next = [...messages];
+    next[index] = { ...message, media };
+    return next;
+  }
+  return messages;
 }
 
 function appendProjectedSessionInput(
@@ -572,6 +609,13 @@ export function useNanobotStream(
         setMessages((prev) => transitionTurnDelivery(prev, turnId, "accepted"));
       }
       if (ev.event === "message_accepted") return;
+      if (ev.event === "attachment.status") {
+        // The uploading connection is excluded from the ``user_message``
+        // broadcast, so its own tiles (partial notice included) only ever
+        // arrive through this event (MIT-1967 review).
+        setMessages((prev) => attachStatusToUserMessage(prev, ev));
+        return;
+      }
       if (ev.event === "user_message") {
         if (ev.provenance?.session_message) {
           flushPendingStreamEvents({ closeAnswerSegment: true });

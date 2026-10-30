@@ -84,6 +84,10 @@ class PdfExtraction:
     total_pages: int
     start_page: int
     end_page: int
+    # True when ``end_page``'s text exceeded the char budget and only a
+    # truncated prefix of that page is present in ``text``. When False, every
+    # page in ``start_page..end_page`` is included in full.
+    partial_last_page: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -462,7 +466,18 @@ def extract_pdf_pages(
     max_chars: int = _MAX_TEXT_LENGTH,
     password: str | None = None,
 ) -> PdfExtraction:
-    """Extract a bounded PDF page range using the bundled pypdf reader."""
+    """Extract a bounded PDF page range using the bundled pypdf reader.
+
+    Char-budget policy (MIT-1967): when the budget would cut a page mid-way,
+    the partial page is dropped and ``end_page`` reports the previous page, so
+    a caller continuing via ``pages='end_page + 2-...'`` (1-based) re-reads
+    the dropped page from its start and no text is ever skipped. The one
+    exception is a page that alone exceeds the whole budget with no earlier
+    page collected: its truncated prefix is kept and ``partial_last_page``
+    flags that page as incomplete, because repeating the range would return
+    the same prefix. Callers must disclose such a page instead of claiming it
+    was fully read.
+    """
     from pypdf import PdfReader
 
     reader = PdfReader(path, strict=False)
@@ -479,6 +494,7 @@ def extract_pdf_pages(
     start, end = _parse_pdf_page_range(pages, total_pages)
     end = min(end, start + max_pages - 1)
     collector = _TextCollector(max_chars)
+    partial_last_page = False
     for index in range(start, end + 1):
         page = reader.pages[index]
         contents = page.get_contents()
@@ -490,10 +506,26 @@ def extract_pdf_pages(
                     f"{_MAX_PDF_CONTENT_STREAM_SIZE // (1024 * 1024)} MB limit"
                 )
         text = (page.extract_text() or "").strip()
-        if text and not collector.add(f"--- Page {index + 1} ---\n{text}", separator="\n\n"):
+        if not text:
+            continue
+        parts_before = len(collector.parts)
+        length_before = collector.length
+        if collector.add(f"--- Page {index + 1} ---\n{text}", separator="\n\n"):
+            continue
+        if length_before > 0:
+            # Drop the page the budget cut so the caller's continuation range
+            # re-reads it whole; keeping a prefix would strand its tail.
+            # The remaining pages are all whole, so the truncation marker
+            # belongs to the dropped page too (MIT-1967 review).
+            del collector.parts[parts_before:]
+            collector.length = length_before
+            collector.truncated = False
+            end = index - 1
+        else:
+            partial_last_page = True
             end = index
-            break
-    return PdfExtraction(collector.render(), total_pages, start, end)
+        break
+    return PdfExtraction(collector.render(), total_pages, start, end, partial_last_page)
 
 
 def _parse_pdf_page_range(pages: str | None, total_pages: int) -> tuple[int, int]:
