@@ -3360,11 +3360,15 @@ def _client_projection_source(record: dict[str, Any]) -> dict[str, Any] | None:
     return projected
 
 
-def update_attachment_display_state(session_key: str, attachment_id: str) -> None:
+def update_attachment_display_state(session_key: str, attachment_id: str,
+                                    partial: str | None = None) -> None:
     """Persist a display overlay so paginated/archived history shows unlocked chips."""
     path = webui_transcript_path(session_key).with_suffix(".attachments.json")
     states: dict[str, Any] = json.loads(path.read_text()) if path.exists() else {}
-    states[attachment_id] = {"error": None, "locked_reason": None}
+    state: dict[str, Any] = {"error": None, "locked_reason": None}
+    if partial:
+        state["partial"] = partial[:256]
+    states[attachment_id] = state
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
     with tmp.open("w") as f:

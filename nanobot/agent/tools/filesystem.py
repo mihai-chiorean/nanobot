@@ -498,9 +498,31 @@ class ReadFileTool(_FsTool):
             return ToolResult.error(f"Error reading PDF: {e}")
 
         if not extraction.text:
-            return f"(PDF has no extractable text: {fp})"
+            if extraction.total_pages <= 0:
+                return f"(PDF has no extractable text: {fp})"
+            # An all-blank requested window is not an empty document; report
+            # the range and keep the walk going so later text pages are
+            # reachable (MIT-1967 review).
+            result = (
+                f"(No extractable text on pages {extraction.start_page + 1}-"
+                f"{extraction.end_page + 1} of {fp})"
+            )
+            if extraction.end_page < extraction.total_pages - 1:
+                next_start = extraction.end_page + 2
+                next_end = min(extraction.end_page + 1 + self._MAX_PDF_PAGES,
+                               extraction.total_pages)
+                result += (
+                    f". Later pages may still contain text; use "
+                    f"pages='{next_start}-{next_end}' to continue."
+                )
+            return result
 
         result = extraction.text
+        if extraction.partial_last_page:
+            result += (
+                f"\n\n(Page {extraction.end_page + 1} exceeded the per-call character limit; "
+                "only its first part is shown, so do not claim to have read its full contents.)"
+            )
         if extraction.end_page < extraction.total_pages - 1:
             next_start = extraction.end_page + 2
             next_end = min(extraction.end_page + 1 + self._MAX_PDF_PAGES, extraction.total_pages)

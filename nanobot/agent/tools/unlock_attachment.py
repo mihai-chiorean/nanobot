@@ -13,6 +13,10 @@ from nanobot.webui.attachment_unlock import AttachmentVault, attachment_vault
 @tool_parameters(tool_parameters_schema(
     attachment_id=StringSchema("Attachment ID from the password protected PDF note."),
     password=StringSchema("Password supplied by the user. Never guess or echo it.", max_length=1024),
+    pages=StringSchema(
+        "Optional page range (e.g. '120-139') to read from a PDF already unlocked in this "
+        "conversation; the stored file is encrypted, so read_file cannot page it — page here.",
+    ),
     required=["attachment_id", "password"],
 ))
 class UnlockAttachmentTool(Tool):
@@ -37,12 +41,18 @@ class UnlockAttachmentTool(Tool):
     def description(self) -> str:
         return ("Unlock an attached password protected PDF with the user's password and return "
                 "its text. Ask for the password first; if wrong ask again. At most 5 attempts "
-                "per attachment. Never repeat, quote, or reveal the password in replies, examples, or shell commands. Only pass it to this tool.")
+                "per attachment. An already unlocked PDF can be paged with pages='a-b' following "
+                "the range its last result suggested; repeat until the final page, and never claim "
+                "to have read pages you have not. "
+                "Never repeat, quote, or reveal the password in replies, examples, or shell commands. Only pass it to this tool.")
 
-    async def execute(self, attachment_id: str, password: str, **kwargs: Any) -> str:
+    async def execute(self, attachment_id: str, password: str,
+                      pages: str | None = None, **kwargs: Any) -> str:
         ctx = current_request_context()
         if ctx is None or ctx.channel != "websocket" or ctx.metadata.get("shared_room"):
             return ToolResult.error("Error: Attachment not found in this conversation.")
-        result = await self.vault.unlock(ctx.chat_id, attachment_id, password,
-                                         session=ctx.session_key)
+        result = await self.vault.unlock(
+            ctx.chat_id, attachment_id, password, session=ctx.session_key,
+            **({"pages": pages} if isinstance(pages, str) and pages.strip() else {}),
+        )
         return ToolResult.error(result) if result.startswith("Error:") else result

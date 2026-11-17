@@ -42,7 +42,11 @@ def _data_url(mime: str, payload: bytes) -> str:
     return f"data:{mime};base64,{base64.b64encode(payload).decode()}"
 
 
-def _make_channel(session_manager: SessionManager | None = None) -> WebSocketChannel:
+def _make_channel(
+    session_manager: SessionManager | None = None,
+    *,
+    session_context_window=None,
+) -> WebSocketChannel:
     bus = MagicMock()
     bus.publish_inbound = AsyncMock()
     cfg = {"enabled": True, "allowFrom": ["*"], "websocketRequiresToken": False}
@@ -57,6 +61,7 @@ def _make_channel(session_manager: SessionManager | None = None) -> WebSocketCha
         runtime_model_name=None,
         runtime_surface="browser",
         runtime_capabilities_overrides=None,
+        session_context_window=session_context_window,
     )
     channel = WebSocketChannel(cfg, bus, gateway=gateway)
     channel._handle_message = AsyncMock()  # type: ignore[method-assign]
