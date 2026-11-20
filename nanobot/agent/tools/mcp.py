@@ -19,7 +19,11 @@ import httpx
 from loguru import logger
 
 from nanobot.agent.tools.base import Tool, ToolResult
-from nanobot.agent.tools.context import _CURRENT_REQUEST_CONTEXT, ZIGGY_PARK_ATTRIBUTE
+from nanobot.agent.tools.context import (
+    _CURRENT_REQUEST_CONTEXT,
+    ZIGGY_PARK_ATTRIBUTE,
+    current_turn_user_message_index,
+)
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.security.network import (
     PinnedDNSAsyncTransport,
@@ -31,6 +35,7 @@ from nanobot.security.network import (
     resolve_url_target,
     validate_url_target,
 )
+from nanobot.session.turn_continuation import RECOVERY_ORIGIN_SCOPE_META
 from nanobot.utils.cancellation import task_is_cancelling
 
 if TYPE_CHECKING:
@@ -38,6 +43,7 @@ if TYPE_CHECKING:
     from mcp.types import Prompt, Resource
     from mcp.types import Tool as MCPToolDefinition
 
+    from nanobot.agent.tools.context import RequestContext
     from nanobot.agent.tools.mcp_oauth import MCPOAuthHandlers
     from nanobot.config.schema import Config, MCPServerConfig
 
@@ -704,6 +710,51 @@ def _ziggy_meta() -> dict[str, object]:
     return meta
 
 
+_IDEMPOTENCY_KEY_META = "ziggy.dev/idempotency_key"
+
+
+def _idempotency_scope(ctx: RequestContext | None) -> str | None:
+    """Stable identity of the logical turn a tool call belongs to (SR-11).
+
+    A replayed turn (River retry, recovery Continue, MCP transient retry) must
+    produce the same scope so the connector can dedupe the write.  Deliberately
+    *not* keyed on ``ctx.turn_id``: it embeds ``time.time_ns()`` and changes on
+    every replay.  Returns ``None`` when nothing stable is available; the call
+    then goes out without an idempotency key (pre-SR-11 behaviour).
+    """
+    if ctx is None:
+        return None
+    metadata = ctx.metadata or {}
+    work_id = metadata.get("work_task_id")
+    if isinstance(work_id, str) and re.fullmatch(r"work_[a-f0-9]{32}", work_id):
+        return work_id
+    for key in ("client_message_id", RECOVERY_ORIGIN_SCOPE_META):
+        value = metadata.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    index = current_turn_user_message_index()
+    if ctx.session_key and isinstance(index, int) and not isinstance(index, bool):
+        return f"{ctx.session_key}#{index}"
+    return None
+
+
+def _idempotency_key(scope: str, tool_name: str, arguments: Mapping[str, Any]) -> str:
+    """Deterministic ``idem_<40 hex>`` key for one logical write call.
+
+    Hash only: no session key, chat id or argument text may leave the runtime
+    (DEC-20).  ``tool_name`` is the server's original tool name and
+    ``arguments`` are serialised with sorted keys so argument-order changes in
+    the replay stay equal.
+    """
+    payload = json.dumps(
+        arguments, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    digest = hashlib.sha256(
+        f"{scope}\n{tool_name}\n{payload}".encode("utf-8")
+    ).hexdigest()
+    return f"idem_{digest[:40]}"
+
+
 _ZIGGY_PARK_META_KEY = "ziggy.dev/park"
 
 
@@ -761,13 +812,23 @@ class MCPToolWrapper(_MCPWrapperBase):
     async def execute(self, **kwargs: Any) -> str:
         retried_transient = False
         refreshed_session = False
+        meta = _ziggy_meta()
+        if not self.read_only:
+            scope = _idempotency_scope(_CURRENT_REQUEST_CONTEXT.get())
+            if scope is not None:
+                # Computed once, before the retry loop: every attempt at this
+                # logical call (transient retry, reconnect retry, and a replay
+                # of the whole turn) must carry the same key.
+                meta[_IDEMPOTENCY_KEY_META] = _idempotency_key(
+                    scope, self._original_name, kwargs
+                )
         while True:
             try:
                 result = await asyncio.wait_for(
                     self._session.call_tool(
                         self._original_name,
                         arguments=kwargs,
-                        meta=_ziggy_meta() or None,
+                        meta=meta or None,
                     ),
                     timeout=self._tool_timeout,
                 )

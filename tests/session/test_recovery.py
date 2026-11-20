@@ -771,3 +771,135 @@ async def test_bus_remains_quiet_after_recovered_state(tmp_path: Path) -> None:
     await asyncio.sleep(0)
     assert bus.inbound.empty()
     assert bus.outbound.empty()
+
+
+# ---------------------------------------------------------------------------
+# SR-11 (MIT-1820): recovery continuation carries the turn's idempotency scope
+# ---------------------------------------------------------------------------
+
+
+async def _continue_awaiting_recovery(
+    tmp_path: Path, messages: list[dict]
+) -> InboundMessage:
+    sessions = SessionManager(tmp_path)
+    session = sessions.get_or_create("websocket:chat")
+    session.messages.extend(messages)
+    session.metadata[PENDING_USER_TURN_KEY] = True
+    _persist(sessions, session)
+
+    coordinator, bus, restarted = _coordinator(tmp_path)
+    await coordinator.scan()
+    state = restarted.get_or_create("websocket:chat").metadata[RECOVERY_METADATA_KEY]
+    assert state["status"] == "awaiting_user"
+    await coordinator.handle_action(
+        "continue",
+        {"chat_id": "chat", "recovery_id": state["recovery_id"]},
+    )
+    continuation = bus.inbound.get_nowait()
+    assert continuation.session_key_override == "websocket:chat"
+    return continuation
+
+
+@pytest.mark.asyncio
+async def test_continuation_carries_client_message_id_scope(tmp_path: Path) -> None:
+    continuation = await _continue_awaiting_recovery(
+        tmp_path,
+        [
+            {"role": "user", "content": "old", "client_message_id": "cm-old"},
+            {"role": "assistant", "content": "done"},
+            {"role": "user", "content": "send it", "client_message_id": "cm-42"},
+        ],
+    )
+    assert continuation.metadata["recovery_origin_scope"] == "cm-42"
+
+
+@pytest.mark.asyncio
+async def test_continuation_falls_back_to_session_key_and_user_index(
+    tmp_path: Path,
+) -> None:
+    continuation = await _continue_awaiting_recovery(
+        tmp_path,
+        [
+            {"role": "user", "content": "send it"},
+            {"role": "assistant", "content": "working", "_recovery_interrupted": True},
+        ],
+    )
+    assert continuation.metadata["recovery_origin_scope"] == "websocket:chat#0"
+
+
+@pytest.mark.asyncio
+async def test_continuation_scope_survives_hidden_summary_user_rows(
+    tmp_path: Path,
+) -> None:
+    from nanobot.session.history_visibility import HIDDEN_HISTORY_META
+
+    continuation = await _continue_awaiting_recovery(
+        tmp_path,
+        [
+            {"role": "user", "content": "send it", "client_message_id": "cm-7"},
+            {
+                "role": "user",
+                "content": "summary continuation",
+                HIDDEN_HISTORY_META: True,
+            },
+        ],
+    )
+    assert continuation.metadata["recovery_origin_scope"] == "cm-7"
+
+
+@pytest.mark.asyncio
+async def test_continuation_write_reuses_the_interrupted_turns_idempotency_key(
+    tmp_path: Path,
+) -> None:
+    """A write replayed by the continuation must hash to the key the original
+    turn sent, or the connector creates a second approval (design §3)."""
+    from types import SimpleNamespace
+
+    from mcp import types as mcp_types
+
+    from nanobot.agent.tools.context import RequestContext, request_context
+    from nanobot.agent.tools.mcp import MCPToolWrapper
+
+    continuation = await _continue_awaiting_recovery(
+        tmp_path,
+        [{"role": "user", "content": "mail it", "client_message_id": "cm-42"}],
+    )
+
+    class _RecordingSession:
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+
+        async def call_tool(self, name, arguments=None, **kwargs):
+            self.calls.append({"name": name, "arguments": arguments, **kwargs})
+            return SimpleNamespace(
+                content=[mcp_types.TextContent(type="text", text="ok")],
+                isError=False,
+            )
+
+    def _tool_def():
+        return SimpleNamespace(
+            name="gmail_send_draft",
+            description="send",
+            inputSchema={"type": "object", "properties": {}},
+        )
+
+    arguments = {"to": "grandma@example.org", "body": "hi"}
+
+    async def _call(metadata: dict) -> dict:
+        session = _RecordingSession()
+        wrapper = MCPToolWrapper(session, "gmail", _tool_def(), tool_timeout=5)
+        ctx = RequestContext(
+            channel="websocket",
+            chat_id="chat",
+            session_key="websocket:chat",
+            metadata=metadata,
+        )
+        with request_context(ctx):
+            await wrapper.execute(**arguments)
+        return session.calls[0]["meta"]
+
+    original_meta = await _call({"client_message_id": "cm-42"})
+    continuation_meta = await _call(dict(continuation.metadata))
+    assert continuation_meta["ziggy.dev/idempotency_key"] == original_meta[
+        "ziggy.dev/idempotency_key"
+    ]
