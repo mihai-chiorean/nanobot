@@ -33,6 +33,7 @@ from nanobot.config.schema import AgentDefaults, ToolsConfig
 from nanobot.agent.turn_provenance import (
     TurnProvenance,
     bind_turn_provenance,
+    log_recording_failure,
     reset_turn_provenance,
 )
 from nanobot.llm_usage.context import (
@@ -540,10 +541,8 @@ class SubagentManager:
                         "subagent_provenance {}",
                         json.dumps(child_record.to_dict(), sort_keys=True),
                     )
-                except Exception:
-                    logger.opt(exception=True).warning(
-                        "subagent provenance logging failed; continuing"
-                    )
+                except Exception as exc:
+                    log_recording_failure("logging a subagent record", exc)
                 reset_work_context(work_tokens)
                 if token is not None:
                     reset_workspace_scope(token)

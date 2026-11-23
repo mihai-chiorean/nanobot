@@ -573,3 +573,100 @@ async def test_subagent_keeps_its_own_record_and_carries_the_parent_turn_id(
     assert child["parent_turn_id"] == "parent-1"
     assert child["turn_id"].startswith("subagent:")
     assert len(child["calls"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# Review round 2 (MIT-1862)
+# ---------------------------------------------------------------------------
+
+_LEAK_SENTINEL = "SENTINEL-hunter2-pw"
+
+
+@pytest.mark.asyncio
+async def test_recording_failure_log_is_content_free(monkeypatch) -> None:
+    """With Loguru diagnose on (prod), a recording failure must not print the
+    exception text, a traceback or frame locals (user text, tool arguments)."""
+
+    def boom(defs: Any) -> Any:
+        raise RuntimeError(f"hash exploded {_LEAK_SENTINEL}")
+
+    monkeypatch.setattr(runner_mod, "tools_offered_fingerprint", boom)
+    provider = MagicMock(spec=LLMProvider)
+    state = {"n": 0}
+
+    async def chat_stream_with_retry(*, messages, **kwargs):
+        state["n"] += 1
+        if state["n"] == 1:
+            return LLMResponse(
+                content="working",
+                tool_calls=[ToolCallRequest(
+                    id="c1", name="alpha_tool", arguments={"password": _LEAK_SENTINEL},
+                )],
+            )
+        return LLMResponse(content="done", tool_calls=[])
+
+    provider.chat_stream_with_retry = chat_stream_with_retry
+    lines: list[str] = []
+    sink_id = logger.add(
+        lambda m: lines.append(str(m)), level="WARNING", diagnose=True, backtrace=True
+    )
+    try:
+        result = await AgentRunner().run(make_run_spec(
+            provider,
+            initial_messages=[{"role": "user", "content": f"my password is {_LEAK_SENTINEL}"}],
+            tools=_registry_with([]),
+            model="test-model",
+            max_iterations=3,
+            max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+            turn_id="t-leak",
+        ))
+    finally:
+        logger.remove(sink_id)
+    assert result.final_content == "done"
+    joined = "".join(lines)
+    assert "recording a model call failed (RuntimeError)" in joined
+    assert _LEAK_SENTINEL not in joined
+    assert "Traceback" not in joined
+
+
+@pytest.mark.asyncio
+async def test_budget_finalization_gets_its_own_span_with_zero_tools(monkeypatch) -> None:
+    """max_iterations reached -> no-tools finalization: 2 provider calls,
+    2 calls entries, 2 iteration spans; the second carries the zero-tool sha."""
+    fake = _FakeLangfuse()
+    monkeypatch.setattr(lf, "_safe_get_client", lambda: fake)
+    seen_tools: list[Any] = []
+    provider = MagicMock(spec=LLMProvider)
+
+    async def chat_stream_with_retry(*, messages, tools=None, **kwargs):
+        seen_tools.append(tools)
+        if tools:
+            return LLMResponse(
+                content="working",
+                tool_calls=[ToolCallRequest(id="c1", name="alpha_tool", arguments={})],
+            )
+        return LLMResponse(content="final summary", tool_calls=[])
+
+    provider.chat_stream_with_retry = chat_stream_with_retry
+    record = TurnProvenance(turn_id="t-budget")
+    token = bind_turn_provenance(record)
+    try:
+        result = await AgentRunner().run(make_run_spec(
+            provider,
+            initial_messages=[{"role": "user", "content": "go"}],
+            tools=_registry_with([]),
+            model="test-model",
+            max_iterations=1,
+            max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+            turn_id="t-budget",
+        ))
+    finally:
+        reset_turn_provenance(token)
+    assert result.final_content == "final summary"
+    assert len(seen_tools) == 2 and seen_tools[1] is None
+    assert [c["tools_n"] for c in record.calls] == [2, 0]
+    spans = [s for s in fake.spans if s.name.startswith("llm-iteration-")]  # type: ignore[attr-defined]
+    assert len(spans) == 2
+    assert spans[0].metadata["ziggy.tools.offered.count"] == 2
+    assert spans[1].metadata["ziggy.tools.offered.count"] == 0
+    assert spans[1].metadata["ziggy.tools.offered.sha"] == _expected_sha([])

@@ -30,7 +30,7 @@ from nanobot.agent.reasoning_policy import escalation_profile
 from nanobot.agent.tools.ask import AskUserInterrupt
 from nanobot.agent.tools.execution import execute_tool_calls
 from nanobot.agent.tools.registry import ToolRegistry
-from nanobot.agent.turn_provenance import current_turn_provenance
+from nanobot.agent.turn_provenance import current_turn_provenance, log_recording_failure
 from nanobot.events import NO_EVENTS, EventSink
 from nanobot.llm_usage.context import (
     LLMUsageSource,
@@ -1444,13 +1444,19 @@ class AgentRunner:
         )
         retry_messages = self._budget_exhausted_finalization_messages(request_messages)
         try:
-            response = await self._request_no_tools(
-                spec,
-                retry_messages,
-                request_state=request_state,
-                transcript=messages if compaction is not None else None,
-                iteration=spec.max_iterations,
-            )
+            # The last iteration's span has closed by now; budget finalization
+            # is its own provider call, so it gets its own iteration span and
+            # its zero-tool fingerprint lands there (TP-05).
+            with observe_llm_iteration(
+                iteration=spec.max_iterations, model=spec.runtime.model
+            ):
+                response = await self._request_no_tools(
+                    spec,
+                    retry_messages,
+                    request_state=request_state,
+                    transcript=messages if compaction is not None else None,
+                    iteration=spec.max_iterations,
+                )
         except Exception:
             logger.exception(
                 "Budget-exhausted finalization failed for {}; using fallback",
@@ -1535,10 +1541,8 @@ class AgentRunner:
                     "ziggy.release": release,
                 }
             )
-        except Exception:
-            logger.opt(exception=True).warning(
-                "model_call provenance recording failed; the call proceeds unrecorded"
-            )
+        except Exception as exc:
+            log_recording_failure("recording a model call", exc)
 
     async def _request_no_tools(
         self,
