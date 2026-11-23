@@ -164,14 +164,8 @@ async def test_template_lines_skipped(tmp_path: Path) -> None:
         payload = response.json()
         texts = [item["text"] for f in payload["files"] for item in f["items"]]
 
-        assert "User prefers terse (one-line) answers" in texts
-        assert not any(re.fullmatch(r"\(.*\)", text) for text in texts), texts
-        assert not any(text.startswith("*This file is automatically updated") for text in texts)
-        assert not any(text.startswith("*Edit this file to customize") for text in texts)
-        assert "---" not in texts
-        # The headings themselves are structure, never items.
-        assert "Long-term Memory" not in texts
-        assert "Important Notes" not in texts
+        # The untouched templates contribute nothing: only the real fact remains.
+        assert texts == ["User prefers terse (one-line) answers"], texts
     finally:
         await channel.stop()
 
@@ -354,3 +348,66 @@ async def test_post_not_allowed(tmp_path: Path) -> None:
         assert response.status_code == 405
     finally:
         await channel.stop()
+
+
+_TEMPLATES = Path(_nanobot_init).parent / "templates"
+
+
+def _list_texts(tmp_path: Path, *, user_md: str, memory_md: str) -> list[str]:
+    from nanobot.webui.memory_api import list_items
+
+    store = MemoryStore(_seed_workspace(tmp_path, user_md=user_md, memory_md=memory_md))
+    return [item["text"] for f in list_items(store)["files"] for item in f["items"]]
+
+
+def test_pristine_shipped_templates_list_no_items(tmp_path: Path) -> None:
+    """Untouched USER.md + MEMORY.md templates: unfilled ``(your name)`` fields,
+    unchecked ``- [ ]`` options, prompts, intro and footer are all skipped."""
+    texts = _list_texts(
+        tmp_path,
+        user_md=(_TEMPLATES / "USER.md").read_text(encoding="utf-8"),
+        memory_md=(_TEMPLATES / "memory" / "MEMORY.md").read_text(encoding="utf-8"),
+    )
+    assert texts == []
+
+
+def test_templates_with_one_real_fact_list_exactly_that_fact(tmp_path: Path) -> None:
+    user_md = (_TEMPLATES / "USER.md").read_text(encoding="utf-8").replace(
+        "- **Name**: (your name)", "- **Name**: Mihai"
+    )
+    assert "- **Name**: Mihai" in user_md
+    texts = _list_texts(
+        tmp_path,
+        user_md=user_md,
+        memory_md=(_TEMPLATES / "memory" / "MEMORY.md").read_text(encoding="utf-8"),
+    )
+    assert texts == ["**Name**: Mihai"]
+
+
+def test_checked_template_option_is_kept(tmp_path: Path) -> None:
+    user_md = (_TEMPLATES / "USER.md").read_text(encoding="utf-8").replace(
+        "- [ ] Expert", "- [x] Expert"
+    )
+    texts = _list_texts(
+        tmp_path,
+        user_md=user_md,
+        memory_md=(_TEMPLATES / "memory" / "MEMORY.md").read_text(encoding="utf-8"),
+    )
+    assert texts == ["Expert"]
+
+
+def test_valid_markdown_facts_are_not_mistaken_for_template_lines(tmp_path: Path) -> None:
+    """Negative controls: italic, emphasised-bullet and parenthesised facts
+    are real memories even though they share shapes with template prompts."""
+    memory_md = (
+        "# Long-term Memory\n\n## User Information\n\n"
+        "* Favorite editor: **Vim**\n"
+        "*Prefers email to phone calls*\n"
+        "(Allergic to peanuts)\n"
+    )
+    texts = _list_texts(tmp_path, user_md="# User Profile\n", memory_md=memory_md)
+    assert texts == [
+        "Favorite editor: **Vim**",
+        "*Prefers email to phone calls*",
+        "(Allergic to peanuts)",
+    ]

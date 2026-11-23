@@ -16,7 +16,9 @@ files and the route deliberately takes no parameters.
 
 from __future__ import annotations
 
+import functools
 import re
+from importlib.resources import files as pkg_files
 from typing import Any, Callable
 
 from nanobot.agent.memory import MemoryStore, provenance_key
@@ -35,21 +37,42 @@ _RULE_RE = re.compile(r"^[-*_]{3,}$")
 _BULLET_RE = re.compile(r"^[-*+]\s+")
 
 
-def _is_template_placeholder(line: str) -> bool:
-    """A whole-line ``(…)`` placeholder or the italic footer of a template.
+#: The shipped templates that seed the two files. Their prompt lines are
+#: what an untouched (or partly filled) file still carries.
+_TEMPLATE_FILES: tuple[tuple[str, ...], ...] = (("USER.md",), ("memory", "MEMORY.md"))
 
-    ``nanobot/templates/memory/MEMORY.md`` ships ``(Important facts about the
-    user)``-style parenthesised prompts and an italic ``*This file is …*``
-    footer; an untouched ``USER.md`` carries the same shapes. They are editor
-    prompts, not beliefs about the user, so they never surface as items. A
-    fact that merely *contains* parentheses (``- Likes (terse) answers``) is
-    not a placeholder line and stays.
+#: An unchecked ``- [ ] option`` choice: an offered option, not a belief.
+_UNCHECKED_RE = re.compile(r"^[-*+]\s+\[\s\]\s+")
+#: A checked ``- [x] option`` choice: the marker is dropped from the text.
+_CHECKED_RE = re.compile(r"^([-*+]\s+)\[[xX]\]\s+")
+
+
+@functools.cache
+def _template_lines() -> frozenset[str]:
+    """Every non-heading, non-empty line of the shipped templates, stripped.
+
+    These are editor prompts (``- **Name**: (your name)``, ``(Things to
+    remember)``, the italic footer, the intro sentence), never beliefs about
+    the user. Matching the exact shipped lines — rather than generic Markdown
+    shapes such as "italic line" or "parenthesised line" — keeps real facts
+    written in those shapes.
     """
-    if line.startswith("(") and line.endswith(")") and len(line) > 1:
-        return True
-    return (
-        len(line) > 2 and line.startswith("*") and line.endswith("*") and not line.startswith("**")
-    )
+    root = pkg_files("nanobot") / "templates"
+    lines: set[str] = set()
+    for parts in _TEMPLATE_FILES:
+        node = root
+        for part in parts:
+            node = node / part
+        for raw in node.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if line and not _HEADING_RE.match(line):
+                lines.add(line)
+    return frozenset(lines)
+
+
+def _is_template_prompt(line: str) -> bool:
+    """A shipped template prompt line or an unchecked template option."""
+    return line in _template_lines() or bool(_UNCHECKED_RE.match(line))
 
 
 def _source_from_record(
@@ -112,13 +135,13 @@ def _parse_file(
         if heading:
             section = heading.group(2)
             continue
-        if _is_template_placeholder(line):
+        if _is_template_prompt(line):
             continue
         item: dict[str, Any] = {
             "id": provenance_key(line),
             "file": label,
             "section": section,
-            "text": _BULLET_RE.sub("", line, count=1),
+            "text": _BULLET_RE.sub("", _CHECKED_RE.sub(r"\1", line, count=1), count=1),
         }
         source = _source_from_record(store.find_provenance(line), title_for)
         if source is not None:
