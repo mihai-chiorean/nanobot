@@ -985,6 +985,11 @@ class MemoryStore:
         skills_dir.mkdir(parents=True, exist_ok=True)
 
         extra_read = [BUILTIN_SKILLS_DIR] if BUILTIN_SKILLS_DIR.exists() else None
+        # Before Dream's first edit, put any tracked file that never entered
+        # history (e.g. a pre-existing archive.md) into a baseline commit, so
+        # /dream-restore can bring its original content back. Not a "dream:"
+        # commit: /dream-restore must not undo the baseline itself.
+        self._git.snapshot_uncommitted_paths("snapshot: pre-dream baseline")
         # Demoted facts land in memory/archive.md; create it empty so Dream's
         # first demotion is an edit of an existing file, not an unscoped create.
         if not self.archive_file.exists():

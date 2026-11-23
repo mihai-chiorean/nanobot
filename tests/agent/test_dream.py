@@ -1020,6 +1020,31 @@ class TestDreamArchiveHistory:
         assert new_sha is not None
         assert store.read_archive() == "# Archive\n- old demoted fact\n"
 
+    def test_restore_recovers_preexisting_untracked_archive(self, store):
+        """An initialised store whose archive.md (A) never entered history:
+        Dream overwrites it with B, and /dream-restore brings A back."""
+        from nanobot.cli.gateway_runtime import _commit_dream_changes
+        from nanobot.command.builtin import _DREAM_COMMIT_PREFIX
+
+        assert store.git.init()  # no archive.md yet, so not in history
+        store.write_archive("# Archive\n- fact A\n")  # pre-existing, uncommitted
+
+        store.build_dream_tools()  # the Dream run starts
+        store.write_archive("# Archive\n- fact B\n")  # Dream overwrites A
+        sha = _commit_dream_changes(store)
+        assert sha is not None
+
+        assert store.git.revert(sha, message_prefix=_DREAM_COMMIT_PREFIX) is not None
+        assert store.read_archive() == "# Archive\n- fact A\n"
+
+    def test_no_baseline_commit_when_everything_is_in_history(self, store):
+        assert store.git.init()
+        before = len(store.git.log(max_entries=50))
+        store.build_dream_tools()  # touches an empty archive.md: new file
+        store.build_dream_tools()  # second run: nothing new on disk
+        assert len(store.git.log(max_entries=50)) == before + 1
+
+
 class TestDreamPipelineState:
     """MIT-1871: Dream may not write memory/pipelines/, so the prompt must not
     tell it to strip pipeline checkpoints out of MEMORY.md."""

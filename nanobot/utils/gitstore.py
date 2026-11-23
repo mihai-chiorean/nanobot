@@ -270,6 +270,32 @@ class GitStore:
         except Exception as exc:
             raise GitStoreError(f"Git auto-commit failed: {message}") from exc
 
+    def snapshot_uncommitted_paths(self, message: str) -> str | None:
+        """Commit the tracked files if any exists on disk but not in HEAD.
+
+        Revert never deletes a path missing from the parent tree, so a file
+        whose pre-existing content never entered history (e.g. an
+        ``memory/archive.md`` written before it was tracked) could not be
+        restored after its first edit. Snapshotting before that edit puts the
+        original content in history. Returns the short sha, or None when
+        every on-disk tracked file is already in HEAD.
+        """
+        if not self.is_initialized():
+            return None
+        try:
+            from dulwich.repo import Repo
+
+            with Repo(str(self._git_dir)) as repo:
+                head_tree = self._head_tree(repo)
+                committed = (
+                    set(self._tree_blobs(repo, head_tree.id)) if head_tree is not None else set()
+                )
+            if set(self._expand_tracked_files()) <= committed:
+                return None
+        except Exception as exc:
+            raise GitStoreError(f"Git snapshot check failed: {message}") from exc
+        return self.auto_commit(message)
+
     # -- internal helpers ------------------------------------------------------
 
     def _resolve_sha(self, short_sha: str) -> bytes | None:
