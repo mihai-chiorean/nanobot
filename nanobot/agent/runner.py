@@ -202,6 +202,13 @@ class AgentRunSpec:
     # one-shot: the runner clears it on the first ladder step and the policy
     # caps the ladder at one rung, so a turn can never climb past ``think``.
     allow_reasoning_escalation: bool = False
+    # Ziggy-local (TP-02 / MIT-1853): the turn's effective turn id — the wire
+    # ``turn_id`` the client sent (TP-01 puts one on every frame) or, for
+    # clients that send none, the id the loop minted at turn start. The loop
+    # owns the resolution (design section 1); the runner only carries it so
+    # per-call observers (TP-05) can key their rows on the same id the
+    # provenance record and the wire frames use.
+    turn_id: str | None = None
 
 
 @dataclass(slots=True)

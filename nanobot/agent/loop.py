@@ -10,10 +10,10 @@ import os
 import re
 import time
 import weakref
-from collections.abc import Coroutine, Iterable, Mapping
-from contextlib import AbstractContextManager, ExitStack, nullcontext, suppress
+from collections.abc import Coroutine, Iterable, Iterator, Mapping
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext, suppress
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum, auto
 from functools import partial
 from pathlib import Path
@@ -79,7 +79,14 @@ from nanobot.agent.turn_delivery import (
 )
 from nanobot.agent.turn_delivery import TurnRoute as TurnRoute
 from nanobot.agent.turn_hooks import AgentTurnHookSpec, build_agent_turn_hook
-from nanobot.agent.turn_provenance import TurnProvenance, account_intent
+from nanobot.agent.turn_provenance import (
+    TurnProvenance,
+    account_intent,
+    bind_turn_provenance,
+    log_recording_failure,
+    reset_turn_provenance,
+    save_to_session,
+)
 from nanobot.bus.events import INBOUND_META_USER_SHELL, InboundMessage, OutboundMessage
 from nanobot.bus.outbound_events import (
     ProgressEvent,
@@ -211,6 +218,64 @@ def is_system_modification(content: str) -> bool:
     return False
 
 
+# Design section 2: a release id must match the collector's service.version
+# rule; anything else records as "unknown".
+_PROVENANCE_RELEASE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$")
+
+
+def _provenance_release_id() -> str:
+    """Release id for the provenance record (TP-02, design section 2).
+
+    Reads ``nanobot.runtime_release`` (added by TP-03) lazily so a tree
+    without the module — and any raise inside it — records "unknown" instead
+    of failing the turn.
+    """
+    try:
+        from nanobot import runtime_release
+    except ImportError:
+        return "unknown"
+    try:
+        value = runtime_release.release_id()
+    except Exception:
+        logger.warning("runtime_release.release_id() failed; recording release as unknown")
+        return "unknown"
+    if isinstance(value, str) and _PROVENANCE_RELEASE_RE.fullmatch(value):
+        return value
+    return "unknown"
+
+
+def _effective_turn_id(
+    *metadatas: Mapping[str, Any] | None, fallback: str
+) -> str:
+    """The turn id everything keys on (TP-02, design section 1).
+
+    The wire ``turn_id`` (``WEBUI_TURN_METADATA_KEY``) from the first mapping
+    that carries one, else the id the loop minted at turn start. The loop
+    passes the routed delivery metadata first: ``WebuiTurnRoutePolicy`` mints
+    the wire id of an independently dispatched turn (a late subagent result)
+    there, not on the inbound message, and that routed id is the one the
+    client sees on every frame.
+    """
+    for metadata in metadatas:
+        wire_turn_id = (metadata or {}).get(WEBUI_TURN_METADATA_KEY)
+        if isinstance(wire_turn_id, str) and wire_turn_id:
+            return wire_turn_id
+    return fallback
+
+
+@contextmanager
+def _provenance_boundary(what: str) -> Iterator[None]:
+    """Provenance is observability: a failure recording it never fails a turn.
+
+    Any exception inside is logged at WARNING and swallowed, so the answer is
+    still persisted and delivered without (or with a partial) record.
+    """
+    try:
+        yield
+    except Exception as exc:
+        log_recording_failure(what, exc)
+
+
 @dataclass
 class TurnContext:
     msg: InboundMessage
@@ -220,6 +285,10 @@ class TurnContext:
     kind: TurnKind
     delivery: TurnDelivery
     original_user_text: str | None = None
+    # Ziggy-local (TP-02 / MIT-1853): the effective turn id, resolved once at
+    # turn start (``_effective_turn_id``) and used by the provenance record,
+    # the run spec and the saved assistant row alike.
+    effective_turn_id: str = ""
     session: Session | None = None
 
     history: list[dict[str, Any]] = field(default_factory=list)
@@ -446,7 +515,8 @@ class _TurnProvenanceHook(AgentHook):
         params: Any,
         result: Any,
     ) -> None:
-        self._record.note_tool_result(self._tool_object(tool_call, tool), "ok")
+        with _provenance_boundary("counting a tool result"):
+            self._record.note_tool_result(self._tool_object(tool_call, tool), "ok")
 
     async def on_execute_tool_error(
         self,
@@ -456,7 +526,8 @@ class _TurnProvenanceHook(AgentHook):
         params: Any,
         error: Any,
     ) -> None:
-        self._record.note_tool_result(self._tool_object(tool_call, tool), "error")
+        with _provenance_boundary("counting a tool error"):
+            self._record.note_tool_result(self._tool_object(tool_call, tool), "error")
 
 
 # Stop reasons that make a Work task ``failed`` rather than ``succeeded``.
@@ -1792,6 +1863,7 @@ class AgentLoop:
         publish_file_turn: PublishFileTurn | None = None,
         initial_messages: list[dict[str, Any]] | None = None,
         injected_messages_sink: list[InboundMessage] | None = None,
+        turn_id: str | None = None,
     ) -> AgentRunResult:
         """Run the agent iteration loop.
 
@@ -2101,6 +2173,17 @@ class AgentLoop:
                 initial_messages,
             )
         )
+        # Ziggy-local (TP-02 / MIT-1853): the turn's provenance record takes
+        # the model, preset and resolved reasoning profile from this decision
+        # (design section 2) — the same values that ride the run spec below.
+        provenance_record = self.runtime_event_publisher.current_turn_provenance(
+            active_session_key
+        )
+        if provenance_record is not None:
+            with _provenance_boundary("recording the turn runtime"):
+                provenance_record.model = turn_runtime.model
+                provenance_record.model_preset = turn_runtime.model_preset
+                provenance_record.reasoning_profile = turn_reasoning_profile
         # The admission gateway caps background concurrency by the
         # ``X-Ziggy-Scheduling-Class`` header, which the provider reads from
         # this contextvar. Bound per turn inside the turn's own task (so a
@@ -2163,6 +2246,7 @@ class AgentLoop:
                 runtime=turn_runtime,
                 reasoning_profile=turn_reasoning_profile,
                 allow_reasoning_escalation=turn_allow_escalation,
+                turn_id=turn_id,
                 max_iterations=self.max_iterations,
                 max_tool_result_chars=self.max_tool_result_chars,
                 transcript_input=None if initial_messages is not None else transcript_input,
@@ -2908,58 +2992,93 @@ class AgentLoop:
             tools=tools,
             attributes=dict(attributes or {}),
         )
-        # Ziggy-local (TP-09 / MIT-1870): one provenance record per turn.
-        # ``account_intent`` is computed here, once, from the user's message
-        # text; only the boolean is stored. The counting hook joins the
-        # turn's explicit hook chain (never the caller-visible turn
-        # attributes, which context providers receive verbatim), and the
-        # record itself rides the runtime event publisher, which lifts the
-        # ``used``/``other_steps`` fields at ``turn_completed`` — the same
-        # per-session lifecycle as turn usage.
-        provenance = TurnProvenance(
-            account_intent=account_intent(ctx.original_user_text or "")
+        # Ziggy-local (TP-02 / MIT-1853 + TP-09 / MIT-1870): one provenance
+        # record per turn. ``account_intent`` is computed here, once, from
+        # the user's message text; only the boolean is stored. ``turn_id`` is
+        # the effective id (wire turn id when the frame carried one, else the
+        # id just minted above), ``source`` is the same classification
+        # llm_usage makes — with "work" for Work turns — and ``release`` reads
+        # the runtime-release stamp when the module exists (TP-03). The
+        # counting hook joins the turn's explicit hook chain (never the
+        # caller-visible turn attributes, which context providers receive
+        # verbatim), and the record itself rides the runtime event publisher,
+        # which lifts the ``used``/``other_steps`` fields at
+        # ``turn_completed`` — the same per-session lifecycle as turn usage.
+        # An internal continuation slice reuses the id its first slice
+        # resolved (carried on the queued message), so a turn without a wire
+        # id still folds into one record instead of minting a new fallback.
+        ctx.effective_turn_id = turn_continuation.internal_continuation_turn_id(
+            msg.metadata
+        ) or _effective_turn_id(
+            delivery.route.metadata, msg.metadata, fallback=ctx.turn_id
         )
-        ctx.hooks.append(
-            _TurnProvenanceHook(provenance, tools if tools is not None else self.tools)
-        )
-        self.runtime_event_publisher.record_turn_provenance(key, provenance)
-        # A streaming callback may be present even when the final text comes from a
-        # non-streaming recovery. Only the last completed segment can suppress the
-        # regular outbound message.
-        if ctx.streaming:
-            publish = ctx.events.publish
-            segment_streamed_content = False
+        provenance: TurnProvenance | None = None
+        with _provenance_boundary("building the turn record"):
+            provenance = TurnProvenance(
+                turn_id=ctx.effective_turn_id,
+                started_at=datetime.now(timezone.utc).isoformat(),
+                source=(
+                    "work"
+                    if work_task_id(msg.metadata) is not None
+                    else source_from_request(key, channel=msg.channel, metadata=msg.metadata)
+                ),
+                release=_provenance_release_id(),
+                account_intent=account_intent(ctx.original_user_text or ""),
+            )
+        provenance_token = None
+        if provenance is not None:
+            ctx.hooks.append(
+                _TurnProvenanceHook(provenance, tools if tools is not None else self.tools)
+            )
+            self.runtime_event_publisher.record_turn_provenance(key, provenance)
+            # Bind the record for the whole turn so per-call observers reach
+            # it without the session key (``agent/tools/execution.py`` counts
+            # silent argument repairs that way, TP-07). Task-scoped like the
+            # other turn contextvars: bound inside the single task running
+            # this turn and released in the ``finally`` below so no later
+            # turn sees it.
+            provenance_token = bind_turn_provenance(provenance)
+        try:
+            # A streaming callback may be present even when the final text comes from a
+            # non-streaming recovery. Only the last completed segment can suppress the
+            # regular outbound message.
+            if ctx.streaming:
+                publish = ctx.events.publish
+                segment_streamed_content = False
 
-            async def track_output(event: AgentEvent) -> None:
-                nonlocal segment_streamed_content
-                if isinstance(event, StreamDeltaEvent) and event.content:
-                    segment_streamed_content = True
-                elif isinstance(event, StreamEndEvent):
-                    ctx.streamed_content = segment_streamed_content
-                    segment_streamed_content = False
-                if publish is not None:
-                    await publish(event)
+                async def track_output(event: AgentEvent) -> None:
+                    nonlocal segment_streamed_content
+                    if isinstance(event, StreamDeltaEvent) and event.content:
+                        segment_streamed_content = True
+                    elif isinstance(event, StreamEndEvent):
+                        ctx.streamed_content = segment_streamed_content
+                        segment_streamed_content = False
+                    if publish is not None:
+                        await publish(event)
 
-            ctx.events = EventSink(track_output, ctx.events.accepts)
+                ctx.events = EventSink(track_output, ctx.events.accepts)
 
-        await self._run_turn_stage(ctx, "restore", self._restore_turn)
-        await self._run_turn_stage(ctx, "compact", self._compact_session)
-        if await self._run_turn_stage(ctx, "command", self._dispatch_command):
-            # Ziggy-local (MIT-1010): a command short-circuits every later
-            # stage, including the one that closes the Work task out. Cancel
-            # is the expected case -- work.cancel publishes "/stop", and
-            # cancel_task has already written the terminal row, so this is a
-            # no-op there and a real close-out for anything else.
+            await self._run_turn_stage(ctx, "restore", self._restore_turn)
+            await self._run_turn_stage(ctx, "compact", self._compact_session)
+            if await self._run_turn_stage(ctx, "command", self._dispatch_command):
+                # Ziggy-local (MIT-1010): a command short-circuits every later
+                # stage, including the one that closes the Work task out. Cancel
+                # is the expected case -- work.cancel publishes "/stop", and
+                # cancel_task has already written the terminal row, so this is
+                # a no-op there and a real close-out for anything else.
+                await self._run_turn_stage(ctx, "work", self._record_work_outcome)
+                return ctx.outbound
+            await self._run_turn_stage(ctx, "build", self._build_turn)
+            await self._run_turn_stage(ctx, "run", self._run_turn)
+            await self._run_turn_stage(ctx, "save", self._persist_turn)
+            await self._run_turn_stage(ctx, "respond", self._prepare_outbound)
+            # Ziggy-local (MIT-1010): runs after RESPOND so the artifact refs can be
+            # stamped on the outbound the Work app is about to receive.
             await self._run_turn_stage(ctx, "work", self._record_work_outcome)
             return ctx.outbound
-        await self._run_turn_stage(ctx, "build", self._build_turn)
-        await self._run_turn_stage(ctx, "run", self._run_turn)
-        await self._run_turn_stage(ctx, "save", self._persist_turn)
-        await self._run_turn_stage(ctx, "respond", self._prepare_outbound)
-        # Ziggy-local (MIT-1010): runs after RESPOND so the artifact refs can be
-        # stamped on the outbound the Work app is about to receive.
-        await self._run_turn_stage(ctx, "work", self._record_work_outcome)
-        return ctx.outbound
+        finally:
+            if provenance_token is not None:
+                reset_turn_provenance(provenance_token)
 
     async def _run_turn_stage(
         self,
@@ -3355,6 +3474,7 @@ class AgentLoop:
                 events=ctx.events,
                 publish_file_turn=ctx.publish_file_turn,
                 injected_messages_sink=ctx.injected_messages,
+                turn_id=ctx.effective_turn_id or ctx.turn_id,
             )
         ctx.final_content = result.final_content
         ctx.all_messages = result.messages
@@ -3376,6 +3496,38 @@ class AgentLoop:
     async def _persist_turn(self, ctx: TurnContext) -> None:
         session = ctx.require_session()
         turn_continuation.prepare_save_boundary(ctx)
+
+        # Ziggy-local (TP-02 / MIT-1853): ``answered`` is decided from the
+        # real final content BEFORE the empty-response filler below is
+        # substituted, and the runner's own filler (committed when the model
+        # stayed blank through its retries) is excluded too, so a turn that
+        # ended without saying anything records answered=false. The record
+        # then joins the session metadata as a ``provenance_v1`` entry,
+        # bounded like ``activity_v1``; ephemeral turns never reach a session
+        # file, so they do not record.
+        provenance_record = self.runtime_event_publisher.current_turn_provenance(
+            ctx.session_key
+        )
+        if provenance_record is not None:
+            with _provenance_boundary("saving the turn record"):
+                final_content = ctx.final_content
+                provenance_record.answered = (
+                    isinstance(final_content, str)
+                    and bool(final_content.strip())
+                    and final_content != EMPTY_FINAL_RESPONSE_MESSAGE
+                )
+                if not ctx.ephemeral:
+                    # An internal continuation slice (a sustained goal that
+                    # hit max_iterations) is the same answer as the slice that
+                    # queued it: fold into that slice's stored record instead
+                    # of appending a second one with the same turn id.
+                    save_to_session(
+                        session,
+                        provenance_record,
+                        merge_same_turn=turn_continuation.internal_continuation_inbound(
+                            ctx.msg.metadata
+                        ),
+                    )
 
         if (
             ctx.kind is TurnKind.USER
@@ -3400,15 +3552,10 @@ class AgentLoop:
         # turn id the client sent (TP-01 puts it on every frame) and, for
         # clients that send none, the id minted at turn start -- the same
         # fallback the provenance record is keyed by (design section 1).
-        wire_turn_id = (ctx.msg.metadata or {}).get(WEBUI_TURN_METADATA_KEY)
-        effective_turn_id = (
-            wire_turn_id
-            if isinstance(wire_turn_id, str) and wire_turn_id
-            else ctx.turn_id
-        )
-        turn_record = self.runtime_event_publisher.current_turn_provenance(
-            ctx.session_key
-        )
+        # Ziggy-local (TP-02 / MIT-1853): one resolver now serves the record,
+        # the run spec and this row, so all three carry the identical id.
+        effective_turn_id = ctx.effective_turn_id or ctx.turn_id
+        turn_record = provenance_record
         persisted = self._save_turn(
             session, ctx.all_messages, ctx.save_skip,
             turn_latency_ms=ctx.turn_latency_ms,

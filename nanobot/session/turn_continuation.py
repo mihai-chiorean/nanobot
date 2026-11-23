@@ -27,6 +27,9 @@ INTERNAL_CONTINUATION_META = "_internal_continuation"
 INTERNAL_CONTINUATION_KIND_META = "_internal_continuation_kind"
 INTERNAL_CONTINUATION_PENDING_META = "_internal_continuation_pending"
 INTERNAL_CONTINUATION_RUN_STARTED_AT_META = "_internal_continuation_run_started_at"
+# The effective turn id of the slice that queued the continuation (TP-02), so
+# every slice of one answer keys its provenance on the same id.
+INTERNAL_CONTINUATION_TURN_ID_META = "_internal_continuation_turn_id"
 SKIP_USER_PERSIST_META = "_skip_user_persist"
 
 #: ``Session.metadata`` key holding the idempotency scope of the session's
@@ -110,6 +113,14 @@ def internal_continuation_run_started_at(metadata: Mapping[str, Any] | None) -> 
     return started_at if started_at > 0 else None
 
 
+def internal_continuation_turn_id(metadata: Mapping[str, Any] | None) -> str | None:
+    """The turn id carried by an internal continuation slice, if any."""
+    if not internal_continuation_inbound(metadata):
+        return None
+    value = (metadata or {}).get(INTERNAL_CONTINUATION_TURN_ID_META)
+    return value if isinstance(value, str) and value else None
+
+
 def should_persist_user_message(metadata: Mapping[str, Any] | None) -> bool:
     """Return whether this inbound message should be persisted as user input."""
     if metadata and metadata.get(SKIP_USER_PERSIST_META) is True:
@@ -171,6 +182,8 @@ async def maybe_continue_turn(ctx: TurnContext) -> bool:
         ctx.msg.metadata,
         run_started_at=ctx.visible_run_started_at,
     )
+    if ctx.effective_turn_id:
+        metadata[INTERNAL_CONTINUATION_TURN_ID_META] = ctx.effective_turn_id
     content = _goal_continuation_prompt(ctx.session.metadata)
     messages = _strip_terminal_assistant(ctx.all_messages, ctx.final_content)
     _increment_goal_continuation_round(ctx.session.metadata)

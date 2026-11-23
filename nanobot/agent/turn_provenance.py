@@ -1,22 +1,32 @@
-"""Per-turn source-family accounting for the "Used: ..." line (TP-09).
+"""The per-turn provenance record (TP-02; source families from TP-09).
 
-Design: ``docs/design/turn-provenance.md`` sections 7 and 8. The server
-decides the families and labels so both apps show the same names under each
-answer. Families come from the **tool object**, not from parsing wire names:
-``mcp_ziggy_gmail_browser_open`` cannot be split correctly by name because
-the server key ``ziggy_gmail`` itself contains ``gmail``. MCP wrappers keep
-``_server_name`` and ``_original_name`` (``agent/tools/mcp.py``), so the map
-below matches on the original MCP tool name; built-ins are matched by name.
+Design: ``docs/design/turn-provenance.md`` sections 1, 2 and 7. One record is
+built at turn start, filled as the turn runs (per call by TP-05, prompt by
+TP-06, repairs by TP-07, ``used`` by TP-09) and saved to the session at turn
+end as ``session.metadata["provenance_v1"]``, capped to the newest 100 turns
+— the pattern ``utils/activity_history.py`` sets for ``activity_v1``.
+
+The server decides the families and labels so both apps show the same names
+under each answer. Families come from the **tool object**, not from parsing
+wire names: ``mcp_ziggy_gmail_browser_open`` cannot be split correctly by
+name because the server key ``ziggy_gmail`` itself contains ``gmail``. MCP
+wrappers keep ``_server_name`` and ``_original_name``
+(``agent/tools/mcp.py``), so the map below matches on the original MCP tool
+name; built-ins are matched by name.
 
 Only family names, counts and the single ``account_intent`` boolean are ever
-recorded here — never arguments, queries or results.
+recorded from tool use — never arguments, queries, results or message text.
 """
 
 from __future__ import annotations
 
 import re
+from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
+from collections.abc import Mapping
 from typing import Any
+
+from loguru import logger
 
 # Built-in tools that earn a named family. Every other built-in is an
 # unlisted step and only counts toward ``other_steps``.
@@ -98,18 +108,122 @@ def family_for(tool: Any) -> tuple[str, str, bool] | None:
     return None
 
 
+# Session-metadata key holding the bounded list of turn records, mirroring
+# ``utils/activity_history.py``'s ``activity_v1``.
+PROVENANCE_KEY = "provenance_v1"
+
+# Field order of the stored entry (design section 7). ``None`` values are
+# omitted by ``to_dict``; ``False``/0/[]/{} are kept so consumers can
+# distinguish "decided false" from "not recorded".
+_TO_DICT_FIELDS: tuple[str, ...] = (
+    "turn_id",
+    "started_at",
+    "source",
+    "answered",
+    "release",
+    "model",
+    "model_preset",
+    "reasoning_profile",
+    "account_intent",
+    "prompt",
+    "prompt_rebuilt",
+    "skills_listed_sha",
+    "skills_loaded",
+    "calls",
+    "args_repaired",
+    "used",
+    "other_steps",
+)
+
+
 @dataclass
 class TurnProvenance:
-    """The TP-09 slice of the turn's provenance record.
+    """What produced one turn, as stored in ``provenance_v1``.
 
-    TP-02 owns the full record (turn id, release, prompt fingerprint,
-    per-call entries); this carries only the fields the ``turn_end`` frame
-    and the over-calling metric need, and later TP issues extend it.
+    Built at turn start (turn id, started time, source, release,
+    ``account_intent``) and filled as the turn runs: model, preset and
+    reasoning profile from the turn runtime decision; per-call entries by
+    TP-05; prompt fingerprint by TP-06; argument-repair counters by TP-07
+    (via the ``CURRENT_TURN_PROVENANCE`` contextvar); ``used``/``other_steps``
+    by TP-09. ``answered`` is set by the save stage from the final content.
     """
 
+    turn_id: str | None = None
+    started_at: str | None = None
+    source: str | None = None
+    answered: bool = False
+    release: str | None = None
+    model: str | None = None
+    model_preset: str | None = None
+    reasoning_profile: str | None = None
     account_intent: bool = False
+    prompt: list[dict[str, Any]] = field(default_factory=list)
+    prompt_rebuilt: bool = False
+    skills_listed_sha: str | None = None
+    skills_loaded: list[dict[str, Any]] = field(default_factory=list)
+    calls: list[dict[str, Any]] = field(default_factory=list)
+    args_repaired: dict[str, int] = field(default_factory=dict)
     used: list[dict[str, Any]] = field(default_factory=list)
     other_steps: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        """The stored entry: every field plus the schema tag ``v``, sans ``None``."""
+        entry: dict[str, Any] = {"v": 1}
+        for name in _TO_DICT_FIELDS:
+            value = getattr(self, name)
+            if value is None:
+                continue
+            if isinstance(value, list):
+                value = list(value)
+            elif isinstance(value, dict):
+                value = dict(value)
+            entry[name] = value
+        return entry
+
+    def absorb_earlier_slice(self, entry: Mapping[str, Any]) -> None:
+        """Fold an earlier slice's stored entry of the same turn into this record.
+
+        A sustained goal that hits ``max_iterations`` continues in a queued
+        internal slice; both slices are one answer. Counts add up, the
+        boolean intents OR together (a continuation has no user text, so its
+        own ``account_intent`` is always false), lists concatenate with the
+        earlier slice first, and ``started_at`` keeps the earliest value.
+        ``answered`` and the runtime fields stay this (latest) slice's.
+        """
+        started_at = entry.get("started_at")
+        if isinstance(started_at, str) and started_at:
+            self.started_at = started_at
+        self.account_intent = bool(entry.get("account_intent")) or self.account_intent
+        self.prompt_rebuilt = bool(entry.get("prompt_rebuilt")) or self.prompt_rebuilt
+        if not self.prompt and isinstance(entry.get("prompt"), list):
+            self.prompt = list(entry["prompt"])
+        if self.skills_listed_sha is None and isinstance(entry.get("skills_listed_sha"), str):
+            self.skills_listed_sha = entry["skills_listed_sha"]
+        for name in ("skills_loaded", "calls"):
+            earlier = entry.get(name)
+            if isinstance(earlier, list):
+                setattr(self, name, [*earlier, *getattr(self, name)])
+        earlier_repairs = entry.get("args_repaired")
+        if isinstance(earlier_repairs, dict):
+            merged = {k: v for k, v in earlier_repairs.items() if isinstance(v, int)}
+            for kind, count in self.args_repaired.items():
+                merged[kind] = merged.get(kind, 0) + count
+            self.args_repaired = merged
+        earlier_steps = entry.get("other_steps")
+        if isinstance(earlier_steps, int):
+            self.other_steps += earlier_steps
+        earlier_used = entry.get("used")
+        if isinstance(earlier_used, list):
+            merged_used = [dict(item) for item in earlier_used if isinstance(item, dict)]
+            for item in self.used:
+                for prior in merged_used:
+                    if prior.get("family") == item["family"]:
+                        prior["calls"] = int(prior.get("calls", 0)) + item["calls"]
+                        prior["errors"] = int(prior.get("errors", 0)) + item["errors"]
+                        break
+                else:
+                    merged_used.append(dict(item))
+            self.used = merged_used
 
     def note_tool_result(self, tool: Any, status: str) -> None:
         """Record one executed tool call.
@@ -140,3 +254,75 @@ class TurnProvenance:
                 "errors": 1 if status == "error" else 0,
             }
         )
+
+
+def log_recording_failure(what: str, exc: BaseException) -> None:
+    """Log one provenance/recording failure without leaking content.
+
+    ``what`` must be a fixed literal. Only the exception TYPE name is logged:
+    no exception text, no traceback and no frame locals (Loguru's diagnose
+    mode would print tool arguments and message text from the frames).
+    """
+    logger.warning(
+        "turn provenance: {} failed ({}); continuing without it",
+        what,
+        type(exc).__name__,
+    )
+
+
+CURRENT_TURN_PROVENANCE: ContextVar[TurnProvenance | None] = ContextVar(
+    "nanobot_turn_provenance",
+    default=None,
+)
+
+
+def current_turn_provenance() -> TurnProvenance | None:
+    """The record for the turn running on this task, or ``None``.
+
+    The turn's tools and per-call observers fill the record through this
+    getter (``agent/tools/execution.py`` counts argument repairs that way),
+    so a call site never needs the session key.
+    """
+    return CURRENT_TURN_PROVENANCE.get()
+
+
+def bind_turn_provenance(record: TurnProvenance) -> Token[TurnProvenance | None]:
+    return CURRENT_TURN_PROVENANCE.set(record)
+
+
+def reset_turn_provenance(token: Token[TurnProvenance | None]) -> None:
+    CURRENT_TURN_PROVENANCE.reset(token)
+
+
+def save_to_session(
+    session: Any,
+    record: TurnProvenance,
+    cap: int = 100,
+    *,
+    merge_same_turn: bool = False,
+) -> None:
+    """Append one turn record to ``session.metadata`` under ``provenance_v1``.
+
+    Keeps only the newest ``cap`` entries, bounded the same way
+    ``utils/activity_history.py`` bounds ``activity_v1``. With
+    ``merge_same_turn`` (an internal continuation slice), the newest stored
+    entry with the same ``turn_id`` is folded into ``record`` first and
+    replaced, so one answer keeps exactly one record.
+    """
+    stored: Any = session.metadata.setdefault(PROVENANCE_KEY, [])
+    if not isinstance(stored, list):
+        stored = []
+        session.metadata[PROVENANCE_KEY] = stored
+    replaced: int | None = None
+    if merge_same_turn and record.turn_id:
+        for index in range(len(stored) - 1, -1, -1):
+            earlier = stored[index]
+            if isinstance(earlier, dict) and earlier.get("turn_id") == record.turn_id:
+                record.absorb_earlier_slice(earlier)
+                replaced = index
+                break
+    entry = record.to_dict()
+    if replaced is not None:
+        del stored[replaced]
+    stored.append(entry)
+    session.metadata[PROVENANCE_KEY] = stored[-cap:]
