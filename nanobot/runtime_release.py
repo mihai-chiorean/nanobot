@@ -40,7 +40,7 @@ def _runtime_root() -> Path:
 def _read_release_file(root: Path) -> str:
     try:
         content = (root / "RELEASE_ID").read_text(encoding="utf-8")
-    except OSError:
+    except (OSError, UnicodeError):
         return ""
     lines = content.splitlines()
     return lines[0] if lines else ""

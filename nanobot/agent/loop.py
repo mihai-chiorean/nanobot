@@ -35,6 +35,7 @@ from nanobot.agent.hook import (
 from nanobot.agent.memory import Consolidator
 from nanobot.agent.memory_index import MemoryIndex, SessionRecallIndexer
 from nanobot.agent.model_runtime import ModelRuntimeResolver
+from nanobot.agent.progress_hook import PDFPasswordStore
 from nanobot.agent.reasoning_policy import (
     ReasoningProfile,
     parse_reasoning_profile,
@@ -54,8 +55,10 @@ from nanobot.agent.tools.context import (
     ZIGGY_PARK_ATTRIBUTE,
     RequestContext,
     bind_request_context,
+    bind_turn_idempotency_scope,
     current_request_context,
     reset_request_context,
+    reset_turn_idempotency_scope,
 )
 from nanobot.agent.tools.exec_session import ExecSessionManager
 from nanobot.agent.tools.file_state import FileStateStore, bind_file_states, reset_file_states
@@ -178,6 +181,8 @@ if TYPE_CHECKING:
 _T = TypeVar("_T")
 _SUBAGENT_PROVIDER_TASK_META = "subagent_provider_task_id"
 _SUBAGENT_TERMINAL_WAIT_SECONDS = 300.0
+# MIT-1811: cadence of AgentLoop.wait_idle during the gateway shutdown drain.
+_SHUTDOWN_IDLE_POLL_SECONDS = 0.5
 
 
 class TurnKind(Enum):
@@ -295,6 +300,11 @@ class TurnContext:
     initial_messages: list[dict[str, Any]] | None = field(default=None, repr=False)
     provider_state: ProviderConversationState | None = field(default=None, repr=False)
     request_context: RequestContext | None = None
+    # SR-11: the turn's idempotency scope, resolved and persisted on the
+    # session by ``_build_turn`` before any tool runs; bound as a context var
+    # around the runner so MCP write calls key on it without polluting the
+    # caller-visible RequestContext metadata.
+    idempotency_scope: str | None = None
     runtime_context_blocks: list[RuntimeContextBlock] = field(default_factory=list)
     attributes: dict[str, Any] = field(default_factory=dict)
 
@@ -624,11 +634,14 @@ class _WorkHook(AgentHook):
     async def before_execute_tools(self, context: AgentHookContext) -> None:
         store = self._loop.work_store
         for tool_call in context.tool_calls:
+            arguments = tool_call.arguments or {}
+            if tool_call.name == "unlock_attachment" and isinstance(arguments, dict):
+                arguments = {**arguments, "password": "[REDACTED]"}
             event = await store.run_io(
                 store.append_event,
                 self._task_id,
                 "tool.started",
-                {"name": tool_call.name, "arguments": tool_call.arguments or {}},
+                {"name": tool_call.name, "arguments": arguments},
                 actor="main_agent",
             )
             await self._publish(event)
@@ -884,6 +897,7 @@ class AgentLoop:
         # One file-read/write tracker per logical session. The tool registry is
         # shared by this loop, so tools resolve the active state via contextvars.
         self._file_state_store = FileStateStore(max_sessions=SESSION_CACHE_MAX_SIZE)
+        self._pdf_password_store = PDFPasswordStore()
         # SessionManager owns every durable deletion entrypoint, including the
         # WebUI and fork rollback paths.  Observe that boundary once instead of
         # duplicating cleanup in each consumer.
@@ -922,6 +936,11 @@ class AgentLoop:
         )
         self._unified_session = unified_session
         self._running = False
+        # MIT-1811: first-SIGTERM drain. While _draining, the dispatch loop
+        # drops messages it pulls off the bus instead of starting turns with
+        # them; their receipts stay unprocessed so the next gateway replays
+        # them from ChatInboxStore.
+        self._draining = False
         self._runtime_context_providers: list[RuntimeContextProvider] = []
         self._active_tasks: dict[str, set[asyncio.Task[Any]]] = {}
         self._direct_turn_count: int = 0
@@ -1060,6 +1079,23 @@ class AgentLoop:
         self._publish_runtime_selection(runtime)
         return runtime
 
+    def session_context_window_tokens(self, session_key: str) -> int | None:
+        """Context window the next turn for ``session_key`` would run with.
+
+        Reads session metadata without creating the session; an unknown or
+        preset-less session gets the default runtime's window. Used to size
+        upload-time attachment payloads (MIT-1967 review).
+        """
+        record = self.sessions.read_session_metadata(session_key)
+        metadata = record.get("metadata") if isinstance(record, dict) else None
+        name = model_preset_from_metadata(metadata if isinstance(metadata, dict) else None)
+        if name is None:
+            return self.runtime_resolver.admit().context_window_tokens
+        try:
+            return self.runtime_resolver.resolve_preset(name).context_window_tokens
+        except KeyError:
+            return self.runtime_resolver.admit().context_window_tokens
+
     def runtime_for_session(
         self,
         session: Session,
@@ -1095,6 +1131,7 @@ class AgentLoop:
         session.metadata[SESSION_MODEL_PRESET_METADATA_KEY] = runtime.model_preset
         self.sessions.save(session)
         return runtime
+
     def _publish_runtime_selection(
         self,
         runtime: LLMRuntime,
@@ -1821,6 +1858,7 @@ class AgentLoop:
         turn_scopes: list[AbstractContextManager[Any]] | None = None,
         tools: ToolRegistry | None = None,
         request_context: RequestContext | None = None,
+        idempotency_scope: str | None = None,
         provider_state: ProviderConversationState | None = None,
         publish_file_turn: PublishFileTurn | None = None,
         initial_messages: list[dict[str, Any]] | None = None,
@@ -1894,10 +1932,22 @@ class AgentLoop:
 
             events = EventSink(_record_tool_activity, events.accepts)
 
+        # Sticky for the whole turn (SR-09): set before any non-read-only call
+        # executes and never cleared, because each checkpoint replaces the
+        # previous one and earlier calls are not persisted until the turn ends.
+        turn_had_write = False
+
         async def _checkpoint(payload: dict[str, Any]) -> None:
+            nonlocal turn_had_write
             if session is None:
                 return
             public_payload = dict(payload)
+            for call in public_payload.get("pending_tool_calls") or []:
+                function = call.get("function") if isinstance(call, dict) else None
+                name = function.get("name") if isinstance(function, dict) else None
+                if not isinstance(name, str) or not effective_tools.is_read_only(name):
+                    turn_had_write = True
+            public_payload["turn_had_write"] = turn_had_write
             private_state = public_payload.pop("provider_state", None)
             public_payload.pop(self._PROVIDER_STATE_CHECKPOINT_VERSION_KEY, None)
             if "provider_state" in payload and (
@@ -2090,6 +2140,7 @@ class AgentLoop:
         effective_tools = tools if tools is not None else self.tools
         file_state_token = bind_file_states(self._file_state_store.for_session(active_session_key))
         request_token = bind_request_context(request_ctx)
+        idempotency_scope_token = bind_turn_idempotency_scope(idempotency_scope)
         workspace_token = bind_workspace_scope(effective_scope)
         # The publication binding is task-scoped contextvars state: it is set
         # here, inside the single task that executes this turn, and undone in
@@ -2179,6 +2230,9 @@ class AgentLoop:
                 session_key=active_session_key,
                 workspace=effective_scope.project_path,
                 tool_hint_max_length=self.tool_hint_max_length,
+                pdf_passwords=self._pdf_password_store.for_session(
+                    self.workspace, active_session_key,
+                ),
                 registered_hook_factories=self._hook_factories,
                 turn_hook_factories=list(hook_factories or []),
                 registered_hooks=self._extra_hooks,
@@ -2254,6 +2308,7 @@ class AgentLoop:
             turn_scope_stack.close()
             reset_work_context(work_tokens)
             reset_workspace_scope(workspace_token)
+            reset_turn_idempotency_scope(idempotency_scope_token)
             reset_request_context(request_token)
             reset_file_states(file_state_token)
             reset_scheduling_class(scheduling_token)
@@ -2341,6 +2396,15 @@ class AgentLoop:
                     continue
                 except Exception as e:
                     logger.warning("Error consuming inbound message: {}, continuing...", e)
+                    continue
+
+                # MIT-1811: during the shutdown drain no new turn may start.
+                # A message pulled off the bus is dropped unprocessed; its
+                # durable receipt stays unprocessed, so the next gateway start
+                # replays it from ChatInboxStore. A subagent result for a
+                # session that is still running goes through: the in-flight
+                # turn needs it to finish, and it has no receipt to replay.
+                if self._draining and not self._completes_inflight_turn(msg):
                     continue
 
                 raw = msg.content.strip()
@@ -2780,6 +2844,41 @@ class AgentLoop:
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
 
+    def _completes_inflight_turn(self, msg: InboundMessage) -> bool:
+        return (
+            msg.channel == "system"
+            and msg.metadata.get("injected_event") == "subagent_result"
+            and self._effective_session_key(msg) in self._pending_queues
+        )
+
+    def begin_drain(self) -> None:
+        """Stop starting new turns while letting in-flight ones finish.
+
+        MIT-1811: called on the first SIGTERM. The dispatch loop drops every
+        message it pulls off the bus from now on (never processing it, so
+        durable receipts stay unprocessed for the next gateway to replay),
+        except subagent results for sessions still running; turns already
+        running keep their task groups until they complete.
+        """
+        self._draining = True
+        logger.info("Agent loop draining; {} active turn(s)", self.active_turn_count())
+
+    async def wait_idle(self, timeout: float) -> bool:
+        """Wait until no turn is in flight, up to *timeout* seconds.
+
+        Returns True once ``active_turn_count()`` reaches zero, False at the
+        timeout. Polls every ``_SHUTDOWN_IDLE_POLL_SECONDS``.
+        """
+        event_loop = asyncio.get_running_loop()
+        deadline = event_loop.time() + max(float(timeout), 0.0)
+        while True:
+            if self.active_turn_count() == 0:
+                return True
+            remaining = deadline - event_loop.time()
+            if remaining <= 0:
+                return False
+            await asyncio.sleep(min(_SHUTDOWN_IDLE_POLL_SECONDS, remaining))
+
     def stop(self) -> None:
         """Stop the agent loop."""
         self._running = False
@@ -3198,6 +3297,17 @@ class AgentLoop:
             )
             session = ctx.require_session()
         is_subagent = ctx.kind is TurnKind.SYSTEM and ctx.msg.sender_id == "subagent"
+        # SR-11: one idempotency scope per turn, so a recovery Continue replays
+        # writes with the scope this turn actually used (an ask_user reply, a
+        # fresh per-turn id, ...).  Assigned here, before every early save
+        # below, and written explicitly once those saves are done.
+        ctx.idempotency_scope = turn_continuation.resolve_idempotency_scope(
+            ctx.msg.metadata
+        )
+        if not ctx.ephemeral:
+            session.metadata[turn_continuation.TURN_IDEMPOTENCY_SCOPE_KEY] = (
+                ctx.idempotency_scope
+            )
 
         ctx.history = session.get_history(extend_to_user=is_subagent)
         ctx.ask_user_resume_id = self._detect_ask_user_resume(ctx)
@@ -3293,6 +3403,13 @@ class AgentLoop:
             # Upgrade the replay-safe baseline to the resumable state before
             # prompt assembly and the first model checkpoint.
             self.sessions.save(session)
+        if not ctx.ephemeral:
+            # Unconditional: whether an early save above already carried the
+            # scope depends on the path taken; this must not (SR-11).
+            self.sessions.update_session_metadata(
+                session.key,
+                {turn_continuation.TURN_IDEMPOTENCY_SCOPE_KEY: ctx.idempotency_scope},
+            )
         if ctx.ask_user_resume_id is not None:
             assert ctx.request_context is not None
             ctx.initial_messages = ask_user_tool_result_messages(
@@ -3351,6 +3468,7 @@ class AgentLoop:
                 turn_scopes=ctx.turn_scopes,
                 tools=ctx.tools,
                 request_context=ctx.request_context,
+                idempotency_scope=ctx.idempotency_scope,
                 provider_state=ctx.provider_state,
                 initial_messages=ctx.initial_messages,
                 events=ctx.events,
@@ -3651,6 +3769,27 @@ class AgentLoop:
                 else None
             )
             role, content = entry.get("role"), entry.get("content")
+            if role == "assistant" and entry.get("tool_calls"):
+                # Enforce the history boundary even for resumed/raw transcripts.
+                calls: list[Any] = []
+                for call in entry["tool_calls"]:
+                    if not isinstance(call, dict):
+                        calls.append(call)
+                        continue
+                    call = cast(dict[str, Any], call)
+                    function = call.get("function", {})
+                    if not isinstance(function, dict):
+                        calls.append(call)
+                        continue
+                    function = cast(dict[str, Any], function)
+                    if function.get("name") == "unlock_attachment":
+                        arguments = ToolCallRequest(
+                            id=call.get("id", ""), name="unlock_attachment",
+                            arguments=function.get("arguments"),
+                        ).to_openai_tool_call()["function"]["arguments"]
+                        call = {**call, "function": {**function, "arguments": arguments}}
+                    calls.append(call)
+                entry["tool_calls"] = calls
             if role == "assistant" and not content and not entry.get("tool_calls"):
                 continue  # skip empty assistant messages — they poison session context
             if role == "tool":
