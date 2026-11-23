@@ -27,8 +27,6 @@ from typing import Any
 import httpx
 from loguru import logger
 
-from nanobot.agent.tools.mcp_client_credentials import OAuthClientCredentialsError
-
 # The three endings that push (design §4 "The push"); a tester-made
 # ``cancelled`` is deliberately absent.
 PUSH_STATUSES = frozenset({"succeeded", "failed", "interrupted"})
@@ -182,6 +180,10 @@ async def notify_finished(
     configuration). Never raises: the caller schedules this as a background
     task and a lost push must not touch the turn or the gateway.
     """
+    # Function-level, like the other MCP helpers here: a module-level import
+    # pulls the MCP/config graph in while the agent loop is still importing.
+    from nanobot.agent.tools.mcp_client_credentials import OAuthClientCredentialsError
+
     if status not in PUSH_STATUSES:
         logger.warning(
             "work.finished push skipped for task {} (error_class=invalid_status, status={!r})",
