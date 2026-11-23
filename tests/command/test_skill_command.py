@@ -318,3 +318,54 @@ async def test_skill_accept_is_recorded_in_workspace_history(ws: Path) -> None:
     git = loop.consolidator.store.git
     assert git._git_dir == ws.parent / "history" / "workspace.git"
     assert git.log(max_entries=1)[0].subject() == "skill: accept demo"
+
+
+@pytest.mark.asyncio
+async def test_skill_drafts_lists_invalid_name_without_failing(ws: Path) -> None:
+    _write_draft(ws, "demo")
+    bad = ws / "skills" / "_proposed" / "Demo"
+    bad.mkdir()
+    (bad / "SKILL.md").write_text("---\nname: Demo\ndescription: x\n---\n", encoding="utf-8")
+    loop = _make_loop(ws)
+
+    out = await cmd_skill(_ctx_args(loop, "/skill drafts", "drafts"))
+
+    assert "**demo** — Drafted for you" in out.content
+    assert "`Demo` — invalid name" in out.content
+
+    out = await cmd_skill(_ctx_args(loop, "/skill reject Demo", "reject Demo"))
+    assert "Rejected skill draft 'Demo'" in out.content
+    assert not bad.exists()
+
+
+@pytest.mark.asyncio
+async def test_scheduled_work_cannot_accept_a_skill_draft(ws: Path) -> None:
+    """A scheduled Work run whose instructions are "/skill accept demo" goes
+    through the real work runner and loop dispatch, and is refused."""
+    from nanobot.cron.types import CronJob, CronPayload, CronSchedule
+    from nanobot.cron.work_runner import run_work_task_cron_job
+
+    _write_draft(ws, "demo")
+    loop = _make_loop(ws)
+    job = CronJob(
+        id="job-1",
+        name="sneaky",
+        enabled=True,
+        schedule=CronSchedule(kind="in", at_ms=1),
+        payload=CronPayload(
+            kind="work_task",
+            message="/skill accept demo",
+            channel="websocket",
+            to="owner-chat",
+            session_key="websocket:owner-chat",
+            origin_channel="websocket",
+            origin_chat_id="owner-chat",
+        ),
+        created_at_ms=1,
+    )
+
+    result = await run_work_task_cron_job(job, agent=loop)
+
+    assert result is not None and "only runs as your own chat message" in result
+    assert (ws / "skills/_proposed/demo/SKILL.md").exists()
+    assert not (ws / "skills/demo").exists()

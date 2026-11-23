@@ -72,6 +72,10 @@ class SkillDraftError(ValueError):
     """Raised for an unusable draft name (bad characters, path traversal)."""
 
 
+def is_valid_name(name: str) -> bool:
+    return bool(_SKILL_NAME_RE.fullmatch(name))
+
+
 def _validate_name(name: str) -> str:
     if not _SKILL_NAME_RE.fullmatch(name):
         raise SkillDraftError(
@@ -347,6 +351,52 @@ def _ensure_history(history: GitStore) -> None:
         history.init()
 
 
+def _apply_all_or_nothing(
+    live: Path, draft_files: dict[str, bytes], live_files: dict[str, bytes]
+) -> None:
+    """Write *draft_files* under *live*; on any failure restore the live skill.
+
+    Every file is staged as a temp file first, then renamed into place.  If a
+    stage or a rename fails, completed renames are undone (overwritten files
+    get their old bytes back, new files and directories this created are
+    removed), every temp file is deleted, and the error propagates.
+    """
+    created_dirs: list[Path] = []
+    staged: list[tuple[str, Path, str]] = []
+    replaced: list[str] = []
+    try:
+        for rel, data in draft_files.items():
+            target = live / rel
+            missing = [p for p in [target.parent, *target.parent.parents] if not p.exists()]
+            for directory in reversed(missing):
+                directory.mkdir()
+                created_dirs.append(directory)
+            fd, tmp_name = tempfile.mkstemp(dir=target.parent, prefix=".skill-draft-")
+            staged.append((tmp_name, target, rel))
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+        for tmp_name, target, rel in staged:
+            os.replace(tmp_name, target)
+            replaced.append(rel)
+    except BaseException:
+        for rel in reversed(replaced):
+            target = live / rel
+            try:
+                if rel in live_files:
+                    target.write_bytes(live_files[rel])
+                else:
+                    target.unlink()
+            except OSError:
+                logger.exception("skill_drafts: could not roll back {}", target)
+        for tmp_name, _target, _rel in staged:
+            with suppress(OSError):
+                os.unlink(tmp_name)
+        for directory in reversed(created_dirs):
+            with suppress(OSError):
+                directory.rmdir()
+        raise
+
+
 def accept(ws: Path | str, name: str, history: GitStore) -> list[str]:
     """Apply draft *name* over the live skill. Returns problems; [] means accepted.
 
@@ -388,24 +438,7 @@ def accept(ws: Path | str, name: str, history: GitStore) -> list[str]:
         logger.exception("skill_drafts: pre-accept history commit failed for '{}'", name)
         return [f"Could not record the current state in workspace history ({exc}); nothing changed"]
 
-    # Stage every file before renaming any, so an I/O error leaves the live
-    # skill untouched rather than half-updated.
-    staged: list[tuple[str, Path]] = []
-    try:
-        for rel, data in draft_files.items():
-            target = live / rel
-            target.parent.mkdir(parents=True, exist_ok=True)
-            fd, tmp_name = tempfile.mkstemp(dir=target.parent, prefix=".skill-draft-")
-            staged.append((tmp_name, target))
-            with os.fdopen(fd, "wb") as handle:
-                handle.write(data)
-        for tmp_name, target in staged:
-            os.replace(tmp_name, target)
-    except BaseException:
-        for tmp_name, _target in staged:
-            with suppress(OSError):
-                os.unlink(tmp_name)
-        raise
+    _apply_all_or_nothing(live, draft_files, live_files)
     shutil.rmtree(draft)
     _prune_empty_proposed(draft)
     try:
@@ -416,19 +449,72 @@ def accept(ws: Path | str, name: str, history: GitStore) -> list[str]:
     return []
 
 
+def _reject_target(ws: Path | str, name: str) -> Path | None:
+    """The ``_proposed/`` entry *name* names, valid skill name or not.
+
+    Matches only an existing direct child of ``skills/_proposed/`` by exact
+    name, so a malformed draft (e.g. ``Demo``) can still be removed while
+    ``..`` or a path with separators never resolves outside it.
+    """
+    root = skills_root(ws) / PROPOSED_DIR
+    if root.is_symlink() or not root.is_dir() or name not in os.listdir(root):
+        return None
+    return root / name
+
+
+def _missing_from_head(history: GitStore, ws: Path, base: Path) -> list[str]:
+    """Entries under *base* that the history HEAD does not hold byte for byte."""
+    from dulwich.repo import Repo
+
+    missing: list[str] = []
+    with Repo(str(history._git_dir)) as repo:
+        tree = GitStore._head_tree(repo)
+        for dirpath, dirnames, filenames in os.walk(base, followlinks=False):
+            for entry in [*dirnames, *filenames]:
+                path = Path(dirpath) / entry
+                rel = path.relative_to(ws).as_posix()
+                if path.is_symlink():
+                    missing.append(f"{rel} (symlink)")
+                    continue
+                if path.is_dir():
+                    continue
+                try:
+                    data = path.read_bytes()
+                except OSError:
+                    missing.append(f"{rel} (unreadable)")
+                    continue
+                stored = GitStore._read_blob_from_tree(repo, tree, rel) if tree else None
+                if stored != data:
+                    note = " (too large)" if len(data) > _MAX_TRACKED_FILE_BYTES else ""
+                    missing.append(f"{rel}{note}")
+    return missing
+
+
 def reject(ws: Path | str, name: str, history: GitStore) -> bool:
     """Delete draft *name* (live files untouched). True if a draft was removed.
 
-    Owner-initiated only.  The draft is committed to *history* before it is
-    deleted, so a reject can be undone; if that commit fails nothing is
-    deleted and the error propagates.
+    Owner-initiated only.  Also removes a draft whose directory name is not a
+    valid skill name.  The draft is committed to *history* first and every
+    file in it is checked against that commit; if any file is not held there
+    (too large, a symlink, unreadable) nothing is deleted and
+    :class:`SkillDraftError` explains why, so a reject can always be undone.
     """
-    _validate_name(name)
-    draft = draft_dir(ws, name)
-    if draft.is_symlink() or not draft.is_dir():
+    draft = _reject_target(ws, name)
+    if draft is None:
         return False
+    if draft.is_symlink() or not draft.is_dir():
+        raise SkillDraftError(
+            f"skills/{PROPOSED_DIR}/{name} is not a draft directory; not removing it."
+        )
     _ensure_history(history)
     history.auto_commit(f"skill: before reject {name}")
+    missing = _missing_from_head(history, Path(ws), draft)
+    if missing:
+        raise SkillDraftError(
+            f"Not rejecting draft '{name}': workspace history cannot hold "
+            + ", ".join(missing)
+            + ", so deleting it could not be undone. Nothing was changed."
+        )
     shutil.rmtree(draft)
     _prune_empty_proposed(draft)
     try:

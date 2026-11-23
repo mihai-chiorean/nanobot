@@ -989,6 +989,19 @@ def _skill_reply(ctx: CommandContext, content: str, *, as_text: bool = False) ->
     )
 
 
+def _interactive_user_turn(ctx: CommandContext) -> bool:
+    """A genuine interactive user turn, not an automated run.
+
+    ``is_user_turn`` already excludes system/subagent messages, cron and
+    local-trigger turns and mid-turn injected commands. Scheduled Work runs
+    enter through ``process_direct`` as an ordinary user message, so their
+    Work-task metadata is checked here too.
+    """
+    from nanobot.cron.work_runner import WORK_TASK_META_TASK_ID
+
+    return ctx.is_user_turn and WORK_TASK_META_TASK_ID not in (ctx.msg.metadata or {})
+
+
 async def cmd_skill(ctx: CommandContext) -> OutboundMessage:
     """List skills, or manage the draft overlays (drafts/diff/accept/reject)."""
     from nanobot.agent import skill_drafts
@@ -1016,6 +1029,12 @@ async def cmd_skill(ctx: CommandContext) -> OutboundMessage:
             return _skill_reply(ctx, "No skill drafts waiting. Send /skill accept <name> after an offer.")
         lines = [f"Skill drafts ({len(drafts)}):", ""]
         for draft_name in drafts:
+            if not skill_drafts.is_valid_name(draft_name):
+                lines.append(
+                    f"- `{draft_name}` — invalid name (cannot be accepted; remove it with "
+                    f"/skill reject {draft_name})"
+                )
+                continue
             merged = skill_drafts.merged_view(ws, draft_name)
             lines.append(f"- **{draft_name}** — {skill_drafts.skill_description(merged)}")
         lines.append("")
@@ -1026,11 +1045,11 @@ async def cmd_skill(ctx: CommandContext) -> OutboundMessage:
         return _skill_reply(ctx, _SKILL_USAGE, as_text=True)
     if not name:
         return _skill_reply(ctx, f"{sub.capitalize()} needs a skill name.\n\n{_SKILL_USAGE}", as_text=True)
-    if sub in {"accept", "reject"} and not ctx.is_user_turn:
+    if sub in {"accept", "reject"} and not _interactive_user_turn(ctx):
         # Only the user activates or discards a draft. Automation turns (cron,
-        # triggers, subagent/session relays) and commands injected mid-turn
-        # never get here with is_user_turn set, so the agent cannot accept its
-        # own draft by routing "/skill accept" back into a session.
+        # triggers, subagent/session relays, scheduled Work runs) and commands
+        # injected mid-turn are refused, so the agent cannot accept its own
+        # draft by routing "/skill accept" back into a session.
         return _skill_reply(
             ctx,
             f"/skill {sub} only runs as your own chat message while no task is "

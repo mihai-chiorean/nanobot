@@ -1,5 +1,6 @@
 """Tests for skill draft overlays: check, diff, accept, reject and the offer message."""
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -437,30 +438,68 @@ def test_accept_refuses_overwrite_of_file_too_big_for_history(tmp_path: Path) ->
     assert (tmp_path / "skills/demo/assets/big.bin").read_bytes() == big
 
 
-def test_accept_is_all_or_nothing_on_write_failure(tmp_path: Path, monkeypatch) -> None:
+def test_accept_rolls_back_completed_renames_on_rename_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The 3rd os.replace fails: the 2 completed renames (a new file and an
+    overwrite) are undone, no temp files remain, the draft is kept."""
     _write_live(tmp_path, "demo", {"SKILL.md": _skill_md("demo", "Old"), "scripts/a.py": "old\n"})
     _write_draft(
         tmp_path, "demo",
-        {"SKILL.md": _skill_md("demo", "New"), "scripts/a.py": "new\n"},
+        {
+            "assets/new.txt": "brand new\n",
+            "SKILL.md": _skill_md("demo", "New"),
+            "scripts/a.py": "new\n",
+        },
     )
     git = _git(tmp_path)
-    real_mkstemp = skill_drafts.tempfile.mkstemp
+    real_replace = skill_drafts.os.replace
     calls = {"n": 0}
 
-    def flaky_mkstemp(*args, **kwargs):
-        calls["n"] += 1
-        if calls["n"] == 2:
-            raise OSError("disk full")
-        return real_mkstemp(*args, **kwargs)
+    def flaky_replace(src, dst, *args, **kwargs):
+        if os.fsdecode(os.path.basename(src)).startswith(".skill-draft-"):  # accept renames only
+            calls["n"] += 1
+            if calls["n"] == 3:
+                raise OSError("rename failed")
+        return real_replace(src, dst, *args, **kwargs)
 
-    monkeypatch.setattr(skill_drafts.tempfile, "mkstemp", flaky_mkstemp)
-    with pytest.raises(OSError):
+    monkeypatch.setattr(skill_drafts.os, "replace", flaky_replace)
+    with pytest.raises(OSError, match="rename failed"):
         skill_drafts.accept(tmp_path, "demo", git)
 
+    assert calls["n"] == 3
+    live = tmp_path / "skills/demo"
     assert "Old" in _read(tmp_path, "skills/demo/SKILL.md")
     assert _read(tmp_path, "skills/demo/scripts/a.py") == "old\n"
-    assert not [p for p in (tmp_path / "skills/demo").rglob(".skill-draft-*")]
+    assert not (live / "assets").exists()
+    assert not list(live.rglob(".skill-draft-*"))
     assert (tmp_path / "skills/_proposed/demo/SKILL.md").exists()
+
+
+def test_reject_refuses_when_a_draft_file_is_too_big_for_history(tmp_path: Path) -> None:
+    from nanobot.utils.gitstore import _MAX_TRACKED_FILE_BYTES
+
+    big = b"b" * (_MAX_TRACKED_FILE_BYTES + 1)
+    _write_draft(tmp_path, "demo", {"SKILL.md": _skill_md("demo"), "assets/big.bin": big})
+
+    with pytest.raises(skill_drafts.SkillDraftError, match="assets/big.bin"):
+        skill_drafts.reject(tmp_path, "demo", _git(tmp_path))
+
+    assert (tmp_path / "skills/_proposed/demo/assets/big.bin").read_bytes() == big
+    assert (tmp_path / "skills/_proposed/demo/SKILL.md").exists()
+
+
+def test_reject_removes_draft_with_invalid_name_restorably(tmp_path: Path) -> None:
+    _write_draft(tmp_path, "Demo", {"SKILL.md": _skill_md("Demo")})
+    git = _git(tmp_path)
+
+    assert "Demo" in skill_drafts.list_drafts(tmp_path)
+    assert skill_drafts.reject(tmp_path, "Demo", git) is True
+    assert not (tmp_path / "skills/_proposed/Demo").exists()
+    git.revert(git.log(max_entries=1)[0].sha)
+    assert (tmp_path / "skills/_proposed/Demo/SKILL.md").exists()
+    # Traversal never matches a _proposed entry.
+    assert skill_drafts.reject(tmp_path, "../_proposed", git) is False
 
 
 def test_draft_symlink_out_of_workspace_is_refused_and_not_read(tmp_path: Path) -> None:
