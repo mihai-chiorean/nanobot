@@ -135,8 +135,19 @@ class CronTool(Tool):
         tz: str | None = None,
         at: str | None = None,
         job_id: str | None = None,
+        as_work: Any = None,
     ) -> str:
         if action == "add":
+            if self._as_work_requested(as_work):
+                # SR-24: ``cron`` never creates ``work_task`` jobs. The legacy
+                # ``as_work`` call shape must not silently degrade into a plain
+                # reminder; background Work goes through schedule_work, which
+                # forwards the approved plan to the ziggy-work connector.
+                return ToolResult.error(
+                    "Error: cron cannot create background Work (work_task) jobs. "
+                    "Use schedule_work so workflow intake, confirmation, and the "
+                    "ziggy-work scheduler handle it."
+                )
             request = current_request_context()
             if request is not None and is_cron_turn(request.metadata):
                 return ToolResult.error("Error: cannot schedule new jobs from within a cron job execution")
@@ -146,6 +157,13 @@ class CronTool(Tool):
         elif action == "remove":
             return self._remove_job(job_id)
         return f"Unknown action: {action}"
+
+    @staticmethod
+    def _as_work_requested(value: Any) -> bool:
+        """Whether the legacy ``as_work`` flag was truthy (providers vary on bools)."""
+        if isinstance(value, str):
+            return value.strip().lower() in {"true", "1", "yes", "y", "on"}
+        return bool(value)
 
     def _add_job(
         self,
