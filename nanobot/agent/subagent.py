@@ -30,7 +30,16 @@ from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.bus.events import INBOUND_META_ROOM_SCOPE, InboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.config.schema import AgentDefaults, ToolsConfig
-from nanobot.llm_usage.context import LLMUsageSource, current_llm_usage_source
+from nanobot.agent.turn_provenance import (
+    TurnProvenance,
+    bind_turn_provenance,
+    reset_turn_provenance,
+)
+from nanobot.llm_usage.context import (
+    LLMUsageSource,
+    current_llm_usage_source,
+    current_llm_usage_turn_id,
+)
 from nanobot.providers.base import LLMProvider, LLMUsage
 from nanobot.security.workspace_access import (
     WorkspaceScope,
@@ -62,6 +71,11 @@ class _SubagentOrigin(TypedDict):
     # building its RequestContext without this silently drops the gate that
     # ToolRegistry.prepare_call keys off.
     room_scope: NotRequired[dict[str, Any] | None]
+    # Ziggy-local (TP-05 / MIT-1862): the spawning turn's effective turn id,
+    # captured at spawn time. The child's provider usage rows and model_call
+    # log lines carry it; the child keeps its own provenance record (with
+    # ``parent_turn_id``) and never writes into the parent's.
+    parent_turn_id: NotRequired[str | None]
 
 
 @dataclass(slots=True)
@@ -267,6 +281,7 @@ class SubagentManager:
             "session_key": session_key,
             "llm_usage_source": current_llm_usage_source(),
             "room_scope": _inherited_room_scope(),
+            "parent_turn_id": current_llm_usage_turn_id(),
         }
 
         status = SubagentStatus(
@@ -340,6 +355,7 @@ class SubagentManager:
             "session_key": session_key,
             "llm_usage_source": current_llm_usage_source(),
             "room_scope": _inherited_room_scope(),
+            "parent_turn_id": current_llm_usage_turn_id(),
         }
         status = SubagentStatus(
             task_id=task_id,
@@ -473,6 +489,19 @@ class SubagentManager:
             # here so the property holds by construction: subagent-originated
             # progress can never be attributed to the parent's Work task.
             work_tokens = set_work_context(store=None, task_id=None, workspace=None)
+            # Ziggy-local (TP-05 / MIT-1862): one rule for inline and
+            # background children alike -- the child gets its own provenance
+            # record keyed ``subagent:<task id>`` with ``parent_turn_id``, so
+            # its model calls never append to the parent's mutable record
+            # (whose inclusion would otherwise depend on whether the child ran
+            # before the parent saved). Usage rows and logs carry the parent
+            # turn id via the run spec below.
+            parent_turn_id = origin.get("parent_turn_id")
+            child_record = TurnProvenance(
+                turn_id=f"subagent:{task_id}",
+                parent_turn_id=parent_turn_id,
+            )
+            provenance_token = bind_turn_provenance(child_record)
             try:
                 # Ziggy-local (fork, MIT-202/MIT-186): open the subagent root span
                 # as a child of the parent turn's trace. The llm-iteration and tool
@@ -502,8 +531,19 @@ class SubagentManager:
                             "llm_usage_source",
                             current_llm_usage_source(),
                         ),
+                        turn_id=parent_turn_id,
                     ))
             finally:
+                reset_turn_provenance(provenance_token)
+                try:
+                    logger.info(
+                        "subagent_provenance {}",
+                        json.dumps(child_record.to_dict(), sort_keys=True),
+                    )
+                except Exception:
+                    logger.opt(exception=True).warning(
+                        "subagent provenance logging failed; continuing"
+                    )
                 reset_work_context(work_tokens)
                 if token is not None:
                     reset_workspace_scope(token)

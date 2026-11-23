@@ -117,6 +117,7 @@ PROVENANCE_KEY = "provenance_v1"
 # distinguish "decided false" from "not recorded".
 _TO_DICT_FIELDS: tuple[str, ...] = (
     "turn_id",
+    "parent_turn_id",
     "started_at",
     "source",
     "answered",
@@ -149,6 +150,9 @@ class TurnProvenance:
     """
 
     turn_id: str | None = None
+    # TP-05: set only on a subagent's own record -- the effective turn id of
+    # the turn that spawned it. A child never writes into its parent's record.
+    parent_turn_id: str | None = None
     started_at: str | None = None
     source: str | None = None
     answered: bool = False

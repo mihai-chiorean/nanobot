@@ -798,6 +798,7 @@ class AgentRunner:
                         messages_for_model,
                         request_state=request_state,
                         transcript=messages,
+                        iteration=iteration,
                     )
                     retry_usage = self._record_request_usage(spec, request_state, response)
                     round_usages.append(retry_usage)
@@ -1100,46 +1101,7 @@ class AgentRunner:
         transcript: list[dict[str, Any]] | None,
     ) -> tuple[LLMResponse, LLMUsage]:
         tool_definitions = spec.tools.get_definitions()
-        # TP-05: every call carries the whole registry, so record which set it
-        # was — count + content-free digest — in the log, the turn's
-        # provenance record and the open Langfuse iteration span (design
-        # section 3). The span opens in _run_core before this point, so its
-        # metadata is attached with an update rather than at creation.
-        tools_n, tools_sha = tools_offered_fingerprint(tool_definitions)
-        release = release_id()
-        logger.info(
-            "model_call turn={} iter={} tools n={} sha={} profile={} model={} release={}",
-            spec.turn_id,
-            context.iteration,
-            tools_n,
-            tools_sha,
-            spec.reasoning_profile,
-            spec.runtime.model,
-            release,
-        )
-        provenance_record = current_turn_provenance()
-        if provenance_record is not None:
-            provenance_record.calls.append(
-                {
-                    "iter": context.iteration,
-                    "tools_n": tools_n,
-                    "tools_sha": tools_sha,
-                    "profile": spec.reasoning_profile,
-                    "model": spec.runtime.model,
-                }
-            )
-        update_llm_iteration_metadata(
-            {
-                "gen_ai.operation.name": "chat",
-                "gen_ai.request.model": spec.runtime.model,
-                "gen_ai.conversation.id": spec.session_key or "",
-                "ziggy.turn_id": spec.turn_id or "",
-                "ziggy.tools.offered.count": tools_n,
-                "ziggy.tools.offered.sha": tools_sha,
-                "ziggy.reasoning.profile": spec.reasoning_profile or "",
-                "ziggy.release": release,
-            }
-        )
+        self._record_model_call(spec, context.iteration, tool_definitions)
         messages, provider_context = await self.context_governor.prepare_request(
             request_state,
             messages,
@@ -1330,6 +1292,7 @@ class AgentRunner:
                 spec,
                 fallback_messages,
                 request_state=request_state,
+                iteration=context.iteration,
             )
             fallback_usage = self._record_request_usage(
                 spec,
@@ -1440,6 +1403,7 @@ class AgentRunner:
         *,
         request_state: ModelRequestState,
         transcript: list[dict[str, Any]],
+        iteration: int,
     ) -> LLMResponse:
         retry_messages = self._finalization_retry_messages(messages)
         response = await self._request_no_tools(
@@ -1447,6 +1411,7 @@ class AgentRunner:
             retry_messages,
             request_state=request_state,
             transcript=transcript,
+            iteration=iteration,
         )
         request_state.conversation.observe_response(
             response,
@@ -1484,6 +1449,7 @@ class AgentRunner:
                 retry_messages,
                 request_state=request_state,
                 transcript=messages if compaction is not None else None,
+                iteration=spec.max_iterations,
             )
         except Exception:
             logger.exception(
@@ -1517,6 +1483,63 @@ class AgentRunner:
             return None, usage
         return clean, usage
 
+    @staticmethod
+    def _record_model_call(
+        spec: AgentRunSpec,
+        iteration: int,
+        tool_definitions: list[dict[str, Any]],
+    ) -> None:
+        """Record which tool set one provider call is offered (TP-05).
+
+        Called at every dispatch path -- ``_request_model`` with the registry,
+        ``_request_no_tools`` with ``[]`` -- so each provider call yields
+        exactly one log line, one ``calls`` entry on the turn's provenance
+        record and one update of the open Langfuse iteration span (design
+        section 3). Content-free: count + digest only. Provenance is
+        observability: any failure here is logged at WARNING and the call
+        goes ahead unrecorded.
+        """
+        try:
+            tools_n, tools_sha = tools_offered_fingerprint(tool_definitions)
+            release = release_id()
+            logger.info(
+                "model_call turn={} iter={} tools n={} sha={} profile={} model={} release={}",
+                spec.turn_id,
+                iteration,
+                tools_n,
+                tools_sha,
+                spec.reasoning_profile,
+                spec.runtime.model,
+                release,
+            )
+            provenance_record = current_turn_provenance()
+            if provenance_record is not None:
+                provenance_record.calls.append(
+                    {
+                        "iter": iteration,
+                        "tools_n": tools_n,
+                        "tools_sha": tools_sha,
+                        "profile": spec.reasoning_profile,
+                        "model": spec.runtime.model,
+                    }
+                )
+            update_llm_iteration_metadata(
+                {
+                    "gen_ai.operation.name": "chat",
+                    "gen_ai.request.model": spec.runtime.model,
+                    "gen_ai.conversation.id": spec.session_key or "",
+                    "ziggy.turn_id": spec.turn_id or "",
+                    "ziggy.tools.offered.count": tools_n,
+                    "ziggy.tools.offered.sha": tools_sha,
+                    "ziggy.reasoning.profile": spec.reasoning_profile or "",
+                    "ziggy.release": release,
+                }
+            )
+        except Exception:
+            logger.opt(exception=True).warning(
+                "model_call provenance recording failed; the call proceeds unrecorded"
+            )
+
     async def _request_no_tools(
         self,
         spec: AgentRunSpec,
@@ -1524,7 +1547,9 @@ class AgentRunner:
         *,
         request_state: ModelRequestState,
         transcript: list[dict[str, Any]] | None = None,
+        iteration: int,
     ) -> LLMResponse:
+        self._record_model_call(spec, iteration, [])
         messages, provider_context = await self.context_governor.prepare_request(
             request_state,
             messages,

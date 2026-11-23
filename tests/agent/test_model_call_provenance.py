@@ -340,3 +340,236 @@ def test_observe_llm_iteration_accepts_metadata_and_tracks_the_span() -> None:
         assert span is None
         assert lf._CURRENT_LLM_ITERATION_SPAN.get() is None
     assert lf._CURRENT_LLM_ITERATION_SPAN.get() is None
+
+
+# ---------------------------------------------------------------------------
+# Review round 1 (MIT-1862)
+# ---------------------------------------------------------------------------
+
+import hashlib  # noqa: E402
+import json  # noqa: E402
+from contextlib import contextmanager  # noqa: E402
+
+from nanobot.agent import runner as runner_mod  # noqa: E402
+from nanobot.providers.base import LLMUsage  # noqa: E402
+
+
+def _expected_sha(defs: list[dict[str, Any]] | None) -> str:
+    """Independent statement of the fingerprint contract (design section 3)."""
+    payload = json.dumps(
+        sorted(defs or [], key=lambda d: d.get("function", d).get("name", "")),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+
+class _FakeSpan:
+    def __init__(self, metadata: dict[str, Any]) -> None:
+        self.metadata = dict(metadata)
+        self.updates: list[dict[str, Any]] = []
+
+    def update(self, *, metadata: dict[str, Any]) -> None:
+        self.updates.append(dict(metadata))
+        self.metadata = dict(metadata)
+
+
+class _FakeLangfuse:
+    def __init__(self) -> None:
+        self.spans: list[_FakeSpan] = []
+
+    @contextmanager
+    def start_as_current_observation(self, *, name: str, as_type: str, metadata: dict[str, Any]):
+        span = _FakeSpan(metadata)
+        span.name = name  # type: ignore[attr-defined]
+        self.spans.append(span)
+        yield span
+
+
+def _malformed_then_recovered_provider(seen_tools: list[Any]) -> MagicMock:
+    provider = MagicMock(spec=LLMProvider)
+
+    async def chat_stream_with_retry(*, messages, tools=None, **kwargs):
+        seen_tools.append(tools)
+        if len(seen_tools) < 3:
+            return LLMResponse(
+                content="bad tool request",
+                tool_calls=[ToolCallRequest(id=f"bad{len(seen_tools)}", name=None, arguments={})],
+                finish_reason="tool_calls",
+                usage=LLMUsage.reported(input_tokens=10, output_tokens=1),
+            )
+        return LLMResponse(content="recovered", usage=LLMUsage.reported(input_tokens=10, output_tokens=1))
+
+    provider.chat_stream_with_retry = chat_stream_with_retry
+    return provider
+
+
+@pytest.mark.asyncio
+async def test_fingerprint_failure_never_fails_the_run(monkeypatch) -> None:
+    def boom(defs: Any) -> Any:
+        raise RuntimeError("hash exploded")
+
+    monkeypatch.setattr(runner_mod, "tools_offered_fingerprint", boom)
+    record = TurnProvenance(turn_id="t-boom")
+    token = bind_turn_provenance(record)
+    try:
+        result, _lines = await _run_turn(tools=_registry_with([]), tool_name="alpha_tool")
+    finally:
+        reset_turn_provenance(token)
+    assert result.final_content == "done"
+    assert record.calls == []
+
+
+@pytest.mark.asyncio
+async def test_release_lookup_failure_never_fails_the_run(monkeypatch) -> None:
+    def boom() -> str:
+        raise RuntimeError("release exploded")
+
+    monkeypatch.setattr(runner_mod, "release_id", boom)
+    result, _lines = await _run_turn(tools=_registry_with([]), tool_name=None)
+    assert result.final_content == "done"
+
+
+@pytest.mark.asyncio
+async def test_no_tools_recovery_call_is_recorded_on_every_surface(monkeypatch) -> None:
+    """Two malformed tool responses then a no-tools recovery: 3 provider calls,
+    3 calls entries, 3 log lines; the recovery records what it was actually
+    offered (nothing), and the Langfuse iteration ends on that count."""
+    fake = _FakeLangfuse()
+    monkeypatch.setattr(lf, "_safe_get_client", lambda: fake)
+    seen_tools: list[Any] = []
+    provider = _malformed_then_recovered_provider(seen_tools)
+    tools = _registry_with([])
+    record = TurnProvenance(turn_id="t-rec")
+    token = bind_turn_provenance(record)
+    lines: list[str] = []
+    sink_id = logger.add(lambda m: lines.append(str(m)), level="INFO")
+    try:
+        result = await AgentRunner().run(make_run_spec(
+            provider,
+            initial_messages=[{"role": "user", "content": "use a tool"}],
+            tools=tools,
+            model="test-model",
+            max_iterations=1,
+            max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+            turn_id="t-rec",
+        ))
+    finally:
+        logger.remove(sink_id)
+        reset_turn_provenance(token)
+
+    assert result.final_content == "recovered"
+    assert len(seen_tools) == 3 and seen_tools[2] is None
+    assert [(c["tools_n"], c["tools_sha"]) for c in record.calls] == [
+        (2, _expected_sha(seen_tools[0])),
+        (2, _expected_sha(seen_tools[1])),
+        (0, _expected_sha([])),
+    ]
+    assert len([line for line in lines if "model_call turn=t-rec" in line]) == 3
+    iteration_spans = [s for s in fake.spans if s.name.startswith("llm-iteration-")]  # type: ignore[attr-defined]
+    assert len(iteration_spans) == 1
+    final_meta = iteration_spans[0].metadata
+    assert final_meta["ziggy.tools.offered.count"] == 0
+    assert final_meta["ziggy.tools.offered.sha"] == _expected_sha([])
+
+
+@pytest.mark.asyncio
+async def test_runner_records_the_real_sha_and_updates_the_langfuse_span(monkeypatch) -> None:
+    """End to end through AgentRunner.run: the recorded sha is the digest of the
+    definitions the provider actually received, the two registries differ, and
+    the open Langfuse iteration span carries the same values."""
+    fake = _FakeLangfuse()
+    monkeypatch.setattr(lf, "_safe_get_client", lambda: fake)
+    shas: list[str] = []
+    for extra in ([], ["gamma_tool"]):
+        seen: list[Any] = []
+        provider = _scripted_provider(tool_name=None)
+        original = provider.chat_stream_with_retry
+
+        async def spy(*, messages, tools=None, _seen=seen, _orig=original, **kwargs):
+            _seen.append(tools)
+            return await _orig(messages=messages, tools=tools, **kwargs)
+
+        provider.chat_stream_with_retry = spy
+        record = TurnProvenance(turn_id="t-sha")
+        token = bind_turn_provenance(record)
+        try:
+            await AgentRunner().run(make_run_spec(
+                provider,
+                initial_messages=[{"role": "user", "content": "hi"}],
+                tools=_registry_with(extra),
+                model="test-model",
+                max_iterations=1,
+                max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+                turn_id="t-sha",
+                reasoning_profile="think",
+            ))
+        finally:
+            reset_turn_provenance(token)
+        assert record.calls[0]["tools_sha"] == _expected_sha(seen[0])
+        shas.append(record.calls[0]["tools_sha"])
+        span = [s for s in fake.spans if s.name == "llm-iteration-0"][-1]  # type: ignore[attr-defined]
+        assert span.updates, "the runner must update the open iteration span"
+        assert span.metadata["ziggy.tools.offered.sha"] == record.calls[0]["tools_sha"]
+        assert span.metadata["ziggy.tools.offered.count"] == len(seen[0])
+        assert span.metadata["ziggy.turn_id"] == "t-sha"
+        assert span.metadata["ziggy.reasoning.profile"] == "think"
+        assert span.metadata["iteration"] == 0
+    assert shas[0] != shas[1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["inline", "background"])
+async def test_subagent_keeps_its_own_record_and_carries_the_parent_turn_id(
+    tmp_path, mode: str
+) -> None:
+    """One rule for inline and background children: the child never appends to
+    the parent's record; its usage and logs carry the parent turn id; its own
+    record carries ``parent_turn_id``."""
+    import asyncio
+
+    from nanobot.agent.subagent import SubagentManager
+    from nanobot.bus.queue import MessageBus
+    from nanobot.providers.base import GenerationSettings
+    from nanobot.utils.llm_runtime import LLMRuntime
+
+    usage_turn_ids: list[str | None] = []
+    provider = MagicMock(spec=LLMProvider)
+    provider.get_default_model.return_value = "test"
+    provider.generation = GenerationSettings()
+
+    async def chat_stream_with_retry(*, messages, **kwargs):
+        usage_turn_ids.append(current_llm_usage_turn_id())
+        return LLMResponse(content="child done", tool_calls=[])
+
+    provider.chat_stream_with_retry = chat_stream_with_retry
+    runtime = LLMRuntime.capture(provider, "test", context_window_tokens=128_000)
+    sm = SubagentManager(workspace=tmp_path, bus=MessageBus(), max_tool_result_chars=16_000)
+    sm._announce_result = MagicMock(side_effect=lambda *a, **k: asyncio.sleep(0))
+
+    parent = TurnProvenance(turn_id="parent-1")
+    record_token = bind_turn_provenance(parent)
+    turn_token = bind_llm_usage_turn_id("parent-1")
+    lines: list[str] = []
+    sink_id = logger.add(lambda m: lines.append(str(m)), level="INFO")
+    try:
+        if mode == "inline":
+            result = await sm.run_inline(task="do it", session_key="websocket:t", runtime=runtime)
+            assert result == "child done"
+        else:
+            await sm.spawn(task="do it", session_key="websocket:t", runtime=runtime)
+            await asyncio.gather(*list(sm._running_tasks.values()))
+    finally:
+        logger.remove(sink_id)
+        reset_llm_usage_turn_id(turn_token)
+        reset_turn_provenance(record_token)
+
+    assert parent.calls == []
+    assert usage_turn_ids == ["parent-1"]
+    assert [line for line in lines if "model_call turn=parent-1" in line]
+    child_lines = [line for line in lines if "subagent_provenance " in line]
+    assert len(child_lines) == 1
+    child = json.loads(child_lines[0].split("subagent_provenance ", 1)[1].strip())
+    assert child["parent_turn_id"] == "parent-1"
+    assert child["turn_id"].startswith("subagent:")
+    assert len(child["calls"]) == 1
