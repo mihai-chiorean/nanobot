@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from contextlib import AbstractContextManager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from difflib import get_close_matches
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
@@ -37,6 +38,12 @@ def normalize_command_text(text: str) -> str:
     if command and suffix and _BOT_SUFFIX_RE.fullmatch(suffix):
         return f"{command}{sep}{rest}" if sep else command
     return stripped
+
+
+# True while ``AgentLoop.process_direct`` runs a turn: it came from an
+# in-process caller (scheduled work, heartbeat, Dream, SDK, API, CLI one-shot),
+# not from a channel the owner types into. History-rewriting commands refuse it.
+DIRECT_TURN: ContextVar[bool] = ContextVar("nanobot_direct_turn", default=False)
 
 
 @dataclass
