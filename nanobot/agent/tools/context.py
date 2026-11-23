@@ -34,6 +34,42 @@ _CURRENT_REQUEST_CONTEXT: ContextVar["RequestContext | None"] = ContextVar(
 #: key back to end a Work turn in ``waiting`` instead of ``succeeded``.
 ZIGGY_PARK_ATTRIBUTE = "ziggy_park"
 
+#: Turn-scoped idempotency scope (SR-11): the identity of the logical turn
+#: every non-read-only MCP call in it hashes into ``ziggy.dev/idempotency_key``.
+#: ``AgentLoop`` resolves it once per turn
+#: (``turn_continuation.resolve_idempotency_scope``),
+#: persists it on the session before any tool runs, and binds it here around
+#: the runner; recovery reads the persisted value back so a Continue replays
+#: with the exact scope the interrupted turn used.  A context var, not a
+#: ``RequestContext`` field: the caller-visible metadata/attributes bags stay
+#: exactly what the caller sent (facade contract).
+_CURRENT_TURN_IDEMPOTENCY_SCOPE: ContextVar[str | None] = ContextVar(
+    "nanobot_turn_idempotency_scope",
+    default=None,
+)
+
+
+def bind_turn_idempotency_scope(scope: str | None) -> Token[str | None]:
+    return _CURRENT_TURN_IDEMPOTENCY_SCOPE.set(scope)
+
+
+def reset_turn_idempotency_scope(token: Token[str | None]) -> None:
+    _CURRENT_TURN_IDEMPOTENCY_SCOPE.reset(token)
+
+
+def current_turn_idempotency_scope() -> str | None:
+    return _CURRENT_TURN_IDEMPOTENCY_SCOPE.get()
+
+
+@contextmanager
+def turn_idempotency_scope(scope: str | None):
+    """Bind the running turn's idempotency scope for tool calls."""
+    token = bind_turn_idempotency_scope(scope)
+    try:
+        yield scope
+    finally:
+        reset_turn_idempotency_scope(token)
+
 
 @dataclass(frozen=True)
 class RequestContext:

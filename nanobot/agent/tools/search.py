@@ -199,10 +199,18 @@ class _SearchTool(_FsTool):
             return
 
         for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = sorted(d for d in dirnames if d not in self._IGNORE_DIRS)
             current = Path(dirpath)
+            dirnames[:] = sorted(
+                d
+                for d in dirnames
+                if d not in self._IGNORE_DIRS and not self._is_history_path(current / d)
+            )
             for filename in sorted(filenames):
-                yield current / filename
+                file_path = current / filename
+                # A file symlink can point into history/; check the target.
+                if self._is_history_path(file_path):
+                    continue
+                yield file_path
 
 
 class FindFilesTool(_SearchTool):
@@ -303,6 +311,8 @@ class FindFilesTool(_SearchTool):
                     except OSError:
                         continue
                     if is_dir and raw_entry.name in self._IGNORE_DIRS:
+                        continue
+                    if self._is_history_path(Path(raw_entry.path)):
                         continue
 
                     entry = self._entry(Path(raw_entry.path), root, is_dir=is_dir)
