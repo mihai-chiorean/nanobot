@@ -297,6 +297,7 @@ async def test_history_writes_refused_outside_interactive_user_turn(
     token = None
     if origin == "not_user_turn":
         ctx.is_user_turn = False
+        ctx.session = MagicMock()  # a turn the loop dispatched, e.g. system/cron
     else:
         token = DIRECT_TURN.set(True)
     try:
@@ -308,6 +309,29 @@ async def test_history_writes_refused_outside_interactive_user_turn(
     assert "only be run by you from a chat" in out.content
     assert (ws / "SOUL.md").read_text(encoding="utf-8") == "new"
     assert git.log()[0].sha == sha
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("raw", "handler"),
+    [("/undo", cmd_undo), ("/restore", cmd_restore), ("/dream-restore", cmd_dream_restore)],
+)
+async def test_history_writes_beside_running_turn_say_retry(tmp_path, raw, handler) -> None:
+    """Inline dispatch next to an in-flight turn has no session and is not a
+    user turn; the refusal must say to retry, not blame automation."""
+    ctx, git = _make_ctx(tmp_path, raw)
+    ws = git._workspace
+    (ws / "SOUL.md").write_text("old", encoding="utf-8")
+    old_sha = git.auto_commit("dream: old")
+    (ws / "SOUL.md").write_text("new", encoding="utf-8")
+    sha = git.auto_commit("dream: new")
+    ctx.args = f"{old_sha} confirm" if raw == "/restore" else sha
+    ctx.is_user_turn = False
+
+    out = await handler(ctx)
+
+    assert out.content == "A turn is still running — send it again when it finishes."
+    assert (ws / "SOUL.md").read_text(encoding="utf-8") == "new"
 
 
 @pytest.mark.asyncio

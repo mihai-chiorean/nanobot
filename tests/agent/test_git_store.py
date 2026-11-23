@@ -1038,3 +1038,34 @@ class TestBareWorkspaceHistory:
         script.write_text("#!/bin/sh\necho v3\n", encoding="utf-8")
         assert bare.restore(target).restored == ["skills/s/run.sh"]
         assert os.stat(script).st_mode & 0o777 == 0o755
+
+    def test_failed_rollback_keeps_backup_and_reports_it(self, bare, ws, monkeypatch):
+        """Codex P2: ENOSPC on the second rename and on the rollback rename.
+        The backup is then the only copy of the original: it must survive and
+        its path must be in the error."""
+        import errno
+
+        (ws / "SOUL.md").write_text("soul v1", encoding="utf-8")
+        (ws / "USER.md").write_text("user v1", encoding="utf-8")
+        bare.init()
+        (ws / "SOUL.md").write_text("soul v2", encoding="utf-8")
+        (ws / "USER.md").write_text("user v2", encoding="utf-8")
+        sha = bare.auto_commit("dream: both")
+        real_replace = os.replace
+        calls = []
+
+        def enospc_replace(src, dst, *args, **kwargs):
+            calls.append(dst)
+            if len(calls) in (2, 3):
+                raise OSError(errno.ENOSPC, "No space left on device")
+            return real_replace(src, dst, *args, **kwargs)
+
+        monkeypatch.setattr(os, "replace", enospc_replace)
+        with pytest.raises(GitStoreError, match="Rollback failed") as info:
+            bare.undo(sha)
+
+        backups = [p for p in ws.iterdir() if p.name.endswith(".bak")]
+        assert len(backups) == 1
+        assert backups[0].read_text(encoding="utf-8") == "soul v2"
+        assert str(backups[0]) in str(info.value)
+        assert (ws / "USER.md").read_text(encoding="utf-8") == "user v2"

@@ -645,6 +645,8 @@ class GitStore:
             if result.restored:
                 result.new_sha = self.auto_commit(f"undo {full_sha[:8]}")
             return result
+        except GitStoreError:
+            raise
         except Exception as exc:
             raise GitStoreError(f"Git undo failed for {sha}") from exc
 
@@ -675,6 +677,8 @@ class GitStore:
             self._apply_writes(writes)
             plan.new_sha = self.auto_commit(f"restore {full_sha[:8]}")
             return plan
+        except GitStoreError:
+            raise
         except Exception as exc:
             raise GitStoreError(f"Git restore failed for {sha}") from exc
 
@@ -762,8 +766,9 @@ class GitStore:
         Stage each file to a temp file (keeping the destination's mode, so an
         executable skill script stays executable) and hard-link a backup of
         any file it replaces; then rename the temp files in. Any failure rolls
-        back the renames already done. Temp files and backups never outlive
-        the call.
+        back the renames already done. Temp files and backups are removed,
+        except a backup whose rollback failed: it is the only copy of the
+        original, so it stays next to the file and its path is in the error.
         """
         staged: list[list[Any]] = []  # [tmp, dest, backup | None]
         done: list[list[Any]] = []
@@ -787,13 +792,25 @@ class GitStore:
             for entry in staged:
                 os.replace(entry[0], entry[1])
                 done.append(entry)
-        except BaseException:
-            for _tmp, dest, backup in reversed(done):
-                with suppress(OSError):
+        except BaseException as exc:
+            stranded: list[str] = []
+            for entry in reversed(done):
+                _tmp, dest, backup = entry
+                try:
                     if backup is not None:
                         os.replace(backup, dest)
                     else:
                         os.unlink(dest)
+                except OSError:
+                    if backup is not None:
+                        # Rollback failed: the backup is now the only copy of
+                        # the original. Never delete it; tell the caller.
+                        stranded.append(f"{dest} (original kept at {backup})")
+                        entry[2] = None
+            if stranded:
+                raise GitStoreError(
+                    "Rollback failed; originals left next to the files: " + "; ".join(stranded)
+                ) from exc
             raise
         finally:
             for tmp, _dest, backup in staged:

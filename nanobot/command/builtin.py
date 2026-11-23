@@ -923,12 +923,20 @@ def _history_write_refusal(ctx: CommandContext) -> OutboundMessage | None:
     """Undo/restore rewrite workspace files: only a genuine interactive owner
     turn may run them — never scheduled work, cron, subagents, system events
     or in-process ``process_direct`` callers."""
-    if ctx.is_user_turn and not DIRECT_TURN.get():
+    direct = DIRECT_TURN.get()
+    if ctx.is_user_turn and not direct:
         return None
+    if not direct and ctx.session is None:
+        # Inline dispatch beside an in-flight turn of the same chat.
+        content = "A turn is still running — send it again when it finishes."
+    else:
+        content = (
+            "This command can only be run by you from a chat, "
+            "not by scheduled or automated work."
+        )
     return OutboundMessage(
         channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
-        content="This command can only be run by you from a chat, not by scheduled or automated work.",
-        metadata={"render_as": "text"},
+        content=content, metadata={"render_as": "text"},
     )
 
 
