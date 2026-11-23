@@ -41,26 +41,44 @@ def export_work_task_entries(jobs: list[CronJob]) -> list[dict[str, Any]]:
         if job.payload.kind != "work_task":
             continue
         routing = work_routing(job)
+        schedule = job.schedule
         at: str | None = None
-        if job.schedule.kind == "at" and job.schedule.at_ms:
-            at = datetime.fromtimestamp(
-                job.schedule.at_ms / 1000, tz=timezone.utc
-            ).isoformat()
+        if schedule.kind == "at" and schedule.at_ms:
+            at = datetime.fromtimestamp(schedule.at_ms / 1000, tz=timezone.utc).isoformat()
+        expr = schedule.expr
+        every_ms: int | None = None
+        if schedule.kind == "every" and schedule.every_ms and schedule.every_ms > 0:
+            every_ms = schedule.every_ms
+            # Same ``@every`` form schedule_work sends to the connector.
+            expr = (
+                f"@every {every_ms // 1000}s"
+                if every_ms % 1000 == 0
+                else f"@every {every_ms}ms"
+            )
         entries.append(
             {
                 "title": str(routing.get("work_title") or job.name),
                 "content": job.payload.message,
                 "schedule": {
-                    "kind": job.schedule.kind,
-                    "expr": job.schedule.expr,
-                    "tz": job.schedule.tz,
+                    "kind": schedule.kind,
+                    "expr": expr,
+                    "tz": schedule.tz,
                     "at": at,
+                    "every_ms": every_ms,
                 },
                 "skill": routing.get("work_skill") or routing.get("skill") or None,
                 "enabled": bool(job.enabled),
             }
         )
     return entries
+
+
+def _timing_reconstructable(entry: dict[str, Any]) -> bool:
+    """Whether an exported entry carries enough to recreate its schedule."""
+    schedule = entry["schedule"]
+    if schedule["kind"] == "at":
+        return bool(schedule["at"])
+    return bool(schedule["expr"])
 
 
 def _work_task_jobs(service: CronService) -> list[CronJob]:
@@ -106,8 +124,17 @@ def export(
     # ``export`` does (the pre-change state is what the import needs).
     entries = export_work_task_entries(jobs)
     if disable:
-        for job in jobs:
+        for job, entry in zip(jobs, entries, strict=True):
             if not job.enabled:
+                continue
+            if not _timing_reconstructable(entry):
+                # Disabling it would lose a schedule nobody can re-create.
+                typer.secho(
+                    f"Warning: left work_task job {job.id} ({job.name}) enabled: "
+                    "its schedule cannot be reconstructed from the export",
+                    err=True,
+                    fg="yellow",
+                )
                 continue
             if service.enable_job(job.id, enabled=False) is None:
                 typer.secho(

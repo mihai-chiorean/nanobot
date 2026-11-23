@@ -623,6 +623,7 @@ def test_export_prints_every_work_task_job_and_nothing_else(tmp_path: Path) -> N
         "expr": "16 19 * * *",
         "tz": "UTC",
         "at": None,
+        "every_ms": None,
     }
     assert first["skill"] is None
     assert first["enabled"] is True
@@ -649,7 +650,13 @@ def test_export_reports_at_jobs_with_an_iso_fire_time(tmp_path: Path) -> None:
     assert result.exit_code == 0, result.output
     (entry,) = json.loads(result.stdout)
     expected = datetime.fromtimestamp(at_ms / 1000, tz=timezone.utc).isoformat()
-    assert entry["schedule"] == {"kind": "at", "expr": None, "tz": None, "at": expected}
+    assert entry["schedule"] == {
+        "kind": "at",
+        "expr": None,
+        "tz": None,
+        "at": expected,
+        "every_ms": None,
+    }
 
 
 def test_disable_disables_only_the_work_task_jobs(tmp_path: Path) -> None:
@@ -681,3 +688,44 @@ def test_export_of_a_runtime_without_work_jobs(tmp_path: Path) -> None:
     assert result.exit_code == 0, result.output
     assert json.loads(result.stdout) == []
 
+
+
+def test_export_reports_interval_jobs_with_their_interval(tmp_path: Path) -> None:
+    """An ``every`` work_task keeps its timing: ``every_ms`` plus a normalized
+    ``@every <n>s`` expr, so the import can recreate it after ``--disable``."""
+    raw = json.loads(json.dumps(OWNER_WORK_JOBS[0]))
+    raw["schedule"] = {"kind": "every", "everyMs": 3_600_000}
+    workspace, config_path = _make_workspace(tmp_path, [raw])
+
+    result = _invoke_export(config_path, ["--disable"])
+
+    assert result.exit_code == 0, result.output
+    (entry,) = json.loads(result.stdout)
+    assert entry["schedule"] == {
+        "kind": "every",
+        "expr": "@every 3600s",
+        "tz": None,
+        "at": None,
+        "every_ms": 3_600_000,
+    }
+    service = CronService(workspace / "cron" / "jobs.json")
+    (job,) = service.list_jobs(include_disabled=True)
+    assert job.enabled is False
+
+
+def test_disable_skips_a_job_whose_timing_cannot_be_reconstructed(
+    tmp_path: Path,
+) -> None:
+    """``--disable`` never disables a job the export cannot describe."""
+    broken = json.loads(json.dumps(OWNER_WORK_JOBS[0]))
+    broken["schedule"] = {"kind": "every"}
+    workspace, config_path = _make_workspace(tmp_path, [broken, OWNER_WORK_JOBS[1]])
+
+    result = _invoke_export(config_path, ["--disable"])
+
+    assert result.exit_code == 0, result.output
+    assert broken["id"] in result.stderr
+    service = CronService(workspace / "cron" / "jobs.json")
+    jobs = {job.id: job for job in service.list_jobs(include_disabled=True)}
+    assert jobs[broken["id"]].enabled is True
+    assert jobs[OWNER_WORK_JOBS[1]["id"]].enabled is False
