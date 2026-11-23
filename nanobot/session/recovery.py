@@ -845,19 +845,24 @@ class RecoveryCoordinator:
         """Whether an awaiting_tools checkpoint can be auto-continued (SR-09).
 
         Only true when the whole turn is side-effect free: the checkpoint is
-        well-formed and awaiting tools, every pending call and every earlier
-        tool call of the same turn resolves to a registered read-only tool,
-        and no continuation attempt has been made for this recovery yet.
+        well-formed and awaiting tools, the runner recorded that no
+        non-read-only call was started this turn (``turn_had_write`` is
+        sticky across the turn's checkpoints, and a checkpoint without it
+        fails closed), and every pending call and every persisted tool call
+        since the last user message resolves to a registered read-only tool.
+
+        Attempts are not consulted: a re-interrupted continuation is caught by
+        the ``resuming`` loop guard before this runs, so any earlier recovery
+        state here belongs to a finished turn.
         """
         lookup = self.tool_is_read_only
         if lookup is None:
             return False
         if checkpoint.get("phase") != "awaiting_tools":
             return False
-        if not _runtime_checkpoint_is_well_formed(checkpoint):
+        if checkpoint.get("turn_had_write") is not False:
             return False
-        state = recovery_state_from_metadata(session.metadata)
-        if state is not None and state.get("attempts", 0) != 0:
+        if not _runtime_checkpoint_is_well_formed(checkpoint):
             return False
         if not self._tool_calls_are_read_only(checkpoint.get("pending_tool_calls")):
             return False

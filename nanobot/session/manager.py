@@ -455,6 +455,7 @@ class SessionStore(Protocol):
         *,
         fsync: bool = False,
         touch_updated_at: bool = False,
+        updated_at: datetime | None = None,
     ) -> bool: ...
 
     def list_sessions(self) -> list[SessionInfo]: ...
@@ -1342,6 +1343,7 @@ class JsonlSessionStore:
         *,
         fsync: bool = False,
         touch_updated_at: bool = False,
+        updated_at: datetime | None = None,
     ) -> bool:
         """Atomically replace only a session file's metadata record.
 
@@ -1371,7 +1373,7 @@ class JsonlSessionStore:
                     metadata.update(deepcopy(updates))
                     data["metadata"] = metadata
                     if touch_updated_at:
-                        data["updated_at"] = datetime.now().isoformat()
+                        data["updated_at"] = (updated_at or datetime.now()).isoformat()
                     with open(tmp_path, "x", encoding="utf-8") as target:
                         target.write(json.dumps(data, ensure_ascii=False) + "\n")
                         shutil.copyfileobj(source, target)
@@ -2442,14 +2444,26 @@ class SessionManager:
         touch_updated_at: bool = False,
     ) -> bool:
         """Atomically update metadata without replacing session history."""
+        stamp = datetime.now() if touch_updated_at else None
         updated = self._store.update_metadata(
             key,
             updates,
             fsync=fsync,
             touch_updated_at=touch_updated_at,
+            updated_at=stamp,
         )
         if updated and (session := self.get_cached(key)) is not None:
             session.metadata.update(deepcopy(updates))
+            if stamp is not None:
+                session.updated_at = stamp
+                if self._store is self._jsonl_store and isinstance(
+                    session.metadata.get(_RUNTIME_CHECKPOINT_KEY), dict
+                ):
+                    # The in-flight sidecar is only trusted while its
+                    # base_updated_at matches the main record, so re-base it
+                    # or the bump would silently drop the awaiting_tools
+                    # checkpoint a crash mid-tool needs (SR-09).
+                    self._jsonl_store.save_runtime_checkpoint(session)
         return updated
 
     def list_sessions(self) -> list[dict[str, Any]]:

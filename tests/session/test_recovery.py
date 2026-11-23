@@ -57,8 +57,9 @@ def _awaiting_tools_checkpoint(
     calls: list[tuple[str, str]],
     *,
     completed: list[dict] | None = None,
+    turn_had_write: bool | None = False,
 ) -> dict:
-    return {
+    checkpoint = {
         "phase": "awaiting_tools",
         "assistant_message": {
             "role": "assistant",
@@ -72,6 +73,9 @@ def _awaiting_tools_checkpoint(
             {"id": call_id, "function": {"name": name}} for call_id, name in calls
         ],
     }
+    if turn_had_write is not None:
+        checkpoint["turn_had_write"] = turn_had_write
+    return checkpoint
 
 
 @pytest.mark.asyncio
@@ -632,6 +636,80 @@ async def test_restart_after_auto_continued_turn_committed_is_recovered(tmp_path
     state = restarted2.get_or_create("websocket:chat").metadata[RECOVERY_METADATA_KEY]
     assert state["status"] == "recovered"
     assert state["reason"] == "committed"
+
+
+@pytest.mark.asyncio
+async def test_earlier_recovery_does_not_block_a_later_turn(tmp_path: Path) -> None:
+    """Codex P2: attempts belong to the interrupted turn, not the session."""
+    sessions = SessionManager(tmp_path)
+    session = sessions.get_or_create("websocket:chat")
+    session.messages.append({"role": "user", "content": "read the logs"})
+    session.metadata[PENDING_USER_TURN_KEY] = True
+    session.metadata[RUNTIME_CHECKPOINT_KEY] = _awaiting_tools_checkpoint(
+        [("call-1", "read_file")]
+    )
+    _persist(sessions, session)
+    coordinator, bus, running = _registry_coordinator(
+        tmp_path,
+        read_only=["read_file"],
+        write=["send_email"],
+    )
+    await coordinator.scan()
+    bus.inbound.get_nowait()
+    live = running.get_or_create("websocket:chat")
+    live.metadata.pop(PENDING_USER_TURN_KEY, None)
+    live.messages.append({"role": "assistant", "content": "here are the logs"})
+    running.save(live)
+    await coordinator.turn_completed("websocket:chat")
+    assert live.metadata[RECOVERY_METADATA_KEY]["status"] == "recovered"
+    assert live.metadata[RECOVERY_METADATA_KEY]["attempts"] == 1
+
+    # A later, unrelated turn is interrupted inside another read.
+    live.messages.append({"role": "user", "content": "now read the config"})
+    live.metadata[PENDING_USER_TURN_KEY] = True
+    live.metadata[RUNTIME_CHECKPOINT_KEY] = _awaiting_tools_checkpoint(
+        [("call-9", "read_file")]
+    )
+    running.save(live)
+
+    coordinator2, bus2, restarted2 = _registry_coordinator(
+        tmp_path,
+        read_only=["read_file"],
+        write=["send_email"],
+    )
+    await coordinator2.scan()
+
+    state = restarted2.get_or_create("websocket:chat").metadata[RECOVERY_METADATA_KEY]
+    assert state["status"] == "resuming"
+    assert state["reason"] == "read_only_resumed"
+    assert bus2.inbound.get_nowait().metadata[RECOVERY_INBOUND_METADATA_KEY] == (
+        state["recovery_id"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_without_write_evidence_fails_closed(tmp_path: Path) -> None:
+    """Only a checkpoint that records ``turn_had_write: False`` may resume."""
+    sessions = SessionManager(tmp_path)
+    session = sessions.get_or_create("websocket:chat")
+    session.messages.append({"role": "user", "content": "read the logs"})
+    session.metadata[PENDING_USER_TURN_KEY] = True
+    session.metadata[RUNTIME_CHECKPOINT_KEY] = _awaiting_tools_checkpoint(
+        [("call-1", "read_file")],
+        turn_had_write=None,
+    )
+    _persist(sessions, session)
+
+    coordinator, bus, restarted = _registry_coordinator(
+        tmp_path,
+        read_only=["read_file"],
+        write=["send_email"],
+    )
+    await coordinator.scan()
+
+    assert bus.inbound.empty()
+    state = restarted.get_or_create("websocket:chat").metadata[RECOVERY_METADATA_KEY]
+    assert state["reason"] == "tool_state_unknown"
 
 
 @pytest.mark.asyncio
