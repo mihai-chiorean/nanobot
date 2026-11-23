@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from nanobot.agent.skills import PROPOSED_SKILLS_DIR
 from nanobot.agent.tools.base import Tool, ToolResult, tool_parameters
 from nanobot.agent.tools.context import ToolContext
 from nanobot.agent.tools.file_state import FileStates, current_file_states
@@ -23,6 +24,7 @@ from nanobot.agent.tools.schema import (
 from nanobot.config_base import Base
 from nanobot.security.workspace_access import current_tool_workspace
 from nanobot.utils.file_edit_events import FileDiff, FileEditResult, display_file_edit_path
+from nanobot.utils.gitstore import history_dir_for
 from nanobot.utils.helpers import build_image_content_blocks, detect_image_mime
 from nanobot.utils.sensitive import is_sensitive_path
 
@@ -60,8 +62,25 @@ class SensitivePathError(PermissionError):
     single resolver both fixes that and covers ``write_file`` (which never had
     the check) and any tool added later.
 
+    SM-01 (MIT-1842) reuses it for the workspace history refusal raised at the
+    shared resolver: the same clean error for a path class the agent must
+    never reach.
+
     Subclasses PermissionError because every write tool already funnels that to
     a clean ToolResult.error.
+    """
+
+
+class SkillDraftRequiredError(PermissionError):
+    """Ziggy-local (fork, MIT-1850): a write would edit a live skill in place.
+
+    Raised from ``_resolve_write`` for any path under ``<agent workspace>/
+    skills/<name>/`` (``_proposed`` excluded) while ``tools.skills.drafts`` is
+    on, so agent and Dream skill edits land as overlays in
+    ``skills/_proposed/<name>/`` and only go live via ``/skill accept``.
+
+    Subclasses PermissionError for the same reason as SensitivePathError:
+    every write tool already funnels that to a clean ToolResult.error.
     """
 
 
@@ -96,8 +115,10 @@ class _FsTool(Tool):
         restrict_to_workspace: bool | None = None,
         sandbox_restricts_workspace: bool = False,
         extra_read_allowed_files: list[Path] | None = None,
+        skills_drafts: bool = True,
     ):
         self._workspace = workspace
+        self._skills_drafts = bool(skills_drafts)
         self._allowed_dir = allowed_dir
         # Legacy alias: extra_allowed_dirs is read-only. Write-capable tools
         # must opt in via extra_write_allowed_dirs.
@@ -142,6 +163,7 @@ class _FsTool(Tool):
             file_states=ctx.file_state_store,
             restrict_to_workspace=ctx.config.restrict_to_workspace,
             sandbox_restricts_workspace=sandbox_restricts,
+            skills_drafts=ctx.config.skills.drafts,
         )
 
     @property
@@ -179,7 +201,7 @@ class _FsTool(Tool):
         allowed_root = self._effective_allowed_root(access.allowed_root)
         if extra_files_require_allowed_root and allowed_root is None:
             extra_allowed_files = None
-        return resolve_workspace_path(
+        resolved = resolve_workspace_path(
             path,
             access.project_path,
             allowed_root,
@@ -187,6 +209,43 @@ class _FsTool(Tool):
             extra_allowed_files,
             include_media_dir=include_media_dir,
         )
+        self._refuse_history_path(resolved, path)
+        return resolved
+
+    def _refuse_history_path(self, resolved: Path, path: str | Path) -> None:
+        """Refuse any resolved path inside the workspace's history directory.
+
+        SM-01 (MIT-1842): the undo history is a bare repo at
+        ``<workspace>/../history`` (``history_dir_for``), derived only from
+        the tool's own workspace path. The containment check the resolver
+        already does is not enough on its own: a conversation's project scope
+        can widen the allowed root to any existing directory (e.g. the tenant
+        root), which would put ``history/`` inside it. This refusal applies
+        whatever the effective allowed root is, so the agent can never read or
+        rewrite its own history. Raises the MIT-121 sensitive-path error
+        (PermissionError), which every file tool already funnels to a clean
+        ToolResult.error.
+        """
+        if self._is_history_path(resolved):
+            raise SensitivePathError(
+                f"Access to {path} is blocked (workspace history — the agent "
+                "cannot read or rewrite its own undo history)."
+            )
+
+    def _is_history_path(self, path: Path) -> bool:
+        """True if *path* is the workspace history dir or anything under it.
+
+        Traversing tools (list_dir, grep, find_files) call this per entry to
+        prune history/ when a widened root (e.g. the tenant root) contains it.
+        """
+        if self._workspace is None:
+            return False
+        try:
+            history = history_dir_for(Path(self._workspace))
+            resolved = Path(path).resolve(strict=False)
+        except (OSError, RuntimeError, ValueError):
+            return False
+        return resolved == history or history in resolved.parents
 
     def _resolve_read(self, path: str) -> Path:
         plugin_skill_dirs: list[Path] = []
@@ -233,7 +292,38 @@ class _FsTool(Tool):
             raise SensitivePathError(
                 f"Writing {path} is blocked (sensitive path — credentials or key material)."
             )
+        self._check_skill_draft(resolved)
         return resolved
+
+    def _check_skill_draft(self, resolved: Path) -> None:
+        """MIT-1850: with tools.skills.drafts on, live-skill writes become drafts.
+
+        Checked against this tool's *agent workspace* (self._workspace), never
+        the effective project root, so a project scope covering the workspace's
+        parent cannot route around the overlay. ``skills/_proposed/**`` and
+        paths outside ``skills/`` pass through untouched.
+        """
+        if not self._skills_drafts or self._workspace is None:
+            return
+        try:
+            skills_root = Path(self._workspace).expanduser().resolve(strict=False) / "skills"
+        except (OSError, RuntimeError):
+            return
+        try:
+            rel = resolved.relative_to(skills_root)
+        except ValueError:
+            return
+        # rel.parts == () is the skills root itself; a single part is a loose
+        # file directly under skills/, which the loader can never list (it only
+        # walks <skills>/<name>/SKILL.md), so neither needs the overlay.
+        if len(rel.parts) < 2 or rel.parts[0] == PROPOSED_SKILLS_DIR:
+            return
+        name = rel.parts[0]
+        draft_path = f"skills/{PROPOSED_SKILLS_DIR}/{rel.as_posix()}"
+        raise SkillDraftRequiredError(
+            f"Skills you write are drafts. Write the changed file to {draft_path} "
+            f"instead; the user accepts it with /skill accept {name}."
+        )
 
     def _resolve(self, path: str) -> Path:
         return self._resolve_read(path)
@@ -339,6 +429,17 @@ class ReadFileTool(_FsTool):
     def read_only(self) -> bool:
         return True
 
+    def resolved_read_path(self, path: str) -> Path:
+        """The file a read of ``path`` opens, bundled-skill fallback included.
+
+        Provenance (TP-06) asks the same question after a read succeeds, so
+        it records the file that was actually read.
+        """
+        fp = self._resolve_read(path)
+        if not fp.exists():
+            fp = _builtin_skill_read_path(path) or fp
+        return fp
+
     async def execute(
         self,
         path: str | None = None,
@@ -368,9 +469,7 @@ class ReadFileTool(_FsTool):
             if is_sensitive_path(path):
                 return ToolResult.error(f"Error: Reading {path} is blocked (sensitive path — credentials or key material).")
 
-            fp = self._resolve_read(path)
-            if not fp.exists():
-                fp = _builtin_skill_read_path(path) or fp
+            fp = self.resolved_read_path(path)
             # Post-resolve pass: defence in depth against symlink / traversal
             # escapes. Runs *after* the builtin-skill fallback, which can
             # reassign fp -- checking before it would leave the final value
@@ -498,9 +597,31 @@ class ReadFileTool(_FsTool):
             return ToolResult.error(f"Error reading PDF: {e}")
 
         if not extraction.text:
-            return f"(PDF has no extractable text: {fp})"
+            if extraction.total_pages <= 0:
+                return f"(PDF has no extractable text: {fp})"
+            # An all-blank requested window is not an empty document; report
+            # the range and keep the walk going so later text pages are
+            # reachable (MIT-1967 review).
+            result = (
+                f"(No extractable text on pages {extraction.start_page + 1}-"
+                f"{extraction.end_page + 1} of {fp})"
+            )
+            if extraction.end_page < extraction.total_pages - 1:
+                next_start = extraction.end_page + 2
+                next_end = min(extraction.end_page + 1 + self._MAX_PDF_PAGES,
+                               extraction.total_pages)
+                result += (
+                    f". Later pages may still contain text; use "
+                    f"pages='{next_start}-{next_end}' to continue."
+                )
+            return result
 
         result = extraction.text
+        if extraction.partial_last_page:
+            result += (
+                f"\n\n(Page {extraction.end_page + 1} exceeded the per-call character limit; "
+                "only its first part is shown, so do not claim to have read its full contents.)"
+            )
         if extraction.end_page < extraction.total_pages - 1:
             next_start = extraction.end_page + 2
             next_end = min(extraction.end_page + 1 + self._MAX_PDF_PAGES, extraction.total_pages)
@@ -1216,13 +1337,15 @@ class ListDirTool(_FsTool):
                 for item in sorted(dp.rglob("*")):
                     if any(p in self._IGNORE_DIRS for p in item.parts):
                         continue
+                    if self._is_history_path(item):
+                        continue
                     total += 1
                     if len(items) < cap:
                         rel = item.relative_to(dp)
                         items.append(f"{rel}/" if item.is_dir() else str(rel))
             else:
                 for item in sorted(dp.iterdir()):
-                    if item.name in self._IGNORE_DIRS:
+                    if item.name in self._IGNORE_DIRS or self._is_history_path(item):
                         continue
                     total += 1
                     if len(items) < cap:

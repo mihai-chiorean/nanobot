@@ -18,8 +18,9 @@ from nanobot.command.builtin import (
     cmd_dream_restore,
 )
 from nanobot.command.router import CommandContext
+from nanobot.config.schema import ToolsConfig
 from nanobot.session.manager import SessionManager
-from nanobot.utils.gitstore import CommitInfo
+from nanobot.utils.gitstore import CommitInfo, UndoResult
 
 
 class _FakeStore:
@@ -46,8 +47,12 @@ class _FakeStore:
     def record_dream_provenance(self, diff_body: str, batch: list[dict]) -> None:
         self.provenance_calls.append((diff_body, batch))
 
-    def build_dream_tools(self):
+    def build_dream_tools(self, skills_drafts: bool = True):
+        assert skills_drafts is True
         return None
+
+    def core_memory_stats(self) -> tuple[int, int]:
+        return (12, 2000)
 
     def set_last_dream_cursor(self, value: int) -> None:
         self._last_dream_cursor = value
@@ -66,13 +71,15 @@ class _FakeGit:
         initialized: bool = True,
         commits: list[CommitInfo] | None = None,
         diff_map: dict[str, tuple[CommitInfo, str] | None] | None = None,
-        revert_result: str | None = None,
+        undo_result: UndoResult | None = None,
     ):
         self._initialized = initialized
         self._commits = commits or []
         self._diff_map = diff_map or {}
-        self._revert_result = revert_result
-        self.revert_calls: list[tuple[str, str | None]] = []
+        self._undo_result = undo_result
+        self.undo_calls: list[str] = []
+        self.undo_prefixes: list[str | None] = []
+        self.commit_messages: list[str] = []
 
     def is_initialized(self) -> bool:
         return self._initialized
@@ -98,11 +105,16 @@ class _FakeGit:
             return None
         return result
 
-    def revert(self, sha: str, *, message_prefix: str | None = None) -> str | None:
-        self.revert_calls.append((sha, message_prefix))
-        return self._revert_result
+    def undo(self, sha: str, *, message_prefix: str | None = None) -> UndoResult:
+        self.undo_calls.append(sha)
+        self.undo_prefixes.append(message_prefix)
+        return self._undo_result or UndoResult()
+
+    def has_commit(self, sha: str) -> bool:
+        return any(c.sha.startswith(sha) for c in self._commits) or sha in self._diff_map
 
     def auto_commit(self, message: str) -> str | None:
+        self.commit_messages.append(message)
         return None
 
 
@@ -125,7 +137,10 @@ def _make_ctx(raw: str, git: _FakeGit, *, args: str = "", last_dream_cursor: int
     msg = InboundMessage(channel="cli", sender_id="u1", chat_id="direct", content=raw)
     store = _FakeStore(git, last_dream_cursor=last_dream_cursor)
     loop = SimpleNamespace(consolidator=SimpleNamespace(store=store))
-    return CommandContext(msg=msg, session=None, key=msg.session_key, raw=raw, args=args, loop=loop)
+    return CommandContext(
+        msg=msg, session=None, key=msg.session_key, raw=raw, args=args, loop=loop,
+        is_user_turn=True,
+    )
 
 
 def _make_dream_ctx(tmp_path) -> tuple[CommandContext, _FakeBus]:
@@ -135,6 +150,7 @@ def _make_dream_ctx(tmp_path) -> tuple[CommandContext, _FakeBus]:
     loop = SimpleNamespace(
         bus=bus,
         context=SimpleNamespace(memory=store, timezone="UTC"),
+        tools_config=ToolsConfig(),
         sessions=_make_sessions(tmp_path),
     )
     ctx = CommandContext(msg=msg, session=None, key=msg.session_key, raw="/dream", args="", loop=loop)
@@ -188,6 +204,7 @@ async def test_dream_internal_run_silences_progress(tmp_path) -> None:
     loop = SimpleNamespace(
         bus=bus,
         context=SimpleNamespace(memory=store, timezone="UTC"),
+        tools_config=ToolsConfig(),
         sessions=_make_sessions(tmp_path),
         process_direct=process_direct,
         dream_runtime=lambda: dream_runtime,
@@ -240,6 +257,7 @@ def _build_runnable_dream(
     loop = SimpleNamespace(
         bus=bus,
         context=SimpleNamespace(memory=store, timezone="UTC"),
+        tools_config=ToolsConfig(),
         sessions=_make_sessions(tmp_path),
         process_direct=process_direct,
         dream_runtime=lambda: None,
@@ -292,6 +310,20 @@ async def test_dream_advances_cursor_when_diff_nonempty(tmp_path) -> None:
     await cmd_dream(ctx)
     await _wait_for_dream_report(ctx)
     assert store._last_dream_cursor == 42
+
+
+@pytest.mark.asyncio
+async def test_dream_manual_commit_reports_core_tokens(tmp_path) -> None:
+    """MIT-1871: the manual /dream commit body carries the core budget line."""
+    ctx, store = _build_runnable_dream(
+        tmp_path, initialized=True, content_diff="memory/MEMORY.md: +1 -0",
+    )
+    await cmd_dream(ctx)
+    await _wait_for_dream_report(ctx)
+
+    assert store.git.commit_messages, "commit path was never reached"
+    assert store.git.commit_messages[-1].startswith("dream: manual run\n\nmemory/MEMORY.md: +1 -0")
+    assert store.git.commit_messages[-1].endswith("\n\ncore: 12/2000 tokens")
 
 
 @pytest.mark.asyncio
@@ -375,6 +407,7 @@ async def test_dream_run_completes_when_provenance_read_fails(tmp_path, monkeypa
     loop = SimpleNamespace(
         bus=bus,
         context=SimpleNamespace(memory=store, timezone="UTC"),
+        tools_config=ToolsConfig(),
         sessions=_make_sessions(tmp_path),
         process_direct=process_direct,
         dream_runtime=lambda: None,
@@ -434,6 +467,7 @@ async def test_dream_noop_batch_unlocks_following_history(tmp_path) -> None:
     loop = SimpleNamespace(
         bus=bus,
         context=SimpleNamespace(memory=store, timezone="UTC"),
+        tools_config=ToolsConfig(),
         sessions=_make_sessions(tmp_path),
         process_direct=process_direct,
         dream_runtime=lambda: None,
@@ -641,7 +675,11 @@ async def test_dream_restore_success_mentions_files_and_followup() -> None:
     )
     git = _FakeGit(
         diff_map={commit.sha: (commit, diff)},
-        revert_result="eeee9999",
+        undo_result=UndoResult(
+            restored=["SOUL.md", "memory/MEMORY.md"],
+            skipped=[],
+            new_sha="eeee9999",
+        ),
     )
 
     out = await cmd_dream_restore(_make_ctx("/dream-restore abcd1234", git, args="abcd1234"))
@@ -650,7 +688,7 @@ async def test_dream_restore_success_mentions_files_and_followup() -> None:
     assert "- New safety commit: `eeee9999`" in out.content
     assert "- Restored files: `SOUL.md`, `memory/MEMORY.md`" in out.content
     assert "Use `/dream-log eeee9999` to inspect the restore diff." in out.content
-    assert git.revert_calls == [("abcd1234", "dream:")]
+    assert git.undo_calls == ["abcd1234"]
 
 
 @pytest.mark.asyncio
@@ -660,11 +698,33 @@ async def test_dream_restore_rejects_non_dream_commit_clearly() -> None:
     )
     git = _FakeGit(
         diff_map={commit.sha: (commit, "unrelated diff")},
-        revert_result="eeee9999",
+        undo_result=UndoResult(restored=["SOUL.md"], skipped=[], new_sha="eeee9999"),
     )
 
     out = await cmd_dream_restore(_make_ctx("/dream-restore cccc3333", git, args="cccc3333"))
 
     assert "Only Dream memory versions can be restored." in out.content
     assert "Use `/dream-restore` to list recent versions." in out.content
-    assert git.revert_calls == []
+    assert git.undo_calls == []
+
+
+@pytest.mark.asyncio
+async def test_dream_restore_uses_per_file_undo() -> None:
+    """/dream-restore must undo per file and report later-changed skips."""
+    commit = CommitInfo(sha="abcd1234", message="dream: latest", timestamp="2026-04-04 12:00")
+    git = _FakeGit(
+        diff_map={commit.sha: (commit, "diff --git a/SOUL.md b/SOUL.md\n")},
+        undo_result=UndoResult(
+            restored=["SOUL.md"],
+            skipped=["USER.md"],
+            new_sha="eeee9999",
+        ),
+    )
+
+    out = await cmd_dream_restore(_make_ctx("/dream-restore abcd1234", git, args="abcd1234"))
+
+    assert git.undo_calls == ["abcd1234"]
+    assert git.undo_prefixes == ["dream:"]
+    assert "- Restored files: `SOUL.md`" in out.content
+    assert "`USER.md` — changed again later; use `/restore abcd1234`" in out.content
+    assert "- New safety commit: `eeee9999`" in out.content

@@ -36,6 +36,7 @@ import importlib.util
 import json
 import os
 from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar, Token
 from typing import TYPE_CHECKING, Any, Iterator
 
 from loguru import logger
@@ -209,11 +210,22 @@ def observe_turn(
             yield span
 
 
+# The span opened by the innermost ``observe_llm_iteration`` on this task,
+# so ``update_llm_iteration_metadata`` can reach it without threading the
+# span through the runner call chain.  ``None`` when no span is open or
+# Langfuse is disabled.
+_CURRENT_LLM_ITERATION_SPAN: ContextVar[Any | None] = ContextVar(
+    "nanobot_llm_iteration_span",
+    default=None,
+)
+
+
 @contextmanager
 def observe_llm_iteration(
     *,
     iteration: int,
     model: str | None = None,
+    metadata: dict[str, str | int] | None = None,
 ) -> Iterator[Any]:
     """Wrap one LLM iteration so tool calls + the auto-traced generation
     nest under it.
@@ -224,21 +236,28 @@ def observe_llm_iteration(
     root, losing tool-hierarchy context.  Opening this span *before*
     the provider call and keeping it open across tool dispatch is what
     produces the MIT-186 nested trace shape.
+
+    *metadata* (TP-05) carries extra non-payload span annotations merged
+    over the ``iteration``/``model`` pair; values the caller only learns
+    after the span opens (tools-offered count/sha) go through
+    :func:`update_llm_iteration_metadata` instead.
     """
     client = _safe_get_client()
     if client is None:
         yield None
         return
 
-    metadata: dict[str, Any] = {"iteration": iteration}
+    span_metadata: dict[str, Any] = {"iteration": iteration}
     if model:
-        metadata["model"] = model
+        span_metadata["model"] = model
+    if metadata:
+        span_metadata.update(metadata)
 
     try:
         cm = client.start_as_current_observation(
             name=f"llm-iteration-{iteration}",
             as_type="span",
-            metadata=metadata,
+            metadata=span_metadata,
         )
     except Exception as exc:
         logger.debug("Langfuse llm-iteration span failed: {}", exc)
@@ -248,7 +267,34 @@ def observe_llm_iteration(
     # MIT-210: `yield` sits outside any exception-swallowing try so
     # application errors raised under this span propagate normally.
     with cm as span:
-        yield span
+        token: Token[Any | None] = _CURRENT_LLM_ITERATION_SPAN.set(span)
+        try:
+            yield span
+        finally:
+            _CURRENT_LLM_ITERATION_SPAN.reset(token)
+
+
+def update_llm_iteration_metadata(metadata: dict[str, str | int]) -> None:
+    """Merge *metadata* into the open ``observe_llm_iteration`` span (TP-05).
+
+    The runner knows the tools-offered count/sha only inside the request
+    builder, after the span has opened, so the annotations it cannot pass at
+    creation time are attached here.  A no-op when no iteration span is open
+    (Langfuse disabled, or the call is outside an iteration); fail-safe like
+    the rest of this module.
+    """
+    span = _CURRENT_LLM_ITERATION_SPAN.get()
+    if span is None or not metadata:
+        return
+    try:
+        merged: dict[str, Any] = {}
+        existing = getattr(span, "metadata", None)
+        if isinstance(existing, dict):
+            merged.update(existing)
+        merged.update(metadata)
+        span.update(metadata=merged)
+    except Exception as exc:
+        logger.debug("Langfuse llm-iteration metadata update failed: {}", exc)
 
 
 @contextmanager

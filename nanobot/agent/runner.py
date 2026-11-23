@@ -31,17 +31,20 @@ from nanobot.agent.reasoning_policy import escalation_profile
 from nanobot.agent.tools.ask import AskUserInterrupt
 from nanobot.agent.tools.execution import execute_tool_calls
 from nanobot.agent.tools.registry import ToolRegistry
+from nanobot.agent.turn_provenance import current_turn_provenance, log_recording_failure
 from nanobot.events import NO_EVENTS, EventSink
 from nanobot.llm_usage.context import (
     LLMUsageSource,
     bind_llm_usage_source,
+    bind_llm_usage_turn_id,
     reset_llm_usage_source,
+    reset_llm_usage_turn_id,
     source_from_session_key,
 )
 
 # Ziggy-local (fork, MIT-202/210/211): Langfuse span helpers. Both are
 # no-ops when Langfuse is not configured.
-from nanobot.observability import observe_llm_iteration
+from nanobot.observability import observe_llm_iteration, update_llm_iteration_metadata
 from nanobot.providers.base import (
     LLMProvider,
     LLMResponse,
@@ -50,6 +53,7 @@ from nanobot.providers.base import (
     ToolCallRequest,
 )
 from nanobot.providers.conversation_state import ProviderConversationStateController
+from nanobot.runtime_release import release_id
 from nanobot.session.summary import SessionSummaryCheckpoint
 from nanobot.utils.helpers import (
     build_assistant_message,
@@ -163,6 +167,23 @@ class _ExecProgress:
         return self.count
 
 
+def tools_offered_fingerprint(defs: list[dict[str, Any]]) -> tuple[int, str]:
+    """(count, 16-hex digest) of the tool set offered on one model call (TP-05).
+
+    The digest is the first 16 hex characters of the sha256 of the definitions
+    sorted by tool name and JSON-dumped canonically, so two turns that offer
+    the same set hash the same regardless of registry insertion order. Computed
+    fresh on every call — a turn's registry can change between iterations
+    (MCP reconnects), and a cache would hide exactly that.
+    """
+    payload = json.dumps(
+        sorted(defs, key=lambda d: d.get("function", d).get("name", "")),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return len(defs), hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+
 @dataclass(slots=True)
 class AgentRunSpec:
     """Configuration for a single agent execution."""
@@ -203,6 +224,13 @@ class AgentRunSpec:
     # one-shot: the runner clears it on the first ladder step and the policy
     # caps the ladder at one rung, so a turn can never climb past ``think``.
     allow_reasoning_escalation: bool = False
+    # Ziggy-local (TP-02 / MIT-1853): the turn's effective turn id — the wire
+    # ``turn_id`` the client sent (TP-01 puts one on every frame) or, for
+    # clients that send none, the id the loop minted at turn start. The loop
+    # owns the resolution (design section 1); the runner only carries it so
+    # per-call observers (TP-05) can key their rows on the same id the
+    # provenance record and the wire frames use.
+    turn_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -370,6 +398,9 @@ class AgentRunner:
         llm_usage_source_token = bind_llm_usage_source(
             spec.llm_usage_source or source_from_session_key(spec.session_key)
         )
+        # TP-05: key llm_usage rows on the same turn id the provenance record
+        # and the wire frames use; read back by LLMProvider._observe_llm_call.
+        llm_usage_turn_id_token = bind_llm_usage_turn_id(spec.turn_id)
 
         try:
             await hook.before_run(context)
@@ -426,6 +457,7 @@ class AgentRunner:
                         )
             finally:
                 reset_llm_usage_source(llm_usage_source_token)
+                reset_llm_usage_turn_id(llm_usage_turn_id_token)
 
     @staticmethod
     def _initial_transcript_and_compaction(
@@ -777,6 +809,7 @@ class AgentRunner:
                         messages_for_model,
                         request_state=request_state,
                         transcript=messages,
+                        iteration=iteration,
                     )
                     retry_usage = self._record_request_usage(spec, request_state, response)
                     round_usages.append(retry_usage)
@@ -1079,6 +1112,7 @@ class AgentRunner:
         transcript: list[dict[str, Any]] | None,
     ) -> tuple[LLMResponse, LLMUsage]:
         tool_definitions = spec.tools.get_definitions()
+        self._record_model_call(spec, context.iteration, tool_definitions)
         messages, provider_context = await self.context_governor.prepare_request(
             request_state,
             messages,
@@ -1269,6 +1303,7 @@ class AgentRunner:
                 spec,
                 fallback_messages,
                 request_state=request_state,
+                iteration=context.iteration,
             )
             fallback_usage = self._record_request_usage(
                 spec,
@@ -1379,6 +1414,7 @@ class AgentRunner:
         *,
         request_state: ModelRequestState,
         transcript: list[dict[str, Any]],
+        iteration: int,
     ) -> LLMResponse:
         retry_messages = self._finalization_retry_messages(messages)
         response = await self._request_no_tools(
@@ -1386,6 +1422,7 @@ class AgentRunner:
             retry_messages,
             request_state=request_state,
             transcript=transcript,
+            iteration=iteration,
         )
         request_state.conversation.observe_response(
             response,
@@ -1418,12 +1455,19 @@ class AgentRunner:
         )
         retry_messages = self._budget_exhausted_finalization_messages(request_messages)
         try:
-            response = await self._request_no_tools(
-                spec,
-                retry_messages,
-                request_state=request_state,
-                transcript=messages if compaction is not None else None,
-            )
+            # The last iteration's span has closed by now; budget finalization
+            # is its own provider call, so it gets its own iteration span and
+            # its zero-tool fingerprint lands there (TP-05).
+            with observe_llm_iteration(
+                iteration=spec.max_iterations, model=spec.runtime.model
+            ):
+                response = await self._request_no_tools(
+                    spec,
+                    retry_messages,
+                    request_state=request_state,
+                    transcript=messages if compaction is not None else None,
+                    iteration=spec.max_iterations,
+                )
         except Exception:
             logger.exception(
                 "Budget-exhausted finalization failed for {}; using fallback",
@@ -1456,6 +1500,61 @@ class AgentRunner:
             return None, usage
         return clean, usage
 
+    @staticmethod
+    def _record_model_call(
+        spec: AgentRunSpec,
+        iteration: int,
+        tool_definitions: list[dict[str, Any]],
+    ) -> None:
+        """Record which tool set one provider call is offered (TP-05).
+
+        Called at every dispatch path -- ``_request_model`` with the registry,
+        ``_request_no_tools`` with ``[]`` -- so each provider call yields
+        exactly one log line, one ``calls`` entry on the turn's provenance
+        record and one update of the open Langfuse iteration span (design
+        section 3). Content-free: count + digest only. Provenance is
+        observability: any failure here is logged at WARNING and the call
+        goes ahead unrecorded.
+        """
+        try:
+            tools_n, tools_sha = tools_offered_fingerprint(tool_definitions)
+            release = release_id()
+            logger.info(
+                "model_call turn={} iter={} tools n={} sha={} profile={} model={} release={}",
+                spec.turn_id,
+                iteration,
+                tools_n,
+                tools_sha,
+                spec.reasoning_profile,
+                spec.runtime.model,
+                release,
+            )
+            provenance_record = current_turn_provenance()
+            if provenance_record is not None:
+                provenance_record.calls.append(
+                    {
+                        "iter": iteration,
+                        "tools_n": tools_n,
+                        "tools_sha": tools_sha,
+                        "profile": spec.reasoning_profile,
+                        "model": spec.runtime.model,
+                    }
+                )
+            update_llm_iteration_metadata(
+                {
+                    "gen_ai.operation.name": "chat",
+                    "gen_ai.request.model": spec.runtime.model,
+                    "gen_ai.conversation.id": spec.session_key or "",
+                    "ziggy.turn_id": spec.turn_id or "",
+                    "ziggy.tools.offered.count": tools_n,
+                    "ziggy.tools.offered.sha": tools_sha,
+                    "ziggy.reasoning.profile": spec.reasoning_profile or "",
+                    "ziggy.release": release,
+                }
+            )
+        except Exception as exc:
+            log_recording_failure("recording a model call", exc)
+
     async def _request_no_tools(
         self,
         spec: AgentRunSpec,
@@ -1463,7 +1562,9 @@ class AgentRunner:
         *,
         request_state: ModelRequestState,
         transcript: list[dict[str, Any]] | None = None,
+        iteration: int,
     ) -> LLMResponse:
+        self._record_model_call(spec, iteration, [])
         messages, provider_context = await self.context_governor.prepare_request(
             request_state,
             messages,

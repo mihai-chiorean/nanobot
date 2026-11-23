@@ -211,8 +211,12 @@ class ToolRegistry:
         name = schema.get("name")
         return name if isinstance(name, str) else ""
 
-    def _declares_read_only(self, name: str) -> bool:
-        """Whether *name* resolves to a registered tool that declares itself read-only."""
+    def is_read_only(self, name: str) -> bool:
+        """Whether *name* resolves to a registered tool that declares itself read-only.
+
+        Unknown names resolve to False so callers fail closed on tools they
+        cannot see (SR-09 auto-continue recovery relies on this).
+        """
         tool = self.get(name)
         return tool is not None and bool(tool.read_only)
 
@@ -260,7 +264,7 @@ class ToolRegistry:
             definitions = [
                 schema
                 for schema in definitions
-                if self._declares_read_only(self._schema_name(schema))
+                if self.is_read_only(self._schema_name(schema))
             ]
         # Ziggy-local: a scheduled / cron turn has nobody to answer ask_user,
         # so it is not offered there (prepare_call refuses it as well).
