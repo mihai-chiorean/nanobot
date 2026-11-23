@@ -1222,6 +1222,7 @@ class AgentLoop:
             workspace_sandbox=self.workspace_scopes.sandbox_status,
             runtime_control=AgentRuntimeControl(self),
             work_store=self.work_store,
+            tool_registry=self.tools,
             model_name=self.model,
         )
         loader = ToolLoader()

@@ -11,6 +11,7 @@ if TYPE_CHECKING:
     from nanobot.agent.subagent import SubagentManager
     from nanobot.agent.tools.exec_session import ExecSessionManager
     from nanobot.agent.tools.file_state import FileStates
+    from nanobot.agent.tools.registry import ToolRegistry
     from nanobot.agent.tools.runtime_control import RuntimeControl
     from nanobot.bus.queue import MessageBus
     from nanobot.config.schema import ProviderConfig, ToolsConfig
@@ -137,4 +138,7 @@ class ToolContext:
     runtime_control: RuntimeControl | None = None
     # Ziggy-local (MIT-1010): durable Work store backing the scheduled-work tools.
     work_store: WorkStore | None = None
+    # Ziggy-local (MIT-1859): lets schedule_work find the ziggy-work connector
+    # tool (work_schedule_create) registered from the MCP servers.
+    tool_registry: "ToolRegistry | None" = None
     model_name: str = ""

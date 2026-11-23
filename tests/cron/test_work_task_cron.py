@@ -556,3 +556,176 @@ def test_a_healthy_work_task_is_never_disabled(tmp_path: Path) -> None:
     assert loaded is not None
     assert all(job.enabled for job in loaded[0])
     assert all(job.state.last_status != "error" for job in loaded[0])
+
+
+# --------------------------------------------------------------------------
+# SR-24: ``nanobot work-schedules export`` / ``--disable`` (MIT-1859)
+# --------------------------------------------------------------------------
+
+REMINDER_JOB: dict[str, Any] = {
+    "id": "remind-1",
+    "name": "stretch reminder",
+    "enabled": True,
+    "schedule": {"kind": "every", "everyMs": 3_600_000},
+    "payload": {
+        "kind": "agent_turn",
+        "message": "Remind me to stretch",
+        "deliver": False,
+        "sessionKey": "websocket:chat-remind",
+        "originChannel": "websocket",
+        "originChatId": "chat-remind",
+    },
+    "createdAtMs": 1787598960000,
+    "updatedAtMs": 1789499760000,
+    "deleteAfterRun": False,
+}
+
+
+def _make_workspace(tmp_path: Path, jobs: list[dict[str, Any]]) -> tuple[Path, Path]:
+    """A workspace whose cron store holds *jobs*, plus a config pointing at it."""
+    workspace = tmp_path / "ws"
+    _write_store(workspace / "cron" / "jobs.json", jobs)
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps({"agents": {"defaults": {"workspace": str(workspace)}}}),
+        encoding="utf-8",
+    )
+    return workspace, config_path
+
+
+def _invoke_export(config_path: Path, extra_args: list[str] | None = None):
+    from typer.testing import CliRunner
+
+    from nanobot.cli.work_schedules import work_schedules_app
+
+    return CliRunner().invoke(
+        work_schedules_app,
+        ["export", "--config", str(config_path), *(extra_args or [])],
+    )
+
+
+def test_export_prints_every_work_task_job_and_nothing_else(tmp_path: Path) -> None:
+    store = tmp_path / "ws" / "cron" / "jobs.json"
+    workspace, config_path = _make_workspace(tmp_path, OWNER_WORK_JOBS + [REMINDER_JOB])
+    before = (workspace / "cron" / "jobs.json").read_text(encoding="utf-8")
+
+    result = _invoke_export(config_path)
+
+    assert result.exit_code == 0, result.output
+    entries = json.loads(result.stdout)
+    assert len(entries) == 4
+    first = next(
+        e for e in entries if e["title"] == "Daily backend health & upstream updates digest"
+    )
+    assert first["content"] == "Create a daily backend health digest."
+    assert first["schedule"] == {
+        "kind": "cron",
+        "expr": "16 19 * * *",
+        "tz": "UTC",
+        "at": None,
+        "every_ms": None,
+    }
+    assert first["skill"] is None
+    assert first["enabled"] is True
+    titles = {e["title"] for e in entries}
+    assert "stretch reminder" not in titles  # agent_turn jobs are not Work schedules
+    assert {e["title"] for e in entries} == {j["name"] for j in OWNER_WORK_JOBS}
+
+    # Export changes nothing.
+    assert (workspace / "cron" / "jobs.json").read_text(encoding="utf-8") == before
+    assert not (workspace / "cron" / "action.jsonl").exists()
+    assert store.exists()
+
+
+def test_export_reports_at_jobs_with_an_iso_fire_time(tmp_path: Path) -> None:
+    from datetime import datetime, timezone
+
+    raw = json.loads(json.dumps(OWNER_WORK_JOBS[0]))
+    at_ms = 1_787_654_400_000
+    raw["schedule"] = {"kind": "at", "atMs": at_ms}
+    _workspace, config_path = _make_workspace(tmp_path, [raw])
+
+    result = _invoke_export(config_path)
+
+    assert result.exit_code == 0, result.output
+    (entry,) = json.loads(result.stdout)
+    expected = datetime.fromtimestamp(at_ms / 1000, tz=timezone.utc).isoformat()
+    assert entry["schedule"] == {
+        "kind": "at",
+        "expr": None,
+        "tz": None,
+        "at": expected,
+        "every_ms": None,
+    }
+
+
+def test_disable_disables_only_the_work_task_jobs(tmp_path: Path) -> None:
+    workspace, config_path = _make_workspace(tmp_path, OWNER_WORK_JOBS + [REMINDER_JOB])
+
+    plain = json.loads(_invoke_export(config_path).stdout)
+    disabled_run = _invoke_export(config_path, ["--disable"])
+    assert disabled_run.exit_code == 0, disabled_run.stdout
+
+    # --disable prints the same JSON as a plain export.
+    assert json.loads(disabled_run.stdout) == plain
+    assert all(e["enabled"] is True for e in plain)
+
+    # In the store, the work_task jobs are now disabled and the reminder is not.
+    service = CronService(workspace / "cron" / "jobs.json")
+    jobs = {job.id: job for job in service.list_jobs(include_disabled=True)}
+    for raw in OWNER_WORK_JOBS:
+        assert jobs[raw["id"]].enabled is False, raw["id"]
+        assert jobs[raw["id"]].payload.kind == "work_task"
+    assert jobs["remind-1"].enabled is True
+    assert jobs["remind-1"].payload.kind == "agent_turn"
+
+
+def test_export_of_a_runtime_without_work_jobs(tmp_path: Path) -> None:
+    _workspace, config_path = _make_workspace(tmp_path, [REMINDER_JOB])
+
+    result = _invoke_export(config_path)
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == []
+
+
+
+def test_export_reports_interval_jobs_with_their_interval(tmp_path: Path) -> None:
+    """An ``every`` work_task keeps its timing: ``every_ms`` plus a normalized
+    ``@every <n>s`` expr, so the import can recreate it after ``--disable``."""
+    raw = json.loads(json.dumps(OWNER_WORK_JOBS[0]))
+    raw["schedule"] = {"kind": "every", "everyMs": 3_600_000}
+    workspace, config_path = _make_workspace(tmp_path, [raw])
+
+    result = _invoke_export(config_path, ["--disable"])
+
+    assert result.exit_code == 0, result.output
+    (entry,) = json.loads(result.stdout)
+    assert entry["schedule"] == {
+        "kind": "every",
+        "expr": "@every 3600s",
+        "tz": None,
+        "at": None,
+        "every_ms": 3_600_000,
+    }
+    service = CronService(workspace / "cron" / "jobs.json")
+    (job,) = service.list_jobs(include_disabled=True)
+    assert job.enabled is False
+
+
+def test_disable_skips_a_job_whose_timing_cannot_be_reconstructed(
+    tmp_path: Path,
+) -> None:
+    """``--disable`` never disables a job the export cannot describe."""
+    broken = json.loads(json.dumps(OWNER_WORK_JOBS[0]))
+    broken["schedule"] = {"kind": "every"}
+    workspace, config_path = _make_workspace(tmp_path, [broken, OWNER_WORK_JOBS[1]])
+
+    result = _invoke_export(config_path, ["--disable"])
+
+    assert result.exit_code == 0, result.output
+    assert broken["id"] in result.stderr
+    service = CronService(workspace / "cron" / "jobs.json")
+    jobs = {job.id: job for job in service.list_jobs(include_disabled=True)}
+    assert jobs[broken["id"]].enabled is True
+    assert jobs[OWNER_WORK_JOBS[1]["id"]].enabled is False
