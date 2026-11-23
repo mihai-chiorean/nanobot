@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
+from nanobot.agent.loop import AgentLoop
 from nanobot.bus.events import InboundMessage
+from nanobot.bus.queue import MessageBus
 from nanobot.command.builtin import (
     build_help_text,
     builtin_command_palette,
@@ -16,7 +19,9 @@ from nanobot.command.builtin import (
     cmd_undo,
     register_builtin_commands,
 )
-from nanobot.command.router import DIRECT_TURN_META, CommandContext, CommandRouter
+from nanobot.command.router import DIRECT_TURN, CommandContext, CommandRouter
+from nanobot.cron.types import CronJob
+from nanobot.cron.work_runner import run_work_task_cron_job
 from nanobot.utils.gitstore import GitStore, history_dir_for
 
 TRACKED = ["SOUL.md", "USER.md", "memory/MEMORY.md"]
@@ -289,12 +294,16 @@ async def test_history_writes_refused_outside_interactive_user_turn(
     (ws / "SOUL.md").write_text("new", encoding="utf-8")
     sha = git.auto_commit("dream: new")
     ctx.args = f"{old_sha} confirm" if raw == "/restore" else sha
+    token = None
     if origin == "not_user_turn":
         ctx.is_user_turn = False
     else:
-        ctx.msg.metadata = {DIRECT_TURN_META: True}
-
-    out = await handler(ctx)
+        token = DIRECT_TURN.set(True)
+    try:
+        out = await handler(ctx)
+    finally:
+        if token is not None:
+            DIRECT_TURN.reset(token)
 
     assert "only be run by you from a chat" in out.content
     assert (ws / "SOUL.md").read_text(encoding="utf-8") == "new"
@@ -306,13 +315,6 @@ async def test_scheduled_work_cannot_restore_or_undo(tmp_path) -> None:
     """Codex P1: a scheduled Work job whose instructions are a history command
     runs through the real work runner -> AgentLoop.process_direct -> command
     router, and must be refused with the workspace unchanged."""
-    from unittest.mock import MagicMock
-
-    from nanobot.agent.loop import AgentLoop
-    from nanobot.bus.queue import MessageBus
-    from nanobot.cron.types import CronJob
-    from nanobot.cron.work_runner import run_work_task_cron_job
-
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     provider = MagicMock()

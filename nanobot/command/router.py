@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from contextlib import AbstractContextManager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from difflib import get_close_matches
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
@@ -39,10 +40,10 @@ def normalize_command_text(text: str) -> str:
     return stripped
 
 
-# Set by ``AgentLoop.process_direct`` on every message it builds: the turn came
-# from an in-process caller (scheduled work, heartbeat, SDK, API, CLI one-shot),
+# True while ``AgentLoop.process_direct`` runs a turn: it came from an
+# in-process caller (scheduled work, heartbeat, Dream, SDK, API, CLI one-shot),
 # not from a channel the owner types into. History-rewriting commands refuse it.
-DIRECT_TURN_META = "_direct_turn"
+DIRECT_TURN: ContextVar[bool] = ContextVar("nanobot_direct_turn", default=False)
 
 
 @dataclass

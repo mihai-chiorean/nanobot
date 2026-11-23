@@ -98,7 +98,7 @@ from nanobot.bus.outbound_events import (
 )
 from nanobot.bus.queue import MessageBus
 from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
-from nanobot.command.router import DIRECT_TURN_META, normalize_command_text
+from nanobot.command.router import DIRECT_TURN, normalize_command_text
 from nanobot.config.schema import AgentDefaults, ModelPresetConfig
 from nanobot.events import NO_EVENTS, AgentEvent, EventSink
 from nanobot.llm_usage.context import source_from_request
@@ -4043,7 +4043,6 @@ class AgentLoop:
         # stamp turn metadata (``work_task_id`` and friends) so the audit layer
         # and ziggy-control see the same shape they do on 0.2.x.
         metadata: dict[str, Any] = dict(metadata or {})
-        metadata[DIRECT_TURN_META] = True
         if not persist_user_message:
             metadata[turn_continuation.SKIP_USER_PERSIST_META] = True
         msg = InboundMessage(
@@ -4078,10 +4077,14 @@ class AgentLoop:
                     kwargs["on_runtime_admitted"] = on_runtime_admitted
                 if attributes is not None:
                     kwargs["attributes"] = dict(attributes)
-                return await self._process_message(
-                    msg,
-                    **kwargs,
-                )
+                direct_token = DIRECT_TURN.set(True)
+                try:
+                    return await self._process_message(
+                        msg,
+                        **kwargs,
+                    )
+                finally:
+                    DIRECT_TURN.reset(direct_token)
         finally:
             self._direct_turn_count -= 1
             await self.runtime_event_publisher.run_status_changed(msg, session_key, "idle")

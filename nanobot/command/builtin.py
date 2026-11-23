@@ -16,7 +16,7 @@ from loguru import logger
 from nanobot import __version__
 from nanobot.bus.events import INBOUND_META_USER_SHELL, OutboundMessage
 from nanobot.command.router import (
-    DIRECT_TURN_META,
+    DIRECT_TURN,
     CommandContext,
     CommandRouter,
     normalize_command_text,
@@ -923,7 +923,7 @@ def _history_write_refusal(ctx: CommandContext) -> OutboundMessage | None:
     """Undo/restore rewrite workspace files: only a genuine interactive owner
     turn may run them — never scheduled work, cron, subagents, system events
     or in-process ``process_direct`` callers."""
-    if ctx.is_user_turn and not (ctx.msg.metadata or {}).get(DIRECT_TURN_META):
+    if ctx.is_user_turn and not DIRECT_TURN.get():
         return None
     return OutboundMessage(
         channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
