@@ -54,10 +54,10 @@ from nanobot.agent.tools.context import (
     ZIGGY_PARK_ATTRIBUTE,
     RequestContext,
     bind_request_context,
-    bind_turn_user_message_index,
+    bind_turn_idempotency_scope,
     current_request_context,
     reset_request_context,
-    reset_turn_user_message_index,
+    reset_turn_idempotency_scope,
 )
 from nanobot.agent.tools.exec_session import ExecSessionManager
 from nanobot.agent.tools.file_state import FileStateStore, bind_file_states, reset_file_states
@@ -228,11 +228,11 @@ class TurnContext:
     initial_messages: list[dict[str, Any]] | None = field(default=None, repr=False)
     provider_state: ProviderConversationState | None = field(default=None, repr=False)
     request_context: RequestContext | None = None
-    # SR-11: index of this turn's persisted user message in session.messages,
-    # set by ``_build_turn``; bound as a context var around the runner so MCP
-    # write calls can derive a stable idempotency scope without polluting the
+    # SR-11: the turn's idempotency scope, resolved and persisted on the
+    # session by ``_build_turn`` before any tool runs; bound as a context var
+    # around the runner so MCP write calls key on it without polluting the
     # caller-visible RequestContext metadata.
-    user_message_index: int | None = None
+    idempotency_scope: str | None = None
     runtime_context_blocks: list[RuntimeContextBlock] = field(default_factory=list)
     attributes: dict[str, Any] = field(default_factory=dict)
 
@@ -1318,11 +1318,6 @@ class AgentLoop:
         if has_text or media_paths or runtime_context_blocks:
             extra: dict[str, Any] = ({"media": list(media_paths)} if media_paths else {}) | agent_context.session_extra(msg.metadata)
             extra.update(kwargs)
-            client_message_id = msg.metadata.get("client_message_id")
-            if isinstance(client_message_id, str) and client_message_id.strip():
-                # Persisted so recovery can rebuild the turn's idempotency scope
-                # after a restart drops the inbound message metadata (SR-11).
-                extra["client_message_id"] = client_message_id
             text = content_value if isinstance(content_value, str) else ""
             text_override, automation_extra = automation_history_overrides(msg.metadata)
             if text_override is not None:
@@ -1762,7 +1757,7 @@ class AgentLoop:
         turn_scopes: list[AbstractContextManager[Any]] | None = None,
         tools: ToolRegistry | None = None,
         request_context: RequestContext | None = None,
-        user_message_index: int | None = None,
+        idempotency_scope: str | None = None,
         provider_state: ProviderConversationState | None = None,
         publish_file_turn: PublishFileTurn | None = None,
         initial_messages: list[dict[str, Any]] | None = None,
@@ -2031,7 +2026,7 @@ class AgentLoop:
         effective_tools = tools if tools is not None else self.tools
         file_state_token = bind_file_states(self._file_state_store.for_session(active_session_key))
         request_token = bind_request_context(request_ctx)
-        user_index_token = bind_turn_user_message_index(user_message_index)
+        idempotency_scope_token = bind_turn_idempotency_scope(idempotency_scope)
         workspace_token = bind_workspace_scope(effective_scope)
         # The publication binding is task-scoped contextvars state: it is set
         # here, inside the single task that executes this turn, and undone in
@@ -2184,7 +2179,7 @@ class AgentLoop:
             turn_scope_stack.close()
             reset_work_context(work_tokens)
             reset_workspace_scope(workspace_token)
-            reset_turn_user_message_index(user_index_token)
+            reset_turn_idempotency_scope(idempotency_scope_token)
             reset_request_context(request_token)
             reset_file_states(file_state_token)
             reset_scheduling_class(scheduling_token)
@@ -3174,6 +3169,17 @@ class AgentLoop:
                 staged_provider_state = True
         elif stored_state is not None:
             session.provider_state = None
+        # SR-11: one idempotency scope per turn, persisted before any tool
+        # runs so a recovery Continue replays writes with the scope this turn
+        # actually used (an ask_user reply, a fresh per-turn id, ...).  Set
+        # before the early user persist so that save carries it.
+        ctx.idempotency_scope = turn_continuation.resolve_idempotency_scope(
+            ctx.msg.metadata
+        )
+        if not ctx.ephemeral:
+            session.metadata[turn_continuation.TURN_IDEMPOTENCY_SCOPE_KEY] = (
+                ctx.idempotency_scope
+            )
         if ctx.kind is TurnKind.USER:
             if ctx.ask_user_resume_id is None:
                 ctx.input_persisted_early = self._persist_user_message_early(
@@ -3181,10 +3187,6 @@ class AgentLoop:
                     session,
                     runtime_context_blocks=ctx.runtime_context_blocks,
                 )
-                if ctx.input_persisted_early:
-                    # SR-11: last-resort idempotency scope for turns without a
-                    # client_message_id (see ``_run_turn`` binding).
-                    ctx.user_message_index = len(session.messages) - 1
                 if staged_provider_state and not ctx.input_persisted_early:
                     session.provider_state = stored_state
             # else: the answer becomes the parked call's tool result and is
@@ -3193,6 +3195,11 @@ class AgentLoop:
             # Upgrade the replay-safe baseline to the resumable state before
             # prompt assembly and the first model checkpoint.
             self.sessions.save(session)
+        if not ctx.ephemeral and not ctx.input_persisted_early:
+            self.sessions.update_session_metadata(
+                session.key,
+                {turn_continuation.TURN_IDEMPOTENCY_SCOPE_KEY: ctx.idempotency_scope},
+            )
         if ctx.ask_user_resume_id is not None:
             assert ctx.request_context is not None
             ctx.initial_messages = ask_user_tool_result_messages(
@@ -3251,7 +3258,7 @@ class AgentLoop:
                 turn_scopes=ctx.turn_scopes,
                 tools=ctx.tools,
                 request_context=ctx.request_context,
-                user_message_index=ctx.user_message_index,
+                idempotency_scope=ctx.idempotency_scope,
                 provider_state=ctx.provider_state,
                 initial_messages=ctx.initial_messages,
                 events=ctx.events,

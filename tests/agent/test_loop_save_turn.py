@@ -2516,107 +2516,112 @@ def test_save_turn_drops_duplicate_tool_result_ids() -> None:
     assert session.messages[1]["content"] == "first"
 
 
+
 # ---------------------------------------------------------------------------
 # SR-11 (MIT-1820): idempotency scope plumbing on the turn path
 # ---------------------------------------------------------------------------
 
 
-def test_persist_user_message_records_client_message_id(tmp_path: Path) -> None:
-    """The user row keeps client_message_id so recovery can rebuild the turn's
-    idempotency scope after a restart drops the inbound metadata."""
-    loop = _make_full_loop(tmp_path)
-    session = loop.sessions.get_or_create("websocket:chat")
-    session.add_message("assistant", "earlier answer")
+def _scope_recording_loop(tmp_path: Path, responses: list[LLMResponse]):
+    """Loop whose ``record_write`` tool captures the scope an MCP write call in
+    the same turn would key on, plus what recovery would read from disk at that
+    moment (the crash point: tool ran, result not yet recorded)."""
+    from nanobot.agent.tools.base import Tool, tool_parameters
+    from nanobot.agent.tools.context import current_request_context
+    from nanobot.agent.tools.schema import tool_parameters_schema
+    from nanobot.session.manager import SessionManager
+    from nanobot.session.recovery import turn_idempotency_scope
 
-    assert (
-        loop._persist_user_message_early(
-            InboundMessage(
-                channel="websocket",
-                sender_id="user",
-                chat_id="chat",
-                content="mail grandma",
-                metadata={"client_message_id": "cm-42"},
-            ),
-            session,
-        )
-        is True
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    provider.generation = SimpleNamespace(max_tokens=4096)
+    provider.chat_stream_with_retry = AsyncMock(side_effect=list(responses))
+    loop = AgentLoop(bus=MessageBus(), provider=provider, workspace=tmp_path, model="test-model")
+    seen: list[dict[str, str | None]] = []
+
+    @tool_parameters(tool_parameters_schema(required=[], additional_properties=True))
+    class _RecordWrite(Tool):
+        @property
+        def name(self) -> str:
+            return "record_write"
+
+        @property
+        def description(self) -> str:
+            return "records the turn's idempotency scope"
+
+        async def execute(self, **kwargs):
+            ctx = current_request_context()
+            on_disk = SessionManager(tmp_path).get_or_create(ctx.session_key)
+            seen.append({
+                "live": _idempotency_scope(ctx),
+                "recovered": turn_idempotency_scope(on_disk),
+            })
+            return "ok"
+
+    loop.tools.register(_RecordWrite())
+    return loop, seen
+
+
+def _call(tool_call_id: str, name: str, arguments: dict) -> LLMResponse:
+    from nanobot.providers.base import ToolCallRequest
+
+    return LLMResponse(
+        content="",
+        finish_reason="tool_calls",
+        tool_calls=[ToolCallRequest(id=tool_call_id, name=name, arguments=arguments)],
     )
-    row = session.messages[-1]
-    assert row["role"] == "user"
-    assert row["client_message_id"] == "cm-42"
-    # The caller-visible request metadata keeps exactly what the caller sent.
-    ctx = RequestContext(
-        channel="websocket",
-        chat_id="chat",
-        session_key="websocket:chat",
-        metadata={"client_message_id": "cm-42"},
-    )
-    assert _idempotency_scope(ctx) == "cm-42"
-
-
-def test_persist_user_message_without_client_message_id_leaves_row_clean(
-    tmp_path: Path,
-) -> None:
-    loop = _make_full_loop(tmp_path)
-    session = loop.sessions.get_or_create("websocket:chat")
-
-    assert (
-        loop._persist_user_message_early(
-            InboundMessage(
-                channel="websocket",
-                sender_id="user",
-                chat_id="chat",
-                content="mail grandma",
-                metadata={},
-            ),
-            session,
-        )
-        is True
-    )
-    assert "client_message_id" not in session.messages[-1]
 
 
 @pytest.mark.asyncio
-async def test_run_agent_loop_binds_user_message_index_for_the_turn(
+async def test_recovery_after_ask_user_reply_reuses_the_reply_turns_scope(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The runner binds the turn's persisted-user-row index so MCP write calls
-    get ``session_key#index`` scopes, and distinct turns get distinct scopes."""
-    import nanobot.agent.loop as loop_module
-    from nanobot.agent.tools.context import (
-        bind_turn_user_message_index as real_bind,
-    )
-
-    captured: list[int | None] = []
-
-    def spy_bind(index: int | None):
-        captured.append(index)
-        return real_bind(index)
-
-    monkeypatch.setattr(loop_module, "bind_turn_user_message_index", spy_bind)
-    loop = _make_full_loop(tmp_path)
-    await run_session(loop, InboundMessage(
-        channel="websocket",
-        sender_id="user",
-        chat_id="chat",
-        content="mail grandma",
-        metadata={},
+    """Codex P2: the write after an ask_user reply keys on the reply's client
+    id; a crash before its result is recorded must recover that same scope,
+    not the original request's (replies are tool results, not user rows)."""
+    loop, seen = _scope_recording_loop(tmp_path, [
+        _call("call_ask", "ask_user", {"question": "Send it?", "options": ["Yes"]}),
+        _call("call_write", "record_write", {"to": "grandma"}),
+        LLMResponse(content="Sent.", finish_reason="stop"),
+    ])
+    await loop._process_message(InboundMessage(
+        channel="websocket", sender_id="user", chat_id="chat",
+        content="mail grandma", metadata={"client_message_id": "cm-request"},
     ))
-    await run_session(loop, InboundMessage(
-        channel="websocket",
-        sender_id="user",
-        chat_id="chat",
-        content="mail grandpa",
-        metadata={},
+    await loop._process_message(InboundMessage(
+        channel="websocket", sender_id="user", chat_id="chat",
+        content="Yes", metadata={"client_message_id": "cm-answer"},
     ))
 
-    session = loop.sessions.get_or_create("websocket:chat")
-    user_rows = [i for i, m in enumerate(session.messages) if m["role"] == "user"]
-    assert captured == user_rows
-    assert len(user_rows) == 2
-    # Negative control: distinct turns share a session but never a scope.
-    first, second = user_rows
-    assert _idempotency_key(f"websocket:chat#{first}", "t", {}) != _idempotency_key(
-        f"websocket:chat#{second}", "t", {}
+    assert seen == [{"live": "cm-answer", "recovered": "cm-answer"}]
+
+
+@pytest.mark.asyncio
+async def test_new_session_identical_write_gets_a_distinct_recoverable_scope(
+    tmp_path: Path,
+) -> None:
+    """Codex P2: without a client_message_id, /new (Session.clear keeps the key
+    and resets indices) must not make a later identical write collide with the
+    first one, and each turn's scope must still be what recovery reads."""
+    loop, seen = _scope_recording_loop(tmp_path, [
+        _call("call_1", "record_write", {"to": "grandma"}),
+        LLMResponse(content="Sent.", finish_reason="stop"),
+        _call("call_2", "record_write", {"to": "grandma"}),
+        LLMResponse(content="Sent again.", finish_reason="stop"),
+    ])
+    message = dict(channel="telegram", sender_id="user", chat_id="111", content="mail grandma")
+    await loop._process_message(InboundMessage(**message))
+    session = loop.sessions.get_or_create("telegram:111")
+    session.clear()  # what /new does to the session
+    loop.sessions.save(session)
+    await loop._process_message(InboundMessage(**message))
+
+    assert len(seen) == 2
+    first, second = seen
+    assert first["live"] and second["live"]
+    assert first["live"] != second["live"]
+    assert _idempotency_key(first["live"], "t", {"to": "grandma"}) != _idempotency_key(
+        second["live"], "t", {"to": "grandma"}
     )
+    assert first["recovered"] == first["live"]
+    assert second["recovered"] == second["live"]

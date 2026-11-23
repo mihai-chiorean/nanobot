@@ -17,14 +17,17 @@ from mcp import types as mcp_types
 from nanobot.agent.tools.context import (
     RequestContext,
     request_context,
-    turn_user_message_index,
+    turn_idempotency_scope,
 )
 from nanobot.agent.tools.mcp import (
     MCPToolWrapper,
     _idempotency_key,
     _idempotency_scope,
 )
-from nanobot.session.turn_continuation import RECOVERY_ORIGIN_SCOPE_META
+from nanobot.session.turn_continuation import (
+    RECOVERY_ORIGIN_SCOPE_META,
+    resolve_idempotency_scope,
+)
 
 _WORK_TASK_ID = "work_" + "0123456789abcdef" * 2
 _IDEMPOTENCY_KEY_META = "ziggy.dev/idempotency_key"
@@ -244,16 +247,18 @@ async def test_scopeless_turn_sends_no_idempotency_key():
 
 
 @pytest.mark.asyncio
-async def test_session_fallback_key_carries_no_scope_text():
-    ctx = _make_context(session_key=_SESSION_KEY)
-    with turn_user_message_index(3):
+async def test_bound_turn_scope_wins_and_carries_no_scope_text():
+    # The loop binds the scope it resolved and persisted for the turn; that
+    # value wins over anything in the request metadata.
+    ctx = _make_context(metadata={"client_message_id": "cm-42"}, session_key=_SESSION_KEY)
+    with turn_idempotency_scope("turn_" + "ab" * 16):
         call = await _execute(ctx)
     key = call["meta"][_IDEMPOTENCY_KEY_META]
     assert key == _idempotency_key(
-        f"{_SESSION_KEY}#3", "browser_click", {"target": "button#login"}
+        "turn_" + "ab" * 16, "browser_click", {"target": "button#login"}
     )
     assert re.fullmatch(r"idem_[a-f0-9]{40}", key)
-    assert "websocket" not in key and "chat-7" not in key
+    assert "turn_" not in key
 
 
 def test_idempotency_key_is_order_canonical_and_pure():
@@ -278,7 +283,7 @@ def test_idempotency_scope_priority_and_fallbacks():
                 metadata={
                     "work_task_id": _WORK_TASK_ID,
                     "client_message_id": "cm-1",
-                    RECOVERY_ORIGIN_SCOPE_META: "websocket:chat-7#3",
+                    RECOVERY_ORIGIN_SCOPE_META: "turn_origin",
                 },
                 session_key=_SESSION_KEY,
             )
@@ -300,7 +305,7 @@ def test_idempotency_scope_priority_and_fallbacks():
             _make_context(
                 metadata={
                     "client_message_id": "cm-1",
-                    RECOVERY_ORIGIN_SCOPE_META: "websocket:chat-7#3",
+                    RECOVERY_ORIGIN_SCOPE_META: "turn_origin",
                 },
                 session_key=_SESSION_KEY,
             )
@@ -312,24 +317,18 @@ def test_idempotency_scope_priority_and_fallbacks():
             _make_context(
                 metadata={
                     "client_message_id": "   ",
-                    RECOVERY_ORIGIN_SCOPE_META: "websocket:chat-7#3",
+                    RECOVERY_ORIGIN_SCOPE_META: "turn_origin",
                 },
                 session_key=_SESSION_KEY,
             )
         )
-        == "websocket:chat-7#3"
+        == "turn_origin"
     )
-    # Two different turns in one session, no client_message_id: distinct scopes.
-    early = _make_context(session_key=_SESSION_KEY)
-    late = _make_context(session_key=_SESSION_KEY)
-    with turn_user_message_index(3):
-        early_scope = _idempotency_scope(early)
-    with turn_user_message_index(7):
-        late_scope = _idempotency_scope(late)
-    assert early_scope == f"{_SESSION_KEY}#3"
-    assert early_scope != late_scope
-    # No session key -> no fallback, no key.
-    with turn_user_message_index(3):
-        assert _idempotency_scope(_make_context(metadata={})) is None
-    # No bound index at all -> no fallback.
+    # A new turn without any stable id gets a fresh, distinct scope each time.
+    first = resolve_idempotency_scope({})
+    second = resolve_idempotency_scope({})
+    assert re.fullmatch(r"turn_[a-f0-9]{32}", first)
+    assert first != second
+    assert resolve_idempotency_scope({"client_message_id": "cm-1"}) == "cm-1"
+    # Unbound and no stable metadata -> no scope, no key.
     assert _idempotency_scope(_make_context(session_key=_SESSION_KEY)) is None

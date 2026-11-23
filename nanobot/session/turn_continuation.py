@@ -8,6 +8,8 @@ continuation is allowed and, when it is, queue the next turn directly.
 from __future__ import annotations
 
 import dataclasses
+import re
+import uuid
 from typing import TYPE_CHECKING, Any, Mapping, MutableMapping
 
 from loguru import logger
@@ -27,10 +29,45 @@ INTERNAL_CONTINUATION_PENDING_META = "_internal_continuation_pending"
 INTERNAL_CONTINUATION_RUN_STARTED_AT_META = "_internal_continuation_run_started_at"
 SKIP_USER_PERSIST_META = "_skip_user_persist"
 
-#: ``metadata`` key a recovery continuation carries to keep the scope of the
-#: turn it continues (SR-11), so a write retried after the Continue produces the
-#: same ``ziggy.dev/idempotency_key`` as in the interrupted turn.
+#: ``Session.metadata`` key holding the idempotency scope of the session's
+#: latest turn, persisted before any tool runs (SR-11) so recovery can hand the
+#: exact scope the interrupted turn used to its continuation.
+TURN_IDEMPOTENCY_SCOPE_KEY = "_turn_idempotency_scope"
+
+#: Inbound/continuation ``metadata`` key a recovery continuation carries: the
+#: scope the interrupted turn persisted, so its replayed writes keep their key.
 RECOVERY_ORIGIN_SCOPE_META = "recovery_origin_scope"
+
+_WORK_TASK_ID_RE = re.compile(r"work_[a-f0-9]{32}")
+
+
+def stable_idempotency_scope(metadata: Mapping[str, Any] | None) -> str | None:
+    """The replay-stable scope the inbound metadata names, if any.
+
+    Priority: a well-formed Work task id (River retries), then the client
+    message id (client resends), then a recovery continuation's origin scope.
+    Deliberately never ``turn_id``: it embeds ``time.time_ns()``.
+    """
+    metadata = metadata or {}
+    work_id = metadata.get("work_task_id")
+    if isinstance(work_id, str) and _WORK_TASK_ID_RE.fullmatch(work_id):
+        return work_id
+    for key in ("client_message_id", RECOVERY_ORIGIN_SCOPE_META):
+        value = metadata.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
+
+
+def resolve_idempotency_scope(metadata: Mapping[str, Any] | None) -> str:
+    """The scope for a new turn: the stable one, else a fresh per-turn id.
+
+    The fresh id is unique per turn (so ``/new`` or a later identical request
+    never collides with an earlier write) and stays stable across a crash
+    because the loop persists it before tools run and recovery replays it.
+    """
+    return stable_idempotency_scope(metadata) or f"turn_{uuid.uuid4().hex}"
+
 
 _GOAL_CONTINUATION_KIND = "sustained_goal"
 _GOAL_CONTINUATION_SENDER = "system:continuation"

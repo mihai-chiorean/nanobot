@@ -779,12 +779,16 @@ async def test_bus_remains_quiet_after_recovered_state(tmp_path: Path) -> None:
 
 
 async def _continue_awaiting_recovery(
-    tmp_path: Path, messages: list[dict]
+    tmp_path: Path, messages: list[dict], scope: str | None = None
 ) -> InboundMessage:
+    from nanobot.session.turn_continuation import TURN_IDEMPOTENCY_SCOPE_KEY
+
     sessions = SessionManager(tmp_path)
     session = sessions.get_or_create("websocket:chat")
     session.messages.extend(messages)
     session.metadata[PENDING_USER_TURN_KEY] = True
+    if scope is not None:
+        session.metadata[TURN_IDEMPOTENCY_SCOPE_KEY] = scope
     _persist(sessions, session)
 
     coordinator, bus, restarted = _coordinator(tmp_path)
@@ -801,50 +805,27 @@ async def _continue_awaiting_recovery(
 
 
 @pytest.mark.asyncio
-async def test_continuation_carries_client_message_id_scope(tmp_path: Path) -> None:
+async def test_continuation_carries_the_persisted_turn_scope(tmp_path: Path) -> None:
+    # The interrupted turn resumed from an ask_user reply (cm-answer); the
+    # request's user row says cm-request.  The persisted scope wins: it is
+    # what the write actually keyed on.
     continuation = await _continue_awaiting_recovery(
         tmp_path,
         [
-            {"role": "user", "content": "old", "client_message_id": "cm-old"},
-            {"role": "assistant", "content": "done"},
-            {"role": "user", "content": "send it", "client_message_id": "cm-42"},
+            {"role": "user", "content": "send it", "client_message_id": "cm-request"},
+            {"role": "tool", "name": "ask_user", "tool_call_id": "c1", "content": "Yes"},
         ],
+        scope="cm-answer",
     )
-    assert continuation.metadata["recovery_origin_scope"] == "cm-42"
+    assert continuation.metadata["recovery_origin_scope"] == "cm-answer"
 
 
 @pytest.mark.asyncio
-async def test_continuation_falls_back_to_session_key_and_user_index(
-    tmp_path: Path,
-) -> None:
+async def test_continuation_without_persisted_scope_carries_none(tmp_path: Path) -> None:
     continuation = await _continue_awaiting_recovery(
-        tmp_path,
-        [
-            {"role": "user", "content": "send it"},
-            {"role": "assistant", "content": "working", "_recovery_interrupted": True},
-        ],
+        tmp_path, [{"role": "user", "content": "send it"}]
     )
-    assert continuation.metadata["recovery_origin_scope"] == "websocket:chat#0"
-
-
-@pytest.mark.asyncio
-async def test_continuation_scope_survives_hidden_summary_user_rows(
-    tmp_path: Path,
-) -> None:
-    from nanobot.session.history_visibility import HIDDEN_HISTORY_META
-
-    continuation = await _continue_awaiting_recovery(
-        tmp_path,
-        [
-            {"role": "user", "content": "send it", "client_message_id": "cm-7"},
-            {
-                "role": "user",
-                "content": "summary continuation",
-                HIDDEN_HISTORY_META: True,
-            },
-        ],
-    )
-    assert continuation.metadata["recovery_origin_scope"] == "cm-7"
+    assert "recovery_origin_scope" not in continuation.metadata
 
 
 @pytest.mark.asyncio
@@ -862,7 +843,8 @@ async def test_continuation_write_reuses_the_interrupted_turns_idempotency_key(
 
     continuation = await _continue_awaiting_recovery(
         tmp_path,
-        [{"role": "user", "content": "mail it", "client_message_id": "cm-42"}],
+        [{"role": "user", "content": "mail it"}],
+        scope="cm-42",
     )
 
     class _RecordingSession:

@@ -22,7 +22,7 @@ from nanobot.agent.tools.base import Tool, ToolResult
 from nanobot.agent.tools.context import (
     _CURRENT_REQUEST_CONTEXT,
     ZIGGY_PARK_ATTRIBUTE,
-    current_turn_user_message_index,
+    current_turn_idempotency_scope,
 )
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.security.network import (
@@ -35,7 +35,7 @@ from nanobot.security.network import (
     resolve_url_target,
     validate_url_target,
 )
-from nanobot.session.turn_continuation import RECOVERY_ORIGIN_SCOPE_META
+from nanobot.session.turn_continuation import stable_idempotency_scope
 from nanobot.utils.cancellation import task_is_cancelling
 
 if TYPE_CHECKING:
@@ -716,26 +716,17 @@ _IDEMPOTENCY_KEY_META = "ziggy.dev/idempotency_key"
 def _idempotency_scope(ctx: RequestContext | None) -> str | None:
     """Stable identity of the logical turn a tool call belongs to (SR-11).
 
-    A replayed turn (River retry, recovery Continue, MCP transient retry) must
-    produce the same scope so the connector can dedupe the write.  Deliberately
-    *not* keyed on ``ctx.turn_id``: it embeds ``time.time_ns()`` and changes on
-    every replay.  Returns ``None`` when nothing stable is available; the call
-    then goes out without an idempotency key (pre-SR-11 behaviour).
+    The loop resolves, persists and binds one scope per turn; that bound value
+    wins.  Runs outside the loop's binding (subagents, direct tool calls) fall
+    back to the stable ids in the request metadata.  ``None`` means nothing
+    replay-stable is known; the call then goes out without a key.
     """
+    bound = current_turn_idempotency_scope()
+    if bound:
+        return bound
     if ctx is None:
         return None
-    metadata = ctx.metadata or {}
-    work_id = metadata.get("work_task_id")
-    if isinstance(work_id, str) and re.fullmatch(r"work_[a-f0-9]{32}", work_id):
-        return work_id
-    for key in ("client_message_id", RECOVERY_ORIGIN_SCOPE_META):
-        value = metadata.get(key)
-        if isinstance(value, str) and value.strip():
-            return value
-    index = current_turn_user_message_index()
-    if ctx.session_key and isinstance(index, int) and not isinstance(index, bool):
-        return f"{ctx.session_key}#{index}"
-    return None
+    return stable_idempotency_scope(ctx.metadata)
 
 
 def _idempotency_key(scope: str, tool_name: str, arguments: Mapping[str, Any]) -> str:

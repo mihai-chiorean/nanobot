@@ -25,7 +25,6 @@ from nanobot.bus.outbound_events import (
 )
 from nanobot.bus.queue import MessageBus
 from nanobot.session import turn_continuation
-from nanobot.session.history_visibility import is_hidden_history_message
 from nanobot.session.keys import UNIFIED_SESSION_KEY, last_channel_from_metadata
 from nanobot.session.manager import Session, SessionManager
 from nanobot.webui.metadata import WEBUI_TURN_METADATA_KEY
@@ -66,23 +65,16 @@ class RecoveryAdmission(Protocol):
 
 
 def turn_idempotency_scope(session: Session) -> str | None:
-    """The interrupted turn's idempotency scope, as the live turn computed it.
+    """The idempotency scope the interrupted turn persisted before its tools ran.
 
-    Mirrors ``nanobot.agent.tools.mcp._idempotency_scope`` for the last real
-    user row of the session: the persisted ``client_message_id`` when the
-    session manager stored one, else the ``session_key#index`` fallback.  The
-    continuation carries this as ``recovery_origin_scope`` so write calls
-    replayed after the Continue keep the same ``ziggy.dev/idempotency_key``.
+    The continuation carries it as ``recovery_origin_scope`` so write calls
+    replayed after the Continue keep the same ``ziggy.dev/idempotency_key``
+    (SR-11).  Read back rather than re-derived: the live turn may have keyed
+    on an ``ask_user`` reply's client id or a fresh per-turn id, neither of
+    which is recoverable from the user rows.
     """
-    for index in range(len(session.messages) - 1, -1, -1):
-        message = session.messages[index]
-        if message.get("role") != "user" or is_hidden_history_message(message):
-            continue
-        client_message_id = message.get("client_message_id")
-        if isinstance(client_message_id, str) and client_message_id.strip():
-            return client_message_id
-        return f"{session.key}#{index}"
-    return None
+    scope = session.metadata.get(turn_continuation.TURN_IDEMPOTENCY_SCOPE_KEY)
+    return scope if isinstance(scope, str) and scope else None
 
 
 def record_pending_followup(session: Session, message: InboundMessage) -> str | None:
