@@ -994,6 +994,8 @@ def pick_tool_emoji(*, _rng: "_random.Random | None" = None) -> str:
 
 def summarize_tool_call(name: str, args: dict[str, Any]) -> str:
     """Build a one-line tool status string, capped at _STATUS_MAX chars."""
+    if name == "unlock_attachment":
+        return "Unlocking PDF"
     if "path" in args:
         detail = str(args["path"])
     elif "command" in args:

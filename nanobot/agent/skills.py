@@ -1,5 +1,6 @@
 """Skills loader for agent capabilities."""
 
+import hashlib
 import json
 import os
 import re
@@ -21,6 +22,11 @@ _STRIP_SKILL_FRONTMATTER = re.compile(
 )
 _SKILL_NAME = re.compile(r"^(?!.*--)[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
 _SKILL_REFERENCE = re.compile(r"(?<![\w$])\$([A-Za-z0-9_-]+)")
+
+
+def skill_file_sha(path: Path | str) -> str:
+    """First 16 hex chars of sha256 over a skill file's bytes (TP-06)."""
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()[:16]
 
 
 def parse_skill_metadata(content: str) -> dict[str, object] | None:
@@ -261,6 +267,26 @@ class SkillsLoader:
                 lines.append(f"- **{skill_name}** — {desc}{suffix}  `{relative_path}`")
             sections.append("\n".join(lines))
         return "\n\n".join(sections)
+
+    def skills_listed_sha(self, exclude: set[str] | None = None) -> str | None:
+        """Content hash of the skills ``build_skills_summary`` lists (TP-06).
+
+        First 16 hex chars of sha256 over the sorted ``name:skill_file_sha``
+        lines of the same skill set the summary shows (same sources, same
+        ``exclude``); ``None`` when it lists nothing. Kept apart from the
+        summary so hashing never runs inside prompt rendering. May raise
+        (an unreadable file): callers run it inside the provenance boundary.
+        """
+        listed_sources = {"workspace", "plugin", "builtin"}
+        lines = sorted(
+            f"{entry['name']}:{skill_file_sha(entry['path'])}"
+            for entry in self.list_skills(filter_unavailable=False)
+            if entry["source"] in listed_sources
+            and (not exclude or entry["name"] not in exclude)
+        )
+        if not lines:
+            return None
+        return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()[:16]
 
     @staticmethod
     def _requirement_lists(skill_meta: dict[str, Any]) -> tuple[list[str], list[str]]:

@@ -21,6 +21,7 @@ from nanobot.session.turn_continuation import (
     _save_skip_for_turn,
     internal_continuation_pending,
     internal_continuation_run_started_at,
+    internal_continuation_turn_id,
     maybe_continue_turn,
     should_finalize_on_max_iterations,
     should_stream_budget_response,
@@ -66,6 +67,7 @@ async def test_maybe_continue_turn_queues_internal_message():
         all_messages=messages,
         suppress_response=False,
         visible_run_started_at=1234.5,
+        effective_turn_id="feishu:c1:1",
     )
 
     assert await maybe_continue_turn(ctx) is True
@@ -82,6 +84,8 @@ async def test_maybe_continue_turn_queues_internal_message():
     assert queued.metadata["message_id"] == "msg-1"
     assert queued.metadata["origin_message_id"] == "msg-0"
     assert queued.metadata["_wants_stream"] is True
+    # TP-02: the next slice reuses this slice's provenance turn id.
+    assert internal_continuation_turn_id(queued.metadata) == "feishu:c1:1"
     assert not explicit_goal_requested(queued.metadata)
     assert sustained_goal_turn(meta, message_metadata=queued.metadata)
     assert "Finish the migration." in queued.content

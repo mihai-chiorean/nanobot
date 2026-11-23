@@ -26,14 +26,21 @@ def webui_skills_payload(
     workspace_path: Path,
     *,
     disabled_skills: set[str] | None = None,
+    install_supported: bool = True,
 ) -> dict[str, Any]:
-    """Return agent skills without leaking local filesystem paths."""
+    """Return agent skills without leaking local filesystem paths.
+
+    ``install_supported`` mirrors the workspace install gate
+    (``tools.skills.allow_install``, MIT-1852) so the WebUI can hide the
+    install affordance; it is reported alongside the locally installed skills.
+    """
     loader = SkillsLoader(workspace_path)
     entries = sorted(
         loader.list_skills(filter_unavailable=False),
         key=lambda entry: (entry.get("source") != "workspace", entry["name"]),
     )
     return {
+        "install_supported": bool(install_supported),
         "skills": [
             _skill_payload(loader, entry, disabled_skills=disabled_skills)
             for entry in entries

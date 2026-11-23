@@ -376,6 +376,17 @@ class ReadFileTool(_FsTool):
     def read_only(self) -> bool:
         return True
 
+    def resolved_read_path(self, path: str) -> Path:
+        """The file a read of ``path`` opens, bundled-skill fallback included.
+
+        Provenance (TP-06) asks the same question after a read succeeds, so
+        it records the file that was actually read.
+        """
+        fp = self._resolve_read(path)
+        if not fp.exists():
+            fp = _builtin_skill_read_path(path) or fp
+        return fp
+
     async def execute(
         self,
         path: str | None = None,
@@ -405,9 +416,7 @@ class ReadFileTool(_FsTool):
             if is_sensitive_path(path):
                 return ToolResult.error(f"Error: Reading {path} is blocked (sensitive path — credentials or key material).")
 
-            fp = self._resolve_read(path)
-            if not fp.exists():
-                fp = _builtin_skill_read_path(path) or fp
+            fp = self.resolved_read_path(path)
             # Post-resolve pass: defence in depth against symlink / traversal
             # escapes. Runs *after* the builtin-skill fallback, which can
             # reassign fp -- checking before it would leave the final value
@@ -535,9 +544,31 @@ class ReadFileTool(_FsTool):
             return ToolResult.error(f"Error reading PDF: {e}")
 
         if not extraction.text:
-            return f"(PDF has no extractable text: {fp})"
+            if extraction.total_pages <= 0:
+                return f"(PDF has no extractable text: {fp})"
+            # An all-blank requested window is not an empty document; report
+            # the range and keep the walk going so later text pages are
+            # reachable (MIT-1967 review).
+            result = (
+                f"(No extractable text on pages {extraction.start_page + 1}-"
+                f"{extraction.end_page + 1} of {fp})"
+            )
+            if extraction.end_page < extraction.total_pages - 1:
+                next_start = extraction.end_page + 2
+                next_end = min(extraction.end_page + 1 + self._MAX_PDF_PAGES,
+                               extraction.total_pages)
+                result += (
+                    f". Later pages may still contain text; use "
+                    f"pages='{next_start}-{next_end}' to continue."
+                )
+            return result
 
         result = extraction.text
+        if extraction.partial_last_page:
+            result += (
+                f"\n\n(Page {extraction.end_page + 1} exceeded the per-call character limit; "
+                "only its first part is shown, so do not claim to have read its full contents.)"
+            )
         if extraction.end_page < extraction.total_pages - 1:
             next_start = extraction.end_page + 2
             next_end = min(extraction.end_page + 1 + self._MAX_PDF_PAGES, extraction.total_pages)
