@@ -45,7 +45,6 @@ from nanobot.session.webui_turns import (
     websocket_turn_id,
     websocket_turn_wall_started_at,
 )
-from nanobot.utils.helpers import safe_filename
 from nanobot.utils.prompt_templates import render_template
 from nanobot.webui.cli_apps_api import normalize_cli_app_mentions
 from nanobot.webui.forking import handle_webui_fork_chat
@@ -180,6 +179,11 @@ class WebUICommandRouter:
     def __init__(self, transport: WebUICommandTransport, gateway: GatewayServices) -> None:
         self._transport = transport
         self.gateway = gateway
+        from nanobot.webui.attachment_unlock import attachment_vault
+        self._attachment_vault = (attachment_vault(gateway.session_manager.sessions_dir)
+                                  if gateway.session_manager else None)
+        if self._attachment_vault:
+            self._attachment_vault.notify = self._attachment_unlocked
         self._http_router = gateway.http
         self._media = gateway.media
         self._ingress = gateway.ingress
@@ -205,6 +209,16 @@ class WebUICommandRouter:
 
     def workspace_full_access_available(self, connection: ServerConnection) -> bool:
         return self._http_router.workspace_full_access_available(connection)
+
+    def _session_context_window(self, session_key: str) -> int | None:
+        """Active session's context window; None lets prepare_pdfs decide."""
+        resolver = self.gateway.session_context_window
+        if resolver is None:
+            return None
+        try:
+            return resolver(session_key)
+        except Exception:
+            return None
 
     async def send_webui_protocol_error(
         self,
@@ -249,6 +263,8 @@ class WebUICommandRouter:
 
     async def cleanup_connection(self, connection: ServerConnection) -> None:
         """Release command-owned state associated with one transport connection."""
+        if self._attachment_vault:
+            self._attachment_vault.disconnect(connection)
         chat_ids = self._transport.webui_connection_chats(connection)
         for chat_id in chat_ids:
             if self._temporary_chats.owns(connection, chat_id):
@@ -278,6 +294,8 @@ class WebUICommandRouter:
         cli_apps: list[dict[str, Any]],
         mcp_presets: list[dict[str, Any]],
         session_mentions: list[SessionMention],
+        attachment_statuses: list[dict[str, Any]] | None = None,
+        client_message_id: str | None = None,
     ) -> None:
         body: dict[str, Any] = {
             "event": "user_message",
@@ -291,8 +309,14 @@ class WebUICommandRouter:
         for attachment, name in zip(media, media_names, strict=False):
             if name:
                 attachment["name"] = name
+        if attachment_statuses:
+            media = [{**(media[index] if index < len(media)
+                         and str(media[index].get("name", "")).endswith(str(status.get("name", ""))) else {}), **status}
+                     for index, status in enumerate(attachment_statuses)]
         if media:
             body["media_urls"] = media
+        if client_message_id is not None:
+            body["client_message_id"] = client_message_id
         if cli_apps:
             body["cli_apps"] = cli_apps
         if mcp_presets:
@@ -406,6 +430,11 @@ class WebUICommandRouter:
                 )
                 return
             await work.dispatch(connection, client_id, envelope)
+            return
+
+        if command_type == "attachment.unlock.result":
+            if self._attachment_vault:
+                self._attachment_vault.resolve(connection, envelope)
             return
 
         if command_type == "webui_request":
@@ -695,7 +724,12 @@ class WebUICommandRouter:
             ):
                 return
 
-        message_rejection = self._ingress.validate_text(content)
+        display_content = envelope.get("display_content")
+        has_document_input = isinstance(envelope.get("attachment_cards"), list) and isinstance(display_content, str)
+        visible_content = display_content if isinstance(display_content, str) and has_document_input else content
+        message_rejection = self._ingress.validate_text(visible_content)
+        if has_document_input and len(content.encode("utf-8")) > 1024 * 1024:
+            message_rejection = "text_too_large"
         if message_rejection is not None:
             await reject(
                 "message_rejected",
@@ -716,6 +750,17 @@ class WebUICommandRouter:
         raw_media = envelope.get("media")
         media_paths: list[str] = []
         media_names: list[str | None] = []
+        from nanobot.webui.pdf_attachments import (
+            AttachmentStatus,
+            attachment_name,
+            parse_attachment_cards,
+            prepare_pdfs,
+        )
+        attachment_statuses: list[AttachmentStatus] = []
+        local_attachment_statuses: list[AttachmentStatus] = []
+        attachment_note = ""
+        attachment_session = (temporary_policy.session_key if temporary_policy is not None
+                              else webui_session_key(chat_id))
         if raw_media is not None:
             if not isinstance(raw_media, list):
                 await reject(
@@ -726,20 +771,34 @@ class WebUICommandRouter:
             media_paths, reason = self._media.store_inbound_attachments(
                 cast(list[Any], raw_media)
             )
+            upload_names = [attachment_name(item) for item in cast(list[Any], raw_media)]
+            media_names = list(upload_names)
             if reason is not None:
-                await reject(
-                    "attachment_rejected",
-                    reason=reason,
+                explanations = {
+                    "size": "The file exceeds the 10 MB upload limit; try a smaller file.",
+                    "total_size": "Attachments exceed the 24 MB total limit; send fewer files.",
+                    "mime": "This file type is not supported; try a text PDF or a screenshot.",
+                    "too_many_images": "You can attach up to 4 images; send fewer files.",
+                    "too_many_attachments": "You can attach up to 6 files; send fewer files.",
+                }
+                detail = explanations.get(reason, "The upload could not be read; try attaching the file again.")
+                attachment_statuses = [{"name": name, "error": detail} for name in upload_names[:6]]
+                attachment_note = "\n".join(
+                    f"Attachment read failure for {item['name']}: {detail}" for item in attachment_statuses
+                ) + "\nExplain these failures to the user in plain language."
+            else:
+                attachment_note, attachment_statuses = await prepare_pdfs(
+                    media_paths, upload_names,
+                    context_window_tokens=self._session_context_window(attachment_session),
                 )
-                return
-            for item in cast(list[Any], raw_media):
-                attachment = cast(dict[str, Any], item) if isinstance(item, dict) else {}
-                name = attachment.get("name")
-                media_names.append((safe_filename(name) or None) if isinstance(name, str) else None)
+                local_attachment_statuses = attachment_statuses
             if temporary_policy is not None:
                 self._temporary_chats.register_media(connection, chat_id, media_paths)
 
-        if not content.strip() and not media_paths:
+        if has_document_input:
+            attachment_statuses = parse_attachment_cards(envelope.get("attachment_cards"))
+
+        if not content.strip() and not media_paths and not attachment_statuses:
             await reject("missing content")
             return
         self._transport.webui_attach(connection, chat_id)
@@ -769,9 +828,24 @@ class WebUICommandRouter:
             await reject("access_denied")
             return
 
+        if self._attachment_vault:
+            from nanobot.config.paths import get_media_dir
+            if envelope.get("attachment_unlock_bridge") is True:
+                async def send_unlock(event: str, **fields: Any) -> None:
+                    await self._transport.webui_send_event(connection, event, **fields)
+                self._attachment_vault.bridges[(chat_id, attachment_session)] = (connection, send_unlock)
+            self._attachment_vault.register(chat_id, client_message_id or "",
+                                            local_attachment_statuses, media_paths,
+                                            get_media_dir("websocket"), session=attachment_session)
+            # Envelope cards are display metadata. Only prior server history
+            # can establish a Work capability with the current transport.
+            self._attachment_vault.register_history(chat_id, attachment_session)
+
         metadata: dict[str, Any] = {
             "remote": getattr(connection, "remote_address", None)
         }
+        if attachment_statuses:
+            metadata["attachments"] = attachment_statuses
         # Ziggy-local (MIT-1404): the ziggy-worker asks for a final ``message``
         # frame after a streamed reply; the agent loop reads this flag.
         if envelope.get("explicit_final_message") is True:
@@ -796,6 +870,8 @@ class WebUICommandRouter:
         dispatch_content = (
             f"{USER_SHELL_COMMAND} {content[1:].lstrip()}" if is_user_shell else content
         )
+        if attachment_note:
+            dispatch_content += "\n\n[Attachment processing note]\n" + attachment_note
         cli_apps = normalize_cli_app_mentions(envelope.get("cli_apps"))
         if cli_apps:
             metadata["cli_apps"] = cli_apps
@@ -891,15 +967,26 @@ class WebUICommandRouter:
             ):
                 self._transcripts.append_user_message(
                     chat_id,
-                    content,
+                    visible_content,
                     metadata=metadata,
                     media_paths=media_paths or None,
                     cli_apps=cli_apps or None,
                     mcp_presets=mcp_presets or None,
                     session_mentions=session_mentions or None,
                 )
+            password_note = (self._attachment_vault.note(chat_id, session=attachment_session)
+                             if self._attachment_vault else "")
+            if attachment_statuses or password_note:
+                metadata[RUNTIME_CONTEXT_INPUT_META] = [RuntimeContextBlock(
+                    source="attachment_processing",
+                    content="Use the attached document text when available. For password protected PDFs, "
+                    "ask for the password and call unlock_attachment; never put passwords in shell commands. "
+                    "For other documents use read_file. Explain damaged/unreadable files in plain language, "
+                    "naming the file and suggesting a text PDF or screenshot. Never claim to have read "
+                    "unavailable contents. " + password_note,
+                )]
             if trusted_webui:
-                context_blocks: list[RuntimeContextBlock] = []
+                context_blocks: list[RuntimeContextBlock] = list(metadata.get(RUNTIME_CONTEXT_INPUT_META, []))
                 if not is_user_shell and envelope.get("intent") == "create_automation":
                     context_blocks.append(RuntimeContextBlock(
                         source="webui_automation_creation",
@@ -943,6 +1030,13 @@ class WebUICommandRouter:
             if not accepted and prepared is not None and client_message_id is not None:
                 await self._release_client_message(chat_id, client_message_id)
 
+        if attachment_statuses and (attachment_note or any(item.get("error") for item in attachment_statuses)):
+            await self._transport.webui_send_event(
+                connection, "attachment.status", chat_id=chat_id,
+                client_message_id=client_message_id,
+                **({"turn_id": turn_id} if turn_id else {}),
+                attachments=attachment_statuses,
+            )
         if client_message_id is not None:
             await self._transport.send_message_ack(
                 connection,
@@ -972,6 +1066,8 @@ class WebUICommandRouter:
                 starts_turn=queued_owner is not None,
                 media_paths=media_paths,
                 media_names=media_names,
+                attachment_statuses=[dict(item) for item in attachment_statuses],
+                client_message_id=client_message_id,
                 cli_apps=cli_apps,
                 mcp_presets=mcp_presets,
                 session_mentions=session_mentions,
@@ -998,6 +1094,22 @@ class WebUICommandRouter:
                     if active_turn_id is not None and started_at is not None
                     else {}
                 ),
+            )
+
+    async def _attachment_unlocked(self, chat_id: str, origin: str, attachment_id: str) -> None:
+        from nanobot.webui.transcript import update_attachment_display_state
+        record = (self._attachment_vault.records.get(attachment_id)
+                  if self._attachment_vault else None)
+        partial = record.get("partial") if isinstance(record, dict) else None
+        partial = partial if isinstance(partial, str) and partial else None
+        update_attachment_display_state(webui_session_key(chat_id), attachment_id, partial)
+        for connection in self._transport.webui_subscribers(chat_id):
+            await self._transport.webui_send_event(
+                connection, "attachment.status", chat_id=chat_id,
+                client_message_id=origin, attachment_id=attachment_id, unlocked=True,
+                **({"attachments": [{"name": str(record["name"]), "error": None,
+                                     "partial": partial}]}
+                   if partial is not None and record else {}),
             )
 
     async def _claim_client_message(

@@ -20,6 +20,7 @@ from nanobot.agent.tools.mcp import MCPProvider
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.cli.gateway_runtime import (
     _close_gateway_runtime,
+    _drain_agent_turns,
     _gateway_readiness_payload,
     _MCPReadinessHook,
 )
@@ -427,11 +428,14 @@ async def test_dream_cron_job_records_provenance_off_the_event_loop(tmp_path) ->
             metadata={"_stop_reason": "completed"},
         )
 
+    from nanobot.config.schema import ToolsConfig
+
     agent = SimpleNamespace(
         context=SimpleNamespace(memory=store),
         dream_runtime=lambda: None,
         process_direct=process_direct,
         sessions=SessionManager(workspace, sessions_root=tmp_path / "sessions"),
+        tools_config=ToolsConfig(),
     )
 
     class _Provider:
@@ -452,3 +456,115 @@ async def test_dream_cron_job_records_provenance_off_the_event_loop(tmp_path) ->
     assert seen["thread"] is not loop_thread, "provenance ran on the event-loop thread"
     assert seen["thread"] is not threading.main_thread()
     assert seen["args"] == ("memory/MEMORY.md: +1 -0", batch)
+
+
+# MIT-1811: the first SIGTERM drains running turns for up to
+# gateway.shutdownGraceSeconds instead of cutting them off; a second signal
+# still forces the exit (tests/cli/test_commands.py drives that through the
+# real run() wiring), and grace 0 keeps the old cancel-immediately path.
+
+
+def test_shutdown_grace_config_defaults_and_bounds() -> None:
+    from pydantic import ValidationError
+
+    from nanobot.config.schema import GatewayConfig
+
+    assert GatewayConfig().shutdown_grace_seconds == 90
+    assert GatewayConfig(shutdownGraceSeconds=30).shutdown_grace_seconds == 30
+    assert GatewayConfig(shutdown_grace_seconds=0).shutdown_grace_seconds == 0
+    with pytest.raises(ValidationError):
+        GatewayConfig(shutdownGraceSeconds=601)
+    with pytest.raises(ValidationError):
+        GatewayConfig(shutdownGraceSeconds=-1)
+
+
+async def test_grace_zero_keeps_immediate_cancel_behaviour() -> None:
+    loop = _bare_loop()
+    never = asyncio.Event()
+    child = asyncio.create_task(never.wait())
+    runtime_tasks = asyncio.gather(child)
+
+    start = time.monotonic()
+    drained = await _drain_agent_turns(loop, runtime_tasks, 0)
+    elapsed = time.monotonic() - start
+
+    assert drained is False
+    assert elapsed < 0.2  # no grace wait at all
+    assert not getattr(loop, "_draining", False)  # the loop was never drained
+    assert not runtime_tasks.done()  # caller still cancels exactly as today
+
+    runtime_tasks.cancel()
+    with suppress(asyncio.CancelledError):
+        await runtime_tasks
+
+
+async def test_drain_waits_for_turn_to_finish_within_grace() -> None:
+    loop = _bare_loop()
+    events: list[str] = []
+
+    async def _turn() -> None:
+        try:
+            await asyncio.sleep(0.3)
+        except asyncio.CancelledError:
+            events.append("cancelled")
+            raise
+        events.append("completed")
+
+    turn = asyncio.create_task(_turn())
+    loop._active_tasks["websocket:c1"] = {turn}
+    never = asyncio.Event()
+    child = asyncio.create_task(never.wait())
+    runtime_tasks = asyncio.gather(child)
+
+    start = time.monotonic()
+    drained = await _drain_agent_turns(loop, runtime_tasks, 5)
+    elapsed = time.monotonic() - start
+
+    assert drained is True
+    assert events == ["completed"]  # finished on its own, never cancelled
+    assert 0.2 < elapsed < 3.0  # returned when the turn ended, not at the grace
+    assert loop._draining is True  # stays closed to new turns until exit
+
+    runtime_tasks.cancel()
+    with suppress(asyncio.CancelledError):
+        await runtime_tasks
+
+
+async def test_drain_times_out_and_leaves_cancellation_to_caller() -> None:
+    loop = _bare_loop()
+    turn = asyncio.create_task(asyncio.Event().wait())
+    loop._active_tasks["websocket:c1"] = {turn}
+    never = asyncio.Event()
+    child = asyncio.create_task(never.wait())
+    runtime_tasks = asyncio.gather(child)
+
+    start = time.monotonic()
+    drained = await _drain_agent_turns(loop, runtime_tasks, 1)
+    elapsed = time.monotonic() - start
+
+    assert drained is False
+    assert 0.9 <= elapsed < 2.5  # bounded by the grace, then falls through
+    assert not turn.done()  # the caller's runtime_tasks.cancel() kills it
+
+    runtime_tasks.cancel()
+    with suppress(asyncio.CancelledError):
+        await runtime_tasks
+
+
+async def test_drain_with_no_active_turn_returns_immediately() -> None:
+    loop = _bare_loop()
+    never = asyncio.Event()
+    child = asyncio.create_task(never.wait())
+    runtime_tasks = asyncio.gather(child)
+
+    start = time.monotonic()
+    drained = await _drain_agent_turns(loop, runtime_tasks, 90)
+    elapsed = time.monotonic() - start
+
+    assert drained is True
+    assert elapsed < 0.2
+    assert loop._draining is True
+
+    runtime_tasks.cancel()
+    with suppress(asyncio.CancelledError):
+        await runtime_tasks

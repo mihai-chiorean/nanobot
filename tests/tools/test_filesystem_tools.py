@@ -2,11 +2,18 @@
 
 import pytest
 
+from nanobot.agent.tools.apply_patch import ApplyPatchTool
 from nanobot.agent.tools.filesystem import (
     EditFileTool,
     ListDirTool,
     ReadFileTool,
+    SkillDraftRequiredError,
     WriteFileTool,
+)
+from nanobot.security.workspace_access import (
+    bind_workspace_scope,
+    default_workspace_scope,
+    reset_workspace_scope,
 )
 
 # ---------------------------------------------------------------------------
@@ -723,3 +730,289 @@ class TestSymlinkTraversalBlocking:
         assert result.startswith("Error:")
         assert "sensitive path" in result.lower()
         assert secret.read_text() == original
+
+
+# ---------------------------------------------------------------------------
+# MIT-1850: agent skill writes become drafts under skills/_proposed/
+# ---------------------------------------------------------------------------
+
+
+class TestSkillDraftsGuard:
+    """tools.skills.drafts refuses live-skill writes with a /skill accept hint."""
+
+    @pytest.fixture()
+    def workspace(self, tmp_path):
+        ws = tmp_path / "ws"
+        (ws / "skills" / "weather").mkdir(parents=True)
+        (ws / "skills" / "weather" / "SKILL.md").write_text(
+            "# Weather\nOriginal content.\n", encoding="utf-8"
+        )
+        return ws
+
+    @pytest.mark.asyncio
+    async def test_write_live_skill_refused_with_draft_hint(self, workspace):
+        expected = (
+            "Error: Skills you write are drafts. Write the changed file to "
+            "skills/_proposed/weather/SKILL.md instead; the user accepts it "
+            "with /skill accept weather."
+        )
+        live = workspace / "skills" / "weather" / "SKILL.md"
+        before = live.read_text(encoding="utf-8")
+
+        write = await WriteFileTool(workspace=workspace).execute(
+            path="skills/weather/SKILL.md", content="# Weather\nRewritten\n"
+        )
+        edit = await EditFileTool(workspace=workspace).execute(
+            path="skills/weather/SKILL.md",
+            old_text="Original content.",
+            new_text="Rewritten.",
+        )
+        patch = await ApplyPatchTool(workspace=workspace).execute(
+            edits=[{
+                "path": "skills/weather/SKILL.md",
+                "action": "replace",
+                "old_text": "Original content.",
+                "new_text": "Rewritten.",
+            }]
+        )
+
+        for result in (write, edit, patch):
+            assert expected in str(result), result
+        with pytest.raises(SkillDraftRequiredError):
+            WriteFileTool(workspace=workspace)._resolve_write("skills/weather/SKILL.md")
+        assert live.read_text(encoding="utf-8") == before
+        assert not (workspace / "skills" / "_proposed").exists()
+
+    @pytest.mark.asyncio
+    async def test_proposed_traversal_and_symlink_cannot_reach_live_skill(self, workspace):
+        """A _proposed/ path that resolves into a live skill is still refused."""
+        live = workspace / "skills" / "weather" / "SKILL.md"
+        before = live.read_text(encoding="utf-8")
+        (workspace / "skills" / "_proposed").mkdir()
+        (workspace / "skills" / "_proposed" / "alias").symlink_to(
+            workspace / "skills" / "weather", target_is_directory=True
+        )
+        tool = WriteFileTool(workspace=workspace)
+        for path in (
+            "skills/_proposed/../weather/SKILL.md",
+            "skills/_proposed/alias/SKILL.md",
+        ):
+            result = await tool.execute(path=path, content="# hijacked\n")
+            assert "Skills you write are drafts" in str(result), (path, result)
+        assert live.read_text(encoding="utf-8") == before
+
+    @pytest.mark.asyncio
+    async def test_write_proposed_allowed(self, workspace):
+        write = await WriteFileTool(workspace=workspace).execute(
+            path="skills/_proposed/weather/SKILL.md", content="# Weather\nDraft\n"
+        )
+        assert "Successfully wrote" in write
+        draft = workspace / "skills" / "_proposed" / "weather" / "SKILL.md"
+        assert draft.read_text(encoding="utf-8") == "# Weather\nDraft\n"
+
+        patch = await ApplyPatchTool(workspace=workspace).execute(
+            edits=[{
+                "path": "skills/_proposed/weather/SKILL.md",
+                "action": "replace",
+                "old_text": "Draft",
+                "new_text": "Final draft",
+            }]
+        )
+        assert "Patch applied" in str(patch)
+
+        nested = await WriteFileTool(workspace=workspace).execute(
+            path="skills/_proposed/weather/references/tips.md", content="tips\n"
+        )
+        assert "Successfully wrote" in nested
+        assert (
+            workspace / "skills" / "_proposed" / "weather" / "references" / "tips.md"
+        ).exists()
+
+        # Outside skills/ the tools behave exactly as before.
+        outside = await WriteFileTool(workspace=workspace).execute(
+            path="notes.md", content="free\n"
+        )
+        assert "Successfully wrote" in outside
+        assert (workspace / "notes.md").read_text(encoding="utf-8") == "free\n"
+
+    @pytest.mark.asyncio
+    async def test_drafts_off_allows_live_write(self, workspace):
+        tool = WriteFileTool(workspace=workspace, skills_drafts=False)
+        result = await tool.execute(
+            path="skills/weather/SKILL.md", content="# Weather\nLive rewrite\n"
+        )
+        assert "Successfully wrote" in result
+        live = workspace / "skills" / "weather" / "SKILL.md"
+        assert live.read_text(encoding="utf-8") == "# Weather\nLive rewrite\n"
+
+    @pytest.mark.asyncio
+    async def test_project_scope_does_not_bypass_guard(self, workspace):
+        """A wider allowed root must not let a live skill be edited in place."""
+        parent = workspace.parent
+        live = workspace / "skills" / "weather" / "SKILL.md"
+        before = live.read_text(encoding="utf-8")
+
+        tool = WriteFileTool(workspace=workspace, allowed_dir=parent)
+        result = await tool.execute(path=str(live), content="owned\n")
+        assert "Skills you write are drafts" in str(result)
+        assert "/skill accept weather" in str(result)
+        assert live.read_text(encoding="utf-8") == before
+
+        scope = default_workspace_scope(parent, restrict_to_workspace=False)
+        token = bind_workspace_scope(scope)
+        try:
+            tool2 = WriteFileTool(workspace=workspace)
+            result2 = await tool2.execute(path=str(live), content="owned\n")
+        finally:
+            reset_workspace_scope(token)
+        assert "Skills you write are drafts" in str(result2)
+        assert live.read_text(encoding="utf-8") == before
+
+    def test_skills_tool_config_defaults_and_camel_alias(self):
+        from nanobot.config.schema import ToolsConfig
+
+        cfg = ToolsConfig()
+        assert cfg.skills.drafts is True
+        assert cfg.skills.allow_install is True
+        off = ToolsConfig(skills={"drafts": False, "allowInstall": False})
+        assert off.skills.drafts is False
+        assert off.skills.allow_install is False
+
+
+# ---------------------------------------------------------------------------
+# MIT-1842 (SM-01): the workspace history directory (<ws>/../history) is
+# refused by every filesystem tool, whatever the effective allowed root. A
+# project scope widened to the tenant root must still not reach it.
+# ---------------------------------------------------------------------------
+
+
+class TestHistoryDirRefusal:
+
+    @pytest.fixture
+    def ws_root(self, tmp_path):
+        """Layout: tmp_path is the tenant root, workspace its subdir."""
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        (workspace / "notes.md").write_text("hello", encoding="utf-8")
+        history = tmp_path / "history"
+        (history / "workspace.git").mkdir(parents=True)
+        (history / "workspace.git" / "HEAD").write_text(
+            "ref: refs/heads/master\n", encoding="utf-8"
+        )
+        return tmp_path, workspace
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("tool_cls", [ReadFileTool, WriteFileTool, EditFileTool])
+    async def test_file_tools_refuse_history_dir(self, ws_root, tool_cls):
+        tenant, workspace = ws_root
+        head = tenant / "history" / "workspace.git" / "HEAD"
+        # Effective allowed root is the TENANT ROOT (project-scope widening).
+        tool = tool_cls(workspace=workspace, allowed_dir=tenant)
+        result = await tool.execute(
+            path=str(head),
+            content="x",
+            old_text="ref: refs/heads/master\n",
+            new_text="ref: refs/heads/evil\n",
+        )
+        assert str(result).startswith("Error")
+        assert "history" in str(result).lower()
+        assert head.read_text(encoding="utf-8") == "ref: refs/heads/master\n"
+
+    @pytest.mark.asyncio
+    async def test_history_refused_even_with_no_allowed_root(self, ws_root):
+        tenant, workspace = ws_root
+        marker = tenant / "history" / "workspace.git" / "COMMIT_EDITMSG"
+        marker.write_text("secret", encoding="utf-8")
+        # allowed_dir=None means no containment at all — history still refused.
+        tool = ReadFileTool(workspace=workspace)
+        result = await tool.execute(path=str(marker))
+        assert "Error" in result
+        assert "secret" not in str(result)
+
+    @pytest.mark.asyncio
+    async def test_history_escape_via_traversal_is_refused(self, ws_root):
+        tenant, workspace = ws_root
+        (tenant / "history" / "payload").write_text("boom", encoding="utf-8")
+        tool = WriteFileTool(workspace=workspace, allowed_dir=tenant)
+        result = await tool.execute(
+            path=str(workspace / ".." / "history" / "payload"),
+            content="tampered",
+        )
+        assert str(result).startswith("Error")
+        assert (tenant / "history" / "payload").read_text(encoding="utf-8") == "boom"
+
+    @pytest.mark.asyncio
+    async def test_history_itself_refused_not_only_children(self, ws_root):
+        tenant, workspace = ws_root
+        tool = ReadFileTool(workspace=workspace, allowed_dir=tenant)
+        result = await tool.execute(path=str(tenant / "history"))
+        assert "Error" in result
+
+    @pytest.mark.asyncio
+    async def test_sibling_dirs_still_writable_under_parent_root(self, ws_root):
+        """Negative control: only history/* is refused, not the whole parent."""
+        tenant, workspace = ws_root
+        other = tenant / "other"
+        other.mkdir()
+        tool = WriteFileTool(workspace=workspace, allowed_dir=tenant)
+        result = await tool.execute(path=str(other / "f.md"), content="ok")
+        assert "Successfully wrote" in result
+        assert (other / "f.md").read_text(encoding="utf-8") == "ok"
+
+    @pytest.mark.asyncio
+    async def test_workspace_default_root_still_works(self, ws_root):
+        """Negative control: normal reads inside the workspace are unaffected."""
+        _, workspace = ws_root
+        tool = ReadFileTool(workspace=workspace, allowed_dir=workspace)
+        result = await tool.execute(path="notes.md")
+        assert "hello" in result
+
+    @pytest.mark.asyncio
+    async def test_recursive_grep_from_tenant_root_skips_history(self, ws_root):
+        """Codex P2: grep(path=<tenant root>) must not read history/ descendants."""
+        from nanobot.agent.tools.search import GrepTool
+
+        tenant, workspace = ws_root
+        (workspace / "visible.md").write_text("ref: visible\n", encoding="utf-8")
+        tool = GrepTool(workspace=workspace, allowed_dir=tenant)
+        result = await tool.execute(pattern="ref:", path=str(tenant))
+        assert "visible" in result
+        assert "refs/heads/master" not in result
+        assert "workspace.git" not in result
+
+    @pytest.mark.asyncio
+    async def test_find_files_from_tenant_root_skips_history(self, ws_root):
+        from nanobot.agent.tools.search import FindFilesTool
+
+        tenant, workspace = ws_root
+        tool = FindFilesTool(workspace=workspace, allowed_dir=tenant)
+        result = await tool.execute(path=str(tenant), include_dirs=True)
+        assert "notes.md" in result
+        assert "history" not in result
+        assert "HEAD" not in result
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("recursive", [True, False])
+    async def test_list_dir_from_tenant_root_skips_history(self, ws_root, recursive):
+        tenant, workspace = ws_root
+        tool = ListDirTool(workspace=workspace, allowed_dir=tenant)
+        result = await tool.execute(path=str(tenant), recursive=recursive)
+        assert "workspace" in result
+        assert "history" not in result
+        assert "HEAD" not in result
+
+    @pytest.mark.asyncio
+    async def test_grep_skips_file_symlink_into_history(self, ws_root):
+        """Codex P2 r2: a workspace file symlink into history/ is not read."""
+        from nanobot.agent.tools.search import FindFilesTool, GrepTool
+
+        tenant, workspace = ws_root
+        (workspace / "head.txt").symlink_to(tenant / "history" / "workspace.git" / "HEAD")
+        grep = GrepTool(workspace=workspace, allowed_dir=tenant)
+        result = await grep.execute(pattern="ref:", path=str(workspace))
+        assert "refs/heads/master" not in result
+        find = FindFilesTool(workspace=workspace, allowed_dir=tenant)
+        assert "head.txt" not in await find.execute(path=str(workspace))
+        read = ReadFileTool(workspace=workspace, allowed_dir=tenant)
+        out = await read.execute(path=str(workspace / "head.txt"))
+        assert "refs/heads/master" not in out

@@ -16,6 +16,7 @@ from nanobot.observability.langfuse import (
     observe_subagent,
     observe_tool,
     observe_turn,
+    update_llm_iteration_metadata,
 )
 
 __all__ = [
@@ -26,4 +27,5 @@ __all__ = [
     "observe_subagent",
     "observe_tool",
     "observe_turn",
+    "update_llm_iteration_metadata",
 ]

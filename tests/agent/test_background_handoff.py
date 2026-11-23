@@ -26,7 +26,6 @@ from nanobot.agent.handoff import (
     HANDOFF_UNAVAILABLE_REPLY,
     HandoffHook,
     HandoffRequested,
-    is_write_tool_name,
     signin_needs_tester,
 )
 from nanobot.agent.hook import AgentHook, AgentRunHookContext, CompositeHook
@@ -92,12 +91,23 @@ def _final_response(content: str) -> LLMResponse:
     )
 
 
-def _fake_tool(name: str, *, result: str = "ok", calls: list[str], delay: float = 0.0) -> Tool:
+def _fake_tool(
+    name: str,
+    *,
+    result: str = "ok",
+    calls: list[str],
+    delay: float = 0.0,
+    read_only: bool = True,
+) -> Tool:
     @tool_parameters(tool_parameters_schema(required=[]))
     class _FakeTool(Tool):
         @property
         def name(self) -> str:
             return name
+
+        @property
+        def read_only(self) -> bool:
+            return read_only
 
         @property
         def description(self) -> str:
@@ -143,8 +153,8 @@ class _HandoffAtSecondBatchHook(HandoffHook):
     replaced, and it still honours ``saw_write``).
     """
 
-    def __init__(self) -> None:
-        super().__init__(threshold=float("inf"))
+    def __init__(self, turn_had_write: Any) -> None:
+        super().__init__(threshold=float("inf"), turn_had_write=turn_had_write)
         self.batches = 0
 
     async def before_execute_tools(self, context: Any) -> None:
@@ -165,6 +175,8 @@ async def _handoff_turn(
     advance_before_call: dict[int, float] | None = None,
     hook_factory: Any = None,
     create_task_override: Any = None,
+    before_call: dict[int, Any] | None = None,
+    loop: AgentLoop | None = None,
 ) -> tuple[AgentLoop, Any]:
     provider = _provider()
 
@@ -178,15 +190,26 @@ async def _handoff_turn(
         calls.append(index)
         if advance_before_call and index in advance_before_call:
             clock["now"] += advance_before_call[index]
+        if before_call and index in before_call:
+            before_call[index](loop)
         return responses[index]
 
     calls: list[int] = []
     provider.chat_stream_with_retry = chat_stream_with_retry
-    loop = _make_loop(tmp_path, provider, background_handoff_seconds=threshold)
+    if loop is None:
+        loop = _make_loop(tmp_path, provider, background_handoff_seconds=threshold)
+    else:
+        loop.provider.chat_stream_with_retry = chat_stream_with_retry
     if hook_factory is not None:
-        loop._handoff_hook_for_turn = (  # type: ignore[method-assign]
-            lambda ctx: hook_factory()
-        )
+        real_factory = loop._handoff_hook_for_turn
+
+        def _factory(ctx: TurnContext) -> HandoffHook | None:
+            real = real_factory(ctx)
+            assert real is not None
+            # Reuse the loop's real write-evidence reader.
+            return hook_factory(real._turn_had_write)
+
+        loop._handoff_hook_for_turn = _factory  # type: ignore[method-assign]
     if create_task_override is not None:
         loop.work_store.create_task = create_task_override  # type: ignore[method-assign]
     outbound = await loop._process_message(
@@ -273,7 +296,12 @@ async def test_write_tool_turn_never_hands_off_however_long(
 ) -> None:
     calls: list[str] = []
     tools = [
-        _fake_tool("mcp_ziggy_gmail_gmail_archive_message", result="archived", calls=calls),
+        _fake_tool(
+            "mcp_ziggy_gmail_gmail_archive_message",
+            result="archived",
+            calls=calls,
+            read_only=False,
+        ),
         _fake_tool("read_b", calls=calls),
     ]
     loop, outbound = await _handoff_turn(
@@ -305,7 +333,9 @@ async def test_approval_required_result_never_hands_off(
         '"operation": "browser_act"}'
     )
     tools = [
-        _fake_tool("mcp_ziggy_browser_act", result=approval_payload, calls=calls),
+        _fake_tool(
+            "mcp_ziggy_browser_act", result=approval_payload, calls=calls, read_only=False
+        ),
         _fake_tool("read_b", calls=calls),
     ]
     loop, outbound = await _handoff_turn(
@@ -429,7 +459,14 @@ async def test_handoff_requested_is_not_an_error_for_the_runner() -> None:
     registry = _registry([_fake_tool("never_runs", calls=calls)])
     recorder = _RecorderHook()
     hook = CompositeHook(
-        [recorder, HandoffHook(threshold=1, started_at=time.monotonic() - 10)]
+        [
+            recorder,
+            HandoffHook(
+                threshold=1,
+                turn_had_write=lambda: False,
+                started_at=time.monotonic() - 10,
+            ),
+        ]
     )
 
     with pytest.raises(HandoffRequested) as excinfo:
@@ -453,43 +490,51 @@ async def test_handoff_requested_is_not_an_error_for_the_runner() -> None:
 
 
 def test_handoff_hook_time_semantics_and_write_gate() -> None:
-    assert is_write_tool_name("mcp_ziggy_gmail_gmail_archive_message")
-    assert is_write_tool_name("mcp_ziggy_gmail_send_message")
-    assert is_write_tool_name("browser_fill_form")
-    assert not is_write_tool_name("gmail_search")
-    assert not is_write_tool_name("mcp_ziggy_browser_read_page")
+    from nanobot.agent.hook import AgentHookContext
 
-    async def scenario() -> tuple[bool, bool]:
-        from nanobot.agent.hook import AgentHookContext
-
-        stale = time.monotonic() - 100
-        handoff_raised = False
-        hook = HandoffHook(threshold=1, started_at=stale)
-        context = AgentHookContext(iteration=0, messages=[{"role": "user", "content": "go"}])
-        context.tool_calls = [ToolCallRequest(id="1", name="mcp_ziggy_browser_act", arguments={})]
+    async def raises(hook: HandoffHook, context: AgentHookContext) -> bool:
         try:
             await hook.before_execute_tools(context)
-        except HandoffRequested as exc:
-            handoff_raised = exc.reason == "time"
-
-        write_raised = False
-        gated = HandoffHook(threshold=1, started_at=stale)
-        gated_context = AgentHookContext(
-            iteration=0, messages=[{"role": "user", "content": "go"}]
-        )
-        gated_context.tool_calls = [
-            ToolCallRequest(id="1", name="mcp_ziggy_gmail_send_message", arguments={})
-        ]
-        await gated.after_iteration(gated_context)
-        try:
-            await gated.before_execute_tools(gated_context)
         except HandoffRequested:
-            write_raised = True
-        return handoff_raised, write_raised
+            return True
+        return False
 
-    handoff_raised, write_raised = asyncio.run(scenario())
-    assert handoff_raised
-    assert not write_raised, "a turn that called a write tool must never hand off"
+    def context() -> AgentHookContext:
+        ctx = AgentHookContext(iteration=0, messages=[{"role": "user", "content": "go"}])
+        ctx.tool_calls = [ToolCallRequest(id="1", name="anything", arguments={})]
+        return ctx
+
+    async def scenario() -> tuple[bool, bool, bool, bool]:
+        stale = time.monotonic() - 100
+        # The pending batch's own write does not block: it never runs.
+        handoff = await raises(
+            HandoffHook(threshold=1, turn_had_write=lambda: True, started_at=stale),
+            context(),
+        )
+        # A batch that already ran with write evidence blocks for good.
+        gated = HandoffHook(threshold=1, turn_had_write=lambda: True, started_at=stale)
+        await gated.after_iteration(context())
+        after_write = await raises(gated, context())
+        # Read-only executed batches keep the turn eligible.
+        clean = HandoffHook(threshold=1, turn_had_write=lambda: False, started_at=stale)
+        await clean.after_iteration(context())
+        after_reads = await raises(clean, context())
+        draining = await raises(
+            HandoffHook(
+                threshold=1,
+                turn_had_write=lambda: False,
+                may_hand_off=lambda: False,
+                started_at=stale,
+            ),
+            context(),
+        )
+        return handoff, after_write, after_reads, draining
+
+    handoff, after_write, after_reads, draining = asyncio.run(scenario())
+    assert handoff
+    assert not after_write, "a turn that ran a write must never hand off"
+    assert after_reads
+    assert not draining
 
 
 @pytest.mark.asyncio
@@ -521,6 +566,193 @@ async def test_failed_task_creation_replies_with_the_apology(
     chat = loop.sessions.get_or_create(f"websocket:{_CHAT_ID}")
     assert chat.messages[-1]["content"] == HANDOFF_UNAVAILABLE_REPLY
     _assert_no_unanswered_tool_calls(chat.messages)
+
+
+# ---------------------------------------------------------------------------
+# Invariants shared with the safe-retries work (SR-09 / SR-11 / MIT-1811 /
+# MIT-1847)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_any_non_read_only_tool_blocks_hand_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The gate is SR-09's ``turn_had_write``, not a list of known writes."""
+    calls: list[str] = []
+    tools = [
+        # Not a Gmail/browser tool and not read-only: a write all the same.
+        _fake_tool("mcp_ziggy_calendar_create_event", calls=calls, read_only=False),
+        _fake_tool("read_b", calls=calls),
+    ]
+    loop, outbound = await _handoff_turn(
+        tmp_path,
+        monkeypatch,
+        responses=[
+            _tool_response("call-w", "mcp_ziggy_calendar_create_event"),
+            _tool_response("call-b", "read_b"),
+            _final_response("created and read"),
+        ],
+        tools=tools,
+        advance_before_call={1: 0.05},
+    )
+
+    assert calls == ["mcp_ziggy_calendar_create_event", "read_b"]
+    assert outbound is not None
+    assert outbound.content == "created and read"
+    assert loop.work_store.list_tasks() == []
+
+
+@pytest.mark.asyncio
+async def test_pending_write_batch_does_not_block_hand_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The dropped batch never ran in chat, so its write cannot repeat."""
+    calls: list[str] = []
+    tools = [
+        _fake_tool("read_a", calls=calls),
+        _fake_tool("mcp_ziggy_gmail_send_message", calls=calls, read_only=False),
+    ]
+    loop, outbound = await _handoff_turn(
+        tmp_path,
+        monkeypatch,
+        responses=[
+            _tool_response("call-a", "read_a"),
+            _tool_response("call-s", "mcp_ziggy_gmail_send_message"),
+        ],
+        tools=tools,
+        advance_before_call={1: 0.05},
+    )
+
+    assert calls == ["read_a"], "the send must not run in chat"
+    assert outbound is not None and outbound.content == HANDOFF_REPLY
+    assert len(loop.work_store.list_tasks()) == 1
+
+
+@pytest.mark.asyncio
+async def test_draining_runtime_finishes_the_turn_in_chat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MIT-1811: a hand-off's Work inbound would be dropped during the drain."""
+    calls: list[str] = []
+    tools = [_fake_tool("read_a", calls=calls), _fake_tool("read_b", calls=calls)]
+    loop, outbound = await _handoff_turn(
+        tmp_path,
+        monkeypatch,
+        responses=[
+            _tool_response("call-a", "read_a"),
+            _tool_response("call-b", "read_b"),
+            _final_response("done in chat"),
+        ],
+        tools=tools,
+        advance_before_call={1: 0.05},
+        before_call={1: lambda loop: loop.begin_drain()},
+    )
+
+    assert calls == ["read_a", "read_b"]
+    assert outbound is not None and outbound.content == "done in chat"
+    assert loop.work_store.list_tasks() == []
+    assert loop.bus.inbound.empty()
+
+    # A turn that starts while draining never gets the hook at all.
+    assert loop._handoff_hook_for_turn(_fake_ctx(_chat_message())) is None
+
+
+@pytest.mark.asyncio
+async def test_replayed_chat_turn_links_the_existing_task_without_a_second_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SR-11: one Work run per chat turn, whose writes key on its task id."""
+    from nanobot.session.turn_continuation import resolve_idempotency_scope
+
+    calls: list[str] = []
+    tools = [_fake_tool("read_a", calls=calls), _fake_tool("read_b", calls=calls)]
+    responses = [
+        _tool_response("call-a", "read_a"),
+        _tool_response("call-b", "read_b"),
+    ]
+    message = _chat_message({"client_message_id": "cmid-1"})
+    loop, first = await _handoff_turn(
+        tmp_path,
+        monkeypatch,
+        responses=responses,
+        tools=tools,
+        message=message,
+        advance_before_call={1: 0.05},
+    )
+    inbound = loop.bus.inbound.get_nowait()
+    task_id = first.metadata["handoff_task_id"]
+    # The Work turn's MCP writes are keyed by the task id, stable across
+    # retries of that task.
+    assert resolve_idempotency_scope(inbound.metadata) == task_id
+    work_seed = list(loop.sessions.get_or_create(f"work:{task_id}").messages)
+
+    # The chat inbox redelivers the same message (e.g. the receipt was not
+    # marked processed before a restart).
+    _, second = await _handoff_turn(
+        tmp_path,
+        monkeypatch,
+        responses=responses,
+        tools=tools,
+        message=_chat_message({"client_message_id": "cmid-1"}),
+        advance_before_call={1: 0.05},
+        loop=loop,
+    )
+
+    assert second is not None and second.content == HANDOFF_REPLY
+    assert second.metadata["handoff_task_id"] == task_id
+    assert len(loop.work_store.list_tasks()) == 1
+    assert loop.bus.inbound.empty(), "the replay must not start a second Work run"
+    assert loop.sessions.get_or_create(f"work:{task_id}").messages == work_seed
+
+
+@pytest.mark.asyncio
+async def test_hand_off_leaves_no_resumable_chat_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SR-09 recovery must not auto-continue a chat turn Work now owns."""
+    calls: list[str] = []
+    tools = [_fake_tool("read_a", calls=calls), _fake_tool("read_b", calls=calls)]
+    loop, outbound = await _handoff_turn(
+        tmp_path,
+        monkeypatch,
+        responses=[
+            _tool_response("call-a", "read_a"),
+            _tool_response("call-b", "read_b"),
+        ],
+        tools=tools,
+        advance_before_call={1: 0.05},
+    )
+    assert outbound is not None and outbound.content == HANDOFF_REPLY
+    loop.sessions.invalidate(f"websocket:{_CHAT_ID}")
+    chat = loop.sessions.get_or_create(f"websocket:{_CHAT_ID}")
+    assert AgentLoop._RUNTIME_CHECKPOINT_KEY not in chat.metadata
+
+
+@pytest.mark.asyncio
+async def test_handed_off_work_turn_is_not_an_interactive_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MIT-1847: history-writing commands refuse a handed-off Work turn."""
+    from dataclasses import replace
+
+    calls: list[str] = []
+    tools = [_fake_tool("read_a", calls=calls), _fake_tool("read_b", calls=calls)]
+    loop, _ = await _handoff_turn(
+        tmp_path,
+        monkeypatch,
+        responses=[
+            _tool_response("call-a", "read_a"),
+            _tool_response("call-b", "read_b"),
+        ],
+        tools=tools,
+        advance_before_call={1: 0.05},
+    )
+    inbound = loop.bus.inbound.get_nowait()
+    assert loop.consolidator.store.git.init()
+    reply = await loop._process_message(replace(inbound, content="/undo abc1234"))
+    assert reply is not None
+    assert "can only be run by you from a chat" in reply.content
 
 
 # ---------------------------------------------------------------------------
@@ -630,8 +862,15 @@ def test_after_iteration_raises_signin_reason() -> None:
     async def scenario() -> HandoffRequested:
         from nanobot.agent.hook import AgentHookContext
 
-        hook = HandoffHook(threshold=float("inf"))
+        # site_login is not read-only: the sign-in batch itself is write
+        # evidence, and only the sign-in call is allowed to be.
+        hook = HandoffHook(
+            threshold=float("inf"),
+            turn_had_write=lambda: True,
+            is_read_only=lambda name: False,
+        )
         context = AgentHookContext(iteration=0, messages=[{"role": "user", "content": "go"}])
+        context.tool_calls = [ToolCallRequest(id="1", name="mcp_ziggy_site_login", arguments={})]
         context.tool_results = [_NEEDS_CREDENTIAL]
         with pytest.raises(HandoffRequested) as excinfo:
             await hook.after_iteration(context)
@@ -647,7 +886,9 @@ async def test_needs_credential_result_hands_off_at_once(
 ) -> None:
     calls: list[str] = []
     tools = [
-        _fake_tool("mcp_ziggy_site_login", result=_NEEDS_CREDENTIAL, calls=calls),
+        _fake_tool(
+            "mcp_ziggy_site_login", result=_NEEDS_CREDENTIAL, calls=calls, read_only=False
+        ),
         _fake_tool("read_b", calls=calls),
     ]
     # threshold=inf: the only way this turn can hand off is the sign-in check.
@@ -697,7 +938,9 @@ async def test_blocked_code_wait_result_hands_off(
 ) -> None:
     calls: list[str] = []
     tools = [
-        _fake_tool("mcp_ziggy_site_login", result=_CODE_WAIT_BLOCKED, calls=calls),
+        _fake_tool(
+            "mcp_ziggy_site_login", result=_CODE_WAIT_BLOCKED, calls=calls, read_only=False
+        ),
         _fake_tool("read_b", calls=calls),
     ]
     loop, outbound = await _handoff_turn(
@@ -722,7 +965,9 @@ async def test_credential_fill_approval_tap_does_not_hand_off(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     calls: list[str] = []
-    tools = [_fake_tool("mcp_ziggy_site_login", result=_CREDENTIAL_FILL_APPROVAL, calls=calls)]
+    tools = [_fake_tool(
+            "mcp_ziggy_site_login", result=_CREDENTIAL_FILL_APPROVAL, calls=calls, read_only=False
+        )]
     loop, outbound = await _handoff_turn(
         tmp_path,
         monkeypatch,
@@ -746,7 +991,9 @@ async def test_successful_signin_does_not_hand_off(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     calls: list[str] = []
-    tools = [_fake_tool("mcp_ziggy_site_login", result=_SIGNED_IN, calls=calls)]
+    tools = [_fake_tool(
+            "mcp_ziggy_site_login", result=_SIGNED_IN, calls=calls, read_only=False
+        )]
     loop, outbound = await _handoff_turn(
         tmp_path,
         monkeypatch,
@@ -771,8 +1018,12 @@ async def test_write_then_needs_credential_does_not_hand_off(
 ) -> None:
     calls: list[str] = []
     tools = [
-        _fake_tool("mcp_ziggy_gmail_gmail_send_message", result="sent", calls=calls),
-        _fake_tool("mcp_ziggy_site_login", result=_NEEDS_CREDENTIAL, calls=calls),
+        _fake_tool(
+            "mcp_ziggy_gmail_gmail_send_message", result="sent", calls=calls, read_only=False
+        ),
+        _fake_tool(
+            "mcp_ziggy_site_login", result=_NEEDS_CREDENTIAL, calls=calls, read_only=False
+        ),
     ]
     loop, outbound = await _handoff_turn(
         tmp_path,
@@ -791,3 +1042,125 @@ async def test_write_then_needs_credential_does_not_hand_off(
     assert outbound.content == "sent; sign-in needs you"
     assert "handoff_task_id" not in outbound.metadata
     assert loop.work_store.list_tasks() == []
+
+
+def _batch_response(*names: str) -> LLMResponse:
+    return LLMResponse(
+        content="",
+        finish_reason="tool_calls",
+        tool_calls=[
+            ToolCallRequest(id=f"call-{index}", name=name, arguments={})
+            for index, name in enumerate(names)
+        ],
+        usage=LLMUsage.reported(input_tokens=1, output_tokens=1),
+    )
+
+
+@pytest.mark.asyncio
+async def test_unlisted_write_then_needs_credential_does_not_hand_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SR-09 evidence, not a name list: any earlier non-read-only call blocks."""
+    calls: list[str] = []
+    tools = [
+        _fake_tool("mcp_ziggy_calendar_create_event", calls=calls, read_only=False),
+        _fake_tool(
+            "mcp_ziggy_site_login", result=_NEEDS_CREDENTIAL, calls=calls, read_only=False
+        ),
+    ]
+    loop, outbound = await _handoff_turn(
+        tmp_path,
+        monkeypatch,
+        responses=[
+            _tool_response("call-w", "mcp_ziggy_calendar_create_event"),
+            _tool_response("call-login", "mcp_ziggy_site_login"),
+            _final_response("created; sign-in needs you"),
+        ],
+        tools=tools,
+        threshold=float("inf"),
+    )
+
+    assert calls == ["mcp_ziggy_calendar_create_event", "mcp_ziggy_site_login"]
+    assert outbound is not None
+    assert outbound.content == "created; sign-in needs you"
+    assert loop.work_store.list_tasks() == []
+
+
+@pytest.mark.asyncio
+async def test_write_in_the_signin_batch_does_not_hand_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The sign-in batch stays in the kept history; a write beside it ran."""
+    calls: list[str] = []
+    tools = [
+        _fake_tool("mcp_ziggy_gmail_send_message", result="sent", calls=calls, read_only=False),
+        _fake_tool(
+            "mcp_ziggy_site_login", result=_NEEDS_CREDENTIAL, calls=calls, read_only=False
+        ),
+    ]
+    loop, outbound = await _handoff_turn(
+        tmp_path,
+        monkeypatch,
+        responses=[
+            _batch_response("mcp_ziggy_gmail_send_message", "mcp_ziggy_site_login"),
+            _final_response("sent; sign-in needs you"),
+        ],
+        tools=tools,
+        threshold=float("inf"),
+    )
+
+    assert sorted(calls) == ["mcp_ziggy_gmail_send_message", "mcp_ziggy_site_login"]
+    assert outbound is not None
+    assert outbound.content == "sent; sign-in needs you"
+    assert loop.work_store.list_tasks() == []
+
+
+@pytest.mark.asyncio
+async def test_read_beside_the_signin_still_hands_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[str] = []
+    tools = [
+        _fake_tool("read_a", calls=calls),
+        _fake_tool(
+            "mcp_ziggy_site_login", result=_NEEDS_CREDENTIAL, calls=calls, read_only=False
+        ),
+    ]
+    loop, outbound = await _handoff_turn(
+        tmp_path,
+        monkeypatch,
+        responses=[_batch_response("read_a", "mcp_ziggy_site_login")],
+        tools=tools,
+        threshold=float("inf"),
+    )
+
+    assert outbound is not None and outbound.content == HANDOFF_REPLY
+    assert len(loop.work_store.list_tasks()) == 1
+
+
+@pytest.mark.asyncio
+async def test_draining_runtime_does_not_hand_off_a_signin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[str] = []
+    tools = [
+        _fake_tool(
+            "mcp_ziggy_site_login", result=_NEEDS_CREDENTIAL, calls=calls, read_only=False
+        )
+    ]
+    loop, outbound = await _handoff_turn(
+        tmp_path,
+        monkeypatch,
+        responses=[
+            _tool_response("call-login", "mcp_ziggy_site_login"),
+            _final_response("add a saved login in the app"),
+        ],
+        tools=tools,
+        threshold=float("inf"),
+        before_call={0: lambda loop: loop.begin_drain()},
+    )
+
+    assert calls == ["mcp_ziggy_site_login"]
+    assert outbound is not None and outbound.content == "add a saved login in the app"
+    assert loop.work_store.list_tasks() == []
+    assert loop.bus.inbound.empty()

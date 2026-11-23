@@ -97,6 +97,10 @@ class _GatewayAgentContractStub:
     def pending_local_trigger_ids_for_session(_session_key: str) -> set[str]:
         return set()
 
+    @staticmethod
+    def session_context_window_tokens(_session_key: str) -> int | None:
+        return None
+
     async def submit_local_trigger_turn(
         self,
         _msg: InboundMessage,
@@ -116,6 +120,13 @@ class _GatewayAgentContractStub:
         # Ziggy-local (MIT-1010): gateway startup sweeps Work tasks left
         # running by the previous process, before any channel accepts input.
         return 0
+
+    def begin_drain(self) -> None:
+        # Ziggy-local (MIT-1811): the first SIGTERM stops admitting turns.
+        return None
+
+    async def wait_idle(self, _timeout: float) -> bool:
+        return True
 
 
 class _EmptyGatewaySessionManager:
@@ -254,7 +265,9 @@ def test_disabled_dream_cursor_only_advances_when_behind(tmp_path) -> None:
 
 
 def test_commit_dream_changes_skips_noop_run(tmp_path) -> None:
-    store = MemoryStore(tmp_path)
+    # SM-01: nest the workspace so the derived history dir (<ws>/../history) is
+    # per-test instead of shared under the tmp_path parent.
+    store = MemoryStore(tmp_path / "workspace")
     store.write_soul("# Soul")
     store.write_memory("# Memory")
     store.git.init()
@@ -266,7 +279,7 @@ def test_commit_dream_changes_skips_noop_run(tmp_path) -> None:
 
 
 def test_commit_dream_changes_commits_real_edits(tmp_path) -> None:
-    store = MemoryStore(tmp_path)
+    store = MemoryStore(tmp_path / "workspace")
     store.write_soul("# Soul")
     store.write_memory("# Memory")
     store.git.init()
@@ -281,6 +294,8 @@ def test_commit_dream_changes_commits_real_edits(tmp_path) -> None:
     message = store.git.auto_commit.call_args.args[0]
     assert message.startswith("dream: periodic memory consolidation\n\n")
     assert "Research notes" in message
+    # MIT-1871: the commit body reports the core memory against its budget.
+    assert message.endswith(store.core_memory_line())
 
 
 @pytest.fixture
@@ -4143,6 +4158,232 @@ def test_gateway_starts_cron_only_after_the_work_restart_sweep(
         assert order.index("cron") < order.index("channels")
 
 
+def test_gateway_registers_mcp_tools_before_recovery_scan(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """Regression (PR #154 review, P2).
+
+    Recovery classifies pending tool calls by registry lookup.  If the scan
+    runs before MCP servers are connected, a pending read-only MCP call looks
+    unknown and parks instead of auto-continuing.
+    """
+    config_file = _write_instance_config(tmp_path)
+    config = Config()
+    config.gateway.port = 18793
+    order: list[str] = []
+
+    class _FakeAgentLoop(_GatewayAgentContractStub):
+        @classmethod
+        def from_config(cls, config, bus=None, **extra):
+            return cls(**extra)
+
+        def __init__(self, **_kwargs) -> None:
+            self.model = "test-model"
+            self.provider = object()
+            self.sessions = _EmptyGatewaySessionManager()
+            self.runtime_resolver = MagicMock()
+
+        def llm_runtime(self) -> None:
+            return None
+
+        async def reconcile_work_store(self) -> int:
+            order.append("work-sweep")
+            return 0
+
+        async def run(self) -> None:
+            await asyncio.Event().wait()
+
+        async def aclose(self) -> None:
+            return None
+
+        def stop(self) -> None:
+            return None
+
+    class _FakeChannelManager:
+        def __init__(self, _config, _bus, **_kwargs) -> None:
+            self.enabled_channels = ["telegram"]
+
+        async def start_all(self) -> None:
+            order.append("channels")
+            await asyncio.Event().wait()
+
+        async def stop_all(self) -> None:
+            return None
+
+    class _FakeCronService:
+        def __init__(self, _store_path: Path) -> None:
+            self.on_job = None
+
+        async def start(self) -> None:
+            order.append("cron")
+
+        def stop(self) -> None:
+            return None
+
+        def status(self) -> dict[str, int]:
+            return {"jobs": 0}
+
+        def register_system_job(self, _job) -> None:
+            return None
+
+    class _FakeServer:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> bool:
+            return False
+
+        async def serve_forever(self) -> None:
+            await asyncio.sleep(0)
+            raise _StopGatewayError("stop")
+
+    async def _fake_start_server(_handler, _host: str, _port: int):
+        return _FakeServer()
+
+    _patch_cli_command_runtime(
+        monkeypatch,
+        config,
+        message_bus=MessageBus,
+        session_manager=lambda _workspace: _EmptyGatewaySessionManager(),
+    )
+    monkeypatch.setattr("nanobot.cli.gateway_runtime.AgentLoop", _FakeAgentLoop)
+    monkeypatch.setattr("nanobot.channels.manager.ChannelManager", _FakeChannelManager)
+    monkeypatch.setattr("nanobot.cron.service.CronService", _FakeCronService)
+    monkeypatch.setattr("asyncio.start_server", _fake_start_server)
+
+    async def _fake_mcp_connect(_self) -> None:
+        order.append("mcp-connect")
+
+    async def _fake_scan(_self) -> None:
+        order.append("recovery-scan")
+
+    monkeypatch.setattr(cli_gateway_runtime.MCPProvider, "connect", _fake_mcp_connect)
+    monkeypatch.setattr(
+        "nanobot.session.recovery.RecoveryCoordinator.scan", _fake_scan
+    )
+
+    runner.invoke(app, ["gateway", "--config", str(config_file)])
+
+    assert "recovery-scan" in order and "mcp-connect" in order
+    assert order.index("mcp-connect") < order.index("recovery-scan")
+
+
+def test_gateway_startup_survives_a_hanging_mcp_server(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """Regression (PR #154 review round 2, P2).
+
+    A stdio MCP server that never answers must not hold the pre-scan connect
+    forever: startup has to reach the recovery scan and the channels.
+    """
+    config_file = _write_instance_config(tmp_path)
+    config = Config()
+    config.gateway.port = 18794
+    order: list[str] = []
+
+    class _FakeAgentLoop(_GatewayAgentContractStub):
+        @classmethod
+        def from_config(cls, config, bus=None, **extra):
+            return cls(**extra)
+
+        def __init__(self, **_kwargs) -> None:
+            self.model = "test-model"
+            self.provider = object()
+            self.sessions = _EmptyGatewaySessionManager()
+            self.runtime_resolver = MagicMock()
+
+        def llm_runtime(self) -> None:
+            return None
+
+        async def reconcile_work_store(self) -> int:
+            order.append("work-sweep")
+            return 0
+
+        async def run(self) -> None:
+            await asyncio.Event().wait()
+
+        async def aclose(self) -> None:
+            return None
+
+        def stop(self) -> None:
+            return None
+
+    class _FakeChannelManager:
+        def __init__(self, _config, _bus, **_kwargs) -> None:
+            self.enabled_channels = ["telegram"]
+
+        async def start_all(self) -> None:
+            order.append("channels")
+            await asyncio.Event().wait()
+
+        async def stop_all(self) -> None:
+            return None
+
+    class _FakeCronService:
+        def __init__(self, _store_path: Path) -> None:
+            self.on_job = None
+
+        async def start(self) -> None:
+            order.append("cron")
+
+        def stop(self) -> None:
+            return None
+
+        def status(self) -> dict[str, int]:
+            return {"jobs": 0}
+
+        def register_system_job(self, _job) -> None:
+            return None
+
+    class _FakeServer:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> bool:
+            return False
+
+        async def serve_forever(self) -> None:
+            await asyncio.sleep(0)
+            raise _StopGatewayError("stop")
+
+    async def _fake_start_server(_handler, _host: str, _port: int):
+        return _FakeServer()
+
+    _patch_cli_command_runtime(
+        monkeypatch,
+        config,
+        message_bus=MessageBus,
+        session_manager=lambda _workspace: _EmptyGatewaySessionManager(),
+    )
+    monkeypatch.setattr("nanobot.cli.gateway_runtime.AgentLoop", _FakeAgentLoop)
+    monkeypatch.setattr("nanobot.channels.manager.ChannelManager", _FakeChannelManager)
+    monkeypatch.setattr("nanobot.cron.service.CronService", _FakeCronService)
+    monkeypatch.setattr("asyncio.start_server", _fake_start_server)
+
+    async def _fake_mcp_connect(_self) -> None:
+        order.append("mcp-connect")
+        await asyncio.sleep(3600)
+
+    async def _fake_scan(_self) -> None:
+        order.append("recovery-scan")
+
+    monkeypatch.setattr(cli_gateway_runtime.MCPProvider, "connect", _fake_mcp_connect)
+    monkeypatch.setattr(
+        "nanobot.session.recovery.RecoveryCoordinator.scan", _fake_scan
+    )
+
+    monkeypatch.setattr(
+        cli_gateway_runtime, "_MCP_STARTUP_CONNECT_TIMEOUT_SECONDS", 0.05
+    )
+
+    runner.invoke(app, ["gateway", "--config", str(config_file)])
+
+    assert order[:2] == ["mcp-connect", "recovery-scan"]
+    assert "work-sweep" in order
+
+
 def test_gateway_shutdown_event_exits_forever_runtime_tasks(
     monkeypatch,
     tmp_path: Path,
@@ -4257,6 +4498,7 @@ def test_gateway_shutdown_event_exits_forever_runtime_tasks(
     result = runner.invoke(app, ["gateway", "--config", str(config_file)])
 
     assert result.exit_code == 0
+    assert "crashed unexpectedly" not in result.output
     assert seen["agent_stopped"] is True
     assert seen["agent_closed"] is True
     assert seen["agent_task_cleaned_up"] is True
@@ -4267,6 +4509,227 @@ def test_gateway_shutdown_event_exits_forever_runtime_tasks(
     # Channel cleanup must run before cancellation drains the manager task.
     # DingTalk's stream SDK can otherwise swallow cancellation and reconnect.
     assert shutdown_order == ["channels_stopped", "channel_task_cleaned_up"]
+
+
+# MIT-1811: drive the real gateway run() wiring through a SIGTERM drain.
+
+
+class _SignalLoop:
+    """Captures the gateway's signal handlers so a test can fire them."""
+
+    def __init__(self) -> None:
+        self.handlers: dict[int, tuple[object, tuple[object, ...]]] = {}
+
+    def add_signal_handler(self, signum, callback, *args) -> None:
+        self.handlers[int(signum)] = (callback, args)
+
+    def remove_signal_handler(self, signum) -> bool:
+        self.handlers.pop(int(signum), None)
+        return True
+
+    def fire(self, signum: int) -> None:
+        callback, args = self.handlers[int(signum)]
+        callback(*args)
+
+
+def _run_gateway_through_signals(
+    monkeypatch,
+    tmp_path: Path,
+    *,
+    grace_seconds: int,
+    agent_run,
+    drive,
+):
+    """Run ``nanobot gateway`` with the real signal handlers on a fake loop.
+
+    ``agent_run(agent)`` is the agent loop body; ``drive(agent, signals)``
+    runs as a task on the gateway's event loop and fires the signals.
+    """
+    from nanobot.agent.loop import AgentLoop
+
+    config_file = _write_instance_config(tmp_path)
+    config = Config()
+    config.gateway.port = 18791
+    config.gateway.shutdown_grace_seconds = grace_seconds
+    real_install = cli_gateway_runtime._install_gateway_shutdown_handlers
+    signals = _SignalLoop()
+    holder: dict[str, object] = {}
+
+    class _FakeSessionManager:
+        def flush_all(self) -> int:
+            return 0
+
+    class _FakeAgentLoop(_GatewayAgentContractStub):
+        wait_idle = AgentLoop.wait_idle  # the real drain wait
+
+        @classmethod
+        def from_config(cls, config, bus=None, **extra):
+            return cls(**extra)
+
+        def __init__(self, **_kwargs) -> None:
+            self.model = "test-model"
+            self.provider = object()
+            self.sessions = _FakeSessionManager()
+            self.runtime_resolver = MagicMock()
+            self.turn_active = False
+            self.events: list[str] = []
+            holder["agent"] = self
+
+        def active_turn_count(self) -> int:
+            return 1 if self.turn_active else 0
+
+        def begin_drain(self) -> None:
+            self.events.append("begin_drain")
+
+        def preserve_inflight_turns_on_shutdown(self) -> None:
+            if "preserve" not in self.events:
+                self.events.append("preserve")
+
+        def llm_runtime(self) -> None:
+            return None
+
+        async def run(self) -> None:
+            await agent_run(self)
+
+        async def aclose(self) -> None:
+            return None
+
+        def stop(self) -> None:
+            return None
+
+    class _FakeChannelManager:
+        def __init__(self, _config, _bus, **_kwargs) -> None:
+            self.enabled_channels = ["websocket"]
+
+        async def start_all(self) -> None:
+            await asyncio.Event().wait()
+
+        async def stop_all(self) -> None:
+            return None
+
+    class _FakeCronService:
+        def __init__(self, _store_path: Path) -> None:
+            self.on_job = None
+
+        async def start(self) -> None:
+            return None
+
+        def stop(self) -> None:
+            return None
+
+        def status(self) -> dict[str, int]:
+            return {"jobs": 0}
+
+        def register_system_job(self, _job) -> None:
+            return None
+
+    class _FakeServer:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> bool:
+            return False
+
+        async def serve_forever(self) -> None:
+            await asyncio.Event().wait()
+
+    async def _fake_start_server(_handler, _host: str, _port: int):
+        return _FakeServer()
+
+    def _install(_loop, event, tasks, print_status):
+        restore = real_install(signals, event, tasks, print_status)
+        holder["driver"] = asyncio.create_task(drive(holder["agent"], signals))
+        return restore
+
+    _patch_cli_command_runtime(
+        monkeypatch,
+        config,
+        message_bus=MessageBus,
+        session_manager=lambda _workspace: _EmptyGatewaySessionManager(),
+    )
+    monkeypatch.setattr("nanobot.cli.gateway_runtime.AgentLoop", _FakeAgentLoop)
+    monkeypatch.setattr("nanobot.channels.manager.ChannelManager", _FakeChannelManager)
+    monkeypatch.setattr("nanobot.cron.service.CronService", _FakeCronService)
+    monkeypatch.setattr("asyncio.start_server", _fake_start_server)
+    monkeypatch.setattr(
+        "nanobot.cli.gateway_runtime._install_gateway_shutdown_handlers",
+        _install,
+    )
+
+    result = runner.invoke(app, ["gateway", "--config", str(config_file)])
+    return result, holder["agent"]
+
+
+async def _wait_for(predicate, timeout: float = 3.0) -> bool:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not predicate():
+        if asyncio.get_running_loop().time() > deadline:
+            return False
+        await asyncio.sleep(0.01)
+    return True
+
+
+def test_gateway_sigterm_lets_running_turn_finish(monkeypatch, tmp_path: Path) -> None:
+    """The first SIGTERM drains: a turn mid-flight completes before exit."""
+
+    async def _agent_run(agent) -> None:
+        agent.turn_active = True
+        try:
+            await asyncio.sleep(0.4)  # the in-flight turn
+            agent.events.append("turn_completed")
+        except asyncio.CancelledError:
+            agent.events.append("turn_cancelled")
+            raise
+        finally:
+            agent.turn_active = False
+        await asyncio.Event().wait()
+
+    async def _drive(agent, signals) -> None:
+        await _wait_for(lambda: agent.turn_active)
+        signals.fire(signal.SIGTERM)
+
+    result, agent = _run_gateway_through_signals(
+        monkeypatch, tmp_path, grace_seconds=30, agent_run=_agent_run, drive=_drive
+    )
+
+    assert result.exit_code == 0
+    assert "crashed unexpectedly" not in result.output
+    assert agent.events == ["preserve", "begin_drain", "turn_completed"]
+
+
+def test_gateway_second_sigterm_cuts_the_grace_short(monkeypatch, tmp_path: Path) -> None:
+    """A second SIGTERM during a 600 s drain cancels the runtime tasks at once."""
+
+    async def _agent_run(agent) -> None:
+        agent.turn_active = True
+        try:
+            await asyncio.Event().wait()  # a turn that would outlive the grace
+        except asyncio.CancelledError:
+            agent.events.append("turn_cancelled")
+            raise
+        finally:
+            agent.turn_active = False
+
+    async def _drive(agent, signals) -> None:
+        await _wait_for(lambda: agent.turn_active)
+        signals.fire(signal.SIGTERM)
+        await _wait_for(lambda: "begin_drain" in agent.events)
+        signals.fire(signal.SIGTERM)
+        if not await _wait_for(lambda: "turn_cancelled" in agent.events):
+            # Bug path: the second signal did nothing. Unblock the drain so
+            # the test fails instead of waiting out the 600 s grace.
+            agent.events.append("second_signal_ignored")
+            agent.turn_active = False
+
+    result, agent = _run_gateway_through_signals(
+        monkeypatch, tmp_path, grace_seconds=600, agent_run=_agent_run, drive=_drive
+    )
+
+    assert result.exit_code == 0
+    assert "second_signal_ignored" not in agent.events
+    # Checkpoint preservation is on before the forced cancellation reaches
+    # the turn, so the next gateway can still offer Continue.
+    assert agent.events == ["preserve", "begin_drain", "turn_cancelled"]
 
 
 def test_serve_uses_api_config_defaults_and_workspace_override(

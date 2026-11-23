@@ -15,8 +15,14 @@ from loguru import logger
 
 from nanobot import __version__
 from nanobot.bus.events import INBOUND_META_USER_SHELL, OutboundMessage
-from nanobot.command.router import CommandContext, CommandRouter, normalize_command_text
+from nanobot.command.router import (
+    DIRECT_TURN,
+    CommandContext,
+    CommandRouter,
+    normalize_command_text,
+)
 from nanobot.providers.base import LLMUsage
+from nanobot.utils.gitstore import GitStoreError
 from nanobot.utils.helpers import build_status_content
 from nanobot.utils.restart import set_restart_notice_to_env
 from nanobot.utils.workspace_prompts import initialize_workspace_prompt
@@ -152,6 +158,30 @@ BUILTIN_COMMAND_SPECS: tuple[BuiltinCommandSpec, ...] = (
         accepts_args=True,
     ),
     BuiltinCommandSpec(
+        "/changes",
+        "Show memory history",
+        "List recent workspace memory changes, or show one commit's diff.",
+        "history",
+        "[sha]",
+        accepts_args=True,
+    ),
+    BuiltinCommandSpec(
+        "/undo",
+        "Undo one change",
+        "Undo one memory commit without discarding later edits to other files.",
+        "undo-2",
+        "<sha>",
+        accepts_args=True,
+    ),
+    BuiltinCommandSpec(
+        "/restore",
+        "Restore memory state",
+        "Set all memory files to an earlier version (requires confirm).",
+        "rotate-ccw",
+        "<sha> [confirm]",
+        accepts_args=True,
+    ),
+    BuiltinCommandSpec(
         "/dream-prompt",
         "Dream memory",
         "Tell Dream how to organize this workspace's memory.",
@@ -170,8 +200,10 @@ BUILTIN_COMMAND_SPECS: tuple[BuiltinCommandSpec, ...] = (
     BuiltinCommandSpec(
         "/skill",
         "List skills",
-        "List all enabled skills available to the agent.",
+        "List enabled skills, or manage drafts: drafts, diff/accept/reject <name>.",
         "wrench",
+        "[drafts|diff <name>|accept <name>|reject <name>]",
+        accepts_args=True,
     ),
     BuiltinCommandSpec(
         "/help",
@@ -486,7 +518,7 @@ async def cmd_dream(ctx: CommandContext) -> OutboundMessage:
                 prompt,
                 session_key=key,
                 ephemeral=True,
-                tools=store.build_dream_tools(),
+                tools=store.build_dream_tools(skills_drafts=loop.tools_config.skills.drafts),
                 on_progress=_silent,
                 runtime=dream_runtime,
             )
@@ -517,7 +549,14 @@ async def cmd_dream(ctx: CommandContext) -> OutboundMessage:
             content = f"Dream failed after {elapsed:.1f}s: {e}"
         finally:
             if store.git.is_initialized():
-                commit_msg = build_dream_commit_message("dream: manual run", diff_body)
+                core_tokens, core_budget = store.core_memory_stats()
+                logger.info("Dream run core: {}/{} tokens", core_tokens, core_budget)
+                commit_msg = build_dream_commit_message(
+                    "dream: manual run",
+                    diff_body,
+                    core_tokens=core_tokens,
+                    core_budget=core_budget,
+                )
                 sha = store.git.auto_commit(commit_msg)
                 if sha:
                     content += f" (commit {sha})"
@@ -811,6 +850,8 @@ async def cmd_dream_restore(ctx: CommandContext) -> OutboundMessage:
         else:
             content = _format_dream_restore_list(commits)
     else:
+        if (refusal := _history_write_refusal(ctx)) is not None:
+            return refusal
         sha = args.split()[0]
         result = git.show_commit_diff(sha, message_prefix=_DREAM_COMMIT_PREFIX)
         if not result:
@@ -820,20 +861,280 @@ async def cmd_dream_restore(ctx: CommandContext) -> OutboundMessage:
                 "Use `/dream-restore` to list recent versions."
             )
         else:
-            changed_files = _format_changed_files(result[1])
-            new_sha = git.revert(sha, message_prefix=_DREAM_COMMIT_PREFIX)
-            if new_sha:
-                content = (
-                    f"Restored Dream memory to the state before `{sha}`.\n\n"
-                    f"- New safety commit: `{new_sha}`\n"
-                    f"- Restored files: {changed_files}\n\n"
-                    f"Use `/dream-log {new_sha}` to inspect the restore diff."
-                )
+            undo = git.undo(sha, message_prefix=_DREAM_COMMIT_PREFIX)
+            if undo.conflicts:
+                content = _format_undo_conflicts(sha, undo.conflicts)
+            elif undo.restored or undo.skipped or undo.kept:
+                lines = [
+                    f"Restored Dream memory to the state before `{sha}`."
+                    if undo.restored
+                    else f"Nothing restored from Dream change `{sha}`.",
+                    "",
+                ]
+                if undo.new_sha:
+                    lines.append(f"- New safety commit: `{undo.new_sha}`")
+                if undo.restored:
+                    lines.append(f"- Restored files: {_format_file_paths(undo.restored)}")
+                lines.extend(_format_undo_leftovers(sha, undo))
+                if undo.new_sha:
+                    lines.extend([
+                        "",
+                        f"Use `/dream-log {undo.new_sha}` to inspect the restore diff.",
+                    ])
+                content = "\n".join(lines)
             else:
                 content = (
                     f"Couldn't restore Dream change `{sha}`.\n\n"
                     "It may be the first saved version with no earlier state to restore."
                 )
+    return OutboundMessage(
+        channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
+        content=content, metadata={"render_as": "text"},
+    )
+
+
+_CHANGES_MAX_COMMITS = 15
+_CHANGES_DIFF_MAX_CHARS = 6000
+
+
+def _format_file_paths(paths: list[str]) -> str:
+    if not paths:
+        return "No tracked memory files changed."
+    return ", ".join(f"`{path}`" for path in paths)
+
+
+def _format_undo_leftovers(sha: str, undo: Any) -> list[str]:
+    lines = [
+        f"- Skipped `{path}` — changed again later; use `/restore {sha}`"
+        for path in undo.skipped
+    ]
+    lines.extend(
+        f"- Kept `{path}` — no earlier version in history"
+        for path in undo.kept
+    )
+    return lines
+
+
+def _format_undo_conflicts(sha: str, conflicts: list[str]) -> str:
+    return (
+        f"Nothing changed: couldn't undo `{sha}` because these paths are now "
+        f"a directory, a symlink or under one: {_format_file_paths(conflicts)}."
+    )
+
+
+def _history_write_refusal(ctx: CommandContext) -> OutboundMessage | None:
+    """Undo/restore rewrite workspace files: only a genuine interactive owner
+    turn may run them — never scheduled work, cron, subagents, system events
+    or in-process ``process_direct`` callers."""
+    direct = DIRECT_TURN.get()
+    if ctx.is_user_turn and not direct:
+        return None
+    if not direct and ctx.session is None:
+        # Inline dispatch beside an in-flight turn of the same chat.
+        content = "A turn is still running — send it again when it finishes."
+    else:
+        content = (
+            "This command can only be run by you from a chat, "
+            "not by scheduled or automated work."
+        )
+    return OutboundMessage(
+        channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
+        content=content, metadata={"render_as": "text"},
+    )
+
+
+def _history_git(ctx: CommandContext) -> Any:
+    return ctx.loop.consolidator.store.git
+
+
+async def cmd_changes(ctx: CommandContext) -> OutboundMessage:
+    """Show workspace memory history.
+
+    Usage:
+        /changes         — the last commits, one line each
+        /changes <sha>   — the diff introduced by that commit
+    """
+    git = _history_git(ctx)
+    if not git.is_initialized():
+        return OutboundMessage(
+            channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
+            content=(
+                "Memory history is not available because memory versioning "
+                "is not initialized."
+            ),
+            metadata={"render_as": "text"},
+        )
+
+    args = ctx.args.split()
+    if args:
+        sha = args[0]
+        result = git.show_commit_diff(sha)
+        if not result:
+            content = (
+                f"Couldn't find change `{sha}`.\n\n"
+                "Use `/changes` to list recent changes."
+            )
+        else:
+            commit, diff = result
+            if len(diff) > _CHANGES_DIFF_MAX_CHARS:
+                diff = diff[:_CHANGES_DIFF_MAX_CHARS] + "\n...[diff truncated]"
+            content = commit.format(diff=diff)
+    else:
+        commits = git.log(max_entries=_CHANGES_MAX_COMMITS, include_files=True)
+        if not commits:
+            content = "Memory history has no saved versions yet."
+        else:
+            lines = ["## Memory history", ""]
+            for c in commits:
+                files = ", ".join(c.files) if c.files else "no files"
+                lines.append(f"`{c.sha}` · {c.timestamp} · {c.subject()} · {files}")
+            lines.extend([
+                "",
+                "Show a diff with `/changes <sha>`, undo one change with `/undo <sha>`.",
+            ])
+            content = "\n".join(lines)
+
+    return OutboundMessage(
+        channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
+        content=content, metadata={"render_as": "text"},
+    )
+
+
+async def cmd_undo(ctx: CommandContext) -> OutboundMessage:
+    """Undo the changes a single commit introduced, per file.
+
+    Usage:
+        /undo <sha> — undo one commit's changes, keeping later edits intact
+    """
+    git = _history_git(ctx)
+    if not git.is_initialized():
+        return OutboundMessage(
+            channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
+            content=(
+                "Memory history is not available because memory versioning "
+                "is not initialized."
+            ),
+            metadata={"render_as": "text"},
+        )
+
+    args = ctx.args.split()
+    if not args:
+        return OutboundMessage(
+            channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
+            content="Usage: `/undo <sha>` — list recent changes with `/changes`.",
+            metadata={"render_as": "text"},
+        )
+
+    if (refusal := _history_write_refusal(ctx)) is not None:
+        return refusal
+    sha = args[0]
+    undo = git.undo(sha)
+    if undo.conflicts:
+        content = _format_undo_conflicts(sha, undo.conflicts)
+    elif not (undo.restored or undo.skipped or undo.kept):
+        if git.has_commit(sha):
+            content = (
+                f"Nothing to undo from `{sha}`.\n\n"
+                "It may be the first saved version, or it changed no memory files."
+            )
+        else:
+            content = (
+                f"Couldn't find change `{sha}`.\n\n"
+                "Use `/changes` to list recent changes."
+            )
+    else:
+        lines = [f"## Undo `{sha}`", ""]
+        if undo.restored:
+            lines.append(f"- Restored: {_format_file_paths(undo.restored)}")
+        lines.extend(_format_undo_leftovers(sha, undo))
+        content = "\n".join(lines)
+
+    return OutboundMessage(
+        channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
+        content=content, metadata={"render_as": "text"},
+    )
+
+
+async def cmd_restore(ctx: CommandContext) -> OutboundMessage:
+    """Restore all memory files to an earlier commit (two-step confirm).
+
+    Usage:
+        /restore <sha>            — preview the files that would change
+        /restore <sha> confirm    — do the restore
+    """
+    git = _history_git(ctx)
+    if not git.is_initialized():
+        return OutboundMessage(
+            channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
+            content=(
+                "Memory history is not available because memory versioning "
+                "is not initialized."
+            ),
+            metadata={"render_as": "text"},
+        )
+
+    args = ctx.args.split()
+    if not args:
+        return OutboundMessage(
+            channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
+            content="Usage: `/restore <sha> confirm` — list recent changes with `/changes`.",
+            metadata={"render_as": "text"},
+        )
+
+    sha = args[0]
+    if not git.has_commit(sha):
+        return OutboundMessage(
+            channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
+            content=(
+                f"Couldn't find change `{sha}`.\n\n"
+                "Use `/changes` to list recent changes."
+            ),
+            metadata={"render_as": "text"},
+        )
+
+    confirmed = len(args) > 1 and args[1].lower() == "confirm"
+    if confirmed and (refusal := _history_write_refusal(ctx)) is not None:
+        return refusal
+    plan = git.restore(sha) if confirmed else git.restore_preview(sha)
+    if plan.conflicts:
+        content = (
+            f"Nothing changed: couldn't restore `{sha}` because these paths are "
+            "now a directory, a symlink, too large for history, or under a "
+            f"symlink: {_format_file_paths(plan.conflicts)}."
+        )
+    elif not plan.restored:
+        content = f"Nothing to restore: memory already matches `{sha}`."
+        if plan.kept:
+            content += (
+                "\n\nFiles added since then are kept: "
+                f"{_format_file_paths(plan.kept)}."
+            )
+    else:
+        if confirmed:
+            lines = [
+                f"Restored memory to `{sha}`.",
+                "",
+                f"- Changed files: {_format_file_paths(plan.restored)}",
+            ]
+        else:
+            lines = [
+                f"## Restore `{sha}`",
+                "",
+                "This would overwrite every later change to:",
+                "",
+            ]
+            lines.extend(f"- `{path}`" for path in plan.restored)
+        if plan.kept:
+            lines.append(
+                f"- Kept (added since, never deleted): {_format_file_paths(plan.kept)}"
+            )
+        lines.append("")
+        if confirmed:
+            lines.append(f"Use `/changes {sha}` to inspect the version you restored.")
+        else:
+            lines.append(f"Confirm with `/restore {sha} confirm`.")
+        content = "\n".join(lines)
+
     return OutboundMessage(
         channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
         content=content, metadata={"render_as": "text"},
@@ -961,24 +1262,104 @@ async def cmd_pairing(ctx: CommandContext) -> OutboundMessage:
     )
 
 
-async def cmd_skill(ctx: CommandContext) -> OutboundMessage:
-    """List all enabled skills (name and description only)."""
-    loop = ctx.loop
-    skills = loop.context.skills.list_skills(filter_unavailable=False)
-    if not skills:
-        content = "No skills available."
-    else:
-        lines = [f"Available skills ({len(skills)}):", ""]
-        for entry in skills:
-            desc = loop.context.skills.get_skill_description(entry["name"])
-            lines.append(f"- **{entry['name']}** — {desc}")
-        content = "\n".join(lines)
+_SKILL_USAGE = (
+    "Usage: /skill [drafts | diff <name> | accept <name> | reject <name>]\n\n"
+    "Without arguments, lists the enabled skills."
+)
+
+
+def _skill_reply(ctx: CommandContext, content: str, *, as_text: bool = False) -> OutboundMessage:
+    metadata = dict(ctx.msg.metadata or {})
+    if as_text:
+        metadata["render_as"] = "text"
     return OutboundMessage(
         channel=ctx.msg.channel,
         chat_id=ctx.msg.chat_id,
         content=content,
-        metadata=dict(ctx.msg.metadata or {}),
+        metadata=metadata,
     )
+
+
+async def cmd_skill(ctx: CommandContext) -> OutboundMessage:
+    """List skills, or manage the draft overlays (drafts/diff/accept/reject)."""
+    from nanobot.agent import skill_drafts
+
+    loop = ctx.loop
+    args = ctx.args.strip()
+    if not args:
+        skills = loop.context.skills.list_skills(filter_unavailable=False)
+        if not skills:
+            return _skill_reply(ctx, "No skills available.")
+        lines = [f"Available skills ({len(skills)}):", ""]
+        for entry in skills:
+            desc = loop.context.skills.get_skill_description(entry["name"])
+            lines.append(f"- **{entry['name']}** — {desc}")
+        return _skill_reply(ctx, "\n".join(lines))
+
+    sub, _, rest = args.partition(" ")
+    sub = sub.lower()
+    name = rest.strip()
+    ws = loop.workspace
+
+    if sub == "drafts":
+        drafts = skill_drafts.list_drafts(ws)
+        if not drafts:
+            return _skill_reply(ctx, "No skill drafts waiting. Send /skill accept <name> after an offer.")
+        lines = [f"Skill drafts ({len(drafts)}):", ""]
+        for draft_name in drafts:
+            if not skill_drafts.is_valid_name(draft_name):
+                lines.append(
+                    f"- `{draft_name}` — invalid name (cannot be accepted; remove it with "
+                    f"/skill reject {draft_name})"
+                )
+                continue
+            merged = skill_drafts.merged_view(ws, draft_name)
+            lines.append(f"- **{draft_name}** — {skill_drafts.skill_description(merged)}")
+        lines.append("")
+        lines.append("Review with /skill diff <name>, then /skill accept <name> or /skill reject <name>.")
+        return _skill_reply(ctx, "\n".join(lines))
+
+    if sub not in {"diff", "accept", "reject"}:
+        return _skill_reply(ctx, _SKILL_USAGE, as_text=True)
+    if not name:
+        return _skill_reply(ctx, f"{sub.capitalize()} needs a skill name.\n\n{_SKILL_USAGE}", as_text=True)
+    if sub in {"accept", "reject"}:
+        # Only the owner, typing in a chat, activates or discards a draft:
+        # the same gate as /undo and /restore (scheduled work, cron, triggers,
+        # subagents and every in-process process_direct caller are refused),
+        # so the agent can never accept its own draft.
+        refusal = _history_write_refusal(ctx)
+        if refusal is not None:
+            return refusal
+    history = loop.consolidator.store.git
+
+    try:
+        if sub == "diff":
+            try:
+                return _skill_reply(ctx, skill_drafts.diff(ws, name), as_text=True)
+            except skill_drafts.SkillDraftError as exc:
+                return _skill_reply(ctx, str(exc), as_text=True)
+        if sub == "accept":
+            problems = skill_drafts.accept(ws, name, history)
+            if problems:
+                body = "\n".join(f"- {problem}" for problem in problems)
+                return _skill_reply(
+                    ctx, f"Not accepting draft '{name}' — fix these first:\n{body}"
+                )
+            return _skill_reply(
+                ctx,
+                f"Accepted skill draft '{name}'. It is live now at skills/{name}/ "
+                "(recorded in workspace history).",
+            )
+        # reject
+        if skill_drafts.reject(ws, name, history):
+            return _skill_reply(ctx, f"Rejected skill draft '{name}'. The live skill is unchanged.")
+        return _skill_reply(ctx, f"No draft named '{name}'.")
+    except skill_drafts.SkillDraftError as exc:
+        return _skill_reply(ctx, str(exc), as_text=True)
+    except (OSError, GitStoreError) as exc:
+        logger.exception("skill command: {} {} failed", sub, name)
+        return _skill_reply(ctx, f"Could not {sub} draft '{name}': {exc}", as_text=True)
 
 
 async def cmd_trigger(ctx: CommandContext) -> OutboundMessage:
@@ -1095,11 +1476,18 @@ def register_builtin_commands(router: CommandRouter) -> None:
     router.prefix("/dream-log ", cmd_dream_log)
     router.exact("/dream-restore", cmd_dream_restore)
     router.prefix("/dream-restore ", cmd_dream_restore)
+    router.exact("/changes", cmd_changes)
+    router.prefix("/changes ", cmd_changes)
+    router.exact("/undo", cmd_undo)
+    router.prefix("/undo ", cmd_undo)
+    router.exact("/restore", cmd_restore)
+    router.prefix("/restore ", cmd_restore)
     router.exact("/dream-prompt", cmd_dream_prompt)
     router.prefix("/dream-prompt ", cmd_dream_prompt)
     router.exact("/evaluator-prompt", cmd_evaluator_prompt)
     router.prefix("/evaluator-prompt ", cmd_evaluator_prompt)
     router.exact("/skill", cmd_skill)
+    router.prefix("/skill ", cmd_skill)
     router.exact("/help", cmd_help)
     router.exact("/pairing", cmd_pairing)
     router.prefix("/pairing ", cmd_pairing)

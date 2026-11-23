@@ -323,8 +323,10 @@ class TestDreamCursor:
         store2 = MemoryStore(store.workspace)
         assert store2.get_last_dream_cursor() == 3
 
-    def test_git_restore_rolls_back_dream_cursor(self, tmp_path):
-        store = MemoryStore(tmp_path)
+    def test_git_undo_does_not_roll_back_dream_cursor(self, tmp_path):
+        """SM-01: memory/.dream_cursor is bookkeeping and not tracked; undoing
+        a Dream commit must not re-consume old Dream history."""
+        store = MemoryStore(tmp_path / "workspace")
         store.write_memory("before")
         store.set_last_dream_cursor(1)
         assert store.git.init() is True
@@ -333,15 +335,34 @@ class TestDreamCursor:
         store.set_last_dream_cursor(2)
         dream_sha = store.git.auto_commit("dream: update")
         assert dream_sha is not None
-
-        store.write_memory("newer")
         store.set_last_dream_cursor(3)
 
-        restore_sha = store.git.revert(dream_sha)
+        result = store.git.undo(dream_sha)
 
-        assert restore_sha is not None
+        assert result.new_sha is not None
+        assert result.restored == ["memory/MEMORY.md"]
         assert store.read_memory() == "before"
-        assert store.get_last_dream_cursor() == 1
+        # The cursor keeps its current value: it never entered the tree.
+        assert store.get_last_dream_cursor() == 3
+
+    def test_git_undo_keeps_later_edits(self, tmp_path):
+        """undo must not discard edits made after the undone commit (MIT-1847)."""
+        store = MemoryStore(tmp_path / "workspace")
+        store.write_memory("before")
+        assert store.git.init() is True
+
+        store.write_memory("after")
+        dream_sha = store.git.auto_commit("dream: update")
+        assert dream_sha is not None
+
+        store.write_memory("newer")
+
+        result = store.git.undo(dream_sha)
+
+        assert result.restored == []
+        assert result.skipped == ["memory/MEMORY.md"]
+        assert result.new_sha is None
+        assert store.read_memory() == "newer"
 
 
 class TestLegacyHistoryMigration:
