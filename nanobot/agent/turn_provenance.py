@@ -23,6 +23,7 @@ from __future__ import annotations
 import re
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
+from collections.abc import Mapping
 from typing import Any
 
 # Built-in tools that earn a named family. Every other built-in is an
@@ -177,6 +178,51 @@ class TurnProvenance:
             entry[name] = value
         return entry
 
+    def absorb_earlier_slice(self, entry: Mapping[str, Any]) -> None:
+        """Fold an earlier slice's stored entry of the same turn into this record.
+
+        A sustained goal that hits ``max_iterations`` continues in a queued
+        internal slice; both slices are one answer. Counts add up, the
+        boolean intents OR together (a continuation has no user text, so its
+        own ``account_intent`` is always false), lists concatenate with the
+        earlier slice first, and ``started_at`` keeps the earliest value.
+        ``answered`` and the runtime fields stay this (latest) slice's.
+        """
+        started_at = entry.get("started_at")
+        if isinstance(started_at, str) and started_at:
+            self.started_at = started_at
+        self.account_intent = bool(entry.get("account_intent")) or self.account_intent
+        self.prompt_rebuilt = bool(entry.get("prompt_rebuilt")) or self.prompt_rebuilt
+        if not self.prompt and isinstance(entry.get("prompt"), list):
+            self.prompt = list(entry["prompt"])
+        if self.skills_listed_sha is None and isinstance(entry.get("skills_listed_sha"), str):
+            self.skills_listed_sha = entry["skills_listed_sha"]
+        for name in ("skills_loaded", "calls"):
+            earlier = entry.get(name)
+            if isinstance(earlier, list):
+                setattr(self, name, [*earlier, *getattr(self, name)])
+        earlier_repairs = entry.get("args_repaired")
+        if isinstance(earlier_repairs, dict):
+            merged = {k: v for k, v in earlier_repairs.items() if isinstance(v, int)}
+            for kind, count in self.args_repaired.items():
+                merged[kind] = merged.get(kind, 0) + count
+            self.args_repaired = merged
+        earlier_steps = entry.get("other_steps")
+        if isinstance(earlier_steps, int):
+            self.other_steps += earlier_steps
+        earlier_used = entry.get("used")
+        if isinstance(earlier_used, list):
+            merged_used = [dict(item) for item in earlier_used if isinstance(item, dict)]
+            for item in self.used:
+                for prior in merged_used:
+                    if prior.get("family") == item["family"]:
+                        prior["calls"] = int(prior.get("calls", 0)) + item["calls"]
+                        prior["errors"] = int(prior.get("errors", 0)) + item["errors"]
+                        break
+                else:
+                    merged_used.append(dict(item))
+            self.used = merged_used
+
     def note_tool_result(self, tool: Any, status: str) -> None:
         """Record one executed tool call.
 
@@ -232,16 +278,35 @@ def reset_turn_provenance(token: Token[TurnProvenance | None]) -> None:
     CURRENT_TURN_PROVENANCE.reset(token)
 
 
-def save_to_session(session: Any, record: TurnProvenance, cap: int = 100) -> None:
+def save_to_session(
+    session: Any,
+    record: TurnProvenance,
+    cap: int = 100,
+    *,
+    merge_same_turn: bool = False,
+) -> None:
     """Append one turn record to ``session.metadata`` under ``provenance_v1``.
 
     Keeps only the newest ``cap`` entries, bounded the same way
-    ``utils/activity_history.py`` bounds ``activity_v1``.
+    ``utils/activity_history.py`` bounds ``activity_v1``. With
+    ``merge_same_turn`` (an internal continuation slice), the newest stored
+    entry with the same ``turn_id`` is folded into ``record`` first and
+    replaced, so one answer keeps exactly one record.
     """
-    entry = record.to_dict()
     stored: Any = session.metadata.setdefault(PROVENANCE_KEY, [])
     if not isinstance(stored, list):
         stored = []
         session.metadata[PROVENANCE_KEY] = stored
+    replaced: int | None = None
+    if merge_same_turn and record.turn_id:
+        for index in range(len(stored) - 1, -1, -1):
+            earlier = stored[index]
+            if isinstance(earlier, dict) and earlier.get("turn_id") == record.turn_id:
+                record.absorb_earlier_slice(earlier)
+                replaced = index
+                break
+    entry = record.to_dict()
+    if replaced is not None:
+        del stored[replaced]
     stored.append(entry)
     session.metadata[PROVENANCE_KEY] = stored[-cap:]

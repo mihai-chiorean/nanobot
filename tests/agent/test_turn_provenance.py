@@ -214,10 +214,10 @@ class TestSaveToSession:
 
 class TestEffectiveTurnId:
     def test_wire_id_wins_and_fallback_is_used(self):
-        assert _effective_turn_id({WEBUI_TURN_METADATA_KEY: "wire-1"}, "minted") == "wire-1"
-        assert _effective_turn_id({WEBUI_TURN_METADATA_KEY: ""}, "minted") == "minted"
-        assert _effective_turn_id({WEBUI_TURN_METADATA_KEY: 7}, "minted") == "minted"
-        assert _effective_turn_id(None, "minted") == "minted"
+        assert _effective_turn_id({WEBUI_TURN_METADATA_KEY: "wire-1"}, fallback="minted") == "wire-1"
+        assert _effective_turn_id({WEBUI_TURN_METADATA_KEY: ""}, fallback="minted") == "minted"
+        assert _effective_turn_id({WEBUI_TURN_METADATA_KEY: 7}, fallback="minted") == "minted"
+        assert _effective_turn_id(None, fallback="minted") == "minted"
 
 
 @pytest.mark.asyncio
@@ -376,3 +376,188 @@ async def test_clean_arguments_record_no_repairs(tmp_path: Path):
     entry = _entries(loop)[0]
     assert entry["args_repaired"] == {}
     assert entry["answered"] is True
+
+
+# --- review round 1 (MIT-1853) -------------------------------------------
+
+
+async def _drain(bus: MessageBus) -> list[Any]:
+    out = []
+    while bus.outbound_size > 0:
+        out.append(await bus.consume_outbound())
+    return out
+
+
+@pytest.mark.asyncio
+async def test_record_save_failure_never_fails_the_turn(tmp_path: Path, monkeypatch):
+    """A raise from ``to_dict`` in the save stage is logged; the answer still lands."""
+
+    def boom(self: TurnProvenance) -> dict[str, Any]:
+        raise ValueError("bad record")
+
+    monkeypatch.setattr(TurnProvenance, "to_dict", boom)
+    loop, bus = _make_loop(tmp_path, lambda: _answer("Paris."))
+    await run_session(loop, _msg())
+
+    outbound = await _drain(bus)
+    assert any(m.content == "Paris." for m in outbound)
+    persisted = loop.sessions.read_session_file("websocket:chat1")
+    assert persisted is not None
+    assert any(
+        m.get("role") == "assistant" and m.get("content") == "Paris."
+        for m in persisted.get("messages", [])
+    )
+
+
+@pytest.mark.asyncio
+async def test_record_build_failure_never_fails_the_turn(tmp_path: Path, monkeypatch):
+    """A raise while building the record at turn start: the turn answers, no record."""
+    import nanobot.agent.loop as loop_mod
+
+    def boom(text: str) -> bool:
+        raise RuntimeError("regex exploded")
+
+    monkeypatch.setattr(loop_mod, "account_intent", boom)
+    loop, bus = _make_loop(tmp_path, lambda: _answer("Paris."))
+    await run_session(loop, _msg())
+
+    outbound = await _drain(bus)
+    assert any(m.content == "Paris." for m in outbound)
+    persisted = loop.sessions.read_session_file("websocket:chat1")
+    assert persisted is not None
+    assert PROVENANCE_KEY not in (persisted.get("metadata") or {})
+
+
+@pytest.mark.asyncio
+async def test_late_subagent_result_record_uses_the_routed_wire_id(tmp_path: Path):
+    """An idle-WebUI subagent result: record, run spec and assistant row share
+    the ``subagent:<uuid>`` id ``WebuiTurnRoutePolicy`` puts on the frames."""
+    from nanobot.session.webui_turns import WebuiTurnRoutePolicy
+    from nanobot.session.webui_turns import WEBUI_SESSION_METADATA_KEY
+
+    loop, bus = _make_loop(tmp_path, lambda: _answer("The late result is ready"))
+    loop.turn_delivery_factory.route_policy = WebuiTurnRoutePolicy(loop.sessions)
+    specs: list[Any] = []
+    real_run = loop.runner.run
+
+    async def spy(spec: Any) -> Any:
+        specs.append(spec)
+        return await real_run(spec)
+
+    loop.runner.run = spy  # type: ignore[method-assign]
+    session = loop.sessions.get_or_create("websocket:chat1")
+    session.add_message("user", "Run this in the background")
+    session.metadata[WEBUI_SESSION_METADATA_KEY] = True
+    loop.sessions.save(session)
+
+    await run_session(loop, InboundMessage(
+        channel="system",
+        sender_id="subagent",
+        chat_id="websocket:chat1",
+        content="Background research completed",
+        session_key_override="websocket:chat1",
+        metadata={"injected_event": "subagent_result", "subagent_task_id": "sub-1"},
+    ))
+    outbound = await _drain(bus)
+
+    frame_ids = {
+        (m.metadata or {}).get(WEBUI_TURN_METADATA_KEY)
+        for m in outbound
+        if (m.metadata or {}).get(WEBUI_TURN_METADATA_KEY)
+    }
+    assert len(frame_ids) == 1
+    wire_id = frame_ids.pop()
+    assert wire_id.startswith("subagent:")
+    entry = _entries(loop)[-1]
+    assert entry["turn_id"] == wire_id
+    assert [spec.turn_id for spec in specs] == [wire_id]
+    persisted = loop.sessions.read_session_file("websocket:chat1")
+    assistant = [m for m in persisted["messages"] if m.get("role") == "assistant"]
+    assert assistant[-1].get("turn_id") == wire_id
+
+
+class _WebSearchTool(_SearchTool):
+    @property
+    def name(self) -> str:
+        return "web_search"
+
+
+@pytest.mark.asyncio
+async def test_internal_continuation_folds_into_one_record(tmp_path: Path):
+    """A sustained goal that hits max_iterations and finishes in the queued
+    continuation slice keeps ONE record for the wire id, with the earlier
+    slice's tool counts and its account_intent."""
+    import asyncio
+
+    from nanobot.session.goal_state import GOAL_STATE_KEY
+
+    tool_round = LLMResponse(
+        content=None,
+        tool_calls=[ToolCallRequest(id="c1", name="web_search", arguments={"query": "x"})],
+        usage=None,
+    )
+    state = {"n": 0}
+
+    def respond() -> LLMResponse:
+        state["n"] += 1
+        return tool_round if state["n"] == 1 else _answer("You have 3 unread emails.")
+
+    loop, bus = _make_loop(tmp_path, respond)
+    loop.max_iterations = 1
+    loop.tools.register(_WebSearchTool())
+    session = loop.sessions.get_or_create("websocket:chat1")
+    session.metadata[GOAL_STATE_KEY] = {"status": "active", "objective": "Check my inbox."}
+    loop.sessions.save(session)
+
+    pending: asyncio.Queue[InboundMessage] = asyncio.Queue()
+    first = await loop._process_message(
+        _msg("Check my inbox", {WEBUI_TURN_METADATA_KEY: "wire-goal-1"}),
+        pending_queue=pending,
+    )
+    assert first is None
+    queued = pending.get_nowait()
+    # The second slice finishes the goal: no further continuation.
+    session = loop.sessions.get_or_create("websocket:chat1")
+    session.metadata[GOAL_STATE_KEY] = {"status": "completed", "objective": "Check my inbox."}
+    loop.max_iterations = 10
+    second = await loop._process_message(queued, pending_queue=asyncio.Queue())
+    assert second is not None and second.content == "You have 3 unread emails."
+
+    entries = [e for e in _entries(loop) if e["turn_id"] == "wire-goal-1"]
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry["answered"] is True
+    assert entry["account_intent"] is True
+    assert entry["used"] == [
+        {"family": "web_search", "label": "Web search", "private": False, "calls": 1, "errors": 0}
+    ]
+    persisted = loop.sessions.read_session_file("websocket:chat1")
+    assistant = [m for m in persisted["messages"] if m.get("role") == "assistant"]
+    assert assistant[-1].get("used") == entry["used"]
+
+
+def test_merge_same_turn_folds_counts_and_intents():
+    session = MagicMock()
+    session.metadata = {}
+    first = TurnProvenance(turn_id="t", started_at="2026-01-01T00:00:00+00:00",
+                           account_intent=True, other_steps=2,
+                           args_repaired={"type_cast": 1})
+    first.used.append({"family": "gmail", "label": "Gmail", "private": True,
+                       "calls": 2, "errors": 1})
+    save_to_session(session, first)
+    save_to_session(session, TurnProvenance(turn_id="other"))
+    second = TurnProvenance(turn_id="t", started_at="2026-01-01T00:05:00+00:00",
+                            answered=True, other_steps=1, args_repaired={"type_cast": 2})
+    second.used.append({"family": "gmail", "label": "Gmail", "private": True,
+                        "calls": 1, "errors": 0})
+    save_to_session(session, second, merge_same_turn=True)
+
+    stored = session.metadata[PROVENANCE_KEY]
+    assert [e["turn_id"] for e in stored] == ["other", "t"]
+    merged = stored[-1]
+    assert merged["started_at"] == "2026-01-01T00:00:00+00:00"
+    assert merged["account_intent"] is True and merged["answered"] is True
+    assert merged["other_steps"] == 3
+    assert merged["args_repaired"] == {"type_cast": 3}
+    assert merged["used"] == [{"family": "gmail", "label": "Gmail", "private": True,
+                               "calls": 3, "errors": 1}]
