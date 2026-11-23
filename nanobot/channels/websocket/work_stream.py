@@ -276,6 +276,18 @@ class WorkStreamHub:
         ):
             await self._error(connection, "invalid idempotency key")
             return
+        # MIT-1827: an optional skill scopes the run to the skill's
+        # ``allowed-tools`` and injects the skill content. Validated before
+        # the task is created so an unknown name costs no turn.
+        skill = envelope.get("skill")
+        if skill is not None:
+            if not isinstance(skill, str) or not skill.strip():
+                await self._error(connection, "invalid skill")
+                return
+            skill = skill.strip()
+            if not self._skills().skill_exists(skill):
+                await self._error(connection, "unknown skill", skill=skill)
+                return
         if await self._reject_room_media(connection, str(chat_id), envelope.get("media")):
             return
         media_paths, media_error = self._envelope_media(envelope.get("media"))
@@ -329,6 +341,7 @@ class WorkStreamHub:
                 content=content,
                 media=media_paths,
                 remote=getattr(connection, "remote_address", None),
+                skill=skill,
             )
         except Exception:
             logger.exception("failed to enqueue WebSocket Work task {}", task_id)
@@ -465,6 +478,12 @@ class WorkStreamHub:
 
     # -- shared task operations --------------------------------------------
 
+    def _skills(self) -> Any:
+        """Skill resolver for this workspace (import kept lazy for startup)."""
+        from nanobot.agent.skills import SkillsLoader
+
+        return SkillsLoader(self._store.workspace)
+
     async def publish_work_inbound(
         self,
         task: dict[str, Any],
@@ -473,6 +492,7 @@ class WorkStreamHub:
         content: str,
         media: list[str] | None = None,
         remote: Any = None,
+        skill: str | None = None,
     ) -> None:
         """Enqueue a turn bound to *task*'s own durable session."""
         task_id = str(task["task_id"])
@@ -490,6 +510,8 @@ class WorkStreamHub:
         }
         if read_only_value(task.get("read_only", False)):
             metadata[READ_ONLY_META_KEY] = True
+        if skill:
+            metadata.update(self._skills().build_skill_turn_metadata(skill))
         if remote is not None:
             metadata["remote"] = remote
         await self._bus.publish_inbound(
