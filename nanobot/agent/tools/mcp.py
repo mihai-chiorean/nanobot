@@ -637,6 +637,12 @@ class _MCPWrapperBase(Tool):
             )
             return False
         self._session = refreshed_session
+        # Adopt the refreshed tool's annotations so the retry gate judges the
+        # tool as the server describes it now, not as it did at first connect
+        # (MIT-1817).
+        if hasattr(refreshed_tool, "_annotations"):
+            self._annotations = refreshed_tool._annotations
+            self._trust_annotations = getattr(refreshed_tool, "_trust_annotations", False)
         return True
 
 
@@ -779,6 +785,7 @@ class MCPToolWrapper(_MCPWrapperBase):
         server_name: str,
         tool_def: MCPToolDefinition,
         tool_timeout: int = 30,
+        trust_annotations: bool = False,
     ):
         self._set_mcp_connection(session, server_name)
         self._original_name = tool_def.name
@@ -787,6 +794,11 @@ class MCPToolWrapper(_MCPWrapperBase):
         raw_schema = tool_def.inputSchema or {"type": "object", "properties": {}}
         self._parameters = _normalize_schema_for_openai(raw_schema)
         self._tool_timeout = tool_timeout
+        # MCP ToolAnnotations are hints the spec says not to trust from an
+        # unknown server; they only take effect when the operator marked the
+        # server trusted in their own config (MIT-1817).
+        self._annotations = getattr(tool_def, "annotations", None)
+        self._trust_annotations = bool(trust_annotations)
 
     @property
     def name(self) -> str:
@@ -800,7 +812,38 @@ class MCPToolWrapper(_MCPWrapperBase):
     def parameters(self) -> dict[str, Any]:
         return self._parameters
 
+    @property
+    def read_only(self) -> bool:
+        ann = self._annotations
+        return bool(
+            self._trust_annotations
+            and ann is not None
+            and getattr(ann, "readOnlyHint", False) is True
+        )
+
+    @property
+    def idempotent(self) -> bool:
+        if self.read_only:
+            return True
+        ann = self._annotations
+        return bool(
+            self._trust_annotations
+            and ann is not None
+            and getattr(ann, "idempotentHint", False) is True
+        )
+
+    @property
+    def concurrency_safe(self) -> bool:
+        # Always False (MIT-1817): an MCP server owns its own state (e.g. one
+        # browser session per connection), so marking a tool read-only must
+        # not let the registry batch its calls in parallel.
+        return False
+
     async def execute(self, **kwargs: Any) -> str:
+        # Snapshot the safety flags at dispatch: a concurrent reconnect can
+        # change this shared wrapper's annotations while the call is in flight.
+        dispatch_read_only = self.read_only
+        dispatch_idempotent = self.idempotent
         retried_transient = False
         refreshed_session = False
         meta = _ziggy_meta()
@@ -838,13 +881,37 @@ class MCPToolWrapper(_MCPWrapperBase):
                 logger.warning("MCP tool '{}' was cancelled by server/SDK", self._name)
                 return ToolResult.error("(MCP tool call was cancelled)")
             except Exception as exc:
-                if await self._refresh_session_after_termination(
-                    exc,
-                    refreshed_session,
-                    "tool",
-                ):
-                    refreshed_session = True
-                    continue
+                if _is_session_terminated(exc):
+                    # Always replace a dead session so later calls recover, but
+                    # replay this call only if the tool was idempotent at
+                    # dispatch and is still at least as safe after the refresh:
+                    # the call may have reached the server before the
+                    # connection died, so repeating a non-idempotent call (e.g.
+                    # browser_fill_form) could run the action twice, and a call
+                    # authorized as read-only must not replay as a write
+                    # (MIT-1817).
+                    refreshed_now = await self._refresh_session_after_termination(
+                        exc,
+                        refreshed_session,
+                        "tool",
+                    )
+                    refreshed_session = refreshed_session or refreshed_now
+                    replay_safe = (
+                        dispatch_idempotent
+                        and self.idempotent
+                        and (self.read_only or not dispatch_read_only)
+                    )
+                    if refreshed_now and replay_safe:
+                        continue
+                    if not replay_safe:
+                        logger.warning(
+                            "mcp_retry_skipped tool={} reason=not_idempotent",
+                            self._name,
+                        )
+                        return ToolResult.error(
+                            "(MCP tool call outcome unknown after a connection error: "
+                            "do not repeat it without checking whether it took effect)"
+                        )
                 if _is_transient(exc):
                     if not retried_transient:
                         retried_transient = True
@@ -1363,7 +1430,13 @@ async def connect_mcp_servers(
                         name,
                     )
                     continue
-                wrapper = MCPToolWrapper(session, name, tool_def, tool_timeout=cfg.tool_timeout)
+                wrapper = MCPToolWrapper(
+                    session,
+                    name,
+                    tool_def,
+                    tool_timeout=cfg.tool_timeout,
+                    trust_annotations=cfg.trust_annotations,
+                )
                 registry.register(wrapper)
                 logger.debug("MCP: registered tool '{}' from server '{}'", wrapper.name, name)
                 registered_count += 1
