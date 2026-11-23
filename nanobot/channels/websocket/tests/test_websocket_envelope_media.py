@@ -42,7 +42,11 @@ def _data_url(mime: str, payload: bytes) -> str:
     return f"data:{mime};base64,{base64.b64encode(payload).decode()}"
 
 
-def _make_channel(session_manager: SessionManager | None = None) -> WebSocketChannel:
+def _make_channel(
+    session_manager: SessionManager | None = None,
+    *,
+    session_context_window=None,
+) -> WebSocketChannel:
     bus = MagicMock()
     bus.publish_inbound = AsyncMock()
     cfg = {"enabled": True, "allowFrom": ["*"], "websocketRequiresToken": False}
@@ -57,6 +61,7 @@ def _make_channel(session_manager: SessionManager | None = None) -> WebSocketCha
         runtime_model_name=None,
         runtime_surface="browser",
         runtime_capabilities_overrides=None,
+        session_context_window=session_context_window,
     )
     channel = WebSocketChannel(cfg, bus, gateway=gateway)
     channel._handle_message = AsyncMock()  # type: ignore[method-assign]
@@ -344,7 +349,7 @@ async def test_image_only_message_allows_empty_text(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_message_rejected_when_more_than_four_images(tmp_path) -> None:
+async def test_message_explained_when_more_than_four_images(tmp_path) -> None:
     channel = _make_channel()
     mock_conn = AsyncMock()
     envelope = {
@@ -360,18 +365,19 @@ async def test_message_rejected_when_more_than_four_images(tmp_path) -> None:
     ):
         await channel._dispatch_envelope(mock_conn, "client-1", envelope)
 
-    channel._handle_message.assert_not_awaited()
-    mock_conn.send.assert_awaited_once()
-    err = json.loads(mock_conn.send.call_args[0][0])
-    assert err["event"] == "error"
-    assert err["chat_id"] == "abc123"
-    assert err["detail"] == "attachment_rejected"
-    assert err["reason"] == "too_many_images"
-    assert err["turn_id"] == "turn-attachments"
+    channel._handle_message.assert_awaited_once()
+    call = channel._handle_message.call_args.kwargs
+    assert not call.get("media")
+    assert "Attachment read failure" in call["content"]
+    assert call["metadata"]["attachments"][0]["error"]
+    status = next(json.loads(call.args[0]) for call in mock_conn.send.call_args_list
+                  if json.loads(call.args[0])["event"] == "attachment.status")
+    assert status["event"] == "attachment.status"
+    assert status["attachments"][0]["error"]
 
 
 @pytest.mark.asyncio
-async def test_message_rejected_when_too_many_total_attachments(tmp_path) -> None:
+async def test_message_explained_when_too_many_total_attachments(tmp_path) -> None:
     channel = _make_channel()
     mock_conn = AsyncMock()
     envelope = {
@@ -383,7 +389,7 @@ async def test_message_rejected_when_too_many_total_attachments(tmp_path) -> Non
             {"data_url": _tiny_png_data_url()},
             {"data_url": _tiny_png_data_url()},
             {"data_url": _tiny_png_data_url()},
-            {"data_url": _data_url("application/pdf", b"%PDF-1.4"), "name": "report.pdf"},
+            *[{"data_url": _data_url("application/pdf", b"%PDF-1.4"), "name": "report.pdf"}] * 3,
         ],
     }
 
@@ -392,17 +398,22 @@ async def test_message_rejected_when_too_many_total_attachments(tmp_path) -> Non
     ):
         await channel._dispatch_envelope(mock_conn, "client-1", envelope)
 
-    channel._handle_message.assert_not_awaited()
-    err = json.loads(mock_conn.send.call_args[0][0])
-    assert err["detail"] == "attachment_rejected"
-    assert err["reason"] == "too_many_attachments"
+    channel._handle_message.assert_awaited_once()
+    call = channel._handle_message.call_args.kwargs
+    assert not call.get("media")
+    assert "Attachment read failure" in call["content"]
+    assert call["metadata"]["attachments"][0]["error"]
+    status = next(json.loads(call.args[0]) for call in mock_conn.send.call_args_list
+                  if json.loads(call.args[0])["event"] == "attachment.status")
+    assert status["event"] == "attachment.status"
+    assert status["attachments"][0]["error"]
 
 
 @pytest.mark.asyncio
-async def test_message_rejected_on_oversize_payload(tmp_path) -> None:
+async def test_message_explained_on_oversize_payload(tmp_path) -> None:
     channel = _make_channel()
     mock_conn = AsyncMock()
-    oversized = b"x" * (9 * 1024 * 1024)  # > 8 MB WS limit
+    oversized = b"x" * (11 * 1024 * 1024)  # > 8 MB WS limit
     envelope = {
         "type": "message",
         "chat_id": "abc123",
@@ -415,10 +426,15 @@ async def test_message_rejected_on_oversize_payload(tmp_path) -> None:
     ):
         await channel._dispatch_envelope(mock_conn, "client-1", envelope)
 
-    channel._handle_message.assert_not_awaited()
-    err = json.loads(mock_conn.send.call_args[0][0])
-    assert err["detail"] == "attachment_rejected"
-    assert err["reason"] == "size"
+    channel._handle_message.assert_awaited_once()
+    call = channel._handle_message.call_args.kwargs
+    assert not call.get("media")
+    assert "Attachment read failure" in call["content"]
+    assert call["metadata"]["attachments"][0]["error"]
+    status = next(json.loads(call.args[0]) for call in mock_conn.send.call_args_list
+                  if json.loads(call.args[0])["event"] == "attachment.status")
+    assert status["event"] == "attachment.status"
+    assert status["attachments"][0]["error"]
 
 
 @pytest.mark.asyncio
@@ -474,7 +490,7 @@ async def test_message_with_csv_forwards_saved_path(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_message_rejected_on_unsupported_file_mime(tmp_path) -> None:
+async def test_message_explained_on_unsupported_file_mime(tmp_path) -> None:
     channel = _make_channel()
     mock_conn = AsyncMock()
     envelope = {
@@ -489,14 +505,19 @@ async def test_message_rejected_on_unsupported_file_mime(tmp_path) -> None:
     ):
         await channel._dispatch_envelope(mock_conn, "client-1", envelope)
 
-    channel._handle_message.assert_not_awaited()
-    err = json.loads(mock_conn.send.call_args[0][0])
-    assert err["detail"] == "attachment_rejected"
-    assert err["reason"] == "mime"
+    channel._handle_message.assert_awaited_once()
+    call = channel._handle_message.call_args.kwargs
+    assert not call.get("media")
+    assert "Attachment read failure" in call["content"]
+    assert call["metadata"]["attachments"][0]["error"]
+    status = next(json.loads(call.args[0]) for call in mock_conn.send.call_args_list
+                  if json.loads(call.args[0])["event"] == "attachment.status")
+    assert status["event"] == "attachment.status"
+    assert status["attachments"][0]["error"]
 
 
 @pytest.mark.asyncio
-async def test_message_rejected_on_svg_mime(tmp_path) -> None:
+async def test_message_explained_on_svg_mime(tmp_path) -> None:
     """SVG is explicitly rejected — XSS surface inside embedded scripts."""
     channel = _make_channel()
     mock_conn = AsyncMock()
@@ -512,13 +533,19 @@ async def test_message_rejected_on_svg_mime(tmp_path) -> None:
     ):
         await channel._dispatch_envelope(mock_conn, "client-1", envelope)
 
-    channel._handle_message.assert_not_awaited()
-    err = json.loads(mock_conn.send.call_args[0][0])
-    assert err["reason"] == "mime"
+    channel._handle_message.assert_awaited_once()
+    call = channel._handle_message.call_args.kwargs
+    assert not call.get("media")
+    assert "Attachment read failure" in call["content"]
+    assert call["metadata"]["attachments"][0]["error"]
+    status = next(json.loads(call.args[0]) for call in mock_conn.send.call_args_list
+                  if json.loads(call.args[0])["event"] == "attachment.status")
+    assert status["event"] == "attachment.status"
+    assert status["attachments"][0]["error"]
 
 
 @pytest.mark.asyncio
-async def test_message_rejected_on_malformed_data_url(tmp_path) -> None:
+async def test_message_explained_on_malformed_data_url(tmp_path) -> None:
     channel = _make_channel()
     mock_conn = AsyncMock()
     envelope = {
@@ -533,13 +560,19 @@ async def test_message_rejected_on_malformed_data_url(tmp_path) -> None:
     ):
         await channel._dispatch_envelope(mock_conn, "client-1", envelope)
 
-    channel._handle_message.assert_not_awaited()
-    err = json.loads(mock_conn.send.call_args[0][0])
-    assert err["reason"] == "decode"
+    channel._handle_message.assert_awaited_once()
+    call = channel._handle_message.call_args.kwargs
+    assert not call.get("media")
+    assert "Attachment read failure" in call["content"]
+    assert call["metadata"]["attachments"][0]["error"]
+    status = next(json.loads(call.args[0]) for call in mock_conn.send.call_args_list
+                  if json.loads(call.args[0])["event"] == "attachment.status")
+    assert status["event"] == "attachment.status"
+    assert status["attachments"][0]["error"]
 
 
 @pytest.mark.asyncio
-async def test_message_rejected_on_broken_base64(tmp_path) -> None:
+async def test_message_explained_on_broken_base64(tmp_path) -> None:
     channel = _make_channel()
     mock_conn = AsyncMock()
     envelope = {
@@ -554,13 +587,19 @@ async def test_message_rejected_on_broken_base64(tmp_path) -> None:
     ):
         await channel._dispatch_envelope(mock_conn, "client-1", envelope)
 
-    channel._handle_message.assert_not_awaited()
-    err = json.loads(mock_conn.send.call_args[0][0])
-    assert err["reason"] == "decode"
+    channel._handle_message.assert_awaited_once()
+    call = channel._handle_message.call_args.kwargs
+    assert not call.get("media")
+    assert "Attachment read failure" in call["content"]
+    assert call["metadata"]["attachments"][0]["error"]
+    status = next(json.loads(call.args[0]) for call in mock_conn.send.call_args_list
+                  if json.loads(call.args[0])["event"] == "attachment.status")
+    assert status["event"] == "attachment.status"
+    assert status["attachments"][0]["error"]
 
 
 @pytest.mark.asyncio
-async def test_message_rejected_when_media_item_shape_wrong(tmp_path) -> None:
+async def test_message_explained_when_media_item_shape_wrong(tmp_path) -> None:
     channel = _make_channel()
     mock_conn = AsyncMock()
     envelope = {
@@ -576,9 +615,15 @@ async def test_message_rejected_when_media_item_shape_wrong(tmp_path) -> None:
     ):
         await channel._dispatch_envelope(mock_conn, "client-1", envelope)
 
-    channel._handle_message.assert_not_awaited()
-    err = json.loads(mock_conn.send.call_args[0][0])
-    assert err["reason"] == "malformed"
+    channel._handle_message.assert_awaited_once()
+    call = channel._handle_message.call_args.kwargs
+    assert not call.get("media")
+    assert "Attachment read failure" in call["content"]
+    assert call["metadata"]["attachments"][0]["error"]
+    status = next(json.loads(call.args[0]) for call in mock_conn.send.call_args_list
+                  if json.loads(call.args[0])["event"] == "attachment.status")
+    assert status["event"] == "attachment.status"
+    assert status["attachments"][0]["error"]
 
 
 @pytest.mark.asyncio
@@ -624,12 +669,16 @@ async def test_failed_media_does_not_partially_persist(tmp_path) -> None:
     ):
         await channel._dispatch_envelope(mock_conn, "client-1", envelope)
 
-    channel._handle_message.assert_not_awaited()
-    err = json.loads(mock_conn.send.call_args[0][0])
-    assert err["reason"] == "mime"
-    # Partial-batch failures must not leak files to disk.
-    leftover = [p for p in tmp_path.iterdir() if p.is_file()]
-    assert leftover == [], f"orphan media after rejected batch: {leftover}"
+    channel._handle_message.assert_awaited_once()
+    call = channel._handle_message.call_args.kwargs
+    assert not call.get("media")
+    assert "Attachment read failure" in call["content"]
+    assert call["metadata"]["attachments"][0]["error"]
+    status = next(json.loads(call.args[0]) for call in mock_conn.send.call_args_list
+                  if json.loads(call.args[0])["event"] == "attachment.status")
+    assert status["event"] == "attachment.status"
+    assert status["attachments"][0]["error"]
+    assert [p for p in tmp_path.iterdir() if p.is_file()] == []
 
 
 @pytest.mark.asyncio
@@ -666,3 +715,44 @@ async def test_non_string_content_still_rejected() -> None:
     channel._handle_message.assert_not_awaited()
     err = json.loads(mock_conn.send.call_args[0][0])
     assert err["detail"] == "missing content"
+
+
+@pytest.mark.asyncio
+async def test_protected_pdf_registers_an_unlock_capability_across_turns(tmp_path, monkeypatch):
+    import io
+
+    from pypdf import PdfWriter
+
+    from nanobot.webui.attachment_unlock import attachment_vault
+
+    sessions = SessionManager(tmp_path / "workspace", sessions_root=tmp_path / "sessions")
+    channel = _make_channel(sessions)
+    media = tmp_path / "media"
+    media.mkdir()
+    monkeypatch.setattr("nanobot.webui.media_gateway.get_media_dir", lambda *_: media)
+    monkeypatch.setattr("nanobot.config.paths.get_media_dir", lambda *_: media)
+    writer = PdfWriter()
+    writer.add_blank_page(width=100, height=100)
+    writer.encrypt("fixture-password", algorithm="AES-256")
+    pdf = io.BytesIO()
+    writer.write(pdf)
+    connection = AsyncMock()
+    await channel._dispatch_envelope(connection, "client-1", {
+        "type": "message", "chat_id": "protected-chat", "content": "Review this PDF",
+        "client_message_id": "11111111-1111-4111-8111-111111111111", "turn_id": "protected-turn-1",
+        "media": [{"name": "protected.pdf", "data_url": _data_url("application/pdf", pdf.getvalue())}],
+    })
+    first = channel.bus.publish_inbound.call_args.args[0]
+    card = first.metadata["attachments"][0]
+    assert card["locked_reason"] == "password_required"
+    assert card["attachment_id"].startswith("local_")
+    vault = attachment_vault(sessions.sessions_dir)
+    assert vault.records[card["attachment_id"]]["chat"] == "protected-chat"
+    await channel._dispatch_envelope(connection, "client-1", {
+        "type": "message", "chat_id": "protected-chat", "content": "Here is the password",
+        "client_message_id": "22222222-2222-4222-8222-222222222222", "turn_id": "protected-turn-2",
+    })
+    second = channel.bus.publish_inbound.call_args.args[0]
+    note = second.metadata[RUNTIME_CONTEXT_INPUT_META][0].content
+    assert "unlock_attachment" in note
+    assert card["attachment_id"] in note
