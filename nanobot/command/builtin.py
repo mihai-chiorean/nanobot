@@ -15,7 +15,12 @@ from loguru import logger
 
 from nanobot import __version__
 from nanobot.bus.events import INBOUND_META_USER_SHELL, OutboundMessage
-from nanobot.command.router import CommandContext, CommandRouter, normalize_command_text
+from nanobot.command.router import (
+    DIRECT_TURN_META,
+    CommandContext,
+    CommandRouter,
+    normalize_command_text,
+)
 from nanobot.providers.base import LLMUsage
 from nanobot.utils.helpers import build_status_content
 from nanobot.utils.restart import set_restart_notice_to_env
@@ -842,6 +847,8 @@ async def cmd_dream_restore(ctx: CommandContext) -> OutboundMessage:
         else:
             content = _format_dream_restore_list(commits)
     else:
+        if (refusal := _history_write_refusal(ctx)) is not None:
+            return refusal
         sha = args.split()[0]
         result = git.show_commit_diff(sha, message_prefix=_DREAM_COMMIT_PREFIX)
         if not result:
@@ -909,6 +916,19 @@ def _format_undo_conflicts(sha: str, conflicts: list[str]) -> str:
     return (
         f"Nothing changed: couldn't undo `{sha}` because these paths are now "
         f"a directory, a symlink or under one: {_format_file_paths(conflicts)}."
+    )
+
+
+def _history_write_refusal(ctx: CommandContext) -> OutboundMessage | None:
+    """Undo/restore rewrite workspace files: only a genuine interactive owner
+    turn may run them — never scheduled work, cron, subagents, system events
+    or in-process ``process_direct`` callers."""
+    if ctx.is_user_turn and not (ctx.msg.metadata or {}).get(DIRECT_TURN_META):
+        return None
+    return OutboundMessage(
+        channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
+        content="This command can only be run by you from a chat, not by scheduled or automated work.",
+        metadata={"render_as": "text"},
     )
 
 
@@ -994,6 +1014,8 @@ async def cmd_undo(ctx: CommandContext) -> OutboundMessage:
             metadata={"render_as": "text"},
         )
 
+    if (refusal := _history_write_refusal(ctx)) is not None:
+        return refusal
     sha = args[0]
     undo = git.undo(sha)
     if undo.conflicts:
@@ -1060,6 +1082,8 @@ async def cmd_restore(ctx: CommandContext) -> OutboundMessage:
         )
 
     confirmed = len(args) > 1 and args[1].lower() == "confirm"
+    if confirmed and (refusal := _history_write_refusal(ctx)) is not None:
+        return refusal
     plan = git.restore(sha) if confirmed else git.restore_preview(sha)
     if plan.conflicts:
         content = (

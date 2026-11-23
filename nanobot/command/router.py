@@ -39,6 +39,12 @@ def normalize_command_text(text: str) -> str:
     return stripped
 
 
+# Set by ``AgentLoop.process_direct`` on every message it builds: the turn came
+# from an in-process caller (scheduled work, heartbeat, SDK, API, CLI one-shot),
+# not from a channel the owner types into. History-rewriting commands refuse it.
+DIRECT_TURN_META = "_direct_turn"
+
+
 @dataclass
 class CommandContext:
     """Everything a command handler needs to produce a response."""

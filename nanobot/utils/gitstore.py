@@ -5,12 +5,13 @@ from __future__ import annotations
 import io
 import os
 import shutil
+import stat
 import tempfile
 import time
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from loguru import logger
 
@@ -756,24 +757,50 @@ class GitStore:
             return _UNTRACKABLE
 
     def _apply_writes(self, writes: list[tuple[str, bytes]]) -> None:
-        """Write every file or none: stage temp files, then rename them in."""
-        staged: list[tuple[str, Path]] = []
+        """Write every file or none.
+
+        Stage each file to a temp file (keeping the destination's mode, so an
+        executable skill script stays executable) and hard-link a backup of
+        any file it replaces; then rename the temp files in. Any failure rolls
+        back the renames already done. Temp files and backups never outlive
+        the call.
+        """
+        staged: list[list[Any]] = []  # [tmp, dest, backup | None]
+        done: list[list[Any]] = []
         try:
             for rel, data in writes:
                 dest = self._workspace / rel
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 fd, tmp = tempfile.mkstemp(dir=str(dest.parent), prefix=f".{dest.name}.", suffix=".tmp")
-                staged.append((tmp, dest))
+                entry: list[Any] = [tmp, dest, None]
+                staged.append(entry)
                 with os.fdopen(fd, "wb") as handle:
                     handle.write(data)
+                try:
+                    mode = stat.S_IMODE(dest.stat().st_mode)
+                except FileNotFoundError:
+                    mode = 0o644
+                os.chmod(tmp, mode)
+                if dest.exists():
+                    entry[2] = f"{tmp}.bak"
+                    os.link(dest, entry[2])
+            for entry in staged:
+                os.replace(entry[0], entry[1])
+                done.append(entry)
         except BaseException:
-            for tmp, _ in staged:
+            for _tmp, dest, backup in reversed(done):
                 with suppress(OSError):
-                    os.unlink(tmp)
+                    if backup is not None:
+                        os.replace(backup, dest)
+                    else:
+                        os.unlink(dest)
             raise
-        for tmp, dest in staged:
-            os.replace(tmp, dest)
-
+        finally:
+            for tmp, _dest, backup in staged:
+                for leftover in (tmp, backup):
+                    if leftover is not None:
+                        with suppress(OSError):
+                            os.unlink(leftover)
 
     @classmethod
     def _changed_paths(cls, repo: "Repo", commit: "Commit") -> list[str]:

@@ -991,3 +991,50 @@ class TestBareWorkspaceHistory:
         assert (ws / "SOUL.md").read_text(encoding="utf-8") == "soul v2"
         assert (ws / "USER.md").read_text(encoding="utf-8") == "user v2"
         assert sorted(p.name for p in ws.iterdir()) == ["SOUL.md", "USER.md"]
+
+    def test_rename_failure_mid_apply_rolls_back(self, bare, ws, monkeypatch):
+        """Codex P2: a failure in the rename phase (second os.replace) rolls
+        back the first rename and leaves no temp or backup files."""
+        (ws / "SOUL.md").write_text("soul v1", encoding="utf-8")
+        (ws / "USER.md").write_text("user v1", encoding="utf-8")
+        bare.init()
+        (ws / "SOUL.md").write_text("soul v2", encoding="utf-8")
+        (ws / "USER.md").write_text("user v2", encoding="utf-8")
+        sha = bare.auto_commit("dream: both")
+        head = bare.log()[0].sha
+        real_replace = os.replace
+        calls = []
+
+        def flaky_replace(src, dst, *args, **kwargs):
+            calls.append(dst)
+            if len(calls) == 2:
+                raise OSError("rename failed")
+            return real_replace(src, dst, *args, **kwargs)
+
+        monkeypatch.setattr(os, "replace", flaky_replace)
+        with pytest.raises(GitStoreError):
+            bare.undo(sha)
+
+        assert len(calls) >= 2
+        assert (ws / "SOUL.md").read_text(encoding="utf-8") == "soul v2"
+        assert (ws / "USER.md").read_text(encoding="utf-8") == "user v2"
+        assert sorted(p.name for p in ws.iterdir()) == ["SOUL.md", "USER.md"]
+        assert bare.log()[0].sha == head
+
+    def test_restore_keeps_execute_bit(self, bare, ws):
+        """Codex P2: a 0755 skill script stays executable after restore/undo."""
+        script = ws / "skills" / "s" / "run.sh"
+        script.parent.mkdir(parents=True)
+        script.write_text("#!/bin/sh\necho v1\n", encoding="utf-8")
+        os.chmod(script, 0o755)
+        bare.init()
+        target = bare.log()[0].sha
+        script.write_text("#!/bin/sh\necho v2\n", encoding="utf-8")
+        sha = bare.auto_commit("dream: script")
+
+        assert bare.undo(sha).restored == ["skills/s/run.sh"]
+        assert script.read_text(encoding="utf-8") == "#!/bin/sh\necho v1\n"
+        assert os.stat(script).st_mode & 0o777 == 0o755
+        script.write_text("#!/bin/sh\necho v3\n", encoding="utf-8")
+        assert bare.restore(target).restored == ["skills/s/run.sh"]
+        assert os.stat(script).st_mode & 0o777 == 0o755

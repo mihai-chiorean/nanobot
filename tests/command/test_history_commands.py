@@ -16,7 +16,7 @@ from nanobot.command.builtin import (
     cmd_undo,
     register_builtin_commands,
 )
-from nanobot.command.router import CommandContext, CommandRouter
+from nanobot.command.router import DIRECT_TURN_META, CommandContext, CommandRouter
 from nanobot.utils.gitstore import GitStore, history_dir_for
 
 TRACKED = ["SOUL.md", "USER.md", "memory/MEMORY.md"]
@@ -44,6 +44,7 @@ def _make_ctx(tmp_path, raw: str, args: str = "") -> tuple:
     loop = SimpleNamespace(consolidator=SimpleNamespace(store=SimpleNamespace(git=git)))
     ctx = CommandContext(
         msg=msg, session=None, key=msg.session_key, raw=raw, args=args, loop=loop,
+        is_user_turn=True,
     )
     return ctx, git
 
@@ -270,6 +271,94 @@ async def test_undo_conflict_reports_nothing_changed(tmp_path) -> None:
     assert out.content.startswith("Nothing changed")
     assert "`SOUL.md`" in out.content
     assert (ws / "USER.md").read_text(encoding="utf-8") == "dream user"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("raw", "handler"),
+    [("/undo", cmd_undo), ("/restore", cmd_restore), ("/dream-restore", cmd_dream_restore)],
+)
+@pytest.mark.parametrize("origin", ["not_user_turn", "direct_call"])
+async def test_history_writes_refused_outside_interactive_user_turn(
+    tmp_path, raw, handler, origin,
+) -> None:
+    ctx, git = _make_ctx(tmp_path, raw)
+    ws = git._workspace
+    (ws / "SOUL.md").write_text("old", encoding="utf-8")
+    old_sha = git.auto_commit("dream: old")
+    (ws / "SOUL.md").write_text("new", encoding="utf-8")
+    sha = git.auto_commit("dream: new")
+    ctx.args = f"{old_sha} confirm" if raw == "/restore" else sha
+    if origin == "not_user_turn":
+        ctx.is_user_turn = False
+    else:
+        ctx.msg.metadata = {DIRECT_TURN_META: True}
+
+    out = await handler(ctx)
+
+    assert "only be run by you from a chat" in out.content
+    assert (ws / "SOUL.md").read_text(encoding="utf-8") == "new"
+    assert git.log()[0].sha == sha
+
+
+@pytest.mark.asyncio
+async def test_scheduled_work_cannot_restore_or_undo(tmp_path) -> None:
+    """Codex P1: a scheduled Work job whose instructions are a history command
+    runs through the real work runner -> AgentLoop.process_direct -> command
+    router, and must be refused with the workspace unchanged."""
+    from unittest.mock import MagicMock
+
+    from nanobot.agent.loop import AgentLoop
+    from nanobot.bus.queue import MessageBus
+    from nanobot.cron.types import CronJob
+    from nanobot.cron.work_runner import run_work_task_cron_job
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    provider = MagicMock()
+    provider.get_default_model.return_value = "m"
+    provider.generation = SimpleNamespace(max_tokens=100, temperature=0.1, reasoning_effort=None)
+    loop = AgentLoop(
+        bus=MessageBus(), provider=provider, workspace=workspace, model="m",
+        context_window_tokens=1000,
+    )
+    git = loop.consolidator.store.git
+    (workspace / "SOUL.md").write_text("original", encoding="utf-8")
+    git.init()
+    base_sha = git.log()[0].sha
+    (workspace / "SOUL.md").write_text("owner edit", encoding="utf-8")
+    edit_sha = git.auto_commit("owner edit")
+
+    class _Store:
+        async def run_io(self, fn, *args, **kwargs):
+            return fn(*args, **kwargs)
+
+        def create_task(self, **kwargs):
+            return {"task_id": "work_t", **kwargs}
+
+        def append_event(self, *args, **kwargs):
+            return None
+
+        def update_status(self, *args, **kwargs):
+            return None
+
+    agent = SimpleNamespace(
+        work_store=_Store(), workspace=workspace, model="m",
+        process_direct=loop.process_direct,
+    )
+    replies = []
+    for message in (f"/restore {base_sha} confirm", f"/undo {edit_sha}"):
+        job = CronJob.from_store_dict({
+            "id": "job1", "name": "evil", "enabled": True,
+            "schedule": {"kind": "every", "everyMs": 60000},
+            "payload": {"kind": "work_task", "message": message, "channel": "websocket",
+                        "to": "chat1", "sessionKey": "websocket:chat1"},
+        })
+        replies.append(await run_work_task_cron_job(job, agent=agent))
+
+    assert all("only be run by you from a chat" in (r or "") for r in replies), replies
+    assert (workspace / "SOUL.md").read_text(encoding="utf-8") == "owner edit"
+    assert git.log()[0].sha == edit_sha
 
 
 @pytest.mark.asyncio

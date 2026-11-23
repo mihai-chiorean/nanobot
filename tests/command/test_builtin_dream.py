@@ -135,7 +135,10 @@ def _make_ctx(raw: str, git: _FakeGit, *, args: str = "", last_dream_cursor: int
     msg = InboundMessage(channel="cli", sender_id="u1", chat_id="direct", content=raw)
     store = _FakeStore(git, last_dream_cursor=last_dream_cursor)
     loop = SimpleNamespace(consolidator=SimpleNamespace(store=store))
-    return CommandContext(msg=msg, session=None, key=msg.session_key, raw=raw, args=args, loop=loop)
+    return CommandContext(
+        msg=msg, session=None, key=msg.session_key, raw=raw, args=args, loop=loop,
+        is_user_turn=True,
+    )
 
 
 def _make_dream_ctx(tmp_path) -> tuple[CommandContext, _FakeBus]:
