@@ -4143,6 +4143,117 @@ def test_gateway_starts_cron_only_after_the_work_restart_sweep(
         assert order.index("cron") < order.index("channels")
 
 
+def test_gateway_registers_mcp_tools_before_recovery_scan(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """Regression (PR #154 review, P2).
+
+    Recovery classifies pending tool calls by registry lookup.  If the scan
+    runs before MCP servers are connected, a pending read-only MCP call looks
+    unknown and parks instead of auto-continuing.
+    """
+    config_file = _write_instance_config(tmp_path)
+    config = Config()
+    config.gateway.port = 18793
+    order: list[str] = []
+
+    class _FakeAgentLoop(_GatewayAgentContractStub):
+        @classmethod
+        def from_config(cls, config, bus=None, **extra):
+            return cls(**extra)
+
+        def __init__(self, **_kwargs) -> None:
+            self.model = "test-model"
+            self.provider = object()
+            self.sessions = _EmptyGatewaySessionManager()
+            self.runtime_resolver = MagicMock()
+
+        def llm_runtime(self) -> None:
+            return None
+
+        async def reconcile_work_store(self) -> int:
+            order.append("work-sweep")
+            return 0
+
+        async def run(self) -> None:
+            await asyncio.Event().wait()
+
+        async def aclose(self) -> None:
+            return None
+
+        def stop(self) -> None:
+            return None
+
+    class _FakeChannelManager:
+        def __init__(self, _config, _bus, **_kwargs) -> None:
+            self.enabled_channels = ["telegram"]
+
+        async def start_all(self) -> None:
+            order.append("channels")
+            await asyncio.Event().wait()
+
+        async def stop_all(self) -> None:
+            return None
+
+    class _FakeCronService:
+        def __init__(self, _store_path: Path) -> None:
+            self.on_job = None
+
+        async def start(self) -> None:
+            order.append("cron")
+
+        def stop(self) -> None:
+            return None
+
+        def status(self) -> dict[str, int]:
+            return {"jobs": 0}
+
+        def register_system_job(self, _job) -> None:
+            return None
+
+    class _FakeServer:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> bool:
+            return False
+
+        async def serve_forever(self) -> None:
+            await asyncio.sleep(0)
+            raise _StopGatewayError("stop")
+
+    async def _fake_start_server(_handler, _host: str, _port: int):
+        return _FakeServer()
+
+    _patch_cli_command_runtime(
+        monkeypatch,
+        config,
+        message_bus=MessageBus,
+        session_manager=lambda _workspace: _EmptyGatewaySessionManager(),
+    )
+    monkeypatch.setattr("nanobot.cli.gateway_runtime.AgentLoop", _FakeAgentLoop)
+    monkeypatch.setattr("nanobot.channels.manager.ChannelManager", _FakeChannelManager)
+    monkeypatch.setattr("nanobot.cron.service.CronService", _FakeCronService)
+    monkeypatch.setattr("asyncio.start_server", _fake_start_server)
+
+    async def _fake_mcp_connect(_self) -> None:
+        order.append("mcp-connect")
+
+    async def _fake_scan(_self) -> None:
+        order.append("recovery-scan")
+
+    monkeypatch.setattr(cli_gateway_runtime.MCPProvider, "connect", _fake_mcp_connect)
+    monkeypatch.setattr(
+        "nanobot.session.recovery.RecoveryCoordinator.scan", _fake_scan
+    )
+
+    runner.invoke(app, ["gateway", "--config", str(config_file)])
+
+    assert "recovery-scan" in order and "mcp-connect" in order
+    assert order.index("mcp-connect") < order.index("recovery-scan")
+
+
 def test_gateway_shutdown_event_exits_forever_runtime_tasks(
     monkeypatch,
     tmp_path: Path,

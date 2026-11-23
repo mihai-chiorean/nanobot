@@ -1101,6 +1101,10 @@ def _run_gateway(
             # Recovery must finish before WebSocket and other channels begin
             # accepting new input.  That makes a new user message reliably
             # supersede an old recoverable turn instead of racing its queue.
+            # MCP tools must be registered first: recovery classifies pending
+            # calls by registry lookup, and an MCP tool that is not registered
+            # yet would look unknown and park a resumable read (SR-09).
+            await mcp_provider.connect()
             await recovery.scan()
             # Ziggy-local (MIT-1010): same ordering requirement as recovery --
             # the Work restart sweep cannot distinguish a task left running by
