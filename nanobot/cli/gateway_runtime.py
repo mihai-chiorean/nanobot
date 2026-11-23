@@ -88,6 +88,32 @@ class _MCPReadinessHook(AgentHook):
 _MCP_HOT_RELOAD_TIMEOUT_SECONDS = 15.0 + RELOAD_DRAIN_TIMEOUT_SECONDS
 
 
+# Startup connects MCP before the recovery scan so pending MCP calls classify
+# against registered tools.  A hung server must not hold the gateway (WebUI,
+# health, SIGTERM handling) hostage: after this budget startup proceeds, and
+# any call whose tool is still unregistered simply parks for the user.
+_MCP_STARTUP_CONNECT_TIMEOUT_SECONDS = 20.0
+
+
+async def _connect_mcp_before_recovery(
+    provider: MCPProvider,
+    *,
+    timeout_s: float = _MCP_STARTUP_CONNECT_TIMEOUT_SECONDS,
+) -> None:
+    try:
+        await asyncio.wait_for(provider.connect(), timeout=timeout_s)
+    except TimeoutError:
+        logger.warning(
+            "MCP servers did not connect within {:.0f}s; continuing startup, "
+            "the readiness hook will retry them before the next turn",
+            timeout_s,
+        )
+    except asyncio.CancelledError:
+        if task_is_cancelling():
+            raise
+        logger.warning("MCP startup connect was cancelled by an MCP server/SDK")
+
+
 class _RuntimeConfigInvalidator(Protocol):
     def invalidate_runtime_config(self) -> None: ...
 
@@ -1104,7 +1130,10 @@ def _run_gateway(
             # MCP tools must be registered first: recovery classifies pending
             # calls by registry lookup, and an MCP tool that is not registered
             # yet would look unknown and park a resumable read (SR-09).
-            await mcp_provider.connect()
+            await _connect_mcp_before_recovery(
+                mcp_provider,
+                timeout_s=_MCP_STARTUP_CONNECT_TIMEOUT_SECONDS,
+            )
             await recovery.scan()
             # Ziggy-local (MIT-1010): same ordering requirement as recovery --
             # the Work restart sweep cannot distinguish a task left running by
