@@ -34,6 +34,7 @@ from nanobot.agent.tools.schema import tool_parameters_schema
 from nanobot.bus.events import InboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMResponse, LLMUsage, ToolCallRequest
+from nanobot.work.store import WorkStore
 
 _CHAT_ID = "chat-handoff"
 _ORIGINAL_MESSAGE = "Read my inbox and draft a summary\n(second line must not leak into the title)"
@@ -174,6 +175,8 @@ async def _handoff_turn(
     create_task_override: Any = None,
     before_call: dict[int, Any] | None = None,
     loop: AgentLoop | None = None,
+    pending_queue: asyncio.Queue[InboundMessage] | None = None,
+    provider_calls: list[int] | None = None,
 ) -> tuple[AgentLoop, Any]:
     provider = _provider()
 
@@ -191,7 +194,7 @@ async def _handoff_turn(
             before_call[index](loop)
         return responses[index]
 
-    calls: list[int] = []
+    calls: list[int] = provider_calls if provider_calls is not None else []
     provider.chat_stream_with_retry = chat_stream_with_retry
     if loop is None:
         loop = _make_loop(tmp_path, provider, background_handoff_seconds=threshold)
@@ -209,9 +212,13 @@ async def _handoff_turn(
         loop._handoff_hook_for_turn = _factory  # type: ignore[method-assign]
     if create_task_override is not None:
         loop.work_store.create_task = create_task_override  # type: ignore[method-assign]
+    extra: dict[str, Any] = {}
+    if pending_queue is not None:
+        extra["pending_queue"] = pending_queue
     outbound = await loop._process_message(
         message or _chat_message(),
         tools=_registry(tools),
+        **extra,
     )
     return loop, outbound
 
@@ -750,3 +757,160 @@ async def test_handed_off_work_turn_is_not_an_interactive_turn(
     reply = await loop._process_message(replace(inbound, content="/undo abc1234"))
     assert reply is not None
     assert "can only be run by you from a chat" in reply.content
+
+
+# ---------------------------------------------------------------------------
+# Review round: replays, corrections, drain races, unstarted tasks
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_replayed_turn_never_executes_in_chat_after_a_hand_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Work may already have sent under its own key: the replay runs nothing."""
+    calls: list[str] = []
+    tools = [
+        _fake_tool("read_a", calls=calls),
+        _fake_tool("read_b", calls=calls),
+        _fake_tool("mcp_ziggy_gmail_send_message", calls=calls, read_only=False),
+    ]
+    loop, first = await _handoff_turn(
+        tmp_path,
+        monkeypatch,
+        responses=[_tool_response("call-a", "read_a"), _tool_response("call-b", "read_b")],
+        tools=tools,
+        message=_chat_message({"client_message_id": "cmid-send"}),
+        advance_before_call={1: 0.05},
+    )
+    task_id = first.metadata["handoff_task_id"]
+    loop.bus.inbound.get_nowait()
+    loop.work_store.update_status(task_id, "running")  # Work picked it up
+
+    replay_calls: list[int] = []
+    calls.clear()
+    _, second = await _handoff_turn(
+        tmp_path,
+        monkeypatch,
+        # A fast replay: the model would send right away, inside 45 s.
+        responses=[
+            _tool_response("call-s", "mcp_ziggy_gmail_send_message"),
+            _final_response("sent"),
+        ],
+        tools=tools,
+        message=_chat_message({"client_message_id": "cmid-send"}),
+        loop=loop,
+        provider_calls=replay_calls,
+    )
+
+    assert calls == [], "the replayed turn must not execute anything in chat"
+    assert replay_calls == []
+    assert second is not None and second.content == HANDOFF_REPLY
+    assert second.metadata["handoff_task_id"] == task_id
+    assert loop.bus.inbound.empty(), "a started task is never enqueued again"
+
+
+@pytest.mark.asyncio
+async def test_user_message_injected_mid_turn_blocks_hand_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[str] = []
+    tools = [_fake_tool(name, calls=calls) for name in ("read_a", "read_b")]
+    pending: asyncio.Queue[InboundMessage] = asyncio.Queue()
+    correction = InboundMessage(
+        channel="websocket",
+        sender_id="client-1",
+        chat_id=_CHAT_ID,
+        content="do not send; just inspect",
+    )
+    loop, outbound = await _handoff_turn(
+        tmp_path,
+        monkeypatch,
+        responses=[
+            _tool_response("call-a", "read_a"),
+            _tool_response("call-b", "read_b"),
+            _final_response("inspected only"),
+        ],
+        tools=tools,
+        pending_queue=pending,
+        before_call={0: lambda loop: pending.put_nowait(correction)},
+        advance_before_call={1: 0.05},
+    )
+
+    assert calls == ["read_a", "read_b"]
+    assert outbound is not None and outbound.content == "inspected only"
+    assert loop.work_store.list_tasks() == []
+    chat = loop.sessions.get_or_create(f"websocket:{_CHAT_ID}")
+    assert any(
+        message.get("role") == "user" and "do not send" in str(message.get("content"))
+        for message in chat.messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_drain_during_task_creation_reports_failure_not_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[str] = []
+    tools = [_fake_tool(name, calls=calls) for name in ("read_a", "read_b")]
+    holder: dict[str, AgentLoop] = {}
+
+    def create_then_drain(**kwargs: Any) -> dict[str, Any]:
+        loop = holder["loop"]
+        task = WorkStore.create_task(loop.work_store, **kwargs)
+        loop.begin_drain()  # SIGTERM lands during the hand-off I/O
+        return task
+
+    def capture(loop: AgentLoop) -> None:
+        holder["loop"] = loop
+
+    loop, outbound = await _handoff_turn(
+        tmp_path,
+        monkeypatch,
+        responses=[_tool_response("call-a", "read_a"), _tool_response("call-b", "read_b")],
+        tools=tools,
+        advance_before_call={1: 0.05},
+        before_call={0: capture},
+        create_task_override=create_then_drain,
+    )
+
+    assert outbound is not None and outbound.content == HANDOFF_UNAVAILABLE_REPLY
+    assert "handoff_task_id" not in outbound.metadata
+    assert loop.bus.inbound.empty()
+    (task,) = loop.work_store.list_tasks()
+    assert task["status"] == "failed"
+    assert task["notify_on_finish"] == 0
+
+
+@pytest.mark.asyncio
+async def test_existing_task_that_never_started_is_enqueued_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Crash between task creation and enqueue: the replay starts it, once."""
+    loop = _make_loop(tmp_path, _provider(), background_handoff_seconds=45)
+    stranded = loop.work_store.create_task(
+        chat_id=_CHAT_ID,
+        content=_ORIGINAL_MESSAGE,
+        notify_on_finish=True,
+        request_id=f"handoff:{_CHAT_ID}:cmid-crash",
+    )
+    loop.work_store.reconcile_interrupted()  # the restart sweep
+    task_id = stranded["task_id"]
+    assert loop.work_store.get_task(task_id)["status"] == "interrupted"
+
+    for _ in range(2):
+        _, outbound = await _handoff_turn(
+            tmp_path,
+            monkeypatch,
+            responses=[_final_response("must not run")],
+            tools=[],
+            message=_chat_message({"client_message_id": "cmid-crash"}),
+            loop=loop,
+        )
+        assert outbound is not None and outbound.content == HANDOFF_REPLY
+        assert outbound.metadata["handoff_task_id"] == task_id
+
+    inbound = loop.bus.inbound.get_nowait()
+    assert loop.bus.inbound.empty(), "enqueued exactly once"
+    assert inbound.metadata["work_task_id"] == task_id
+    assert loop.work_store.get_task(task_id)["status"] == "queued"
