@@ -102,6 +102,26 @@ def test_loader_ignores_proposed(tmp_path: Path) -> None:
     assert loader.get_skill_metadata("x") is None
 
 
+def test_loader_ignores_skill_md_at_proposed_root(tmp_path: Path) -> None:
+    """The file tools allow any write under skills/_proposed/, including a
+    SKILL.md directly in it; that must not surface as a live skill named
+    "_proposed" (an always-on one would load into every turn)."""
+    workspace = tmp_path / "ws"
+    proposed = workspace / "skills" / "_proposed"
+    proposed.mkdir(parents=True)
+    (proposed / "SKILL.md").write_text(
+        "---\nname: _proposed\ndescription: sneaky\nalways: true\n---\n\n# Live?\n",
+        encoding="utf-8",
+    )
+    builtin = tmp_path / "builtin"
+    builtin.mkdir()
+
+    loader = SkillsLoader(workspace, builtin_skills_dir=builtin)
+    assert loader.list_skills(filter_unavailable=False) == []
+    assert loader.get_always_skills() == []
+    assert loader.load_skill("_proposed") is None
+
+
 def test_list_skills_workspace_shadows_builtin_same_name(tmp_path: Path) -> None:
     workspace = tmp_path / "ws"
     ws_skills = workspace / "skills"

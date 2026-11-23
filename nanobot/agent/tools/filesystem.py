@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from nanobot.agent.skills import PROPOSED_SKILLS_DIR
 from nanobot.agent.tools.base import Tool, ToolResult, tool_parameters
 from nanobot.agent.tools.context import ToolContext
 from nanobot.agent.tools.file_state import FileStates, current_file_states
@@ -81,12 +82,6 @@ class SkillDraftRequiredError(PermissionError):
     Subclasses PermissionError for the same reason as SensitivePathError:
     every write tool already funnels that to a clean ToolResult.error.
     """
-
-
-# Reserved overlay directory: holds draft skills awaiting /skill accept.
-# Safe to special-case because skill names may not contain "_" (see
-# nanobot/agent/skills.py:_SKILL_NAME), so no real skill is ever named this.
-PROPOSED_SKILLS_DIR = "_proposed"
 
 
 class FileToolsConfig(Base):
