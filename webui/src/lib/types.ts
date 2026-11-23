@@ -43,6 +43,10 @@ export interface UIMediaAttachment {
   kind: UIMediaKind;
   url?: string;
   name?: string;
+  /** Non-error server notice, e.g. "Read pages 1–20 of 147; Ziggy will read the rest on request". */
+  partial?: string;
+  /** Server-issued capability id, e.g. "local_ab12..."; lets unlock notices find their tile. */
+  attachment_id?: string;
 }
 
 interface UIMessageSource { kind: "cron" | "local_trigger" | "trigger" | string; label?: string; }
@@ -1369,6 +1373,16 @@ export type InboundEvent =
       mcp_presets?: UIMcpPresetAttachment[];
       session_mentions?: SessionMention[];
       provenance?: { session_message?: UISessionMessage };
+    }
+  | {
+      event: "attachment.status";
+      chat_id: string;
+      client_message_id?: string;
+      turn_id?: string;
+      /** Server-parsed card state per uploaded file, in upload order. */
+      attachments?: Array<{ name?: string; error?: string | null; partial?: string; attachment_id?: string }>;
+      attachment_id?: string;
+      unlocked?: boolean;
     }
   | ({
       event: "message";

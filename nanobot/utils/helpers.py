@@ -5,11 +5,11 @@ from __future__ import annotations
 import base64
 import json
 import os
+import random as _random
 import re
 import shutil
 import stat
 import time
-import random as _random
 import uuid
 from contextlib import suppress
 from datetime import datetime
@@ -941,17 +941,15 @@ def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]
         for name in added:
             Console().print(f"  [dim]Created {name}[/dim]")
 
-    # Initialize git for memory version control
+    # Initialize git for memory version control. SM-01 (MIT-1842): bare repo
+    # outside the workspace, wider tracked set; never recreates <ws>/.git.
     try:
-        from nanobot.utils.gitstore import GitStore
+        from nanobot.utils.gitstore import DEFAULT_TRACKED_PATTERNS, GitStore, history_dir_for
 
         gs = GitStore(
             workspace,
-            tracked_files=[
-                "SOUL.md",
-                "USER.md",
-                "memory/MEMORY.md",
-            ],
+            tracked_files=DEFAULT_TRACKED_PATTERNS,
+            git_dir=history_dir_for(workspace) / "workspace.git",
         )
         gs.init()
     except Exception:
@@ -996,6 +994,8 @@ def pick_tool_emoji(*, _rng: "_random.Random | None" = None) -> str:
 
 def summarize_tool_call(name: str, args: dict[str, Any]) -> str:
     """Build a one-line tool status string, capped at _STATUS_MAX chars."""
+    if name == "unlock_attachment":
+        return "Unlocking PDF"
     if "path" in args:
         detail = str(args["path"])
     elif "command" in args:

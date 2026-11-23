@@ -8,6 +8,7 @@ store from the other, so core session writes stay independent from UI state.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import secrets
@@ -39,7 +40,7 @@ from nanobot.webui.session_identity import (
     webui_session_key,
 )
 
-_INDEX_VERSION = 8
+_INDEX_VERSION = 9
 _INDEX_FILENAME = ".webui_session_index.json"
 _MODEL_PRESET_FIELD = "model_preset"
 _ROW_SOURCE_FIELD = "_source"
@@ -75,7 +76,7 @@ def list_webui_sessions(session_manager: SessionManager) -> list[dict[str, Any]]
         _public_row(session_manager.sessions_dir, get_webui_dir(), row)
         for row in rows
     ]
-    return sorted(sessions, key=lambda row: row.get("updated_at", ""), reverse=True)
+    return sorted(sessions, key=lambda row: _timestamp(row.get("updated_at")), reverse=True)
 
 
 def _reconcile_index(session_manager: SessionManager) -> tuple[list[dict[str, Any]], bool]:
@@ -429,20 +430,49 @@ def _webui_activity_signature(session_key: str, webui_dir: Path) -> dict[str, in
     }
 
 
-def _webui_activity_updated_at(signature: dict[str, int]) -> str | None:
+def _webui_activity_updated_at(
+    signature: dict[str, int], session_key: str, webui_dir: Path,
+) -> str | None:
+    # Rotation, backfill and restore all rewrite files without a new turn.
+    # Prefer event time; mtime is only a fallback for old undated journals.
+    latest: str | None = None
+    saw_timestamp = False
+    for path in _webui_activity_paths(session_key, webui_dir):
+        if path.suffix != ".jsonl":
+            continue
+        try:
+            with open(path, encoding="utf-8") as handle:
+                for line in handle:
+                    record = _transcript_record(line)
+                    if record is None:
+                        continue
+                    saw_timestamp |= "created_at_ms" in record
+                    timestamp = _transcript_created_at(record)
+                    latest = _latest_updated_at(latest, timestamp)
+        except OSError:
+            continue
+    if latest is not None or saw_timestamp:
+        return latest
     mtime_ns = signature.get(_WEBUI_ACTIVITY_MTIME_NS, 0)
     if mtime_ns <= 0:
         return None
-    return datetime.fromtimestamp(mtime_ns / 1_000_000_000).isoformat()
+    try:
+        fallback = datetime.fromtimestamp(mtime_ns / 1_000_000_000).isoformat()
+    except (OSError, OverflowError, ValueError):
+        return None
+    return fallback if _timestamp(fallback) > 0 else None
 
 
 def _timestamp(value: str | None) -> float:
     if not value:
         return 0.0
     try:
-        return datetime.fromisoformat(value).timestamp()
-    except ValueError:
-        return 0.0
+        seconds = datetime.fromisoformat(value).timestamp()
+        if math.isfinite(seconds) and 0 <= seconds <= datetime.now().timestamp() + 300:
+            return seconds
+    except (OSError, OverflowError, ValueError):
+        pass
+    return 0.0
 
 
 def _latest_updated_at(stored: str | None, activity: str | None) -> str | None:
@@ -474,13 +504,16 @@ def _visible_activity_updated_at(
     visible_message_at: str | None,
     webui_activity: str | None,
 ) -> str | None:
-    return _latest_updated_at(visible_message_at, webui_activity) or stored
+    latest = _latest_updated_at(visible_message_at, webui_activity)
+    if latest is not None and _timestamp(latest) > 0:
+        return latest
+    return stored if _timestamp(stored) > 0 else ""
 
 
 def _indexed_row_for_session(session: Session, path: Path, webui_dir: Path) -> dict[str, Any]:
     signature = _file_signature(path)
     activity_signature = _webui_activity_signature(session.key, webui_dir)
-    activity_updated_at = _webui_activity_updated_at(activity_signature)
+    activity_updated_at = _webui_activity_updated_at(activity_signature, session.key, webui_dir)
     visible_message_at = _last_visible_message_at(session.messages)
     return {
         "key": session.key,
@@ -530,7 +563,8 @@ def _transcript_created_at(record: dict[str, Any]) -> str | None:
     ):
         return None
     try:
-        return datetime.fromtimestamp(value / 1000).isoformat()
+        timestamp = datetime.fromtimestamp(value / 1000).isoformat()
+        return timestamp if _timestamp(timestamp) > 0 else None
     except (OSError, OverflowError, ValueError):
         return None
 
@@ -545,10 +579,6 @@ def _scan_transcript_row(
         stem.removeprefix(_WEBUI_SESSION_STEM_PREFIX)
     )
     signature = _webui_activity_signature(path_key, webui_dir)
-    activity_updated_at = _webui_activity_updated_at(signature)
-    if activity_updated_at is None:
-        return None
-
     preview = ""
     fallback_preview = ""
     created_at: str | None = None
@@ -593,6 +623,7 @@ def _scan_transcript_row(
             break
     if not saw_record:
         return None
+    activity_updated_at = _webui_activity_updated_at(signature, path_key, webui_dir) or ""
     if session_key is None:
         fallback = webui_session_key(stem.removeprefix(_WEBUI_SESSION_STEM_PREFIX))
         if not _valid_transcript_session_key(fallback, stem):
@@ -687,7 +718,7 @@ def _scan_session_row(
             key = data.get("key") or storage_key
             metadata = data.get("metadata", {})
             activity_signature = _webui_activity_signature(key, webui_dir)
-            activity_updated_at = _webui_activity_updated_at(activity_signature)
+            activity_updated_at = _webui_activity_updated_at(activity_signature, key, webui_dir)
             return {
                 "key": key,
                 "created_at": created_at_s,
