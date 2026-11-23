@@ -359,6 +359,10 @@ class GatewayConfig(Base):
     port: int = 18790
     restart_mode: Literal["auto", "exec", "spawn", "exit"] = "auto"
     heartbeat: HeartbeatConfig = Field(default_factory=HeartbeatConfig)
+    # MIT-1811: on the first SIGTERM, stop admitting new turns and let the
+    # ones already running finish for up to this many seconds before the
+    # usual cancellation path. 0 disables the grace (cancel immediately).
+    shutdown_grace_seconds: int = Field(default=90, ge=0, le=600)
 
 
 class OAuthClientCredentialsConfig(Base):
