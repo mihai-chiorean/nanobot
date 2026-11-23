@@ -26,6 +26,8 @@ from dataclasses import dataclass, field
 from collections.abc import Mapping
 from typing import Any
 
+from loguru import logger
+
 # Built-in tools that earn a named family. Every other built-in is an
 # unlisted step and only counts toward ``other_steps``.
 _BUILTIN_FAMILIES: dict[str, tuple[str, str, bool]] = {
@@ -252,6 +254,20 @@ class TurnProvenance:
                 "errors": 1 if status == "error" else 0,
             }
         )
+
+
+def log_recording_failure(what: str, exc: BaseException) -> None:
+    """Log one provenance/recording failure without leaking content.
+
+    ``what`` must be a fixed literal. Only the exception TYPE name is logged:
+    no exception text, no traceback and no frame locals (Loguru's diagnose
+    mode would print tool arguments and message text from the frames).
+    """
+    logger.warning(
+        "turn provenance: {} failed ({}); continuing without it",
+        what,
+        type(exc).__name__,
+    )
 
 
 CURRENT_TURN_PROVENANCE: ContextVar[TurnProvenance | None] = ContextVar(

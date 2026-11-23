@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+from loguru import logger
+
 import pytest
 
 from agent.session_helpers import run_session
@@ -483,7 +485,8 @@ class _WebSearchTool(_SearchTool):
 
 
 @pytest.mark.asyncio
-async def test_internal_continuation_folds_into_one_record(tmp_path: Path):
+@pytest.mark.parametrize("wire_id", ["wire-goal-1", None])
+async def test_internal_continuation_folds_into_one_record(tmp_path: Path, wire_id):
     """A sustained goal that hits max_iterations and finishes in the queued
     continuation slice keeps ONE record for the wire id, with the earlier
     slice's tool counts and its account_intent."""
@@ -511,7 +514,7 @@ async def test_internal_continuation_folds_into_one_record(tmp_path: Path):
 
     pending: asyncio.Queue[InboundMessage] = asyncio.Queue()
     first = await loop._process_message(
-        _msg("Check my inbox", {WEBUI_TURN_METADATA_KEY: "wire-goal-1"}),
+        _msg("Check my inbox", {WEBUI_TURN_METADATA_KEY: wire_id} if wire_id else None),
         pending_queue=pending,
     )
     assert first is None
@@ -523,8 +526,11 @@ async def test_internal_continuation_folds_into_one_record(tmp_path: Path):
     second = await loop._process_message(queued, pending_queue=asyncio.Queue())
     assert second is not None and second.content == "You have 3 unread emails."
 
-    entries = [e for e in _entries(loop) if e["turn_id"] == "wire-goal-1"]
+    # Without a wire id the first slice's minted fallback id is carried over.
+    entries = _entries(loop)
     assert len(entries) == 1
+    if wire_id:
+        assert entries[0]["turn_id"] == wire_id
     entry = entries[0]
     assert entry["answered"] is True
     assert entry["account_intent"] is True
@@ -561,3 +567,69 @@ def test_merge_same_turn_folds_counts_and_intents():
     assert merged["args_repaired"] == {"type_cast": 3}
     assert merged["used"] == [{"family": "gmail", "label": "Gmail", "private": True,
                                "calls": 3, "errors": 1}]
+
+
+_LEAK_SENTINEL = "SENTINEL-hunter2-pw"
+
+
+def _diagnose_sink() -> tuple[list[str], int]:
+    """A sink formatted like production (diagnose + backtrace on)."""
+    lines: list[str] = []
+    sink_id = logger.add(
+        lambda m: lines.append(str(m)), level="DEBUG", diagnose=True, backtrace=True
+    )
+    return lines, sink_id
+
+
+@pytest.mark.asyncio
+async def test_save_failure_log_leaks_no_message_text_or_traceback(tmp_path: Path, monkeypatch):
+    def boom(self: TurnProvenance) -> dict[str, Any]:
+        raise ValueError(f"bad record {_LEAK_SENTINEL}")
+
+    monkeypatch.setattr(TurnProvenance, "to_dict", boom)
+    loop, bus = _make_loop(tmp_path, lambda: _answer("Paris."))
+    lines, sink_id = _diagnose_sink()
+    try:
+        await run_session(loop, _msg(f"my password is {_LEAK_SENTINEL}"))
+    finally:
+        logger.remove(sink_id)
+    await _drain(bus)
+    failure = [line for line in lines if "turn provenance:" in line]
+    assert failure and "ValueError" in failure[0]
+    warnings = "".join(line for line in lines if "WARNING" in line or "ERROR" in line)
+    assert _LEAK_SENTINEL not in warnings
+    assert "Traceback" not in "".join(lines)
+
+
+@pytest.mark.asyncio
+async def test_tool_count_failure_log_leaks_no_tool_arguments(tmp_path: Path, monkeypatch):
+    def boom(self: TurnProvenance, tool: Any, status: str) -> None:
+        raise RuntimeError(f"count failed {_LEAK_SENTINEL}")
+
+    monkeypatch.setattr(TurnProvenance, "note_tool_result", boom)
+    tool_round = LLMResponse(
+        content=None,
+        tool_calls=[
+            ToolCallRequest(id="c1", name="search", arguments={"query": _LEAK_SENTINEL})
+        ],
+        usage=None,
+    )
+    state = {"n": 0}
+
+    def respond() -> LLMResponse:
+        state["n"] += 1
+        return tool_round if state["n"] == 1 else _answer("found it")
+
+    loop, bus = _make_loop(tmp_path, respond)
+    loop.tools.register(_SearchTool())
+    lines, sink_id = _diagnose_sink()
+    try:
+        await run_session(loop, _msg("look it up"))
+    finally:
+        logger.remove(sink_id)
+    outbound = await _drain(bus)
+    assert any(m.content == "found it" for m in outbound)
+    failure = [line for line in lines if "turn provenance:" in line]
+    assert failure and "RuntimeError" in failure[0]
+    assert all(_LEAK_SENTINEL not in line for line in failure)
+    assert "Traceback" not in "".join(lines)

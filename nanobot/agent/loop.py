@@ -80,6 +80,7 @@ from nanobot.agent.turn_provenance import (
     TurnProvenance,
     account_intent,
     bind_turn_provenance,
+    log_recording_failure,
     reset_turn_provenance,
     save_to_session,
 )
@@ -266,10 +267,8 @@ def _provenance_boundary(what: str) -> Iterator[None]:
     """
     try:
         yield
-    except Exception:
-        logger.opt(exception=True).warning(
-            "turn provenance: {} failed; the turn continues without it", what
-        )
+    except Exception as exc:
+        log_recording_failure(what, exc)
 
 
 @dataclass
@@ -2906,7 +2905,12 @@ class AgentLoop:
         # verbatim), and the record itself rides the runtime event publisher,
         # which lifts the ``used``/``other_steps`` fields at
         # ``turn_completed`` — the same per-session lifecycle as turn usage.
-        ctx.effective_turn_id = _effective_turn_id(
+        # An internal continuation slice reuses the id its first slice
+        # resolved (carried on the queued message), so a turn without a wire
+        # id still folds into one record instead of minting a new fallback.
+        ctx.effective_turn_id = turn_continuation.internal_continuation_turn_id(
+            msg.metadata
+        ) or _effective_turn_id(
             delivery.route.metadata, msg.metadata, fallback=ctx.turn_id
         )
         provenance: TurnProvenance | None = None
