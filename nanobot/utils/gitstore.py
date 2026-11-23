@@ -5,10 +5,13 @@ from __future__ import annotations
 import io
 import os
 import shutil
+import stat
+import tempfile
 import time
-from dataclasses import dataclass
+from contextlib import suppress
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from loguru import logger
 
@@ -59,6 +62,11 @@ def history_dir_for(workspace: Path) -> Path:
     return Path(workspace).resolve().parent / "history"
 
 
+# Workspace states that history cannot represent (see _workspace_state).
+_CONFLICT = object()
+_UNTRACKABLE = object()
+
+
 class GitStoreError(RuntimeError):
     """Raised when the memory Git repository cannot complete an operation."""
 
@@ -68,6 +76,7 @@ class CommitInfo:
     sha: str  # Short SHA (8 chars)
     message: str
     timestamp: str  # Formatted datetime
+    files: list[str] = field(default_factory=list)  # Paths the commit changed
 
     def subject(self) -> str:
         """First line of the commit message, or a placeholder if empty."""
@@ -80,6 +89,24 @@ class CommitInfo:
         if diff:
             return f"{header}\n```diff\n{diff}\n```"
         return f"{header}\n(no file changes)"
+
+
+@dataclass
+class UndoResult:
+    """Outcome of :meth:`GitStore.undo` / :meth:`GitStore.restore`.
+
+    restored: paths written (or, for a preview, that would be).
+    skipped: undo only — changed again after the commit; left alone.
+    kept: no earlier version in history; left alone, never deleted.
+    conflicts: file/directory or symlink conflicts; when non-empty the
+    whole operation was refused and nothing changed.
+    """
+
+    restored: list[str] = field(default_factory=list)
+    skipped: list[str] = field(default_factory=list)
+    kept: list[str] = field(default_factory=list)
+    conflicts: list[str] = field(default_factory=list)
+    new_sha: str | None = None
 
 
 class GitStore:
@@ -327,11 +354,13 @@ class GitStore:
         self,
         max_entries: int = 20,
         message_prefix: str | None = None,
+        include_files: bool = False,
     ) -> list[CommitInfo]:
         """Return simplified commit log, optionally filtered by message prefix.
 
         When filtering, *max_entries* counts matching commits rather than every
-        commit traversed in the repository.
+        commit traversed in the repository. With *include_files*, each entry
+        lists the paths the commit changed against its first parent.
         """
         if not self.is_initialized():
             return []
@@ -362,6 +391,7 @@ class GitStore:
                             sha=sha.decode()[:8],
                             message=msg,
                             timestamp=ts,
+                            files=self._changed_paths(repo, commit) if include_files else [],
                         ))
                     sha = commit.parents[0] if commit.parents else None
 
@@ -541,120 +571,264 @@ class GitStore:
         except Exception as exc:
             raise GitStoreError(f"Git commit display failed for {short_sha}") from exc
 
-    # -- restore ---------------------------------------------------------------
+    # -- undo / restore --------------------------------------------------------
+    #
+    # MIT-1847 (SM-03), on top of the SM-01 invariants:
+    # - paths come from history trees, so wildcard-tracked files are covered;
+    # - a path missing from the source tree is never deleted (it may have
+    #   existed but been excluded: oversize, symlink, not yet tracked);
+    # - a file the operation would overwrite must already be in history
+    #   (undo: it still matches the undone commit; restore: snapshot first),
+    #   and anything history cannot hold (directory, symlink, oversize file)
+    #   is never overwritten;
+    # - a file/directory conflict or a symlinked parent directory refuses the
+    #   whole operation before anything is written;
+    # - writes are staged to temp files first, then renamed into place.
 
-    def revert(self, commit: str, *, message_prefix: str | None = None) -> str | None:
-        """Revert (undo) the changes introduced by the given commit.
+    def has_commit(self, sha: str) -> bool:
+        """Return whether *sha* resolves to a commit reachable from HEAD."""
+        if not self.is_initialized():
+            return False
+        return self._resolve_sha(sha) is not None
 
-        Every file the commit changed is restored to its state at the commit's
-        parent, then a new commit records the revert. Files absent from the
-        parent tree are kept, never deleted; a file/directory conflict refuses
-        the whole revert with nothing changed. When *message_prefix*
-        is provided, commits outside that history are rejected before any files
-        are changed.
+    def undo(self, sha: str, *, message_prefix: str | None = None) -> UndoResult:
+        """Undo the changes one commit introduced, per file.
 
-        Returns the new commit SHA, or ``None`` when the commit cannot be reverted.
-        Repository and filesystem failures raise :class:`GitStoreError`.
+        A changed path goes back to the commit's parent version only while the
+        workspace file still matches the commit's version; files changed again
+        later are skipped, so later edits are never discarded. Paths the commit
+        added are kept (prior state unknown). Commits ``undo <sha>`` when
+        anything was restored. Root commits, unknown SHAs and commits outside
+        *message_prefix* return an empty result with nothing changed.
         """
         if not self.is_initialized():
-            return None
-
+            return UndoResult()
         try:
             from dulwich.repo import Repo
 
-            full_sha = self._resolve_sha(commit)
-            if not full_sha:
-                logger.warning("Git revert: SHA not found: {}", commit)
-                return None
-
             with Repo(str(self._git_dir)) as repo:
-                commit_obj = repo[full_sha]
-                if commit_obj.type_name != b"commit":
-                    return None
-                typed_commit = cast("Commit", commit_obj)
-
-                commit_message = typed_commit.message.decode(
-                    "utf-8",
-                    errors="replace",
-                ).strip()
-                if message_prefix is not None and not commit_message.startswith(message_prefix):
-                    logger.warning(
-                        "Git revert: commit {} does not match message prefix {!r}",
-                        commit,
-                        message_prefix,
+                commit, full_sha = self._lookup_commit(repo, sha, message_prefix)
+                if commit is None or not commit.parents:
+                    if commit is not None:
+                        logger.warning("Git undo: cannot undo root commit {}", sha)
+                    return UndoResult()
+                parent = cast("Commit", repo[commit.parents[0]])
+                before = self._tree_blobs(repo, parent.tree)
+                after = self._tree_blobs(repo, commit.tree)
+                result = UndoResult()
+                writes: list[tuple[str, bytes]] = []
+                for path in sorted(before.keys() | after.keys()):
+                    if before.get(path) == after.get(path):
+                        continue
+                    state = self._workspace_state(path)
+                    if state is _CONFLICT:
+                        result.conflicts.append(path)
+                        continue
+                    expected = (
+                        cast("Blob", repo[after[path]]).data if path in after else None
                     )
-                    return None
-
-                if not typed_commit.parents:
-                    logger.warning("Git revert: cannot revert root commit {}", commit)
-                    return None
-
-                # Undo what this commit changed: every path whose blob differs
-                # between the parent and the commit tree goes back to the
-                # parent's bytes. Paths come from the trees, so wildcard-
-                # tracked files (skills/**, prompts/*.md) are covered and
-                # files the commit did not touch are left alone.
-                #
-                # A path missing from the parent tree is never deleted: it may
-                # have existed then but been excluded (size cap, symlink), so
-                # its prior state is unknown. Such paths are kept and logged.
-                parent_obj = cast("Commit", repo[typed_commit.parents[0]])
-                before = self._tree_blobs(repo, parent_obj.tree)
-                after = self._tree_blobs(repo, typed_commit.tree)
-                changed = sorted(
-                    p for p in before.keys() | after.keys() if before.get(p) != after.get(p)
+                    if state != expected:
+                        result.skipped.append(path)
+                    elif path not in before:
+                        result.kept.append(path)
+                    else:
+                        writes.append((path, cast("Blob", repo[before[path]]).data))
+            if result.conflicts:
+                logger.warning(
+                    "Git undo: refusing {}; file/directory conflict at {}",
+                    sha,
+                    ", ".join(result.conflicts),
                 )
-                workspace = self._workspace.resolve()
-                writes: list[tuple[str, Path, bytes]] = []
-                kept: list[str] = []
-                for filepath in changed:
-                    blob_id = before.get(filepath)
-                    if blob_id is None:
-                        kept.append(filepath)
-                        continue
-                    dest = self._workspace / filepath
-                    if workspace not in dest.resolve().parents:
-                        continue
-                    writes.append((filepath, dest, cast("Blob", repo[blob_id]).data))
-
-                # Preflight (all-or-nothing): refuse before touching anything
-                # if a target is now a directory or one of its parents is now
-                # a file (file <-> directory replacement by the commit).
-                conflicts = [
-                    filepath
-                    for filepath, dest, _ in writes
-                    if dest.is_dir()
-                    or any(
-                        (self._workspace / anc).exists() and not (self._workspace / anc).is_dir()
-                        for anc in Path(filepath).parents
-                    )
-                ]
-                if conflicts:
-                    logger.warning(
-                        "Git revert: refusing {}; file/directory conflict at {}",
-                        commit,
-                        ", ".join(conflicts),
-                    )
-                    return None
-                if kept:
-                    logger.warning(
-                        "Git revert: {} added {}; kept (prior state unknown)",
-                        commit,
-                        ", ".join(kept),
-                    )
-                for _, dest, data in writes:
-                    dest.parent.mkdir(parents=True, exist_ok=True)
-                    dest.write_bytes(data)
-                restored = [filepath for filepath, _, _ in writes]
-
-            if not restored:
-                return None
-
-            # Commit the restored state
-            msg = f"revert: undo {commit}"
-            return self.auto_commit(msg)
+                return UndoResult(conflicts=result.conflicts)
+            self._apply_writes(writes)
+            result.restored = [path for path, _ in writes]
+            if result.restored:
+                result.new_sha = self.auto_commit(f"undo {full_sha[:8]}")
+            return result
+        except GitStoreError:
+            raise
         except Exception as exc:
-            raise GitStoreError(f"Git revert failed for {commit}") from exc
+            raise GitStoreError(f"Git undo failed for {sha}") from exc
+
+    def restore_preview(self, sha: str) -> UndoResult:
+        """What :meth:`restore` would do, without changing anything."""
+        if not self.is_initialized():
+            return UndoResult()
+        try:
+            plan, _writes, _full = self._plan_restore(sha)
+            return plan
+        except Exception as exc:
+            raise GitStoreError(f"Git restore preview failed for {sha}") from exc
+
+    def restore(self, sha: str) -> UndoResult:
+        """Set every path recorded at *sha* back to its content there, then commit.
+
+        Current files are snapshotted into history first, so every overwrite
+        is itself undoable. Tracked files absent at *sha* are kept, never
+        deleted. Any conflict refuses the whole restore with nothing changed.
+        """
+        if not self.is_initialized():
+            return UndoResult()
+        try:
+            plan, writes, full_sha = self._plan_restore(sha)
+            if plan.conflicts or not writes:
+                return plan
+            self.auto_commit(f"snapshot: before restore {full_sha[:8]}")
+            self._apply_writes(writes)
+            plan.new_sha = self.auto_commit(f"restore {full_sha[:8]}")
+            return plan
+        except GitStoreError:
+            raise
+        except Exception as exc:
+            raise GitStoreError(f"Git restore failed for {sha}") from exc
+
+    def _plan_restore(self, sha: str) -> tuple[UndoResult, list[tuple[str, bytes]], str]:
+        from dulwich.repo import Repo
+
+        plan = UndoResult()
+        writes: list[tuple[str, bytes]] = []
+        with Repo(str(self._git_dir)) as repo:
+            commit, full_sha = self._lookup_commit(repo, sha, None)
+            if commit is None:
+                return plan, writes, ""
+            target = self._tree_blobs(repo, commit.tree)
+            current = set(self._expand_tracked_files())
+            for path in sorted(target.keys() | current):
+                state = self._workspace_state(path)
+                if path not in target:
+                    if state is not None:
+                        plan.kept.append(path)
+                    continue
+                data = cast("Blob", repo[target[path]]).data
+                if state == data:
+                    continue
+                if state is _CONFLICT or state is _UNTRACKABLE:
+                    plan.conflicts.append(path)
+                    continue
+                writes.append((path, data))
+        if plan.conflicts:
+            return UndoResult(conflicts=plan.conflicts), [], full_sha
+        plan.restored = [path for path, _ in writes]
+        return plan, writes, full_sha
+
+    def _lookup_commit(
+        self, repo: "Repo", sha: str, message_prefix: str | None
+    ) -> tuple["Commit | None", str]:
+        full = self._resolve_sha(sha)
+        if not full:
+            logger.warning("Git store: SHA not found: {}", sha)
+            return None, ""
+        obj = repo[full]
+        if obj.type_name != b"commit":
+            return None, ""
+        commit = cast("Commit", obj)
+        if message_prefix is not None and not commit.message.decode(
+            "utf-8", errors="replace"
+        ).strip().startswith(message_prefix):
+            logger.warning("Git store: commit {} does not match {!r}", sha, message_prefix)
+            return None, ""
+        return commit, full.decode()
+
+    def _workspace_state(self, rel: str) -> "bytes | None | object":
+        """Current state of a tracked path, for comparison with history.
+
+        ``None`` when absent, the bytes for a regular file history can hold,
+        ``_CONFLICT`` when the path is a directory or a parent is a symlink or
+        not a directory (never write through it: it could lead outside the
+        workspace, e.g. into history/), and ``_UNTRACKABLE`` for a symlink,
+        oversize or unreadable file (content history does not have).
+        """
+        parts = Path(rel).parts
+        if not parts or Path(rel).is_absolute() or ".." in parts:
+            return _CONFLICT
+        node = self._workspace
+        for part in parts[:-1]:
+            node = node / part
+            if node.is_symlink() or (node.exists() and not node.is_dir()):
+                return _CONFLICT
+        dest = self._workspace / rel
+        if dest.is_symlink():
+            return _UNTRACKABLE
+        if not dest.exists():
+            return None
+        if dest.is_dir():
+            return _CONFLICT
+        try:
+            if not dest.is_file() or dest.stat().st_size > _MAX_TRACKED_FILE_BYTES:
+                return _UNTRACKABLE
+            return dest.read_bytes()
+        except OSError:
+            return _UNTRACKABLE
+
+    def _apply_writes(self, writes: list[tuple[str, bytes]]) -> None:
+        """Write every file or none.
+
+        Stage each file to a temp file (keeping the destination's mode, so an
+        executable skill script stays executable) and hard-link a backup of
+        any file it replaces; then rename the temp files in. Any failure rolls
+        back the renames already done. Temp files and backups are removed,
+        except a backup whose rollback failed: it is the only copy of the
+        original, so it stays next to the file and its path is in the error.
+        """
+        staged: list[list[Any]] = []  # [tmp, dest, backup | None]
+        done: list[list[Any]] = []
+        try:
+            for rel, data in writes:
+                dest = self._workspace / rel
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                fd, tmp = tempfile.mkstemp(dir=str(dest.parent), prefix=f".{dest.name}.", suffix=".tmp")
+                entry: list[Any] = [tmp, dest, None]
+                staged.append(entry)
+                with os.fdopen(fd, "wb") as handle:
+                    handle.write(data)
+                try:
+                    mode = stat.S_IMODE(dest.stat().st_mode)
+                except FileNotFoundError:
+                    mode = 0o644
+                os.chmod(tmp, mode)
+                if dest.exists():
+                    entry[2] = f"{tmp}.bak"
+                    os.link(dest, entry[2])
+            for entry in staged:
+                os.replace(entry[0], entry[1])
+                done.append(entry)
+        except BaseException as exc:
+            stranded: list[str] = []
+            for entry in reversed(done):
+                _tmp, dest, backup = entry
+                try:
+                    if backup is not None:
+                        os.replace(backup, dest)
+                    else:
+                        os.unlink(dest)
+                except OSError:
+                    if backup is not None:
+                        # Rollback failed: the backup is now the only copy of
+                        # the original. Never delete it; tell the caller.
+                        stranded.append(f"{dest} (original kept at {backup})")
+                        entry[2] = None
+            if stranded:
+                raise GitStoreError(
+                    "Rollback failed; originals left next to the files: " + "; ".join(stranded)
+                ) from exc
+            raise
+        finally:
+            for tmp, _dest, backup in staged:
+                for leftover in (tmp, backup):
+                    if leftover is not None:
+                        with suppress(OSError):
+                            os.unlink(leftover)
+
+    @classmethod
+    def _changed_paths(cls, repo: "Repo", commit: "Commit") -> list[str]:
+        """Paths the commit changed compared with its first parent."""
+        after = cls._tree_blobs(repo, commit.tree)
+        before = (
+            cls._tree_blobs(repo, cast("Commit", repo[commit.parents[0]]).tree)
+            if commit.parents
+            else {}
+        )
+        return sorted(p for p in before.keys() | after.keys() if before.get(p) != after.get(p))
 
     @staticmethod
     def _tree_blobs(repo: "Repo", tree_id: bytes, prefix: str = "") -> dict[str, bytes]:
