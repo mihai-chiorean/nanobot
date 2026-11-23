@@ -2625,3 +2625,30 @@ async def test_new_session_identical_write_gets_a_distinct_recoverable_scope(
     )
     assert first["recovered"] == first["live"]
     assert second["recovered"] == second["live"]
+
+
+@pytest.mark.asyncio
+async def test_subagent_completion_turn_persists_its_own_scope_for_recovery(
+    tmp_path: Path,
+) -> None:
+    """Codex P2 (round 2): a subagent completion runs as a new turn after the
+    main turn ended.  Its early save must not leave the previous turn's scope
+    on disk, or a crash after its write recovers the wrong key."""
+    loop, seen = _scope_recording_loop(tmp_path, [
+        LLMResponse(content="Started a helper.", finish_reason="stop"),
+        _call("call_write", "record_write", {"to": "grandma"}),
+        LLMResponse(content="Sent.", finish_reason="stop"),
+    ])
+    await loop._process_message(InboundMessage(
+        channel="cli", sender_id="user", chat_id="sub",
+        content="research then mail grandma",
+        metadata={"client_message_id": "cm-request"},
+    ))
+    await loop._process_message(InboundMessage(
+        channel="system", sender_id="subagent", chat_id="cli:sub",
+        content="subagent result", metadata={"subagent_task_id": "sub-1"},
+    ))
+
+    assert len(seen) == 1
+    assert seen[0]["live"] != "cm-request"
+    assert seen[0]["recovered"] == seen[0]["live"]

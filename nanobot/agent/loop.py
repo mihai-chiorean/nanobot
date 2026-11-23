@@ -3089,6 +3089,17 @@ class AgentLoop:
             )
             session = ctx.require_session()
         is_subagent = ctx.kind is TurnKind.SYSTEM and ctx.msg.sender_id == "subagent"
+        # SR-11: one idempotency scope per turn, so a recovery Continue replays
+        # writes with the scope this turn actually used (an ask_user reply, a
+        # fresh per-turn id, ...).  Assigned here, before every early save
+        # below, and written explicitly once those saves are done.
+        ctx.idempotency_scope = turn_continuation.resolve_idempotency_scope(
+            ctx.msg.metadata
+        )
+        if not ctx.ephemeral:
+            session.metadata[turn_continuation.TURN_IDEMPOTENCY_SCOPE_KEY] = (
+                ctx.idempotency_scope
+            )
 
         ctx.history = session.get_history(extend_to_user=is_subagent)
         ctx.ask_user_resume_id = self._detect_ask_user_resume(ctx)
@@ -3169,17 +3180,6 @@ class AgentLoop:
                 staged_provider_state = True
         elif stored_state is not None:
             session.provider_state = None
-        # SR-11: one idempotency scope per turn, persisted before any tool
-        # runs so a recovery Continue replays writes with the scope this turn
-        # actually used (an ask_user reply, a fresh per-turn id, ...).  Set
-        # before the early user persist so that save carries it.
-        ctx.idempotency_scope = turn_continuation.resolve_idempotency_scope(
-            ctx.msg.metadata
-        )
-        if not ctx.ephemeral:
-            session.metadata[turn_continuation.TURN_IDEMPOTENCY_SCOPE_KEY] = (
-                ctx.idempotency_scope
-            )
         if ctx.kind is TurnKind.USER:
             if ctx.ask_user_resume_id is None:
                 ctx.input_persisted_early = self._persist_user_message_early(
@@ -3195,7 +3195,9 @@ class AgentLoop:
             # Upgrade the replay-safe baseline to the resumable state before
             # prompt assembly and the first model checkpoint.
             self.sessions.save(session)
-        if not ctx.ephemeral and not ctx.input_persisted_early:
+        if not ctx.ephemeral:
+            # Unconditional: whether an early save above already carried the
+            # scope depends on the path taken; this must not (SR-11).
             self.sessions.update_session_metadata(
                 session.key,
                 {turn_continuation.TURN_IDEMPOTENCY_SCOPE_KEY: ctx.idempotency_scope},
