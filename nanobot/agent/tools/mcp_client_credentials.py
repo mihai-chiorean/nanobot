@@ -57,6 +57,11 @@ def _read_client_secret(configured_path: str) -> str:
 class OAuthClientCredentialsError(RuntimeError):
     """The token endpoint did not return a usable access token."""
 
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        # The token endpoint's HTTP status when it answered non-200.
+        self.status_code = status_code
+
 
 class OAuthClientCredentialsAuth(httpx.Auth):
     """``httpx.Auth`` that attaches a cached client-credentials bearer token.
@@ -124,7 +129,8 @@ class OAuthClientCredentialsAuth(httpx.Auth):
             # Do not surface the body: a misbehaving endpoint could echo input.
             raise OAuthClientCredentialsError(
                 f"MCP token endpoint returned HTTP {response.status_code} "
-                f"for client {self._client_id}"
+                f"for client {self._client_id}",
+                status_code=response.status_code,
             )
         try:
             payload = response.json()
