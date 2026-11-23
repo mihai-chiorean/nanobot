@@ -7,13 +7,12 @@ import pytest
 
 from nanobot.agent import skill_drafts
 from nanobot.bus.events import INBOUND_META_ROOM_SCOPE, OutboundMessage
+from nanobot.utils.gitstore import DEFAULT_TRACKED_PATTERNS, GitStore
 
 
-@pytest.fixture(autouse=True)
-def _no_shared_history():
-    skill_drafts._HISTORY = None
-    yield
-    skill_drafts._HISTORY = None
+def _git(ws: Path) -> GitStore:
+    # Per-test history dir (tests use tmp_path itself as the workspace).
+    return GitStore(ws, DEFAULT_TRACKED_PATTERNS, git_dir=ws / ".test-history" / "workspace.git")
 
 
 def _skill_md(name: str, description: str = "Does a helpful thing") -> str:
@@ -116,7 +115,7 @@ def test_accept_overlays_and_keeps_untouched_live_files(tmp_path: Path) -> None:
     )
     _write_draft(tmp_path, "demo", {"SKILL.md": _skill_md("demo", "Updated description")})
 
-    problems = skill_drafts.accept(tmp_path, "demo")
+    problems = skill_drafts.accept(tmp_path, "demo", _git(tmp_path))
 
     assert problems == []
     assert "Updated description" in _read(tmp_path, "skills/demo/SKILL.md")
@@ -128,7 +127,7 @@ def test_accept_overlays_and_keeps_untouched_live_files(tmp_path: Path) -> None:
 def test_accept_new_skill_creates_dir(tmp_path: Path) -> None:
     _write_draft(tmp_path, "new-skill", {"SKILL.md": _skill_md("new-skill")})
 
-    assert skill_drafts.accept(tmp_path, "new-skill") == []
+    assert skill_drafts.accept(tmp_path, "new-skill", _git(tmp_path)) == []
     assert _read(tmp_path, "skills/new-skill/SKILL.md").startswith("---")
     assert skill_drafts.list_drafts(tmp_path) == []
 
@@ -136,7 +135,7 @@ def test_accept_new_skill_creates_dir(tmp_path: Path) -> None:
 def test_accept_refuses_invalid_frontmatter(tmp_path: Path) -> None:
     _write_draft(tmp_path, "broken", {"SKILL.md": "# no frontmatter at all\n"})
 
-    problems = skill_drafts.accept(tmp_path, "broken")
+    problems = skill_drafts.accept(tmp_path, "broken", _git(tmp_path))
 
     assert problems
     assert any("frontmatter" in problem.lower() for problem in problems)
@@ -147,7 +146,7 @@ def test_accept_refuses_invalid_frontmatter(tmp_path: Path) -> None:
 def test_accept_refuses_frontmatter_name_mismatch(tmp_path: Path) -> None:
     _write_draft(tmp_path, "right-name", {"SKILL.md": _skill_md("wrong-name")})
 
-    problems = skill_drafts.accept(tmp_path, "right-name")
+    problems = skill_drafts.accept(tmp_path, "right-name", _git(tmp_path))
 
     assert any("wrong-name" in problem for problem in problems)
     assert not (tmp_path / "skills/right-name").exists()
@@ -162,7 +161,7 @@ def test_check_flags_illegal_root_file_in_live_skill(tmp_path: Path) -> None:
     problems = skill_drafts.check(tmp_path, "demo")
 
     assert any("state.json" in problem for problem in problems)
-    assert skill_drafts.accept(tmp_path, "demo") != []
+    assert skill_drafts.accept(tmp_path, "demo", _git(tmp_path)) != []
 
 
 def test_check_passes_valid_draft_with_resource_dirs(tmp_path: Path) -> None:
@@ -177,16 +176,16 @@ def test_reject_deletes_draft_only(tmp_path: Path) -> None:
     _write_live(tmp_path, "demo", {"SKILL.md": _skill_md("demo"), "scripts/keep.py": "x = 1\n"})
     _write_draft(tmp_path, "demo", {"SKILL.md": _skill_md("demo", "Changed")})
 
-    assert skill_drafts.reject(tmp_path, "demo") is True
+    assert skill_drafts.reject(tmp_path, "demo", _git(tmp_path)) is True
     assert _read(tmp_path, "skills/demo/SKILL.md") == _skill_md("demo")
     assert _read(tmp_path, "skills/demo/scripts/keep.py") == "x = 1\n"
     assert not (tmp_path / "skills/_proposed/demo").exists()
-    assert skill_drafts.reject(tmp_path, "demo") is False
+    assert skill_drafts.reject(tmp_path, "demo", _git(tmp_path)) is False
 
 
 def test_accept_rejects_path_traversal_names(tmp_path: Path) -> None:
-    assert skill_drafts.accept(tmp_path, "../evil") != []
-    assert skill_drafts.accept(tmp_path, "") != []
+    assert skill_drafts.accept(tmp_path, "../evil", _git(tmp_path)) != []
+    assert skill_drafts.accept(tmp_path, "", _git(tmp_path)) != []
 
 
 # ---------------------------------------------------------------------------
@@ -354,8 +353,7 @@ def test_offer_lists_check_problems(tmp_path: Path) -> None:
 
 
 def test_accept_commit_fires_no_offer_for_deleted_draft(tmp_path: Path) -> None:
-    """The accept commit's changed paths touch _proposed/ but the draft is gone:
-    exactly one offer (from the original turn commit), none from the accept."""
+    """A commit whose changed paths touch an accepted (deleted) draft offers nothing."""
     _write_draft(tmp_path, "demo", {"SKILL.md": _skill_md("demo")})
     published, publish = _collect_publish()
     history = FakeHistory()
@@ -367,40 +365,142 @@ def test_accept_commit_fires_no_offer_for_deleted_draft(tmp_path: Path) -> None:
         commit_message=lambda sha: history.commits[-1]["message"],
     )
 
-    skill_drafts.accept(tmp_path, "demo")
+    assert skill_drafts.accept(tmp_path, "demo", _git(tmp_path)) == []
 
-    assert published == []
-    assert history.latest_subject == "skill: accept demo"
-
-    # Even if SM-02 hands the callback the accept commit's real changed paths,
-    # the draft directory is gone: no offer.
     history.record_turn_commit(
-        "skill: accept demo", session_key="cli:direct", channel="cli",
+        "turn t-2", session_key="cli:direct", channel="cli",
         changed_paths=["skills/_proposed/demo/SKILL.md"],
     )
     assert published == []
 
 
-def test_accept_commits(tmp_path: Path) -> None:
+# ---------------------------------------------------------------------------
+# accept / reject are recorded in workspace history and never lose data
+# ---------------------------------------------------------------------------
+
+
+def test_accept_commits_and_overwrite_is_revertible(tmp_path: Path) -> None:
+    _write_live(tmp_path, "demo", {"SKILL.md": _skill_md("demo", "Old description")})
+    _write_draft(tmp_path, "demo", {"SKILL.md": _skill_md("demo", "New description")})
+    git = _git(tmp_path)
+
+    assert skill_drafts.accept(tmp_path, "demo", git) == []
+
+    newest = git.log(max_entries=1)[0]
+    assert newest.subject() == "skill: accept demo"
+    assert "New description" in _read(tmp_path, "skills/demo/SKILL.md")
+    assert git.revert(newest.sha) is not None
+    assert "Old description" in _read(tmp_path, "skills/demo/SKILL.md")
+
+
+def test_accept_records_uncommitted_live_state_first(tmp_path: Path) -> None:
+    """A live edit made after the last commit is snapshotted before accept
+    overwrites it, so it can be restored too."""
+    git = _git(tmp_path)
+    _write_live(tmp_path, "demo", {"SKILL.md": _skill_md("demo", "Committed")})
+    git.init()
+    _write_live(tmp_path, "demo", {"SKILL.md": _skill_md("demo", "Hand edited")})
+    _write_draft(tmp_path, "demo", {"SKILL.md": _skill_md("demo", "Draft")})
+
+    assert skill_drafts.accept(tmp_path, "demo", git) == []
+
+    subjects = [c.subject() for c in git.log(max_entries=3)]
+    assert subjects[:2] == ["skill: accept demo", "skill: before accept demo"]
+    git.revert(git.log(max_entries=1)[0].sha)
+    assert "Hand edited" in _read(tmp_path, "skills/demo/SKILL.md")
+
+
+def test_accept_refuses_when_history_cannot_record(tmp_path: Path) -> None:
+    _write_live(tmp_path, "demo", {"SKILL.md": _skill_md("demo", "Old")})
+    _write_draft(tmp_path, "demo", {"SKILL.md": _skill_md("demo", "New")})
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("x", encoding="utf-8")
+    broken = GitStore(tmp_path, DEFAULT_TRACKED_PATTERNS, git_dir=blocker / "workspace.git")
+
+    problems = skill_drafts.accept(tmp_path, "demo", broken)
+
+    assert problems and "nothing changed" in problems[0]
+    assert "Old" in _read(tmp_path, "skills/demo/SKILL.md")
+    assert (tmp_path / "skills/_proposed/demo/SKILL.md").exists()
+
+
+def test_accept_refuses_overwrite_of_file_too_big_for_history(tmp_path: Path) -> None:
+    from nanobot.utils.gitstore import _MAX_TRACKED_FILE_BYTES
+
+    big = b"a" * (_MAX_TRACKED_FILE_BYTES + 1)
+    _write_live(tmp_path, "demo", {"SKILL.md": _skill_md("demo"), "assets/big.bin": big})
+    _write_draft(tmp_path, "demo", {"assets/big.bin": b"small"})
+
+    problems = skill_drafts.accept(tmp_path, "demo", _git(tmp_path))
+
+    assert any("too large for workspace history" in p for p in problems)
+    assert (tmp_path / "skills/demo/assets/big.bin").read_bytes() == big
+
+
+def test_accept_is_all_or_nothing_on_write_failure(tmp_path: Path, monkeypatch) -> None:
+    _write_live(tmp_path, "demo", {"SKILL.md": _skill_md("demo", "Old"), "scripts/a.py": "old\n"})
+    _write_draft(
+        tmp_path, "demo",
+        {"SKILL.md": _skill_md("demo", "New"), "scripts/a.py": "new\n"},
+    )
+    git = _git(tmp_path)
+    real_mkstemp = skill_drafts.tempfile.mkstemp
+    calls = {"n": 0}
+
+    def flaky_mkstemp(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise OSError("disk full")
+        return real_mkstemp(*args, **kwargs)
+
+    monkeypatch.setattr(skill_drafts.tempfile, "mkstemp", flaky_mkstemp)
+    with pytest.raises(OSError):
+        skill_drafts.accept(tmp_path, "demo", git)
+
+    assert "Old" in _read(tmp_path, "skills/demo/SKILL.md")
+    assert _read(tmp_path, "skills/demo/scripts/a.py") == "old\n"
+    assert not [p for p in (tmp_path / "skills/demo").rglob(".skill-draft-*")]
+    assert (tmp_path / "skills/_proposed/demo/SKILL.md").exists()
+
+
+def test_draft_symlink_out_of_workspace_is_refused_and_not_read(tmp_path: Path) -> None:
+    ws = tmp_path / "ws"
+    secret = tmp_path / "secret.txt"
+    secret.write_text("TOP SECRET\n", encoding="utf-8")
+    _write_draft(ws, "demo", {"SKILL.md": _skill_md("demo")})
+    (ws / "skills/_proposed/demo/leak.md").symlink_to(secret)
+
+    problems = skill_drafts.accept(ws, "demo", _git(ws))
+
+    assert any("symlink" in p for p in problems)
+    assert not (ws / "skills/demo").exists()
+    assert "TOP SECRET" not in skill_drafts.diff(ws, "demo")
+    assert "leak.md" not in skill_drafts.merged_view(ws, "demo")
+
+
+def test_symlinked_live_skill_dir_is_refused(tmp_path: Path) -> None:
+    """skills/<name> pointing outside the workspace must not be written through."""
+    ws = tmp_path / "ws"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (ws / "skills").mkdir(parents=True)
+    (ws / "skills" / "demo").symlink_to(outside, target_is_directory=True)
+    _write_draft(ws, "demo", {"SKILL.md": _skill_md("demo")})
+
+    problems = skill_drafts.accept(ws, "demo", _git(ws))
+
+    assert any("symlink" in p for p in problems)
+    assert list(outside.iterdir()) == []
+
+
+def test_reject_commits_draft_first_so_it_is_restorable(tmp_path: Path) -> None:
     _write_draft(tmp_path, "demo", {"SKILL.md": _skill_md("demo")})
-    history = FakeHistory()
-    skill_drafts.wire(history, workspace=tmp_path, publish=lambda m: None)
+    git = _git(tmp_path)
 
-    assert skill_drafts.accept(tmp_path, "demo") == []
-    assert history.latest_subject == "skill: accept demo"
+    assert skill_drafts.reject(tmp_path, "demo", git) is True
 
-
-def test_reject_commits(tmp_path: Path) -> None:
-    _write_draft(tmp_path, "demo", {"SKILL.md": _skill_md("demo")})
-    history = FakeHistory()
-    skill_drafts.wire(history, workspace=tmp_path, publish=lambda m: None)
-
-    assert skill_drafts.reject(tmp_path, "demo") is True
-    assert history.latest_subject == "skill: reject demo"
-
-
-def test_commits_are_skipped_without_history(tmp_path: Path) -> None:
-    """Pre-SM-02 degradation: accept/reject still work, commit is skipped."""
-    _write_draft(tmp_path, "demo", {"SKILL.md": _skill_md("demo")})
-
-    assert skill_drafts.accept(tmp_path, "demo") == []
+    newest = git.log(max_entries=1)[0]
+    assert newest.subject() == "skill: reject demo"
+    assert not (tmp_path / "skills/_proposed/demo").exists()
+    git.revert(newest.sha)
+    assert (tmp_path / "skills/_proposed/demo/SKILL.md").exists()

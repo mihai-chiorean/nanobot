@@ -151,9 +151,22 @@ async def test_skill_command_registered_on_router(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _ctx_args(loop: AgentLoop, raw: str, args: str) -> CommandContext:
+@pytest.fixture
+def ws(tmp_path: Path) -> Path:
+    # A workspace subdir, so its history (<ws>/../history) is per-test.
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    return workspace
+
+
+def _ctx_args(
+    loop: AgentLoop, raw: str, args: str, *, is_user_turn: bool = True
+) -> CommandContext:
     msg = InboundMessage(channel="cli", sender_id="user", chat_id="direct", content=raw)
-    return CommandContext(msg=msg, session=None, key=msg.session_key, raw=raw, args=args, loop=loop)
+    return CommandContext(
+        msg=msg, session=None, key=msg.session_key, raw=raw, args=args, loop=loop,
+        is_user_turn=is_user_turn,
+    )
 
 
 def _write_draft(ws: Path, name: str, *, valid: bool = True) -> None:
@@ -169,9 +182,9 @@ def _write_draft(ws: Path, name: str, *, valid: bool = True) -> None:
 
 
 @pytest.mark.asyncio
-async def test_skill_drafts_lists_pending(tmp_path: Path) -> None:
-    _write_draft(tmp_path, "demo")
-    loop = _make_loop(tmp_path)
+async def test_skill_drafts_lists_pending(ws: Path) -> None:
+    _write_draft(ws, "demo")
+    loop = _make_loop(ws)
 
     out = await cmd_skill(_ctx_args(loop, "/skill drafts", "drafts"))
 
@@ -179,8 +192,8 @@ async def test_skill_drafts_lists_pending(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_skill_drafts_empty(tmp_path: Path) -> None:
-    loop = _make_loop(tmp_path)
+async def test_skill_drafts_empty(ws: Path) -> None:
+    loop = _make_loop(ws)
 
     out = await cmd_skill(_ctx_args(loop, "/skill drafts", "drafts"))
 
@@ -188,9 +201,9 @@ async def test_skill_drafts_empty(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_skill_diff_shows_overlay(tmp_path: Path) -> None:
-    _write_draft(tmp_path, "demo")
-    loop = _make_loop(tmp_path)
+async def test_skill_diff_shows_overlay(ws: Path) -> None:
+    _write_draft(ws, "demo")
+    loop = _make_loop(ws)
 
     out = await cmd_skill(_ctx_args(loop, "/skill diff demo", "diff demo"))
 
@@ -199,8 +212,8 @@ async def test_skill_diff_shows_overlay(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_skill_diff_unknown_draft(tmp_path: Path) -> None:
-    loop = _make_loop(tmp_path)
+async def test_skill_diff_unknown_draft(ws: Path) -> None:
+    loop = _make_loop(ws)
 
     out = await cmd_skill(_ctx_args(loop, "/skill diff ghost", "diff ghost"))
 
@@ -208,38 +221,38 @@ async def test_skill_diff_unknown_draft(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_skill_accept_refuses_invalid_frontmatter(tmp_path: Path) -> None:
-    _write_draft(tmp_path, "demo", valid=False)
-    loop = _make_loop(tmp_path)
+async def test_skill_accept_refuses_invalid_frontmatter(ws: Path) -> None:
+    _write_draft(ws, "demo", valid=False)
+    loop = _make_loop(ws)
 
     out = await cmd_skill(_ctx_args(loop, "/skill accept demo", "accept demo"))
 
     assert "Not accepting draft 'demo'" in out.content
     assert "frontmatter" in out.content.lower()
-    assert (tmp_path / "skills/_proposed/demo/SKILL.md").exists()
-    assert not (tmp_path / "skills/demo").exists()
+    assert (ws / "skills/_proposed/demo/SKILL.md").exists()
+    assert not (ws / "skills/demo").exists()
 
 
 @pytest.mark.asyncio
-async def test_skill_accept_then_reject_flow(tmp_path: Path) -> None:
-    _write_draft(tmp_path, "demo")
-    loop = _make_loop(tmp_path)
+async def test_skill_accept_then_reject_flow(ws: Path) -> None:
+    _write_draft(ws, "demo")
+    loop = _make_loop(ws)
 
     out = await cmd_skill(_ctx_args(loop, "/skill accept demo", "accept demo"))
     assert "Accepted skill draft 'demo'" in out.content
-    assert (tmp_path / "skills/demo/SKILL.md").exists()
-    assert not (tmp_path / "skills/_proposed/demo").exists()
+    assert (ws / "skills/demo/SKILL.md").exists()
+    assert not (ws / "skills/_proposed/demo").exists()
 
-    _write_draft(tmp_path, "demo")
+    _write_draft(ws, "demo")
     out = await cmd_skill(_ctx_args(loop, "/skill reject demo", "reject demo"))
     assert "Rejected skill draft 'demo'" in out.content
     # The live skill survived the reject.
-    assert (tmp_path / "skills/demo/SKILL.md").exists()
+    assert (ws / "skills/demo/SKILL.md").exists()
 
 
 @pytest.mark.asyncio
-async def test_skill_reject_missing_draft(tmp_path: Path) -> None:
-    loop = _make_loop(tmp_path)
+async def test_skill_reject_missing_draft(ws: Path) -> None:
+    loop = _make_loop(ws)
 
     out = await cmd_skill(_ctx_args(loop, "/skill reject ghost", "reject ghost"))
 
@@ -247,8 +260,8 @@ async def test_skill_reject_missing_draft(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_skill_invalid_name_is_refused(tmp_path: Path) -> None:
-    loop = _make_loop(tmp_path)
+async def test_skill_invalid_name_is_refused(ws: Path) -> None:
+    loop = _make_loop(ws)
 
     out = await cmd_skill(_ctx_args(loop, "/skill accept ../../etc", "accept ../../etc"))
 
@@ -256,8 +269,8 @@ async def test_skill_invalid_name_is_refused(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_skill_unknown_subcommand_shows_usage(tmp_path: Path) -> None:
-    loop = _make_loop(tmp_path)
+async def test_skill_unknown_subcommand_shows_usage(ws: Path) -> None:
+    loop = _make_loop(ws)
 
     out = await cmd_skill(_ctx_args(loop, "/skill bogus", "bogus"))
 
@@ -265,13 +278,43 @@ async def test_skill_unknown_subcommand_shows_usage(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_skill_subcommands_dispatch_via_router(tmp_path: Path) -> None:
-    _write_draft(tmp_path, "demo")
+async def test_skill_subcommands_dispatch_via_router(ws: Path) -> None:
+    _write_draft(ws, "demo")
     router = CommandRouter()
     register_builtin_commands(router)
-    loop = _make_loop(tmp_path)
+    loop = _make_loop(ws)
 
     out = await router.dispatch(_ctx(loop, "/skill drafts"))
 
     assert out is not None
     assert "**demo** — Drafted for you" in out.content
+
+
+@pytest.mark.asyncio
+async def test_skill_accept_and_reject_refused_outside_a_user_turn(ws: Path) -> None:
+    """Cron/trigger/subagent turns and mid-turn injected commands are not user
+    turns: "/skill accept" routed there must not let the agent accept its own draft."""
+    _write_draft(ws, "demo")
+    loop = _make_loop(ws)
+
+    for sub in ("accept", "reject"):
+        out = await cmd_skill(
+            _ctx_args(loop, f"/skill {sub} demo", f"{sub} demo", is_user_turn=False)
+        )
+        assert "only runs as your own chat message" in out.content
+
+    assert (ws / "skills/_proposed/demo/SKILL.md").exists()
+    assert not (ws / "skills/demo").exists()
+
+
+@pytest.mark.asyncio
+async def test_skill_accept_is_recorded_in_workspace_history(ws: Path) -> None:
+    _write_draft(ws, "demo")
+    loop = _make_loop(ws)
+
+    out = await cmd_skill(_ctx_args(loop, "/skill accept demo", "accept demo"))
+
+    assert "Accepted skill draft 'demo'" in out.content
+    git = loop.consolidator.store.git
+    assert git._git_dir == ws.parent / "history" / "workspace.git"
+    assert git.log(max_entries=1)[0].subject() == "skill: accept demo"

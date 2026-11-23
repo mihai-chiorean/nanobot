@@ -17,6 +17,7 @@ from nanobot import __version__
 from nanobot.bus.events import INBOUND_META_USER_SHELL, OutboundMessage
 from nanobot.command.router import CommandContext, CommandRouter, normalize_command_text
 from nanobot.providers.base import LLMUsage
+from nanobot.utils.gitstore import GitStoreError
 from nanobot.utils.helpers import build_status_content
 from nanobot.utils.restart import set_restart_notice_to_env
 from nanobot.utils.workspace_prompts import initialize_workspace_prompt
@@ -1025,6 +1026,18 @@ async def cmd_skill(ctx: CommandContext) -> OutboundMessage:
         return _skill_reply(ctx, _SKILL_USAGE, as_text=True)
     if not name:
         return _skill_reply(ctx, f"{sub.capitalize()} needs a skill name.\n\n{_SKILL_USAGE}", as_text=True)
+    if sub in {"accept", "reject"} and not ctx.is_user_turn:
+        # Only the user activates or discards a draft. Automation turns (cron,
+        # triggers, subagent/session relays) and commands injected mid-turn
+        # never get here with is_user_turn set, so the agent cannot accept its
+        # own draft by routing "/skill accept" back into a session.
+        return _skill_reply(
+            ctx,
+            f"/skill {sub} only runs as your own chat message while no task is "
+            "running in this chat. Send it again when the current task finishes.",
+            as_text=True,
+        )
+    history = loop.consolidator.store.git
 
     try:
         if sub == "diff":
@@ -1033,22 +1046,24 @@ async def cmd_skill(ctx: CommandContext) -> OutboundMessage:
             except skill_drafts.SkillDraftError as exc:
                 return _skill_reply(ctx, str(exc), as_text=True)
         if sub == "accept":
-            problems = skill_drafts.accept(ws, name)
+            problems = skill_drafts.accept(ws, name, history)
             if problems:
                 body = "\n".join(f"- {problem}" for problem in problems)
                 return _skill_reply(
                     ctx, f"Not accepting draft '{name}' — fix these first:\n{body}"
                 )
             return _skill_reply(
-                ctx, f"Accepted skill draft '{name}'. It is live now at skills/{name}/."
+                ctx,
+                f"Accepted skill draft '{name}'. It is live now at skills/{name}/ "
+                "(recorded in workspace history).",
             )
         # reject
-        if skill_drafts.reject(ws, name):
+        if skill_drafts.reject(ws, name, history):
             return _skill_reply(ctx, f"Rejected skill draft '{name}'. The live skill is unchanged.")
         return _skill_reply(ctx, f"No draft named '{name}'.")
     except skill_drafts.SkillDraftError as exc:
         return _skill_reply(ctx, str(exc), as_text=True)
-    except OSError as exc:
+    except (OSError, GitStoreError) as exc:
         logger.exception("skill command: {} {} failed", sub, name)
         return _skill_reply(ctx, f"Could not {sub} draft '{name}': {exc}", as_text=True)
 

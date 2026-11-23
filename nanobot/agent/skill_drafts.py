@@ -7,10 +7,14 @@ or change.  The **merged view** of a draft is the live ``skills/<name>/``
 (possibly absent for a new skill) with the draft's files laid over it.
 
 Nothing goes live until the owner sends ``/skill accept <name>`` (a user
-message, so the model cannot accept its own draft).  Accept copies each draft
-file over the live skill -- creating directories, atomic writes, and it
-**never deletes live files** -- then deletes the draft dir and records the
-change through the SM-02 workspace history.
+turn, so the model cannot accept its own draft; ``cmd_skill`` refuses accept
+and reject from any other turn).  Accept first commits the current state to
+the workspace history (the bare GitStore at ``<workspace>/../history``), so
+every live file it overwrites and the draft it removes stay restorable, then
+copies the draft's files over the live skill (staged temp files, then
+renames; it **never deletes live files**), deletes the draft dir and commits
+``skill: accept <name>``.  Drafts or live skills containing symlinks are
+refused: nothing is read or written through a link.
 
 An ``on_commit`` callback (:func:`make_offer_callback`, attached by
 :func:`wire`) watches commits that touch ``skills/_proposed/<name>/`` and
@@ -19,13 +23,12 @@ commit, and for a Dream commit to the owner's most recent non-room session --
 never a shared room, whose guests can be testers and drafts are built from
 the owner's private workflows.
 
-Integration note (SM-02, MIT-1845): ``wire`` expects SM-02's
-``WorkspaceHistory`` -- an object with an ``on_commit`` list of
-``(sha, changed_paths)`` callables and
-``commit_if_changed(subject, session_key=None, channel=None) -> sha | None``.
-Turn commits carry ``session: <key>`` in the message body; Dream commits carry
-no session line.  Until SM-02 lands, the seams stay unset and every entry
-point degrades safely (checks/commands work, no commits, no offers).
+Integration note (SM-02, MIT-1845): ``wire`` attaches the offer callback to
+an ``on_commit`` list of ``(sha, changed_paths)`` callables, which SM-02's
+per-turn commits will provide.  Turn commits carry ``session: <key>`` in the
+message body; Dream commits carry no session line.  Until SM-02 is wired, no
+offers are sent; drafts still show in ``/skill drafts``.  Accept/reject do not
+depend on SM-02: they commit through the GitStore handed to them.
 """
 
 from __future__ import annotations
@@ -45,14 +48,16 @@ from typing import Any
 
 from loguru import logger
 
-from nanobot.agent.skills import parse_skill_metadata, valid_skill_metadata
+from nanobot.agent.skills import (
+    PROPOSED_SKILLS_DIR,
+    parse_skill_metadata,
+    valid_skill_metadata,
+)
 from nanobot.bus.events import INBOUND_META_ROOM_SCOPE, OutboundMessage
 from nanobot.session.keys import UNIFIED_SESSION_KEY, last_channel_from_metadata
+from nanobot.utils.gitstore import _MAX_TRACKED_FILE_BYTES, GitStore, history_dir_for
 
-# Canonical definition lives in nanobot/agent/tools/filesystem.py (SM-04);
-# mirrored here so this module does not import the tool stack.  Skill names
-# may not contain "_" (skills.py:_SKILL_NAME), so no real skill can collide.
-PROPOSED_DIR = "_proposed"
+PROPOSED_DIR = PROPOSED_SKILLS_DIR
 
 # Same cap the workspace-history working-tree diff uses (gitstore.py).
 DIFF_MAX_CHARS = 6000
@@ -61,10 +66,6 @@ _SKILL_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
 
 _VALIDATORS: ModuleType | None = None
 _VALIDATORS_RESOLVED = False
-
-# The SM-02 WorkspaceHistory instance registered via wire(); accept/reject
-# commit through it.  None until SM-02 lands and wiring calls wire().
-_HISTORY: Any = None
 
 
 class SkillDraftError(ValueError):
@@ -117,20 +118,55 @@ def draft_dir(ws: Path | str, name: str) -> Path:
     return skills_root(ws) / PROPOSED_DIR / _validate_name(name)
 
 
+def _symlinks(base: Path) -> list[str]:
+    """Relpaths of symlinks (to files or dirs) anywhere under *base*."""
+    links: list[str] = []
+    if base.is_symlink() or not base.is_dir():
+        return links
+    for dirpath, dirnames, filenames in os.walk(base, followlinks=False):
+        for entry in [*dirnames, *filenames]:
+            path = Path(dirpath) / entry
+            if path.is_symlink():
+                links.append(path.relative_to(base).as_posix())
+    return sorted(links)
+
+
 def _iter_files(base: Path) -> dict[str, bytes]:
-    """All files under *base*, keyed by forward-slash relpath."""
+    """Regular files under *base*, keyed by forward-slash relpath.
+
+    Never follows a symlink: a link is how a draft could pull in a file from
+    outside the workspace (or from the history dir).  ``check`` reports links
+    as problems, so accept refuses such a draft.
+    """
     files: dict[str, bytes] = {}
-    if not base.is_dir():
+    if base.is_symlink() or not base.is_dir():
         return files
-    for path in sorted(base.rglob("*")):
-        if not path.is_file():
-            continue
-        rel = path.relative_to(base).as_posix()
-        try:
-            files[rel] = path.read_bytes()
-        except OSError:
-            logger.warning("skill_drafts: unreadable file {}", path)
-    return files
+    for dirpath, _dirnames, filenames in os.walk(base, followlinks=False):
+        for entry in filenames:
+            path = Path(dirpath) / entry
+            if path.is_symlink() or not path.is_file():
+                continue
+            rel = path.relative_to(base).as_posix()
+            try:
+                files[rel] = path.read_bytes()
+            except OSError:
+                logger.warning("skill_drafts: unreadable file {}", path)
+    return dict(sorted(files.items()))
+
+
+def _link_problems(ws: Path | str, name: str) -> list[str]:
+    """Symlinks on the draft's or live skill's path, or inside either tree."""
+    root = skills_root(ws)
+    problems: list[str] = []
+    for path in (root, root / PROPOSED_DIR, draft_dir(ws, name), live_skill_dir(ws, name)):
+        if path.is_symlink():
+            problems.append(f"{path.relative_to(Path(ws)).as_posix()} is a symlink")
+    if problems:
+        return problems
+    for label, base in (("Draft", draft_dir(ws, name)), ("Live skill", live_skill_dir(ws, name))):
+        for rel in _symlinks(base):
+            problems.append(f"{label} '{name}' contains a symlink: {rel}")
+    return problems
 
 
 def list_drafts(ws: Path | str) -> list[str]:
@@ -138,7 +174,9 @@ def list_drafts(ws: Path | str) -> list[str]:
     root = skills_root(ws) / PROPOSED_DIR
     if not root.is_dir():
         return []
-    return sorted(entry.name for entry in root.iterdir() if entry.is_dir())
+    return sorted(
+        entry.name for entry in root.iterdir() if entry.is_dir() and not entry.is_symlink()
+    )
 
 
 def merged_view(ws: Path | str, name: str) -> dict[str, bytes]:
@@ -165,6 +203,9 @@ def check(ws: Path | str, name: str) -> list[str]:
         return [str(exc)]
     if not draft_dir(ws, name).is_dir():
         return [f"No draft named '{name}'."]
+    links = _link_problems(ws, name)
+    if links:
+        return links
     merged = merged_view(ws, name)
     if not merged:
         return [f"Draft '{name}' is empty."]
@@ -294,69 +335,106 @@ def diff(ws: Path | str, name: str, *, max_chars: int = DIFF_MAX_CHARS) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _atomic_copy(src: Path, dst: Path) -> None:
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(dir=dst.parent, prefix=".skill-draft-")
-    try:
-        with os.fdopen(fd, "wb") as handle, open(src, "rb") as source:
-            shutil.copyfileobj(source, handle)
-        os.replace(tmp_name, dst)
-    except BaseException:
+def _prune_empty_proposed(draft: Path) -> None:
+    parent = draft.parent
+    if parent.is_dir() and not any(parent.iterdir()):
         with suppress(OSError):
-            os.unlink(tmp_name)
-        raise
+            parent.rmdir()
 
 
-def _commit(subject: str) -> None:
-    """Record *subject* through SM-02's WorkspaceHistory; no-op before it lands."""
-    if _HISTORY is None:
-        logger.debug(
-            "skill_drafts: no workspace history registered; skipping commit '{}'", subject
-        )
-        return
-    try:
-        _HISTORY.commit_if_changed(subject)
-    except Exception:
-        # SM-02 promises commit_if_changed never raises; belt and braces.
-        logger.exception("skill_drafts: history commit failed for '{}'", subject)
+def _ensure_history(history: GitStore) -> None:
+    if not history.is_initialized():
+        history.init()
 
 
-def accept(ws: Path | str, name: str) -> list[str]:
+def accept(ws: Path | str, name: str, history: GitStore) -> list[str]:
     """Apply draft *name* over the live skill. Returns problems; [] means accepted.
 
-    Never deletes live files: only the draft's own files are copied over.
+    Owner-initiated only (``/skill accept`` on a user turn).  Records the
+    pre-accept state in *history* first, so every live file it overwrites and
+    the draft it removes can be restored; refuses (writing nothing) when that
+    commit fails or a file is too large for history to hold.  Copies only the
+    draft's files, never deletes live files, then commits
+    ``skill: accept <name>``.
     """
     problems = check(ws, name)
     if problems:
         return problems
     live = live_skill_dir(ws, name)
     draft = draft_dir(ws, name)
-    for rel in _draft_files(ws, name):
-        rel_path = Path(rel)
-        if rel_path.is_absolute() or ".." in rel_path.parts:
-            return [f"Draft file '{rel}' escapes the skill directory."]
-        _atomic_copy(draft / rel_path, live / rel_path)
+    draft_files = _draft_files(ws, name)
+    live_files = _iter_files(live)
+    for rel, data in draft_files.items():
+        target = live / rel
+        if target.is_dir():
+            problems.append(f"Live skill has a directory where the draft has a file: {rel}")
+            continue
+        for parent in Path(rel).parents:
+            if str(parent) != "." and (live / parent).is_file():
+                problems.append(f"Live skill has a file where the draft needs a directory: {parent.as_posix()}")
+        old = live_files.get(rel)
+        if old is not None and old != data and len(old) > _MAX_TRACKED_FILE_BYTES:
+            problems.append(
+                f"Live file {rel} is too large for workspace history, so overwriting it "
+                "could not be undone"
+            )
+    if problems:
+        return problems
+
+    try:
+        _ensure_history(history)
+        history.auto_commit(f"skill: before accept {name}")
+    except Exception as exc:
+        logger.exception("skill_drafts: pre-accept history commit failed for '{}'", name)
+        return [f"Could not record the current state in workspace history ({exc}); nothing changed"]
+
+    # Stage every file before renaming any, so an I/O error leaves the live
+    # skill untouched rather than half-updated.
+    staged: list[tuple[str, Path]] = []
+    try:
+        for rel, data in draft_files.items():
+            target = live / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp_name = tempfile.mkstemp(dir=target.parent, prefix=".skill-draft-")
+            staged.append((tmp_name, target))
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+        for tmp_name, target in staged:
+            os.replace(tmp_name, target)
+    except BaseException:
+        for tmp_name, _target in staged:
+            with suppress(OSError):
+                os.unlink(tmp_name)
+        raise
     shutil.rmtree(draft)
-    parent = draft.parent
-    if parent.is_dir() and not any(parent.iterdir()):
-        with suppress(OSError):
-            parent.rmdir()
-    _commit(f"skill: accept {name}")
+    _prune_empty_proposed(draft)
+    try:
+        history.auto_commit(f"skill: accept {name}")
+    except Exception:
+        # The pre-accept commit already holds everything this changed.
+        logger.exception("skill_drafts: history commit failed for 'skill: accept {}'", name)
     return []
 
 
-def reject(ws: Path | str, name: str) -> bool:
-    """Delete draft *name* (live files untouched). True if a draft was removed."""
+def reject(ws: Path | str, name: str, history: GitStore) -> bool:
+    """Delete draft *name* (live files untouched). True if a draft was removed.
+
+    Owner-initiated only.  The draft is committed to *history* before it is
+    deleted, so a reject can be undone; if that commit fails nothing is
+    deleted and the error propagates.
+    """
     _validate_name(name)
     draft = draft_dir(ws, name)
-    if not draft.is_dir():
+    if draft.is_symlink() or not draft.is_dir():
         return False
+    _ensure_history(history)
+    history.auto_commit(f"skill: before reject {name}")
     shutil.rmtree(draft)
-    parent = draft.parent
-    if parent.is_dir() and not any(parent.iterdir()):
-        with suppress(OSError):
-            parent.rmdir()
-    _commit(f"skill: reject {name}")
+    _prune_empty_proposed(draft)
+    try:
+        history.auto_commit(f"skill: reject {name}")
+    except Exception:
+        logger.exception("skill_drafts: history commit failed for 'skill: reject {}'", name)
     return True
 
 
@@ -391,12 +469,10 @@ def draft_names_touched(changed_paths: Iterable[str]) -> list[str]:
 def commit_message_for(ws: Path | str, sha: str) -> str | None:
     """Commit body of *sha* (full or short) from the workspace history repo.
 
-    The SM-01 bare repo at ``<workspace>/../history/workspace.git`` first, the
-    legacy in-workspace ``.git`` second; mirrors GitStore's dual-location
-    handling.  Returns None when neither repo holds the commit.
+    The SM-01 bare repo at ``<workspace>/../history/workspace.git`` (the only
+    history location since MIT-1842).  Returns None when it lacks the commit.
     """
-    ws = Path(ws)
-    candidates = [ws.parent / "history" / "workspace.git", ws / ".git"]
+    candidates = [history_dir_for(Path(ws)) / "workspace.git"]
     needle = sha.lower()
     for git_dir in candidates:
         if not git_dir.exists():
@@ -617,19 +693,16 @@ def wire(
     sessions: SessionSource | None = None,
     commit_message: Callable[[str], str | None] | None = None,
 ) -> Callable[[str, list[str]], None]:
-    """Attach draft offers to SM-02's WorkspaceHistory and enable accept/reject commits.
+    """Attach draft offers to SM-02's per-turn commit hook (``history.on_commit``).
 
-    Call once at startup with the same ``WorkspaceHistory`` instance the agent
-    loop commits through.  *publish* delivers an OutboundMessage (the wiring
+    Call once at startup with the object the agent loop commits turns through.  *publish* delivers an OutboundMessage (the wiring
     passes a ``bus.publish_outbound`` bridge safe to call from the commit
     thread).  Returns the registered callback.
     """
-    global _HISTORY
     callback = make_offer_callback(
         workspace, publish=publish, sessions=sessions, commit_message=commit_message
     )
     history.on_commit.append(callback)
-    _HISTORY = history
     return callback
 
 
