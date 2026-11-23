@@ -226,31 +226,14 @@ class SkillsLoader:
         Returns:
             Markdown-formatted skills summary.
         """
-        return self.build_skills_summary_with_sha(exclude=exclude, workspace=workspace)[0]
-
-    def build_skills_summary_with_sha(
-        self,
-        exclude: set[str] | None = None,
-        *,
-        workspace: Path | None = None,
-    ) -> tuple[str, str | None]:
-        """As ``build_skills_summary``, plus a content hash of what was listed.
-
-        The second element is ``skills_listed_sha`` (TP-06): the first 16 hex
-        chars of sha256 over the sorted ``name:skill_file_sha(SKILL.md)``
-        lines of the skills actually listed — ``None`` when nothing was. It
-        lets a turn record prove which skill set the summary showed, with the
-        summary text itself unchanged.
-        """
         all_skills = self.list_skills(filter_unavailable=False)
         if not all_skills:
-            return "", None
+            return ""
 
         agent_workspace = self.workspace.expanduser().resolve()
         project_workspace = (workspace or self.workspace).expanduser().resolve()
         use_relative_roots = project_workspace == agent_workspace
         sections: list[str] = []
-        listed_lines: list[str] = []
         groups = (
             ("Workspace skills", "workspace", self.workspace_skills),
             ("Agent Plugin skills", "plugin", self.workspace / "plugins"),
@@ -282,19 +265,28 @@ class SkillsLoader:
                     suffix = f" (unavailable: {missing})" if missing else " (unavailable)"
                 relative_path = Path(entry["path"]).relative_to(root).as_posix()
                 lines.append(f"- **{skill_name}** — {desc}{suffix}  `{relative_path}`")
-                try:
-                    listed_lines.append(f"{skill_name}:{skill_file_sha(entry['path'])}")
-                except OSError:
-                    # Provenance must never alter the prompt: an unreadable
-                    # file still lists, it just hashes as unreadable.
-                    listed_lines.append(f"{skill_name}:unreadable")
             sections.append("\n".join(lines))
-        listed_sha = (
-            hashlib.sha256("\n".join(sorted(listed_lines)).encode("utf-8")).hexdigest()[:16]
-            if listed_lines
-            else None
+        return "\n\n".join(sections)
+
+    def skills_listed_sha(self, exclude: set[str] | None = None) -> str | None:
+        """Content hash of the skills ``build_skills_summary`` lists (TP-06).
+
+        First 16 hex chars of sha256 over the sorted ``name:skill_file_sha``
+        lines of the same skill set the summary shows (same sources, same
+        ``exclude``); ``None`` when it lists nothing. Kept apart from the
+        summary so hashing never runs inside prompt rendering. May raise
+        (an unreadable file): callers run it inside the provenance boundary.
+        """
+        listed_sources = {"workspace", "plugin", "builtin"}
+        lines = sorted(
+            f"{entry['name']}:{skill_file_sha(entry['path'])}"
+            for entry in self.list_skills(filter_unavailable=False)
+            if entry["source"] in listed_sources
+            and (not exclude or entry["name"] not in exclude)
         )
-        return "\n\n".join(sections), listed_sha
+        if not lines:
+            return None
+        return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()[:16]
 
     @staticmethod
     def _requirement_lists(skill_meta: dict[str, Any]) -> tuple[list[str], list[str]]:

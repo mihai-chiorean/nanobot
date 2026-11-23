@@ -49,6 +49,21 @@ async def handle_runtime_control(state: Any, msg: InboundMessage, tools: ToolReg
     return await image_generation_tools.handle_runtime_control(state, msg, tools)
 
 
+def _fingerprint_sections(pieces: list[tuple[str, str]]) -> list[dict[str, Any]]:
+    """Fingerprint already-rendered prompt sections (TP-06).
+
+    Provenance is observability: any failure here is logged content-free and
+    yields no fingerprint, never a failed or altered prompt.
+    """
+    try:
+        return [_fingerprint_entry(key, text) for key, text in pieces]
+    except Exception as exc:
+        from nanobot.agent.turn_provenance import log_recording_failure
+
+        log_recording_failure("fingerprinting the system prompt", exc)
+        return []
+
+
 def _fingerprint_entry(section: str, text: str) -> dict[str, Any]:
     """One ``{section, sha, bytes}`` entry for a system-prompt section (TP-06)."""
     raw = text.encode("utf-8")
@@ -202,24 +217,23 @@ class ContextBuilder:
             # bootstrap files, memory and skills all describe private context
             # that must not reach a guest-visible conversation.
             prompt = self.SHARED_ROOM_SYSTEM_PROMPT
-            return prompt, [_fingerprint_entry("shared_room", prompt)]
+            return prompt, _fingerprint_sections([("shared_room", prompt)])
         root = workspace or self.workspace
         parts: list[str] = []
-        sections: list[dict[str, Any]] = []
+        # (section key, exact text) for each fingerprinted piece; hashed only
+        # after the prompt is rendered so hashing can never change or abort it.
+        pieces: list[tuple[str, str]] = []
 
         def _add(section: str, key: str) -> None:
             parts.append(section)
-            sections.append(_fingerprint_entry(key, section))
+            pieces.append((key, section))
 
         _add(self._get_identity(channel=channel, workspace=root), "identity")
 
         bootstrap_parts = self._load_bootstrap_parts(root)
         if bootstrap_parts:
             parts.append("\n\n".join(chunk for _filename, chunk in bootstrap_parts))
-            sections.extend(
-                _fingerprint_entry(f"bootstrap.{filename}", chunk)
-                for filename, chunk in bootstrap_parts
-            )
+            pieces.extend((f"bootstrap.{filename}", chunk) for filename, chunk in bootstrap_parts)
 
         if self.workflow_scheduling:
             _add(
@@ -252,7 +266,7 @@ class ContextBuilder:
             if active_content:
                 _add(f"# Active Skills\n\n{active_content}", "active_skills")
 
-        skills_summary, _skills_listed_sha = self.skills.build_skills_summary_with_sha(
+        skills_summary = self.skills.build_skills_summary(
             exclude=set(active_skills),
             workspace=root,
         )
@@ -270,7 +284,8 @@ class ContextBuilder:
                 "archived_summary",
             )
 
-        return "\n\n---\n\n".join(parts), sections
+        prompt = "\n\n---\n\n".join(parts)
+        return prompt, _fingerprint_sections(pieces)
 
     def _get_identity(self, channel: str | None = None, workspace: Path | None = None) -> str:
         """Get the core identity section."""

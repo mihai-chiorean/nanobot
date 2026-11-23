@@ -522,9 +522,24 @@ class _TurnProvenanceHook(AgentHook):
             self._record.note_tool_result(self._tool_object(tool_call, tool), "ok")
         if tool_call.name == "read_file":
             # TP-06: a successful read of a SKILL.md is the model loading
-            # that skill itself; only its name and file hash are kept.
+            # that skill itself; only its name and file hash are kept. The
+            # executed (repaired) params and the path the tool itself
+            # resolved -- bundled-skill fallback included -- decide it.
             with _provenance_boundary("noting a skill read"):
-                self._record.note_read_file_skill(tool_call.arguments)
+                self._note_skill_read(self._tool_object(tool_call, tool), params)
+
+    def _note_skill_read(self, tool: Any, params: Any) -> None:
+        path = params.get("path") if isinstance(params, dict) else None
+        if not isinstance(path, str) or not path:
+            return
+        resolve = getattr(tool, "resolved_read_path", None)
+        if callable(resolve):
+            resolved = resolve(path)
+        else:
+            resolved = Path(path).expanduser()
+            if not resolved.is_absolute():
+                return
+        self._record.note_skill_file(resolved)
 
     async def on_execute_tool_error(
         self,
@@ -1558,10 +1573,7 @@ class AgentLoop:
                 return
             skills = self.context.skills
             always_skills = skills.get_always_skills()
-            _summary, listed_sha = skills.build_skills_summary_with_sha(
-                exclude=set(always_skills),
-            )
-            provenance.skills_listed_sha = listed_sha
+            provenance.skills_listed_sha = skills.skills_listed_sha(exclude=set(always_skills))
             paths = {
                 entry["name"]: entry["path"]
                 for entry in skills.list_skills(filter_unavailable=False)

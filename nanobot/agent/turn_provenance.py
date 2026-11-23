@@ -200,8 +200,13 @@ class TurnProvenance:
             self.started_at = started_at
         self.account_intent = bool(entry.get("account_intent")) or self.account_intent
         self.prompt_rebuilt = bool(entry.get("prompt_rebuilt")) or self.prompt_rebuilt
-        if not self.prompt and isinstance(entry.get("prompt"), list):
-            self.prompt = list(entry["prompt"])
+        earlier_prompt = entry.get("prompt")
+        if isinstance(earlier_prompt, list) and earlier_prompt:
+            if not self.prompt:
+                self.prompt = list(earlier_prompt)
+            elif earlier_prompt != self.prompt:
+                # The answer spans two different prompts; the latest is kept.
+                self.prompt_rebuilt = True
         if self.skills_listed_sha is None and isinstance(entry.get("skills_listed_sha"), str):
             self.skills_listed_sha = entry["skills_listed_sha"]
         earlier_calls = entry.get("calls")
@@ -254,32 +259,18 @@ class TurnProvenance:
         if entry not in self.skills_loaded:
             self.skills_loaded.append(entry)
 
-    def note_read_file_skill(self, arguments: Any) -> None:
+    def note_skill_file(self, path: Path) -> None:
         """Record a skill the model pulled in itself with ``read_file`` (TP-06).
 
-        A ``read_file`` of ``.../<name>/SKILL.md`` is how the model loads an
-        on-demand skill; the parent directory name plus the file hash join
-        ``skills_loaded``. Relative paths resolve against the turn's
-        workspace scope. Anything that is not an existing SKILL.md records
-        nothing, and the arguments are never retained.
+        ``path`` is the file the read actually resolved to. An existing
+        ``.../<name>/SKILL.md`` joins ``skills_loaded`` as its parent
+        directory name plus the file hash; anything else records nothing.
         """
-        args = arguments if isinstance(arguments, dict) else {}
-        path = args.get("path")
-        if not isinstance(path, str) or not path.endswith("/SKILL.md"):
-            return
-        candidate = Path(path).expanduser()
-        if not candidate.is_absolute():
-            from nanobot.security.workspace_access import current_workspace_scope
-
-            scope = current_workspace_scope()
-            if scope is None:
-                return
-            candidate = scope.project_path / candidate
-        if not candidate.is_file():
+        if path.name != "SKILL.md" or not path.is_file():
             return
         from nanobot.agent.skills import skill_file_sha
 
-        self.note_skill(candidate.parent.name, skill_file_sha(candidate))
+        self.note_skill(path.parent.name, skill_file_sha(path))
 
     def note_tool_result(self, tool: Any, status: str) -> None:
         """Record one executed tool call.

@@ -177,45 +177,46 @@ class TestSectionSensitivity:
 class TestSkillHashes:
     def test_editing_one_skill_md_changes_skills_listed_sha(self, tmp_path):
         loader = SkillsLoader(_make_workspace(tmp_path), builtin_skills_dir=tmp_path / "none")
-        summary_before, sha_before = loader.build_skills_summary_with_sha(exclude={"foo"})
+        summary_before = loader.build_skills_summary(exclude={"foo"})
+        sha_before = loader.skills_listed_sha(exclude={"foo"})
         assert summary_before and isinstance(sha_before, str) and len(sha_before) == 16
         bar = tmp_path / "skills" / "bar" / "SKILL.md"
         bar.write_text(
             bar.read_text(encoding="utf-8") + "\nAn extra line changes the bytes.\n",
             encoding="utf-8",
         )
-        summary_after, sha_after = loader.build_skills_summary_with_sha(exclude={"foo"})
+        summary_after = loader.build_skills_summary(exclude={"foo"})
+        sha_after = loader.skills_listed_sha(exclude={"foo"})
         assert summary_after == summary_before  # description-based text unchanged
         assert sha_after != sha_before
 
-    def test_build_skills_summary_unchanged_and_equal_to_pair_first(self, tmp_path):
-        loader = SkillsLoader(_make_workspace(tmp_path), builtin_skills_dir=tmp_path / "none")
-        summary = loader.build_skills_summary(exclude={"foo"})
-        assert "bar" in summary  # sanity: the fixture really listed a skill
-        assert summary == loader.build_skills_summary_with_sha(exclude={"foo"})[0]
-
     def test_empty_listing_has_no_listed_sha(self, tmp_path):
         loader = SkillsLoader(_make_workspace(tmp_path), builtin_skills_dir=tmp_path / "none")
-        summary, sha = loader.build_skills_summary_with_sha(exclude={"foo", "bar"})
-        assert summary == ""
-        assert sha is None
+        assert loader.build_skills_summary(exclude={"foo", "bar"}) == ""
+        assert loader.skills_listed_sha(exclude={"foo", "bar"}) is None
 
     def test_listed_sha_follows_sorted_name_line_pairs(self, tmp_path):
         loader = SkillsLoader(_make_workspace(tmp_path), builtin_skills_dir=tmp_path / "none")
-        _summary, sha = loader.build_skills_summary_with_sha(exclude={"foo"})
+        sha = loader.skills_listed_sha(exclude={"foo"})
         expected = _sha16(
             f"bar:{skill_file_sha(tmp_path / 'skills' / 'bar' / 'SKILL.md')}"
         )
         assert sha == expected
 
     @staticmethod
-    def _read(record: TurnProvenance, name: str, arguments, *, ok: bool = True) -> None:
+    def _read(
+        record: TurnProvenance, name: str, params, *, ok: bool = True,
+        tool=None, raw_arguments=None,
+    ) -> None:
         hook = _TurnProvenanceHook(record, None)
-        call = ToolCallRequest(id="tc", name=name, arguments=arguments)
+        call = ToolCallRequest(
+            id="tc", name=name,
+            arguments=params if raw_arguments is None else raw_arguments,
+        )
         if ok:
-            asyncio.run(hook.after_execute_tool(MagicMock(), call, None, None, "x"))
+            asyncio.run(hook.after_execute_tool(MagicMock(), call, tool, params, "x"))
         else:
-            asyncio.run(hook.on_execute_tool_error(MagicMock(), call, None, None, "x"))
+            asyncio.run(hook.on_execute_tool_error(MagicMock(), call, tool, params, "x"))
 
     def test_executed_read_file_of_skill_md_is_recorded(self, tmp_path):
         _make_workspace(tmp_path)
@@ -228,6 +229,36 @@ class TestSkillHashes:
                 "name": "foo",
                 "sha": skill_file_sha(tmp_path / "skills" / "foo" / "SKILL.md"),
             }
+        ]
+
+    def test_repaired_arguments_use_the_executed_params(self, tmp_path):
+        _make_workspace(tmp_path)
+        record = TurnProvenance(turn_id="t")
+        path = str(tmp_path / "skills" / "foo" / "SKILL.md")
+        # The model wrapped its args; the repair layer unwrapped them and the
+        # tool ran with ``params``. The raw wire args must not decide it.
+        self._read(
+            record, "read_file", {"path": path},
+            raw_arguments={"arguments": {"path": path}},
+        )
+        assert [item["name"] for item in record.skills_loaded] == ["foo"]
+
+    def test_bundled_skill_read_records_the_resolved_file(self, tmp_path):
+        from nanobot.agent.skills import BUILTIN_SKILLS_DIR
+        from nanobot.agent.tools.filesystem import ReadFileTool
+
+        bundled = sorted(BUILTIN_SKILLS_DIR.glob("*/SKILL.md"))
+        assert bundled, "fixture needs at least one bundled skill"
+        target = bundled[0]
+        tool = ReadFileTool(workspace=tmp_path, allowed_dir=tmp_path)
+        relative = f"skills/{target.parent.name}/SKILL.md"
+        assert not (tmp_path / relative).exists()
+        # Sanity: the tool really serves this path from the bundled fallback.
+        assert tool.resolved_read_path(relative) == target.resolve()
+        record = TurnProvenance(turn_id="t")
+        self._read(record, "read_file", {"path": relative}, tool=tool)
+        assert record.skills_loaded == [
+            {"name": target.parent.name, "sha": skill_file_sha(target)}
         ]
 
     def test_skill_read_negative_controls(self, tmp_path):
@@ -256,7 +287,7 @@ class TestSkillHashes:
         secret_path = str(tmp_path / "skills" / "foo" / "SKILL.md")
 
         def boom(_path):
-            raise PermissionError(f"denied: {secret_path}")
+            raise RuntimeError(f"secret {secret_path}")
 
         monkeypatch.setattr("nanobot.agent.skills.skill_file_sha", boom)
         lines: list[str] = []
@@ -266,8 +297,8 @@ class TestSkillHashes:
         finally:
             logger.remove(sink)
         assert record.skills_loaded == []
-        assert any("noting a skill read" in line and "PermissionError" in line for line in lines)
-        assert not any(secret_path in line or "denied" in line for line in lines)
+        assert any("noting a skill read" in line and "RuntimeError" in line for line in lines)
+        assert not any(secret_path in line or "secret" in line for line in lines)
 
     def test_continuation_slices_dedupe_skills_loaded(self):
         sha = "a" * 16
@@ -477,14 +508,165 @@ async def test_prompt_recording_failure_never_fails_the_turn(tmp_path, monkeypat
     assert not any(skill_dir in line for line in lines)
 
 
-def test_unreadable_skill_still_lists(tmp_path, monkeypatch):
-    loader = SkillsLoader(_make_workspace(tmp_path), builtin_skills_dir=tmp_path / "none")
-    summary_ok, _ = loader.build_skills_summary_with_sha(exclude={"foo"})
+def test_continuation_with_a_different_prompt_flags_rebuilt():
+    first = TurnProvenance(turn_id="t")
+    first.note_prompt([{"section": "identity", "sha": "a" * 16, "bytes": 1}])
+    second = TurnProvenance(turn_id="t")
+    second.note_prompt([{"section": "identity", "sha": "b" * 16, "bytes": 1}])
+    second.absorb_earlier_slice(first.to_dict())
+    assert second.prompt_rebuilt is True
+    assert second.prompt[0]["sha"] == "b" * 16  # latest kept
+
+    same = TurnProvenance(turn_id="t")
+    same.note_prompt(list(first.prompt))
+    same.absorb_earlier_slice(first.to_dict())
+    assert same.prompt_rebuilt is False
+
+
+def _content_free(lines: list[str], *needles: str) -> bool:
+    return not any(needle in line for line in lines for needle in needles)
+
+
+def test_fingerprint_failure_keeps_the_prompt_and_logs_no_content(tmp_path, monkeypatch):
+    from loguru import logger
+
+    import nanobot.agent.context as context_mod
+
+    builder = ContextBuilder(workspace=_make_workspace(tmp_path))
+    expected = _reference_build_system_prompt(builder, channel="websocket")
+
+    def boom(_section, _text):
+        raise RuntimeError("secret-fingerprint-text")
+
+    monkeypatch.setattr(context_mod, "_fingerprint_entry", boom)
+    lines: list[str] = []
+    sink = logger.add(lambda m: lines.append(str(m)), level="WARNING")
+    try:
+        prompt, sections = builder.build_system_prompt_with_fingerprint(channel="websocket")
+    finally:
+        logger.remove(sink)
+    assert prompt == expected
+    assert sections == []
+    assert any("fingerprinting the system prompt" in line for line in lines)
+    assert _content_free(lines, "secret-fingerprint-text", MEMORY_TEXT)
+
+
+def test_skill_hash_failure_never_touches_prompt_rendering(tmp_path, monkeypatch):
+    builder = ContextBuilder(workspace=_make_workspace(tmp_path))
+    expected = _reference_build_system_prompt(builder)
 
     def boom(_path):
-        raise PermissionError("nope")
+        raise RuntimeError("secret")
 
     monkeypatch.setattr("nanobot.agent.skills.skill_file_sha", boom)
-    summary, sha = loader.build_skills_summary_with_sha(exclude={"foo"})
-    assert summary == summary_ok
-    assert sha == _sha16("bar:unreadable")
+    assert builder.build_system_prompt() == expected
+
+
+# ---------------------------------------------------------------------------
+# Golden: the prompt bytes must match the pre-TP-06 assembly. This is a frozen
+# copy of origin/ziggy-main's ``build_system_prompt`` / ``_load_bootstrap_files``
+# (before TP-06), using only helpers TP-06 does not touch.
+# ---------------------------------------------------------------------------
+
+
+def _reference_bootstrap(builder: ContextBuilder, workspace: Path | None = None) -> str:
+    from nanobot.utils.helpers import load_bundled_template
+
+    parts: list[str] = []
+    project_root = workspace or builder.workspace
+    sources = [
+        ("AGENTS.md", project_root),
+        ("SOUL.md", builder.workspace),
+        ("USER.md", builder.workspace),
+    ]
+    for filename, root in sources:
+        file_path = root / filename
+        if file_path.exists():
+            content = file_path.read_text(encoding="utf-8")
+            if filename == "SOUL.md" and builder._is_template_content(content, "legacy/SOUL.md"):
+                content = load_bundled_template("SOUL.md") or content
+            if not content.strip():
+                continue
+            if filename in builder._SKIPPABLE_DEFAULTS and builder._is_template_content(
+                content, filename
+            ):
+                continue
+            parts.append(f"## {filename}\n\n{content}")
+    return "\n\n".join(parts) if parts else ""
+
+
+def _reference_build_system_prompt(
+    builder: ContextBuilder,
+    *,
+    channel=None,
+    session_summary=None,
+    workspace: Path | None = None,
+    include_memory: bool = True,
+    shared_room: bool = False,
+) -> str:
+    from nanobot.utils.prompt_templates import render_template
+
+    if shared_room:
+        return builder.SHARED_ROOM_SYSTEM_PROMPT
+    root = workspace or builder.workspace
+    parts = [builder._get_identity(channel=channel, workspace=root)]
+    bootstrap = _reference_bootstrap(builder, root)
+    if bootstrap:
+        parts.append(bootstrap)
+    if builder.workflow_scheduling:
+        parts.append(
+            render_template("agent/workflow_intake.md", cron_scheduling=builder.cron_scheduling)
+        )
+    parts.append(render_template("agent/tool_contract.md", cron_scheduling=builder.cron_scheduling))
+    project_path = root.expanduser().resolve()
+    if project_path != builder.workspace.expanduser().resolve():
+        parts.append(
+            "# Current Project\n\n"
+            f"Working directory: {project_path}\n"
+            "Use it as the default root for project files and relative tool paths."
+        )
+    if include_memory:
+        memory = builder.memory.read_memory()
+        if memory and not builder._is_template_content(memory, "memory/MEMORY.md"):
+            parts.append(f"# Memory\n\n## Long-term Memory\n{memory}")
+    active_skills = builder.skills.get_always_skills()
+    if active_skills:
+        active_content = builder.skills.load_skills_for_context(active_skills)
+        if active_content:
+            parts.append(f"# Active Skills\n\n{active_content}")
+    skills_summary = builder.skills.build_skills_summary(exclude=set(active_skills), workspace=root)
+    if skills_summary:
+        parts.append(render_template("agent/skills_section.md", skills_summary=skills_summary))
+    if session_summary and session_summary["text"] != "(nothing)":
+        parts.append(
+            "[Archived Context Summary]\n\n"
+            f"Previous conversation summary (last active {session_summary['last_active']}):\n"
+            f"{session_summary['text']}"
+        )
+    return "\n\n---\n\n".join(parts)
+
+
+@pytest.mark.parametrize("with_user", [True, False])
+@pytest.mark.parametrize("workflow", [True, False])
+def test_prompt_bytes_match_the_pre_tp06_assembly(tmp_path, with_user, workflow):
+    builder = ContextBuilder(
+        workspace=_make_workspace(tmp_path, with_user=with_user),
+        workflow_scheduling=workflow,
+        cron_scheduling=workflow,
+    )
+    other = tmp_path / "proj"
+    other.mkdir()
+    (other / "AGENTS.md").write_text("Project-local rules.\n", encoding="utf-8")
+    summary = {"text": "We talked about deploys.", "last_active": "2026-11-01"}
+    for kw in (
+        {},
+        {"channel": "websocket"},
+        {"include_memory": False},
+        {"shared_room": True},
+        {"workspace": other},
+        {"session_summary": summary},
+        {"session_summary": {"text": "(nothing)", "last_active": "x"}},
+    ):
+        expected = _reference_build_system_prompt(builder, **kw)
+        assert builder.build_system_prompt(**kw) == expected, kw
+        assert builder.build_system_prompt_with_fingerprint(**kw)[0] == expected, kw
