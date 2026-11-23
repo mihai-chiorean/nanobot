@@ -2,7 +2,7 @@
 
 import pytest
 
-from nanobot.agent.memory import MemoryStore
+from nanobot.agent.memory import MemoryStore, count_tokens
 from nanobot.config.schema import ModelPresetConfig
 from nanobot.providers.base import LLMResponse
 from nanobot.security.workspace_access import (
@@ -113,7 +113,44 @@ class TestBuildDreamPrompt:
 
         assert result is not None
         prompt, _, _batch = result
-        assert prompt.startswith(store.default_dream_prompt() + "\n\n## Conversation History\n")
+        expected_template = store.default_dream_prompt(
+            core_tokens=count_tokens(store.read_memory()),
+            core_budget=store.core_memory_tokens,
+        )
+        assert prompt.startswith(expected_template + "\n\n## Conversation History\n")
+
+    def test_dream_prompt_renders_budget_and_size(self, store):
+        store.append_history("hello")
+        store.core_memory_tokens = 1234
+
+        result = store.build_dream_prompt()
+        assert result is not None
+        prompt, _, _batch = result
+        expected_size = count_tokens(store.read_memory())
+        assert f"must stay under 1234 tokens (currently {expected_size})" in prompt
+        assert "OVER BUDGET" not in prompt
+
+        # Over budget: the first instruction says so.
+        store.core_memory_tokens = 1
+        result = store.build_dream_prompt()
+        assert result is not None
+        prompt, _, _batch = result
+        assert "OVER BUDGET" in prompt
+        assert f"{expected_size}/1 tokens" in prompt
+
+    def test_dream_prompt_routes_skills_to_proposed(self, store):
+        store.append_history("hello")
+
+        result = store.build_dream_prompt()
+        assert result is not None
+        prompt, _, _batch = result
+        assert "skills/_proposed/" in prompt
+        assert "metadata.smoke-prompt" in prompt
+        assert "memory/archive.md" in prompt
+        assert "## Remembered" in prompt
+        # No direct-to-live-skill routing and no source-copy removal anymore.
+        assert "skills/<name>/SKILL.md" not in prompt
+        assert "remove the source copy" not in prompt
 
     def test_truncates_long_entries_at_1000_chars(self, store):
         long_content = "x" * 2000
@@ -166,6 +203,8 @@ class TestBuildDreamPrompt:
             "agent/dream.md",
             strip=True,
             skill_creator_path="skills/skill-creator/SKILL.md",
+            core_tokens=0,
+            core_budget=2000,
         )
 
         assert "History attribute tags" in prompt
@@ -269,6 +308,38 @@ class TestDreamTools:
 
         assert "Successfully wrote" in result
         assert target.read_text(encoding="utf-8").startswith("---\nname: demo")
+
+    @pytest.mark.asyncio
+    async def test_dream_tools_can_write_archive(self, store):
+        assert not store.archive_file.exists()
+
+        tools = store.build_dream_tools()
+
+        # The archive exists empty after building the tools, so Dream's first
+        # demotion is an edit of an existing file.
+        assert store.archive_file.exists()
+        assert store.archive_file.read_text(encoding="utf-8") == ""
+
+        write_result = await tools.execute(
+            "write_file",
+            {"path": "memory/archive.md", "content": "# Archive\n- Demoted fact\n"},
+        )
+        assert "Successfully wrote" in write_result
+        patch_result = await tools.execute(
+            "apply_patch",
+            {
+                "edits": [
+                    {
+                        "path": "memory/archive.md",
+                        "action": "replace",
+                        "old_text": "Demoted fact",
+                        "new_text": "Archived fact",
+                    }
+                ]
+            },
+        )
+        assert "Patch applied" in patch_result
+        assert "Archived fact" in store.archive_file.read_text(encoding="utf-8")
 
     @pytest.mark.asyncio
     async def test_dream_tools_keep_internal_write_scope_under_full_access(self, store):
@@ -803,6 +874,35 @@ class TestDreamCommitMessage:
             == "dream: x\n\nSOUL.md: +1 -0"
         )
 
+    def test_dream_commit_message_reports_core_tokens(self):
+        msg = MemoryStore.build_dream_commit_message(
+            "dream: manual run",
+            "memory/MEMORY.md: +2 -5",
+            core_tokens=1840,
+            core_budget=2000,
+        )
+        assert msg.startswith("dream: manual run\n\nmemory/MEMORY.md: +2 -5")
+        assert msg.endswith("\n\ncore: 1840/2000 tokens")
+
+        # Without a core measurement the shape is unchanged.
+        assert (
+            MemoryStore.build_dream_commit_message("dream: x", "SOUL.md: +1 -0")
+            == "dream: x\n\nSOUL.md: +1 -0"
+        )
+        # A no-op run stays the bare prefix even with core stats.
+        assert (
+            MemoryStore.build_dream_commit_message(
+                "dream: x", "", core_tokens=10, core_budget=2000,
+            )
+            == "dream: x"
+        )
+
+    def test_core_memory_line_matches_store(self, store):
+        line = store.core_memory_line()
+        assert line == (
+            f"core: {count_tokens(store.read_memory())}/{store.core_memory_tokens} tokens"
+        )
+
 
 class TestDreamContentDiff:
     """The ground-truth signal that gates cursor advance and commit messages."""
@@ -874,3 +974,159 @@ class TestDreamContentDiff:
         store.git.auto_commit("initial")
         store.set_last_dream_cursor(99)  # only memory/.dream_cursor changes
         assert store.dream_content_diff() == ""
+
+
+class TestCountTokens:
+    def test_count_tokens_fallback(self, monkeypatch):
+        import nanobot.utils.helpers as helpers
+
+        def boom():
+            raise RuntimeError("tiktoken cache missing")
+
+        monkeypatch.setattr(helpers, "_get_token_encoding", boom)
+
+        assert count_tokens("x" * 400) == 100
+        assert count_tokens("hello world") == 11 // 4
+        assert count_tokens("") == 0
+
+    def test_count_tokens_matches_tiktoken_when_available(self):
+        from nanobot.utils.helpers import _get_token_encoding
+
+        try:
+            enc = _get_token_encoding()
+        except Exception:
+            pytest.skip("tiktoken cl100k_base not cached on this machine")
+        text = "The quick brown fox. 猫は魚を食べる。\n" * 7
+        assert count_tokens(text) == len(enc.encode(text))
+
+
+class TestDreamArchiveHistory:
+    """MIT-1871: archive.md edits are committed and restorable like MEMORY.md."""
+
+    def test_archive_only_change_commits_and_restores(self, store):
+        from nanobot.cli.gateway_runtime import _commit_dream_changes
+        from nanobot.command.builtin import _DREAM_COMMIT_PREFIX
+
+        store.write_archive("# Archive\n- old demoted fact\n")
+        assert store.git.init()
+
+        # A Dream run that only demotes into the archive.
+        store.write_archive("# Archive\n- old demoted fact\n- newly demoted fact\n")
+        assert "memory/archive.md" in store.dream_content_diff()
+        sha = _commit_dream_changes(store)
+        assert sha is not None
+
+        new_sha = store.git.revert(sha, message_prefix=_DREAM_COMMIT_PREFIX)
+        assert new_sha is not None
+        assert store.read_archive() == "# Archive\n- old demoted fact\n"
+
+    def test_restore_recovers_preexisting_untracked_archive(self, store):
+        """An initialised store whose archive.md (A) never entered history:
+        Dream overwrites it with B, and /dream-restore brings A back."""
+        from nanobot.cli.gateway_runtime import _commit_dream_changes
+        from nanobot.command.builtin import _DREAM_COMMIT_PREFIX
+
+        assert store.git.init()  # no archive.md yet, so not in history
+        store.write_archive("# Archive\n- fact A\n")  # pre-existing, uncommitted
+
+        store.build_dream_tools()  # the Dream run starts
+        store.write_archive("# Archive\n- fact B\n")  # Dream overwrites A
+        sha = _commit_dream_changes(store)
+        assert sha is not None
+
+        assert store.git.revert(sha, message_prefix=_DREAM_COMMIT_PREFIX) is not None
+        assert store.read_archive() == "# Archive\n- fact A\n"
+
+    def test_no_baseline_commit_when_everything_is_in_history(self, store):
+        assert store.git.init()
+        before = len(store.git.log(max_entries=50))
+        store.build_dream_tools()  # touches an empty archive.md: new file
+        store.build_dream_tools()  # second run: nothing new on disk
+        assert len(store.git.log(max_entries=50)) == before + 1
+
+
+class TestDreamPipelineState:
+    """MIT-1871: Dream may not write memory/pipelines/, so the prompt must not
+    tell it to strip pipeline checkpoints out of MEMORY.md."""
+
+    @pytest.mark.asyncio
+    async def test_dream_cannot_write_pipeline_files(self, store):
+        tools = store.build_dream_tools()
+        result = await tools.execute(
+            "write_file",
+            {"path": "memory/pipelines/inbox.md", "content": "last_seen_id=42\n"},
+        )
+        assert not (store.workspace / "memory" / "pipelines" / "inbox.md").exists(), result
+
+    @pytest.mark.parametrize("core_budget", [2000, 1])
+    def test_prompt_never_asks_to_remove_pipeline_state(self, core_budget):
+        prompt = render_template(
+            "agent/dream.md",
+            strip=True,
+            skill_creator_path="skills/skill-creator/SKILL.md",
+            core_tokens=10,
+            core_budget=core_budget,
+        )
+        lowered = prompt.lower()
+        assert "strip pipeline run state" not in lowered
+        assert "remove them from `memory/memory.md`" not in lowered
+        assert "never edit, move or delete it" in prompt
+
+
+class TestCoreBudgetEnforcement:
+    """MIT-1871: the configured budget reaches the Dream prompt through the loop,
+    measured with the real token counter (not just rendered prompt strings)."""
+
+    def _loop(self, tmp_path, budget):
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from nanobot.agent.loop import AgentLoop
+        from nanobot.bus.queue import MessageBus
+
+        provider = MagicMock()
+        provider.get_default_model.return_value = "test-model"
+        provider.supports_tools = True
+        provider.generation = MagicMock(max_tokens=4096)
+        with (
+            patch("nanobot.agent.loop.SessionManager"),
+            patch("nanobot.agent.loop.SubagentManager") as mock_sub,
+            patch("nanobot.agent.loop.Consolidator"),
+        ):
+            mock_sub.return_value.cancel_by_session = AsyncMock(return_value=0)
+            return AgentLoop(
+                bus=MessageBus(),
+                provider=provider,
+                workspace=tmp_path,
+                context_window_tokens=32_000,
+                memory_index_enabled=False,
+                dream_core_memory_tokens=budget,
+            )
+
+    def test_configured_budget_drives_over_budget_banner(self, tmp_path):
+        core = "# Memory\n" + "".join(f"- fact number {i} about the user\n" for i in range(60))
+        loop = self._loop(tmp_path, budget=50)
+        store = loop.context.memory
+        store.write_memory(core)
+        store.append_history("hello")
+
+        assert store.core_memory_tokens == 50
+        tokens = count_tokens(core)
+        assert tokens > 50  # a stubbed counter (0) would fail here
+        result = store.build_dream_prompt()
+        assert result is not None
+        assert f"OVER BUDGET: {tokens}/50 tokens" in result[0]
+        assert store.core_memory_line() == f"core: {tokens}/50 tokens"
+
+    def test_under_budget_has_no_banner(self, tmp_path):
+        loop = self._loop(tmp_path, budget=2000)
+        store = loop.context.memory
+        store.write_memory("# Memory\n- one fact\n")
+        store.append_history("hello")
+        result = store.build_dream_prompt()
+        assert result is not None
+        assert "OVER BUDGET" not in result[0]
+
+    def test_config_default_budget_is_2000(self):
+        from nanobot.config.schema import Config
+
+        assert Config().agents.defaults.dream.core_memory_tokens == 2000
