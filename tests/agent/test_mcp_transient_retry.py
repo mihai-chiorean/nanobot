@@ -496,15 +496,29 @@ async def test_prompt_reconnects_on_connection_closed_exception():
 @pytest.mark.asyncio
 async def test_transient_retry_sends_identical_idempotency_key():
     """SR-11: the key is computed once before the retry loop, so the replayed
-    attempt carries the byte-identical ziggy.dev/idempotency_key."""
+    attempt carries the byte-identical ziggy.dev/idempotency_key.
+
+    The tool is marked idempotent but not read-only: it is still keyed, and an
+    automatic replay is allowed even where retries are gated on idempotency
+    (MIT-1817), so the retry this test needs actually happens.
+    """
     from nanobot.agent.tools.context import RequestContext, request_context
+
+    class _IdempotentWriteWrapper(MCPToolWrapper):
+        @property
+        def read_only(self) -> bool:
+            return False
+
+        @property
+        def idempotent(self) -> bool:
+            return True
 
     session = AsyncMock()
     result = _make_tool_result("ok")
     exc = _FakeClosedResourceError("connection lost")
     session.call_tool = AsyncMock(side_effect=[exc, result])
 
-    wrapper = MCPToolWrapper(
+    wrapper = _IdempotentWriteWrapper(
         session, "gmail", _make_tool_def(name="gmail_send_draft"), tool_timeout=5
     )
     ctx = RequestContext(
