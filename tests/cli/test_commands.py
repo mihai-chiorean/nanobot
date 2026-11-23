@@ -4347,6 +4347,10 @@ def _run_gateway_through_signals(
         def begin_drain(self) -> None:
             self.events.append("begin_drain")
 
+        def preserve_inflight_turns_on_shutdown(self) -> None:
+            if "preserve" not in self.events:
+                self.events.append("preserve")
+
         def llm_runtime(self) -> None:
             return None
 
@@ -4456,7 +4460,7 @@ def test_gateway_sigterm_lets_running_turn_finish(monkeypatch, tmp_path: Path) -
 
     assert result.exit_code == 0
     assert "crashed unexpectedly" not in result.output
-    assert agent.events == ["begin_drain", "turn_completed"]
+    assert agent.events == ["preserve", "begin_drain", "turn_completed"]
 
 
 def test_gateway_second_sigterm_cuts_the_grace_short(monkeypatch, tmp_path: Path) -> None:
@@ -4489,7 +4493,9 @@ def test_gateway_second_sigterm_cuts_the_grace_short(monkeypatch, tmp_path: Path
 
     assert result.exit_code == 0
     assert "second_signal_ignored" not in agent.events
-    assert agent.events == ["begin_drain", "turn_cancelled"]
+    # Checkpoint preservation is on before the forced cancellation reaches
+    # the turn, so the next gateway can still offer Continue.
+    assert agent.events == ["preserve", "begin_drain", "turn_cancelled"]
 
 
 def test_serve_uses_api_config_defaults_and_workspace_override(

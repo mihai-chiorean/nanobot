@@ -1238,6 +1238,10 @@ def _run_gateway(
                 # configured grace before cancelling (MIT-1811). A second
                 # signal cancels the runtime tasks, which ends the drain
                 # early; the timeout path below is unchanged from before.
+                # Mark the exit as a gateway shutdown before anything can
+                # cancel a turn: a forced second signal must keep durable
+                # checkpoints exactly like the grace-timeout path does.
+                agent.preserve_inflight_turns_on_shutdown()
                 await _drain_agent_turns(
                     agent,
                     runtime_tasks,
