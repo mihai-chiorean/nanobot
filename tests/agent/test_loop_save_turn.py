@@ -12,6 +12,7 @@ from nanobot.agent.context import ContextBuilder, TranscriptInput
 from nanobot.agent.loop import AgentLoop
 from nanobot.agent.runner import AgentRunResult
 from nanobot.agent.tools.context import RequestContext, request_context
+from nanobot.agent.tools.mcp import _idempotency_key, _idempotency_scope
 from nanobot.bus.events import InboundMessage
 from nanobot.bus.outbound_events import (
     GoalStatusEvent,
@@ -2513,3 +2514,141 @@ def test_save_turn_drops_duplicate_tool_result_ids() -> None:
 
     assert [m["role"] for m in session.messages] == ["assistant", "tool"]
     assert session.messages[1]["content"] == "first"
+
+
+
+# ---------------------------------------------------------------------------
+# SR-11 (MIT-1820): idempotency scope plumbing on the turn path
+# ---------------------------------------------------------------------------
+
+
+def _scope_recording_loop(tmp_path: Path, responses: list[LLMResponse]):
+    """Loop whose ``record_write`` tool captures the scope an MCP write call in
+    the same turn would key on, plus what recovery would read from disk at that
+    moment (the crash point: tool ran, result not yet recorded)."""
+    from nanobot.agent.tools.base import Tool, tool_parameters
+    from nanobot.agent.tools.context import current_request_context
+    from nanobot.agent.tools.schema import tool_parameters_schema
+    from nanobot.session.manager import SessionManager
+    from nanobot.session.recovery import turn_idempotency_scope
+
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    provider.generation = SimpleNamespace(max_tokens=4096)
+    provider.chat_stream_with_retry = AsyncMock(side_effect=list(responses))
+    loop = AgentLoop(bus=MessageBus(), provider=provider, workspace=tmp_path, model="test-model")
+    seen: list[dict[str, str | None]] = []
+
+    @tool_parameters(tool_parameters_schema(required=[], additional_properties=True))
+    class _RecordWrite(Tool):
+        @property
+        def name(self) -> str:
+            return "record_write"
+
+        @property
+        def description(self) -> str:
+            return "records the turn's idempotency scope"
+
+        async def execute(self, **kwargs):
+            ctx = current_request_context()
+            on_disk = SessionManager(tmp_path).get_or_create(ctx.session_key)
+            seen.append({
+                "live": _idempotency_scope(ctx),
+                "recovered": turn_idempotency_scope(on_disk),
+            })
+            return "ok"
+
+    loop.tools.register(_RecordWrite())
+    return loop, seen
+
+
+def _call(tool_call_id: str, name: str, arguments: dict) -> LLMResponse:
+    from nanobot.providers.base import ToolCallRequest
+
+    return LLMResponse(
+        content="",
+        finish_reason="tool_calls",
+        tool_calls=[ToolCallRequest(id=tool_call_id, name=name, arguments=arguments)],
+    )
+
+
+@pytest.mark.asyncio
+async def test_recovery_after_ask_user_reply_reuses_the_reply_turns_scope(
+    tmp_path: Path,
+) -> None:
+    """Codex P2: the write after an ask_user reply keys on the reply's client
+    id; a crash before its result is recorded must recover that same scope,
+    not the original request's (replies are tool results, not user rows)."""
+    loop, seen = _scope_recording_loop(tmp_path, [
+        _call("call_ask", "ask_user", {"question": "Send it?", "options": ["Yes"]}),
+        _call("call_write", "record_write", {"to": "grandma"}),
+        LLMResponse(content="Sent.", finish_reason="stop"),
+    ])
+    await loop._process_message(InboundMessage(
+        channel="websocket", sender_id="user", chat_id="chat",
+        content="mail grandma", metadata={"client_message_id": "cm-request"},
+    ))
+    await loop._process_message(InboundMessage(
+        channel="websocket", sender_id="user", chat_id="chat",
+        content="Yes", metadata={"client_message_id": "cm-answer"},
+    ))
+
+    assert seen == [{"live": "cm-answer", "recovered": "cm-answer"}]
+
+
+@pytest.mark.asyncio
+async def test_new_session_identical_write_gets_a_distinct_recoverable_scope(
+    tmp_path: Path,
+) -> None:
+    """Codex P2: without a client_message_id, /new (Session.clear keeps the key
+    and resets indices) must not make a later identical write collide with the
+    first one, and each turn's scope must still be what recovery reads."""
+    loop, seen = _scope_recording_loop(tmp_path, [
+        _call("call_1", "record_write", {"to": "grandma"}),
+        LLMResponse(content="Sent.", finish_reason="stop"),
+        _call("call_2", "record_write", {"to": "grandma"}),
+        LLMResponse(content="Sent again.", finish_reason="stop"),
+    ])
+    message = dict(channel="telegram", sender_id="user", chat_id="111", content="mail grandma")
+    await loop._process_message(InboundMessage(**message))
+    session = loop.sessions.get_or_create("telegram:111")
+    session.clear()  # what /new does to the session
+    loop.sessions.save(session)
+    await loop._process_message(InboundMessage(**message))
+
+    assert len(seen) == 2
+    first, second = seen
+    assert first["live"] and second["live"]
+    assert first["live"] != second["live"]
+    assert _idempotency_key(first["live"], "t", {"to": "grandma"}) != _idempotency_key(
+        second["live"], "t", {"to": "grandma"}
+    )
+    assert first["recovered"] == first["live"]
+    assert second["recovered"] == second["live"]
+
+
+@pytest.mark.asyncio
+async def test_subagent_completion_turn_persists_its_own_scope_for_recovery(
+    tmp_path: Path,
+) -> None:
+    """Codex P2 (round 2): a subagent completion runs as a new turn after the
+    main turn ended.  Its early save must not leave the previous turn's scope
+    on disk, or a crash after its write recovers the wrong key."""
+    loop, seen = _scope_recording_loop(tmp_path, [
+        LLMResponse(content="Started a helper.", finish_reason="stop"),
+        _call("call_write", "record_write", {"to": "grandma"}),
+        LLMResponse(content="Sent.", finish_reason="stop"),
+    ])
+    await loop._process_message(InboundMessage(
+        channel="cli", sender_id="user", chat_id="sub",
+        content="research then mail grandma",
+        metadata={"client_message_id": "cm-request"},
+    ))
+    await loop._process_message(InboundMessage(
+        channel="system", sender_id="subagent", chat_id="cli:sub",
+        content="subagent result", metadata={"subagent_task_id": "sub-1"},
+    ))
+
+    assert len(seen) == 1
+    assert seen[0]["live"] != "cm-request"
+    assert seen[0]["recovered"] == seen[0]["live"]

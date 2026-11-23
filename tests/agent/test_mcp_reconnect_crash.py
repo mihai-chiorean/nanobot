@@ -47,12 +47,13 @@ def _run_mcp_server(port: int, ready_event: multiprocessing.Event) -> None:
     import uvicorn
     from mcp.server.fastmcp import FastMCP
     from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+    from mcp.types import ToolAnnotations
     from starlette.responses import Response
     from starlette.types import Receive, Scope, Send
 
     mcp = FastMCP("IdleTimeoutDemo", json_response=True, port=port)
 
-    @mcp.tool()
+    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
     def greet(name: str = "World") -> str:  # noqa: N802
         """Greet someone."""
         return f"Hello, {name}!"
@@ -172,6 +173,9 @@ async def test_mcp_reconnect_after_session_timeout(tmp_path, mcp_server_url):
         url=mcp_server_url,
         tool_timeout=_TOOL_TIMEOUT_SECONDS,
         enabled_tools=["*"],
+        # Read-only greet; trust its annotation so the reconnect path applies
+        # (MIT-1817: only idempotent calls get the session-refresh retry).
+        trust_annotations=True,
     )
     provider, registry = _make_provider(mcp_servers={"repro": cfg})
 
@@ -206,6 +210,9 @@ async def test_mcp_reconnect_during_shutdown_does_not_crash(
         url=mcp_server_url,
         tool_timeout=_TOOL_TIMEOUT_SECONDS,
         enabled_tools=["*"],
+        # Read-only greet; trust its annotation so the reconnect path applies
+        # (MIT-1817: only idempotent calls get the session-refresh retry).
+        trust_annotations=True,
     )
     provider, registry = _make_provider(mcp_servers={"repro": cfg})
 
