@@ -19,7 +19,11 @@ import httpx
 from loguru import logger
 
 from nanobot.agent.tools.base import Tool, ToolResult
-from nanobot.agent.tools.context import _CURRENT_REQUEST_CONTEXT, ZIGGY_PARK_ATTRIBUTE
+from nanobot.agent.tools.context import (
+    _CURRENT_REQUEST_CONTEXT,
+    ZIGGY_PARK_ATTRIBUTE,
+    current_turn_idempotency_scope,
+)
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.security.network import (
     PinnedDNSAsyncTransport,
@@ -31,6 +35,7 @@ from nanobot.security.network import (
     resolve_url_target,
     validate_url_target,
 )
+from nanobot.session.turn_continuation import stable_idempotency_scope
 from nanobot.utils.cancellation import task_is_cancelling
 
 if TYPE_CHECKING:
@@ -38,6 +43,7 @@ if TYPE_CHECKING:
     from mcp.types import Prompt, Resource
     from mcp.types import Tool as MCPToolDefinition
 
+    from nanobot.agent.tools.context import RequestContext
     from nanobot.agent.tools.mcp_oauth import MCPOAuthHandlers
     from nanobot.config.schema import Config, MCPServerConfig
 
@@ -704,6 +710,42 @@ def _ziggy_meta() -> dict[str, object]:
     return meta
 
 
+_IDEMPOTENCY_KEY_META = "ziggy.dev/idempotency_key"
+
+
+def _idempotency_scope(ctx: RequestContext | None) -> str | None:
+    """Stable identity of the logical turn a tool call belongs to (SR-11).
+
+    The loop resolves, persists and binds one scope per turn; that bound value
+    wins.  Runs outside the loop's binding (subagents, direct tool calls) fall
+    back to the stable ids in the request metadata.  ``None`` means nothing
+    replay-stable is known; the call then goes out without a key.
+    """
+    bound = current_turn_idempotency_scope()
+    if bound:
+        return bound
+    if ctx is None:
+        return None
+    return stable_idempotency_scope(ctx.metadata)
+
+
+def _idempotency_key(scope: str, tool_name: str, arguments: Mapping[str, Any]) -> str:
+    """Deterministic ``idem_<40 hex>`` key for one logical write call.
+
+    Hash only: no session key, chat id or argument text may leave the runtime
+    (DEC-20).  ``tool_name`` is the server's original tool name and
+    ``arguments`` are serialised with sorted keys so argument-order changes in
+    the replay stay equal.
+    """
+    payload = json.dumps(
+        arguments, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    digest = hashlib.sha256(
+        f"{scope}\n{tool_name}\n{payload}".encode("utf-8")
+    ).hexdigest()
+    return f"idem_{digest[:40]}"
+
+
 _ZIGGY_PARK_META_KEY = "ziggy.dev/park"
 
 
@@ -761,13 +803,23 @@ class MCPToolWrapper(_MCPWrapperBase):
     async def execute(self, **kwargs: Any) -> str:
         retried_transient = False
         refreshed_session = False
+        meta = _ziggy_meta()
+        if not self.read_only:
+            scope = _idempotency_scope(_CURRENT_REQUEST_CONTEXT.get())
+            if scope is not None:
+                # Computed once, before the retry loop: every attempt at this
+                # logical call (transient retry, reconnect retry, and a replay
+                # of the whole turn) must carry the same key.
+                meta[_IDEMPOTENCY_KEY_META] = _idempotency_key(
+                    scope, self._original_name, kwargs
+                )
         while True:
             try:
                 result = await asyncio.wait_for(
                     self._session.call_tool(
                         self._original_name,
                         arguments=kwargs,
-                        meta=_ziggy_meta() or None,
+                        meta=meta or None,
                     ),
                     timeout=self._tool_timeout,
                 )

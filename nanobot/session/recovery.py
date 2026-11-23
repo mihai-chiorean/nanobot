@@ -64,6 +64,19 @@ class RecoveryAdmission(Protocol):
     def unregister_recovery_task(self, session_key: str, task: asyncio.Task[Any]) -> None: ...
 
 
+def turn_idempotency_scope(session: Session) -> str | None:
+    """The idempotency scope the interrupted turn persisted before its tools ran.
+
+    The continuation carries it as ``recovery_origin_scope`` so write calls
+    replayed after the Continue keep the same ``ziggy.dev/idempotency_key``
+    (SR-11).  Read back rather than re-derived: the live turn may have keyed
+    on an ``ask_user`` reply's client id or a fresh per-turn id, neither of
+    which is recoverable from the user rows.
+    """
+    scope = session.metadata.get(turn_continuation.TURN_IDEMPOTENCY_SCOPE_KEY)
+    return scope if isinstance(scope, str) and scope else None
+
+
 def record_pending_followup(session: Session, message: InboundMessage) -> str | None:
     """Durably journal a WebUI follow-up before injecting it into a live turn."""
     if message.channel != "websocket":
@@ -788,6 +801,20 @@ class RecoveryCoordinator:
         state: Mapping[str, Any],
     ) -> None:
         recovery_id = cast(str, state["recovery_id"])
+        metadata: dict[str, Any] = {
+            "webui": True,
+            "_wants_stream": True,
+            WEBUI_TURN_METADATA_KEY: f"recovery:{recovery_id}",
+            RECOVERY_INBOUND_METADATA_KEY: recovery_id,
+            turn_continuation.INTERNAL_CONTINUATION_META: True,
+            turn_continuation.SKIP_USER_PERSIST_META: True,
+        }
+        # The continuation re-runs the interrupted turn's write calls; carrying
+        # the origin turn's scope keeps their ziggy.dev/idempotency_key equal
+        # across the replay (SR-11).
+        scope = turn_idempotency_scope(session)
+        if scope is not None:
+            metadata[turn_continuation.RECOVERY_ORIGIN_SCOPE_META] = scope
         await self.bus.publish_inbound(
             InboundMessage(
                 channel="websocket",
@@ -797,14 +824,7 @@ class RecoveryCoordinator:
                     "Continue the interrupted request from the saved conversation context. "
                     "Do not repeat completed work or mention the restart unless it affects the answer."
                 ),
-                metadata={
-                    "webui": True,
-                    "_wants_stream": True,
-                    WEBUI_TURN_METADATA_KEY: f"recovery:{recovery_id}",
-                    RECOVERY_INBOUND_METADATA_KEY: recovery_id,
-                    turn_continuation.INTERNAL_CONTINUATION_META: True,
-                    turn_continuation.SKIP_USER_PERSIST_META: True,
-                },
+                metadata=metadata,
                 session_key_override=session.key,
                 require_existing_session=True,
             )

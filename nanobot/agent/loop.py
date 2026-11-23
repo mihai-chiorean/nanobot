@@ -55,8 +55,10 @@ from nanobot.agent.tools.context import (
     ZIGGY_PARK_ATTRIBUTE,
     RequestContext,
     bind_request_context,
+    bind_turn_idempotency_scope,
     current_request_context,
     reset_request_context,
+    reset_turn_idempotency_scope,
 )
 from nanobot.agent.tools.exec_session import ExecSessionManager
 from nanobot.agent.tools.file_state import FileStateStore, bind_file_states, reset_file_states
@@ -227,6 +229,11 @@ class TurnContext:
     initial_messages: list[dict[str, Any]] | None = field(default=None, repr=False)
     provider_state: ProviderConversationState | None = field(default=None, repr=False)
     request_context: RequestContext | None = None
+    # SR-11: the turn's idempotency scope, resolved and persisted on the
+    # session by ``_build_turn`` before any tool runs; bound as a context var
+    # around the runner so MCP write calls key on it without polluting the
+    # caller-visible RequestContext metadata.
+    idempotency_scope: str | None = None
     runtime_context_blocks: list[RuntimeContextBlock] = field(default_factory=list)
     attributes: dict[str, Any] = field(default_factory=dict)
 
@@ -1773,6 +1780,7 @@ class AgentLoop:
         turn_scopes: list[AbstractContextManager[Any]] | None = None,
         tools: ToolRegistry | None = None,
         request_context: RequestContext | None = None,
+        idempotency_scope: str | None = None,
         provider_state: ProviderConversationState | None = None,
         publish_file_turn: PublishFileTurn | None = None,
         initial_messages: list[dict[str, Any]] | None = None,
@@ -2041,6 +2049,7 @@ class AgentLoop:
         effective_tools = tools if tools is not None else self.tools
         file_state_token = bind_file_states(self._file_state_store.for_session(active_session_key))
         request_token = bind_request_context(request_ctx)
+        idempotency_scope_token = bind_turn_idempotency_scope(idempotency_scope)
         workspace_token = bind_workspace_scope(effective_scope)
         # The publication binding is task-scoped contextvars state: it is set
         # here, inside the single task that executes this turn, and undone in
@@ -2196,6 +2205,7 @@ class AgentLoop:
             turn_scope_stack.close()
             reset_work_context(work_tokens)
             reset_workspace_scope(workspace_token)
+            reset_turn_idempotency_scope(idempotency_scope_token)
             reset_request_context(request_token)
             reset_file_states(file_state_token)
             reset_scheduling_class(scheduling_token)
@@ -3105,6 +3115,17 @@ class AgentLoop:
             )
             session = ctx.require_session()
         is_subagent = ctx.kind is TurnKind.SYSTEM and ctx.msg.sender_id == "subagent"
+        # SR-11: one idempotency scope per turn, so a recovery Continue replays
+        # writes with the scope this turn actually used (an ask_user reply, a
+        # fresh per-turn id, ...).  Assigned here, before every early save
+        # below, and written explicitly once those saves are done.
+        ctx.idempotency_scope = turn_continuation.resolve_idempotency_scope(
+            ctx.msg.metadata
+        )
+        if not ctx.ephemeral:
+            session.metadata[turn_continuation.TURN_IDEMPOTENCY_SCOPE_KEY] = (
+                ctx.idempotency_scope
+            )
 
         ctx.history = session.get_history(extend_to_user=is_subagent)
         ctx.ask_user_resume_id = self._detect_ask_user_resume(ctx)
@@ -3200,6 +3221,13 @@ class AgentLoop:
             # Upgrade the replay-safe baseline to the resumable state before
             # prompt assembly and the first model checkpoint.
             self.sessions.save(session)
+        if not ctx.ephemeral:
+            # Unconditional: whether an early save above already carried the
+            # scope depends on the path taken; this must not (SR-11).
+            self.sessions.update_session_metadata(
+                session.key,
+                {turn_continuation.TURN_IDEMPOTENCY_SCOPE_KEY: ctx.idempotency_scope},
+            )
         if ctx.ask_user_resume_id is not None:
             assert ctx.request_context is not None
             ctx.initial_messages = ask_user_tool_result_messages(
@@ -3258,6 +3286,7 @@ class AgentLoop:
                 turn_scopes=ctx.turn_scopes,
                 tools=ctx.tools,
                 request_context=ctx.request_context,
+                idempotency_scope=ctx.idempotency_scope,
                 provider_state=ctx.provider_state,
                 initial_messages=ctx.initial_messages,
                 events=ctx.events,
