@@ -713,6 +713,83 @@ async def test_checkpoint_without_write_evidence_fails_closed(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
+async def test_stale_sidecar_with_write_evidence_never_auto_continues(tmp_path: Path) -> None:
+    """Codex round 2 P1: a full save embedded a read-only checkpoint, then the
+    newer sidecar (send in flight, turn_had_write=True) was orphaned by a
+    crash between the metadata-only rewrite and the sidecar re-base.  Reload
+    discards the sidecar; the embedded checkpoint must not auto-continue."""
+    sessions = SessionManager(tmp_path)
+    session = sessions.get_or_create("websocket:chat")
+    session.messages.append({"role": "user", "content": "read then send"})
+    session.metadata[PENDING_USER_TURN_KEY] = True
+    session.metadata[RUNTIME_CHECKPOINT_KEY] = _awaiting_tools_checkpoint(
+        [("call-1", "read_file")]
+    )
+    _persist(sessions, session)  # full save: the read checkpoint is embedded
+    session.metadata[RUNTIME_CHECKPOINT_KEY] = _awaiting_tools_checkpoint(
+        [("call-2", "send_email")],
+        turn_had_write=True,
+    )
+    sessions.save_runtime_checkpoint(session)
+    # Tool-end activity rewrite lands; the process dies before the re-base.
+    assert sessions._jsonl_store.update_metadata(
+        "websocket:chat",
+        {"activity_v1": [{"call_id": "call-2"}]},
+        touch_updated_at=True,
+    )
+
+    coordinator, bus, restarted = _registry_coordinator(
+        tmp_path,
+        read_only=["read_file"],
+        write=["send_email"],
+    )
+    await coordinator.scan()
+
+    assert bus.inbound.empty()
+    state = restarted.get_or_create("websocket:chat").metadata[RECOVERY_METADATA_KEY]
+    assert state["status"] == "awaiting_user"
+    assert state["reason"] == "tool_state_unknown"
+
+
+@pytest.mark.asyncio
+async def test_unregistered_tool_parks_and_keeps_continuable_context(tmp_path: Path) -> None:
+    """A call whose tool is not registered yet (e.g. MCP still connecting)
+    parks; its call and an interrupted result stay in history so Continue
+    still works."""
+    sessions = SessionManager(tmp_path)
+    session = sessions.get_or_create("websocket:chat")
+    session.messages.append({"role": "user", "content": "query the mcp"})
+    session.metadata[PENDING_USER_TURN_KEY] = True
+    session.metadata[RUNTIME_CHECKPOINT_KEY] = _awaiting_tools_checkpoint(
+        [("call-1", "mcp_docs_search")]
+    )
+    _persist(sessions, session)
+
+    coordinator, bus, restarted = _registry_coordinator(
+        tmp_path,
+        read_only=["read_file"],
+        write=[],
+    )
+    await coordinator.scan()
+
+    assert bus.inbound.empty()
+    restored = restarted.get_or_create("websocket:chat")
+    state = restored.metadata[RECOVERY_METADATA_KEY]
+    assert state["status"] == "awaiting_user"
+    assert state["reason"] == "tool_state_unknown"
+    assert state.get("can_continue") is not False
+    assert restored.messages[-2]["tool_calls"][0]["id"] == "call-1"
+    assert restored.messages[-1]["tool_call_id"] == "call-1"
+
+    resumed = await coordinator.handle_action(
+        "continue",
+        {"chat_id": "chat", "recovery_id": state["recovery_id"]},
+    )
+    assert resumed["status"] == "resuming"
+    assert not bus.inbound.empty()
+
+
+@pytest.mark.asyncio
 async def test_tool_lookup_leaves_other_checkpoint_paths_unchanged(tmp_path: Path) -> None:
     sessions = SessionManager(tmp_path)
     completed_session = sessions.get_or_create("websocket:chat-done")
