@@ -1853,10 +1853,22 @@ class AgentLoop:
 
             events = EventSink(_record_tool_activity, events.accepts)
 
+        # Sticky for the whole turn (SR-09): set before any non-read-only call
+        # executes and never cleared, because each checkpoint replaces the
+        # previous one and earlier calls are not persisted until the turn ends.
+        turn_had_write = False
+
         async def _checkpoint(payload: dict[str, Any]) -> None:
+            nonlocal turn_had_write
             if session is None:
                 return
             public_payload = dict(payload)
+            for call in public_payload.get("pending_tool_calls") or []:
+                function = call.get("function") if isinstance(call, dict) else None
+                name = function.get("name") if isinstance(function, dict) else None
+                if not isinstance(name, str) or not effective_tools.is_read_only(name):
+                    turn_had_write = True
+            public_payload["turn_had_write"] = turn_had_write
             private_state = public_payload.pop("provider_state", None)
             public_payload.pop(self._PROVIDER_STATE_CHECKPOINT_VERSION_KEY, None)
             if "provider_state" in payload and (

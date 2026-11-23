@@ -458,6 +458,7 @@ class SessionStore(Protocol):
         *,
         fsync: bool = False,
         touch_updated_at: bool = False,
+        updated_at: datetime | None = None,
     ) -> bool: ...
 
     def list_sessions(self) -> list[SessionInfo]: ...
@@ -1237,6 +1238,24 @@ class JsonlSessionStore:
             finally:
                 tmp.unlink(missing_ok=True)
 
+    @staticmethod
+    def _distrust_embedded_checkpoint(session: Session) -> None:
+        """Mark the main record's checkpoint as possibly superseded.
+
+        A sidecar that is discarded as stale or mismatched may have held newer
+        turn state than the checkpoint embedded in the main record (e.g. a
+        crash between a metadata-only rewrite and the sidecar re-base).  We
+        cannot tell which is newest, so the embedded checkpoint must not carry
+        "no write happened" evidence into recovery: SR-09 auto-continue then
+        fails closed and the turn parks for the user.
+        """
+        checkpoint = session.metadata.get(_RUNTIME_CHECKPOINT_KEY)
+        if isinstance(checkpoint, dict):
+            session.metadata[_RUNTIME_CHECKPOINT_KEY] = {
+                **cast(dict[str, Any], checkpoint),
+                "turn_had_write": True,
+            }
+
     def _overlay_runtime_checkpoint_unlocked(self, session: Session, main_path: Path) -> None:
         checkpoint_path = self.get_runtime_checkpoint_path(session.key)
         try:
@@ -1246,12 +1265,14 @@ class JsonlSessionStore:
                     "Ignoring non-regular runtime checkpoint for session {}",
                     session.key,
                 )
+                self._distrust_embedded_checkpoint(session)
                 return
             # A complete session save supersedes an older sidecar. This comparison
             # closes the small crash window between replacing the JSONL and unlinking
             # its previous checkpoint.
             if main_path.stat().st_mtime_ns > checkpoint_stat.st_mtime_ns:
                 checkpoint_path.unlink(missing_ok=True)
+                self._distrust_embedded_checkpoint(session)
                 return
             raw = _json_object(json.loads(checkpoint_path.read_text(encoding="utf-8")))
             if (
@@ -1262,6 +1283,7 @@ class JsonlSessionStore:
                 or not isinstance(raw.get("checkpoint"), dict)
             ):
                 checkpoint_path.unlink(missing_ok=True)
+                self._distrust_embedded_checkpoint(session)
                 return
             provider_record = raw.get("provider_state")
             provider_state = (
@@ -1283,6 +1305,7 @@ class JsonlSessionStore:
                 session.key,
                 exc,
             )
+            self._distrust_embedded_checkpoint(session)
             # Atomic writes mean a malformed target cannot become valid later.
             # Remove it once so future loads do not repeatedly parse and log it.
             with suppress(OSError):
@@ -1345,6 +1368,7 @@ class JsonlSessionStore:
         *,
         fsync: bool = False,
         touch_updated_at: bool = False,
+        updated_at: datetime | None = None,
     ) -> bool:
         """Atomically replace only a session file's metadata record.
 
@@ -1374,7 +1398,7 @@ class JsonlSessionStore:
                     metadata.update(deepcopy(updates))
                     data["metadata"] = metadata
                     if touch_updated_at:
-                        data["updated_at"] = datetime.now().isoformat()
+                        data["updated_at"] = (updated_at or datetime.now()).isoformat()
                     with open(tmp_path, "x", encoding="utf-8") as target:
                         target.write(json.dumps(data, ensure_ascii=False) + "\n")
                         shutil.copyfileobj(source, target)
@@ -2449,14 +2473,26 @@ class SessionManager:
         touch_updated_at: bool = False,
     ) -> bool:
         """Atomically update metadata without replacing session history."""
+        stamp = datetime.now() if touch_updated_at else None
         updated = self._store.update_metadata(
             key,
             updates,
             fsync=fsync,
             touch_updated_at=touch_updated_at,
+            updated_at=stamp,
         )
         if updated and (session := self.get_cached(key)) is not None:
             session.metadata.update(deepcopy(updates))
+            if stamp is not None:
+                session.updated_at = stamp
+                if self._store is self._jsonl_store and isinstance(
+                    session.metadata.get(_RUNTIME_CHECKPOINT_KEY), dict
+                ):
+                    # The in-flight sidecar is only trusted while its
+                    # base_updated_at matches the main record, so re-base it
+                    # or the bump would silently drop the awaiting_tools
+                    # checkpoint a crash mid-tool needs (SR-09).
+                    self._jsonl_store.save_runtime_checkpoint(session)
         return updated
 
     def list_sessions(self) -> list[dict[str, Any]]:
