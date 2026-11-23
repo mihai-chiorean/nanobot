@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import io
+import os
+import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,6 +21,42 @@ if TYPE_CHECKING:
 # are tiny in practice, but a pathological rewrite must not blow up the audit
 # record. The structured per-file summary is always emitted in full regardless.
 _WORKING_TREE_DIFF_MAX_CHARS = 6000
+
+# SM-01 (MIT-1842): tracked-file patterns for the workspace history. Expanded
+# at commit time relative to the workspace, so new skills/prompts/pipeline
+# files are covered without re-instantiating the store. Deliberately excludes
+# memory/history.jsonl (append-only, large; already in recall + backups) and
+# memory/.dream_cursor (bookkeeping; restoring it would make Dream re-consume
+# old history).
+DEFAULT_TRACKED_PATTERNS: list[str] = [
+    "AGENTS.md",
+    "SOUL.md",
+    "USER.md",
+    "HEARTBEAT.md",
+    "memory/MEMORY.md",
+    "memory/archive.md",
+    "memory/provenance.jsonl",
+    "memory/pipelines/*.md",
+    "prompts/*.md",
+    "skills/**",
+]
+
+# Tracked files over this size are skipped (skill assets are the realistic
+# case; anything this big in the instruction set is an accident).
+_MAX_TRACKED_FILE_BYTES = 1024 * 1024
+
+# Commit identity for bare (outside-the-workspace) history commits.
+_BARE_COMMIT_IDENTITY = b"ziggy <ziggy@runtime>"
+
+
+def history_dir_for(workspace: Path) -> Path:
+    """Return the workspace's history directory: ``<workspace>/../history``.
+
+    SM-01 (MIT-1842): the agent's undo history must live where its file tools
+    cannot reach. Derived *only* from the workspace path — never from config
+    or tool arguments — so no caller can point it at another workspace.
+    """
+    return Path(workspace).resolve().parent / "history"
 
 
 class GitStoreError(RuntimeError):
@@ -45,85 +83,174 @@ class CommitInfo:
 
 
 class GitStore:
-    """Git-backed version control for memory files."""
+    """Git-backed version control for workspace instruction and memory files.
 
-    def __init__(self, workspace: Path, tracked_files: list[str]):
+    SM-01 (MIT-1842): a bare repo outside the workspace
+    (``history_dir_for(workspace) / "workspace.git"``), so the agent's file
+    tools cannot rewrite its own undo history. Commits read the tracked files
+    as bytes and write blobs + a tree straight into the object store; there is
+    no index, no checkout, no ``<workspace>/.git`` and no ``.gitignore``.
+    """
+
+    def __init__(self, workspace: Path, tracked_files: list[str], git_dir: Path):
         self._workspace = workspace
-        self._tracked_files = tracked_files
+        self._tracked_files = list(tracked_files)
+        self._git_dir = Path(git_dir)
+        # Rate-limit the "tracked file too large" warning: one line per path.
+        self._oversize_logged: set[str] = set()
 
     def is_initialized(self) -> bool:
         """Check if the git repo has been initialized."""
-        return (self._workspace / ".git").is_dir()
+        return self._git_dir.is_dir()
 
     # -- init ------------------------------------------------------------------
 
     def init(self) -> bool:
-        """Initialize a git repo if not already initialized.
+        """Initialize the bare repo at git_dir if not already initialized.
 
-        Creates .gitignore and makes an initial commit.
-        Returns True if a new repo was created, False if already exists.
+        First moves any legacy ``<workspace>/.git`` (the old in-workspace store
+        the agent could reach) out of the workspace to
+        ``<history>/legacy-dot-git``. Returns True if a new repo was created,
+        False if it already exists.
         """
         if self.is_initialized():
             return False
+        return self._init_bare()
 
-        if self._is_inside_git_repo():
-            logger.warning(
-                "Workspace {} is already inside a git repo; "
-                "skipping nested repo initialization",
-                self._workspace,
-            )
-            return False
+    def _init_bare(self) -> bool:
+        """Initialize the bare repo at git_dir (MIT-1842).
 
+        Migrates a legacy ``<workspace>/.git`` (the old in-workspace store the
+        agent could reach) to ``<history>/legacy-dot-git`` so the old Dream
+        history stays readable with the host's ``git``. The workspace
+        ``.gitignore`` the old store wrote is harmless and left alone. Then
+        makes an initial commit of the tracked patterns as they are now.
+        """
         try:
-            from dulwich import porcelain
+            from dulwich.repo import Repo
 
-            porcelain.init(str(self._workspace))
+            history = self._git_dir.parent
+            history.mkdir(parents=True, exist_ok=True)
+            os.chmod(history, 0o700)
 
-            # Write .gitignore (merge with existing if present)
-            gitignore = self._workspace / ".gitignore"
-            dream_entries = self._build_gitignore()
-            if gitignore.exists():
-                existing = gitignore.read_text(encoding="utf-8")
-                existing_lines = set(existing.splitlines())
-                new_lines = [
-                    line
-                    for line in dream_entries.splitlines()
-                    if line not in existing_lines
-                ]
-                if new_lines:
-                    merged = existing.rstrip("\n") + "\n" + "\n".join(new_lines) + "\n"
-                    gitignore.write_text(merged, encoding="utf-8")
-            else:
-                gitignore.write_text(dream_entries, encoding="utf-8")
+            legacy = self._workspace / ".git"
+            parked = history / "legacy-dot-git"
+            if legacy.is_dir() and not legacy.is_symlink() and not parked.exists():
+                # shutil.move renames, and falls back to copy + remove-old
+                # when history/ is on another filesystem (EXDEV).
+                shutil.move(str(legacy), str(parked))
+                logger.info("Migrated legacy workspace git repo {} to {}", legacy, parked)
 
-            # Ensure tracked files exist (touch them if missing) so the initial
-            # commit has something to track.
-            for rel in self._tracked_files:
-                p = self._workspace / rel
-                p.parent.mkdir(parents=True, exist_ok=True)
-                if not p.exists():
-                    p.write_text("", encoding="utf-8")
-
-            # Initial commit
-            porcelain.add(
-                str(self._workspace),
-                paths=self._staging_paths(".gitignore", *self._tracked_files),
-            )
-            porcelain.commit(
-                str(self._workspace),
-                message=b"init: nanobot memory store",
-                author=b"nanobot <nanobot@dream>",
-                committer=b"nanobot <nanobot@dream>",
-            )
-            logger.info("Git store initialized at {}", self._workspace)
+            self._git_dir.mkdir(parents=True, exist_ok=True)
+            os.chmod(self._git_dir, 0o700)
+            Repo.init_bare(str(self._git_dir))
+            self._bare_commit("init: workspace history")
+            logger.info("Git store initialized at {}", self._git_dir)
             return True
         except Exception as exc:
             raise GitStoreError(f"Git store init failed for {self._workspace}") from exc
 
+    # -- bare-mode tracked-file expansion and committing ------------------------
+
+    def _expand_tracked_files(self) -> dict[str, bytes]:
+        """Expand tracked-file patterns against the workspace, reading bytes.
+
+        Skips symlinks, files over ``_MAX_TRACKED_FILE_BYTES`` (logged once
+        per path) and missing files. Files that were removed simply drop out
+        of the resulting tree.
+        """
+        files: dict[str, bytes] = {}
+        for pattern in self._tracked_files:
+            for candidate in self._expand_pattern(pattern):
+                try:
+                    if candidate.is_symlink() or not candidate.is_file():
+                        continue
+                    rel = candidate.relative_to(self._workspace).as_posix()
+                    size = candidate.stat().st_size
+                    if size > _MAX_TRACKED_FILE_BYTES:
+                        # The set only rate-limits the warning; eligibility is
+                        # re-checked every commit so a shrunk file comes back.
+                        if rel not in self._oversize_logged:
+                            self._oversize_logged.add(rel)
+                            logger.warning(
+                                "Git store: skipping tracked file {} ({} bytes > {} limit)",
+                                rel,
+                                size,
+                                _MAX_TRACKED_FILE_BYTES,
+                            )
+                        continue
+                    self._oversize_logged.discard(rel)
+                    files[rel] = candidate.read_bytes()
+                except OSError:
+                    continue
+        return files
+
+    def _expand_pattern(self, pattern: str) -> list[Path]:
+        """All candidate paths for one tracked-file pattern."""
+        if pattern.endswith("**"):
+            base = self._workspace / pattern.rstrip("*").rstrip("/")
+            out: list[Path] = []
+            if base.is_dir() and not base.is_symlink():
+                for root, dirs, names in os.walk(base, followlinks=False):
+                    # Never descend through a symlinked directory.
+                    dirs[:] = sorted(
+                        d for d in dirs if not os.path.islink(os.path.join(root, d))
+                    )
+                    for name in sorted(names):
+                        out.append(Path(root) / name)
+            return out
+        if any(ch in pattern for ch in "*?["):
+            parent_rel = Path(pattern).parent
+            name = Path(pattern).name
+            parent = self._workspace / parent_rel
+            if not parent.is_dir() or parent.is_symlink():
+                return []
+            return [parent / match for match in sorted(parent.glob(name))]
+        return [self._workspace / pattern]
+
+    def _bare_build_tree(self, repo: Repo) -> bytes:
+        """Write blobs for every tracked file and return the root tree id."""
+        from dulwich.index import commit_tree
+        from dulwich.objects import Blob
+
+        entries: list[tuple[bytes, bytes, int]] = []
+        for rel, data in self._expand_tracked_files().items():
+            blob = Blob.from_string(data)
+            repo.object_store.add_object(blob)
+            entries.append((rel.encode("utf-8"), blob.id, 0o100644))
+        return cast(bytes, commit_tree(repo.object_store, sorted(entries)))
+
+    def _bare_commit(self, message: str) -> bytes | None:
+        """Commit the current tracked files to the bare repo.
+
+        Returns the full commit id (ASCII bytes), or None when the tree
+        matches HEAD (nothing changed).
+        """
+        from dulwich.repo import Repo
+
+        msg_bytes = message.encode("utf-8") if isinstance(message, str) else message
+        with Repo(str(self._git_dir)) as repo:
+            tree_id = self._bare_build_tree(repo)
+            try:
+                head_sha: ObjectID | None = repo.refs[cast("Ref", b"HEAD")]
+            except KeyError:
+                head_sha = None
+            if head_sha is not None:
+                head_obj = repo[head_sha]
+                if head_obj.type_name == b"commit" and cast("Commit", head_obj).tree == tree_id:
+                    return None
+            sha = repo.get_worktree().commit(
+                tree=tree_id,
+                message=msg_bytes,
+                author=_BARE_COMMIT_IDENTITY,
+                committer=_BARE_COMMIT_IDENTITY,
+            )
+        return sha
+
     # -- daily operations ------------------------------------------------------
 
     def auto_commit(self, message: str) -> str | None:
-        """Stage tracked memory files and commit if there are changes.
+        """Commit the tracked files if they differ from HEAD.
 
         Returns the short commit SHA, or None if nothing to commit.
         """
@@ -131,52 +258,26 @@ class GitStore:
             return None
 
         try:
-            from dulwich import porcelain
-
-            # Stage first so Dulwich refreshes the content hashes.  A status
-            # check can miss rapid same-size rewrites when the filesystem also
-            # preserves the file's mtime.
-            porcelain.add(str(self._workspace), paths=self._staging_paths(*self._tracked_files))
-            st = porcelain.status(str(self._workspace))
-            staged = cast(dict[object, list[object]], st.staged)
-            if not any(staged.values()):
+            sha = self._bare_commit(message)
+            if sha is None:
                 return None
-
-            message_value = cast(object, message)
-            msg_bytes = (
-                message_value.encode("utf-8")
-                if isinstance(message_value, str)
-                else cast(bytes, message_value)
-            )
-            sha_bytes = porcelain.commit(
-                str(self._workspace),
-                message=msg_bytes,
-                author=b"nanobot <nanobot@dream>",
-                committer=b"nanobot <nanobot@dream>",
-            )
-            if cast(object, sha_bytes) is None:
-                return None
-            # porcelain.commit returns the id as a 40-char hex string that is
-            # already encoded to bytes; .hex() would encode those ASCII bytes
-            # again and produce an id no git command can resolve.
-            sha = sha_bytes.decode()[:8]
-            logger.debug("Git auto-commit: {} ({})", sha, message)
-            return sha
+            # worktree.commit returns the full id as ASCII bytes; decode
+            # before slicing or the short sha is a bytes repr no git command
+            # can resolve.
+            short = sha.decode()[:8]
+            logger.debug("Git auto-commit: {} ({})", short, message)
+            return short
         except Exception as exc:
             raise GitStoreError(f"Git auto-commit failed: {message}") from exc
 
     # -- internal helpers ------------------------------------------------------
-
-    def _staging_paths(self, *paths: str) -> list[str]:
-        """Return absolute paths without resolving tracked-file symlinks."""
-        return [str((self._workspace / path).absolute()) for path in paths]
 
     def _resolve_sha(self, short_sha: str) -> bytes | None:
         """Resolve a short SHA prefix to the full SHA bytes."""
         try:
             from dulwich.repo import Repo
 
-            with Repo(str(self._workspace)) as repo:
+            with Repo(str(self._git_dir)) as repo:
                 try:
                     sha: ObjectID | None = repo.refs[cast("Ref", b"HEAD")]
                 except KeyError:
@@ -193,37 +294,6 @@ class GitStore:
             return None
         except Exception as exc:
             raise GitStoreError(f"Git SHA resolution failed: {short_sha}") from exc
-
-    def _is_inside_git_repo(self) -> bool:
-        """Check if self._workspace is already inside a git repository.
-
-        Walks up from self._workspace to the filesystem root, returning True
-        if any parent directory contains a .git entry.
-
-        Git worktrees and submodules can use a ``.git`` file instead of a
-        directory, so we must treat either form as "already inside a repo".
-        """
-        current = self._workspace.resolve()
-        while current != current.parent:
-            if (current / ".git").exists():
-                return True
-            current = current.parent
-        return False
-
-    def _build_gitignore(self) -> str:
-        """Generate .gitignore content from tracked files."""
-        dirs: set[str] = set()
-        for f in self._tracked_files:
-            parent = str(Path(f).parent)
-            if parent != ".":
-                dirs.add(parent)
-        lines = ["/*"]
-        for d in sorted(dirs):
-            lines.append(f"!{d}/")
-        for f in self._tracked_files:
-            lines.append(f"!{f}")
-        lines.append("!.gitignore")
-        return "\n".join(lines) + "\n"
 
     # -- query -----------------------------------------------------------------
 
@@ -244,7 +314,7 @@ class GitStore:
             from dulwich.repo import Repo
 
             entries: list[CommitInfo] = []
-            with Repo(str(self._workspace)) as repo:
+            with Repo(str(self._git_dir)) as repo:
                 try:
                     head = repo.refs[cast("Ref", b"HEAD")]
                 except KeyError:
@@ -288,7 +358,7 @@ class GitStore:
 
             out = io.BytesIO()
             porcelain.diff(
-                str(self._workspace),
+                str(self._git_dir),
                 commit=full1,
                 commit2=full2,
                 outstream=out,
@@ -336,16 +406,22 @@ class GitStore:
         changed = 0
 
         try:
-            with Repo(str(self._workspace)) as repo:
+            with Repo(str(self._git_dir)) as repo:
                 head_tree = self._head_tree(repo)
                 for path in paths:
-                    head_text = (
+                    head_bytes = (
                         self._read_blob_from_tree(repo, head_tree, path)
                         if head_tree is not None
                         else None
                     )
-                    if head_text is None:
-                        head_text = ""
+                    # Same replacement-decode the str-returning reader used, so
+                    # binary head content never leaks U+FFFD via the wt-side
+                    # binary guard below.
+                    head_text = (
+                        head_bytes.decode("utf-8", errors="replace")
+                        if head_bytes is not None
+                        else ""
+                    )
                     wt_path = self._workspace / path
                     try:
                         wt_text = (
@@ -430,7 +506,7 @@ class GitStore:
                     full_sha = self._resolve_sha(c.sha)
                     if not full_sha:
                         return None
-                    with Repo(str(self._workspace)) as repo:
+                    with Repo(str(self._git_dir)) as repo:
                         commit = cast("Commit", repo[full_sha])
                         parent = commit.parents[0] if commit.parents else None
                     diff = self.diff_commits(parent.decode()[:8], c.sha) if parent else ""
@@ -444,8 +520,10 @@ class GitStore:
     def revert(self, commit: str, *, message_prefix: str | None = None) -> str | None:
         """Revert (undo) the changes introduced by the given commit.
 
-        Restores all tracked memory files to the state at the commit's parent,
-        then creates a new commit recording the revert. When *message_prefix*
+        Every file the commit changed is restored to its state at the commit's
+        parent, then a new commit records the revert. Files absent from the
+        parent tree are kept, never deleted; a file/directory conflict refuses
+        the whole revert with nothing changed. When *message_prefix*
         is provided, commits outside that history are rejected before any files
         are changed.
 
@@ -463,7 +541,7 @@ class GitStore:
                 logger.warning("Git revert: SHA not found: {}", commit)
                 return None
 
-            with Repo(str(self._workspace)) as repo:
+            with Repo(str(self._git_dir)) as repo:
                 commit_obj = repo[full_sha]
                 if commit_obj.type_name != b"commit":
                     return None
@@ -485,24 +563,63 @@ class GitStore:
                     logger.warning("Git revert: cannot revert root commit {}", commit)
                     return None
 
-                # Use the parent's tree — this undoes the commit's changes
+                # Undo what this commit changed: every path whose blob differs
+                # between the parent and the commit tree goes back to the
+                # parent's bytes. Paths come from the trees, so wildcard-
+                # tracked files (skills/**, prompts/*.md) are covered and
+                # files the commit did not touch are left alone.
+                #
+                # A path missing from the parent tree is never deleted: it may
+                # have existed then but been excluded (size cap, symlink), so
+                # its prior state is unknown. Such paths are kept and logged.
                 parent_obj = cast("Commit", repo[typed_commit.parents[0]])
-                tree = cast("Tree", repo[parent_obj.tree])
+                before = self._tree_blobs(repo, parent_obj.tree)
+                after = self._tree_blobs(repo, typed_commit.tree)
+                changed = sorted(
+                    p for p in before.keys() | after.keys() if before.get(p) != after.get(p)
+                )
+                workspace = self._workspace.resolve()
+                writes: list[tuple[str, Path, bytes]] = []
+                kept: list[str] = []
+                for filepath in changed:
+                    blob_id = before.get(filepath)
+                    if blob_id is None:
+                        kept.append(filepath)
+                        continue
+                    dest = self._workspace / filepath
+                    if workspace not in dest.resolve().parents:
+                        continue
+                    writes.append((filepath, dest, cast("Blob", repo[blob_id]).data))
 
-                commit_tree = cast("Tree", repo[typed_commit.tree])
-                restored: list[str] = []
-                for filepath in self._tracked_files:
-                    content = self._read_blob_from_tree(repo, tree, filepath)
-                    if content is None and (
-                        self._read_blob_from_tree(repo, commit_tree, filepath) is not None
-                    ):
-                        # The reverted commit first added this file (e.g. a
-                        # newly tracked memory/archive.md): undo means empty.
-                        content = ""
-                    if content is not None:
-                        dest = self._workspace / filepath
-                        dest.write_text(content, encoding="utf-8")
-                        restored.append(filepath)
+                # Preflight (all-or-nothing): refuse before touching anything
+                # if a target is now a directory or one of its parents is now
+                # a file (file <-> directory replacement by the commit).
+                conflicts = [
+                    filepath
+                    for filepath, dest, _ in writes
+                    if dest.is_dir()
+                    or any(
+                        (self._workspace / anc).exists() and not (self._workspace / anc).is_dir()
+                        for anc in Path(filepath).parents
+                    )
+                ]
+                if conflicts:
+                    logger.warning(
+                        "Git revert: refusing {}; file/directory conflict at {}",
+                        commit,
+                        ", ".join(conflicts),
+                    )
+                    return None
+                if kept:
+                    logger.warning(
+                        "Git revert: {} added {}; kept (prior state unknown)",
+                        commit,
+                        ", ".join(kept),
+                    )
+                for _, dest, data in writes:
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    dest.write_bytes(data)
+                restored = [filepath for filepath, _, _ in writes]
 
             if not restored:
                 return None
@@ -514,12 +631,30 @@ class GitStore:
             raise GitStoreError(f"Git revert failed for {commit}") from exc
 
     @staticmethod
+    def _tree_blobs(repo: "Repo", tree_id: bytes, prefix: str = "") -> dict[str, bytes]:
+        """Map every blob path in a tree (recursively) to its blob id."""
+        out: dict[str, bytes] = {}
+        tree = cast("Tree", repo[tree_id])
+        for entry in tree.iteritems():
+            path = f"{prefix}{entry.path.decode('utf-8')}"
+            obj = repo[entry.sha]
+            if obj.type_name == b"tree":
+                out.update(GitStore._tree_blobs(repo, entry.sha, f"{path}/"))
+            elif obj.type_name == b"blob":
+                out[path] = entry.sha
+        return out
+
+    @staticmethod
     def _read_blob_from_tree(
         repo: "Repo",
         tree: "Tree",
         filepath: str,
-    ) -> str | None:
-        """Read a blob's content from a tree object by walking path parts."""
+    ) -> bytes | None:
+        """Read a blob's raw bytes from a tree object by walking path parts.
+
+        Returns bytes (not str) so binary skill assets round-trip exactly
+        through history (MIT-1842); text callers decode themselves.
+        """
         parts = Path(filepath).parts
         current = tree
         for part in parts:
@@ -530,7 +665,7 @@ class GitStore:
             obj = repo[entry[1]]
             if obj.type_name == b"blob":
                 blob = cast("Blob", obj)
-                return blob.data.decode("utf-8", errors="replace")
+                return blob.data
             if obj.type_name == b"tree":
                 current = cast("Tree", obj)
             else:

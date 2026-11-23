@@ -323,8 +323,10 @@ class TestDreamCursor:
         store2 = MemoryStore(store.workspace)
         assert store2.get_last_dream_cursor() == 3
 
-    def test_git_restore_rolls_back_dream_cursor(self, tmp_path):
-        store = MemoryStore(tmp_path)
+    def test_git_restore_does_not_roll_back_dream_cursor(self, tmp_path):
+        """SM-01: memory/.dream_cursor is bookkeeping and no longer tracked;
+        restoring a commit must not re-consume old Dream history."""
+        store = MemoryStore(tmp_path / "workspace")
         store.write_memory("before")
         store.set_last_dream_cursor(1)
         assert store.git.init() is True
@@ -341,7 +343,8 @@ class TestDreamCursor:
 
         assert restore_sha is not None
         assert store.read_memory() == "before"
-        assert store.get_last_dream_cursor() == 1
+        # The cursor keeps its current value: it never entered the tree.
+        assert store.get_last_dream_cursor() == 3
 
 
 class TestLegacyHistoryMigration:
