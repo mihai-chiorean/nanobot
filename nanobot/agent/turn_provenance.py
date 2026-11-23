@@ -24,6 +24,7 @@ import re
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 from loguru import logger
@@ -199,14 +200,25 @@ class TurnProvenance:
             self.started_at = started_at
         self.account_intent = bool(entry.get("account_intent")) or self.account_intent
         self.prompt_rebuilt = bool(entry.get("prompt_rebuilt")) or self.prompt_rebuilt
-        if not self.prompt and isinstance(entry.get("prompt"), list):
-            self.prompt = list(entry["prompt"])
+        earlier_prompt = entry.get("prompt")
+        if isinstance(earlier_prompt, list) and earlier_prompt:
+            if not self.prompt:
+                self.prompt = list(earlier_prompt)
+            elif earlier_prompt != self.prompt:
+                # The answer spans two different prompts; the latest is kept.
+                self.prompt_rebuilt = True
         if self.skills_listed_sha is None and isinstance(entry.get("skills_listed_sha"), str):
             self.skills_listed_sha = entry["skills_listed_sha"]
-        for name in ("skills_loaded", "calls"):
-            earlier = entry.get(name)
-            if isinstance(earlier, list):
-                setattr(self, name, [*earlier, *getattr(self, name)])
+        earlier_calls = entry.get("calls")
+        if isinstance(earlier_calls, list):
+            self.calls = [*earlier_calls, *self.calls]
+        earlier_skills = entry.get("skills_loaded")
+        if isinstance(earlier_skills, list):
+            merged_skills = [dict(item) for item in earlier_skills if isinstance(item, dict)]
+            for item in self.skills_loaded:
+                if item not in merged_skills:
+                    merged_skills.append(item)
+            self.skills_loaded = merged_skills
         earlier_repairs = entry.get("args_repaired")
         if isinstance(earlier_repairs, dict):
             merged = {k: v for k, v in earlier_repairs.items() if isinstance(v, int)}
@@ -228,6 +240,37 @@ class TurnProvenance:
                 else:
                     merged_used.append(dict(item))
             self.used = merged_used
+
+    def note_prompt(self, sections: list[dict[str, Any]]) -> None:
+        """Record one system-prompt build's section fingerprint (TP-06).
+
+        The first non-empty list is the turn's fingerprint; a later build
+        with a different list (compaction or a summary change mid-turn)
+        flags ``prompt_rebuilt`` and the last one is kept.
+        """
+        if self.prompt and sections and sections != self.prompt:
+            self.prompt_rebuilt = True
+        if sections:
+            self.prompt = list(sections)
+
+    def note_skill(self, name: str, sha: str) -> None:
+        """Append ``{name, sha}`` to ``skills_loaded``, de-duplicated (TP-06)."""
+        entry = {"name": name, "sha": sha}
+        if entry not in self.skills_loaded:
+            self.skills_loaded.append(entry)
+
+    def note_skill_file(self, path: Path) -> None:
+        """Record a skill the model pulled in itself with ``read_file`` (TP-06).
+
+        ``path`` is the file the read actually resolved to. An existing
+        ``.../<name>/SKILL.md`` joins ``skills_loaded`` as its parent
+        directory name plus the file hash; anything else records nothing.
+        """
+        if path.name != "SKILL.md" or not path.is_file():
+            return
+        from nanobot.agent.skills import skill_file_sha
+
+        self.note_skill(path.parent.name, skill_file_sha(path))
 
     def note_tool_result(self, tool: Any, status: str) -> None:
         """Record one executed tool call.

@@ -1,0 +1,672 @@
+"""TP-06: per-turn system-prompt section fingerprints and skill hashes.
+
+Design: docs/design/turn-provenance.md §4. The fingerprint is returned,
+never stored on the builder (one ContextBuilder serves concurrent turns),
+and the prompt text stays byte-identical to ``build_system_prompt``.
+"""
+
+import asyncio
+import hashlib
+import json
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from nanobot.agent.context import ContextBuilder
+from nanobot.agent.loop import AgentLoop, _TurnProvenanceHook
+from nanobot.agent.skills import SkillsLoader, skill_file_sha
+from nanobot.agent.turn_provenance import TurnProvenance
+from nanobot.bus.events import InboundMessage
+from nanobot.bus.queue import MessageBus
+from nanobot.providers.base import LLMResponse, ToolCallRequest
+
+# ---------------------------------------------------------------------------
+# Fixtures: a workspace with AGENTS.md, SOUL.md, USER.md, MEMORY.md and two
+# workspace skills (foo always-on, bar on-demand).
+# ---------------------------------------------------------------------------
+
+MEMORY_TEXT = "Fact one: the deploy key lives in vault."
+
+
+def _write_skill(base: Path, name: str, *, always: bool) -> Path:
+    skill_dir = base / name
+    skill_dir.mkdir(parents=True)
+    front = f"name: {name}\ndescription: The {name} skill for tests.\n"
+    if always:
+        front += "metadata:\n  nanobot:\n    always: true\n"
+    path = skill_dir / "SKILL.md"
+    path.write_text(f"---\n{front}---\n# {name.capitalize()}\nBody of {name}.\n", encoding="utf-8")
+    return path
+
+
+def _make_workspace(tmp_path: Path, *, with_user: bool = True) -> Path:
+    (tmp_path / "AGENTS.md").write_text(
+        "# Project instructions\nDo the thing.\n", encoding="utf-8"
+    )
+    (tmp_path / "SOUL.md").write_text(
+        "I am a custom soul, not the bundled template.\n", encoding="utf-8"
+    )
+    if with_user:
+        (tmp_path / "USER.md").write_text(
+            "User prefers terse answers.\n", encoding="utf-8"
+        )
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    (memory_dir / "MEMORY.md").write_text(MEMORY_TEXT, encoding="utf-8")
+    skills = tmp_path / "skills"
+    _write_skill(skills, "foo", always=True)
+    _write_skill(skills, "bar", always=False)
+    return tmp_path
+
+
+def _sections(builder: ContextBuilder, **kw) -> dict[str, dict]:
+    _, sections = builder.build_system_prompt_with_fingerprint(**kw)
+    return {entry["section"]: entry for entry in sections}
+
+
+def _sha16(text: str) -> str:
+    raw = text.encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()[:16]
+
+
+# ---------------------------------------------------------------------------
+# Byte identity and entry shape
+# ---------------------------------------------------------------------------
+
+
+class TestByteIdentity:
+    def test_prompt_text_identical_to_build_system_prompt(self, tmp_path):
+        builder = ContextBuilder(workspace=_make_workspace(tmp_path))
+        for kw in (
+            {},
+            {"channel": "websocket"},
+            {"include_memory": False},
+            {"shared_room": True},
+        ):
+            prompt, _sections = builder.build_system_prompt_with_fingerprint(**kw)
+            assert prompt == builder.build_system_prompt(**kw)
+
+    def test_sha_and_bytes_over_the_section_utf8(self, tmp_path):
+        builder = ContextBuilder(workspace=_make_workspace(tmp_path))
+        entry = _sections(builder)["memory"]
+        expected_text = f"# Memory\n\n## Long-term Memory\n{MEMORY_TEXT}"
+        assert entry["sha"] == _sha16(expected_text)
+        assert entry["bytes"] == len(expected_text.encode("utf-8"))
+
+    def test_section_keys_for_the_full_workspace(self, tmp_path):
+        builder = ContextBuilder(workspace=_make_workspace(tmp_path), workflow_scheduling=True)
+        keys = list(_sections(builder, channel="websocket"))
+        assert keys == [
+            "identity",
+            "bootstrap.AGENTS.md",
+            "bootstrap.SOUL.md",
+            "bootstrap.USER.md",
+            "workflow_intake",
+            "tool_contract",
+            "memory",
+            "active_skills",
+            "skills_summary",
+        ]
+
+    def test_project_section_only_for_a_foreign_workspace(self, tmp_path):
+        builder = ContextBuilder(workspace=_make_workspace(tmp_path))
+        assert "project" not in _sections(builder)
+        other = tmp_path / "proj"
+        other.mkdir()
+        sections = _sections(builder, workspace=other)
+        expected = (
+            "# Current Project\n\n"
+            f"Working directory: {other.expanduser().resolve()}\n"
+            "Use it as the default root for project files and relative tool paths."
+        )
+        assert sections["project"]["sha"] == _sha16(expected)
+
+    def test_bootstrap_parts_are_the_joined_string_pieces(self, tmp_path):
+        builder = ContextBuilder(workspace=_make_workspace(tmp_path))
+        parts = builder._load_bootstrap_parts()
+        assert [name for name, _chunk in parts] == ["AGENTS.md", "SOUL.md", "USER.md"]
+        assert builder._load_bootstrap_files() == "\n\n".join(
+            chunk for _name, chunk in parts
+        )
+        sections = _sections(builder)
+        for name, chunk in parts:
+            assert sections[f"bootstrap.{name}"]["sha"] == _sha16(chunk)
+
+
+# ---------------------------------------------------------------------------
+# Section sensitivity
+# ---------------------------------------------------------------------------
+
+
+class TestSectionSensitivity:
+    def test_changing_only_memory_changes_only_the_memory_sha(self, tmp_path):
+        builder = ContextBuilder(workspace=_make_workspace(tmp_path))
+        before = _sections(builder)
+        (tmp_path / "memory" / "MEMORY.md").write_text(
+            MEMORY_TEXT + "\nFact two: the owner likes tests.", encoding="utf-8"
+        )
+        after = _sections(builder)
+        assert set(after) == set(before)
+        changed = {key for key in before if before[key]["sha"] != after[key]["sha"]}
+        assert changed == {"memory"}
+
+    def test_missing_user_md_leaves_out_the_bootstrap_user_section(self, tmp_path):
+        builder = ContextBuilder(workspace=_make_workspace(tmp_path, with_user=False))
+        keys = list(_sections(builder))
+        assert "bootstrap.USER.md" not in keys
+        assert "bootstrap.AGENTS.md" in keys and "bootstrap.SOUL.md" in keys
+
+    def test_shared_room_gives_exactly_the_shared_room_entry(self, tmp_path):
+        builder = ContextBuilder(workspace=_make_workspace(tmp_path))
+        prompt, sections = builder.build_system_prompt_with_fingerprint(shared_room=True)
+        assert len(sections) == 1
+        entry = sections[0]
+        assert entry["section"] == "shared_room"
+        assert prompt == ContextBuilder.SHARED_ROOM_SYSTEM_PROMPT
+        assert entry["sha"] == _sha16(prompt)
+        assert entry["bytes"] == len(prompt.encode("utf-8"))
+
+
+# ---------------------------------------------------------------------------
+# Skills: listed sha and loaded entries
+# ---------------------------------------------------------------------------
+
+
+class TestSkillHashes:
+    def test_editing_one_skill_md_changes_skills_listed_sha(self, tmp_path):
+        loader = SkillsLoader(_make_workspace(tmp_path), builtin_skills_dir=tmp_path / "none")
+        summary_before = loader.build_skills_summary(exclude={"foo"})
+        sha_before = loader.skills_listed_sha(exclude={"foo"})
+        assert summary_before and isinstance(sha_before, str) and len(sha_before) == 16
+        bar = tmp_path / "skills" / "bar" / "SKILL.md"
+        bar.write_text(
+            bar.read_text(encoding="utf-8") + "\nAn extra line changes the bytes.\n",
+            encoding="utf-8",
+        )
+        summary_after = loader.build_skills_summary(exclude={"foo"})
+        sha_after = loader.skills_listed_sha(exclude={"foo"})
+        assert summary_after == summary_before  # description-based text unchanged
+        assert sha_after != sha_before
+
+    def test_empty_listing_has_no_listed_sha(self, tmp_path):
+        loader = SkillsLoader(_make_workspace(tmp_path), builtin_skills_dir=tmp_path / "none")
+        assert loader.build_skills_summary(exclude={"foo", "bar"}) == ""
+        assert loader.skills_listed_sha(exclude={"foo", "bar"}) is None
+
+    def test_listed_sha_follows_sorted_name_line_pairs(self, tmp_path):
+        loader = SkillsLoader(_make_workspace(tmp_path), builtin_skills_dir=tmp_path / "none")
+        sha = loader.skills_listed_sha(exclude={"foo"})
+        expected = _sha16(
+            f"bar:{skill_file_sha(tmp_path / 'skills' / 'bar' / 'SKILL.md')}"
+        )
+        assert sha == expected
+
+    @staticmethod
+    def _read(
+        record: TurnProvenance, name: str, params, *, ok: bool = True,
+        tool=None, raw_arguments=None,
+    ) -> None:
+        hook = _TurnProvenanceHook(record, None)
+        call = ToolCallRequest(
+            id="tc", name=name,
+            arguments=params if raw_arguments is None else raw_arguments,
+        )
+        if ok:
+            asyncio.run(hook.after_execute_tool(MagicMock(), call, tool, params, "x"))
+        else:
+            asyncio.run(hook.on_execute_tool_error(MagicMock(), call, tool, params, "x"))
+
+    def test_executed_read_file_of_skill_md_is_recorded(self, tmp_path):
+        _make_workspace(tmp_path)
+        record = TurnProvenance(turn_id="t", started_at="s", source="user")
+        path = str(tmp_path / "skills" / "foo" / "SKILL.md")
+        self._read(record, "read_file", {"path": path})
+        self._read(record, "read_file", {"path": path})
+        assert record.skills_loaded == [
+            {
+                "name": "foo",
+                "sha": skill_file_sha(tmp_path / "skills" / "foo" / "SKILL.md"),
+            }
+        ]
+
+    def test_repaired_arguments_use_the_executed_params(self, tmp_path):
+        _make_workspace(tmp_path)
+        record = TurnProvenance(turn_id="t")
+        path = str(tmp_path / "skills" / "foo" / "SKILL.md")
+        # The model wrapped its args; the repair layer unwrapped them and the
+        # tool ran with ``params``. The raw wire args must not decide it.
+        self._read(
+            record, "read_file", {"path": path},
+            raw_arguments={"arguments": {"path": path}},
+        )
+        assert [item["name"] for item in record.skills_loaded] == ["foo"]
+
+    def test_bundled_skill_read_records_the_resolved_file(self, tmp_path):
+        from nanobot.agent.skills import BUILTIN_SKILLS_DIR
+        from nanobot.agent.tools.filesystem import ReadFileTool
+
+        bundled = sorted(BUILTIN_SKILLS_DIR.glob("*/SKILL.md"))
+        assert bundled, "fixture needs at least one bundled skill"
+        target = bundled[0]
+        tool = ReadFileTool(workspace=tmp_path, allowed_dir=tmp_path)
+        relative = f"skills/{target.parent.name}/SKILL.md"
+        assert not (tmp_path / relative).exists()
+        # Sanity: the tool really serves this path from the bundled fallback.
+        assert tool.resolved_read_path(relative) == target.resolve()
+        record = TurnProvenance(turn_id="t")
+        self._read(record, "read_file", {"path": relative}, tool=tool)
+        assert record.skills_loaded == [
+            {"name": target.parent.name, "sha": skill_file_sha(target)}
+        ]
+
+    def test_skill_read_negative_controls(self, tmp_path):
+        _make_workspace(tmp_path)
+        record = TurnProvenance(turn_id="t", started_at="s", source="user")
+        foo = str(tmp_path / "skills" / "foo" / "SKILL.md")
+        # exec cat of a real SKILL.md is not the model opening the file.
+        self._read(record, "exec", {"command": f"cat {foo}"})
+        # A failed read loaded nothing.
+        self._read(record, "read_file", {"path": foo}, ok=False)
+        self._read(record, "read_file", {"path": str(tmp_path / "memory" / "MEMORY.md")})
+        self._read(record, "read_file", {"path": str(tmp_path / "skills" / "ghost" / "SKILL.md")})
+        self._read(record, "read_file", {"path": 42})
+        self._read(record, "read_file", "not-a-dict")
+        self._read(record, "read_file", {"path": str(tmp_path / "notes" / "SKILL.md.bak")})
+        self._read(record, "read_file", {"path": f"{tmp_path}/nope/deep/SKILL.md"})
+        assert record.skills_loaded == []
+
+    def test_skill_read_failure_is_swallowed_and_logged_without_content(
+        self, tmp_path, monkeypatch
+    ):
+        from loguru import logger
+
+        _make_workspace(tmp_path)
+        record = TurnProvenance(turn_id="t", started_at="s", source="user")
+        secret_path = str(tmp_path / "skills" / "foo" / "SKILL.md")
+
+        def boom(_path):
+            raise RuntimeError(f"secret {secret_path}")
+
+        monkeypatch.setattr("nanobot.agent.skills.skill_file_sha", boom)
+        lines: list[str] = []
+        sink = logger.add(lambda m: lines.append(str(m)), level="WARNING")
+        try:
+            self._read(record, "read_file", {"path": secret_path})
+        finally:
+            logger.remove(sink)
+        assert record.skills_loaded == []
+        assert any("noting a skill read" in line and "RuntimeError" in line for line in lines)
+        assert not any(secret_path in line or "secret" in line for line in lines)
+
+    def test_continuation_slices_dedupe_skills_loaded(self):
+        sha = "a" * 16
+        earlier = TurnProvenance(turn_id="t")
+        earlier.note_skill("foo", sha)
+        later = TurnProvenance(turn_id="t")
+        later.note_skill("foo", sha)
+        later.note_skill("bar", "b" * 16)
+        later.absorb_earlier_slice(earlier.to_dict())
+        assert later.skills_loaded == [
+            {"name": "foo", "sha": sha},
+            {"name": "bar", "sha": "b" * 16},
+        ]
+
+    def test_note_prompt_flags_only_a_differing_rebuild(self):
+        record = TurnProvenance(turn_id="t", started_at="s", source="user")
+        a = [{"section": "identity", "sha": "a" * 16, "bytes": 1}]
+        record.note_prompt(a)
+        record.note_prompt(list(a))
+        assert record.prompt == a and record.prompt_rebuilt is False
+        b = [{"section": "identity", "sha": "b" * 16, "bytes": 2}]
+        record.note_prompt(b)
+        assert record.prompt_rebuilt is True
+        assert record.prompt == b  # the last one is kept
+
+    def test_to_dict_shape(self):
+        record = TurnProvenance(turn_id="t", started_at="s", source="user")
+        payload = record.to_dict()
+        assert payload["v"] == 1
+        assert payload["turn_id"] == "t"
+        assert "model" not in payload and "model_preset" not in payload  # None omitted
+        assert payload["prompt"] == [] and payload["other_steps"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Concurrency: one builder, many workspaces, no shared fingerprint state
+# ---------------------------------------------------------------------------
+
+
+class TestConcurrentFingerprints:
+    def test_two_threads_get_their_own_fingerprint(self, tmp_path):
+        workspace = _make_workspace(tmp_path)
+        builder = ContextBuilder(workspace=workspace)
+        ws_a = tmp_path / "a"
+        ws_b = tmp_path / "b"
+        ws_a.mkdir()
+        ws_b.mkdir()
+
+        def build(root: Path):
+            return builder.build_system_prompt_with_fingerprint(
+                channel="websocket", workspace=root
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(build, ws_a)
+            second = pool.submit(build, ws_b)
+            prompt_a, sections_a = first.result()
+            prompt_b, sections_b = second.result()
+
+        solo_a = builder.build_system_prompt_with_fingerprint(
+            channel="websocket", workspace=ws_a
+        )
+        solo_b = builder.build_system_prompt_with_fingerprint(
+            channel="websocket", workspace=ws_b
+        )
+        assert (prompt_a, sections_a) == solo_a
+        assert (prompt_b, sections_b) == solo_b
+        assert prompt_a != prompt_b  # sanity: they really are different prompts
+        project_a = next(e for e in sections_a if e["section"] == "project")
+        project_b = next(e for e in sections_b if e["section"] == "project")
+        assert project_a["sha"] != project_b["sha"]
+
+
+# ---------------------------------------------------------------------------
+# End-to-end: a real turn persists the fingerprint into provenance_v1
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_turn_records_prompt_fingerprint_and_skills(tmp_path):
+    workspace = _make_workspace(tmp_path)
+    bus = MessageBus()
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    skill_path = str(workspace / "skills" / "bar" / "SKILL.md")
+    calls = iter(
+        [
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCallRequest(
+                        id="tc1", name="read_file", arguments={"path": skill_path}
+                    )
+                ],
+            ),
+            LLMResponse(
+                content="Bar does the needful. SENTINEL-ANSWER-9182",
+                tool_calls=[],
+            ),
+        ]
+    )
+    provider.chat_stream_with_retry = AsyncMock(side_effect=lambda *a, **kw: next(calls))
+    loop = AgentLoop(bus=bus, provider=provider, workspace=workspace, model="test-model")
+
+    await loop._dispatch_one(
+        InboundMessage(
+            channel="websocket",
+            sender_id="u1",
+            chat_id="chat1",
+            content="load $bar and tell me about it",
+            metadata={"webui_turn_id": "wire-turn-7"},
+        ),
+        asyncio.Queue(),
+    )
+    while bus.outbound_size > 0:
+        await bus.consume_outbound()
+
+    persisted = loop.sessions.read_session_file("websocket:chat1")
+    assert persisted is not None
+    entries = (persisted.get("metadata") or {}).get("provenance_v1")
+    assert isinstance(entries, list) and len(entries) == 1
+    entry = entries[0]
+
+    assert entry["turn_id"] == "wire-turn-7"
+    assert entry["source"] == "user"
+    assert entry["answered"] is True
+    assert entry["v"] == 1
+
+    keys = [section["section"] for section in entry["prompt"]]
+    assert keys == [
+        "identity",
+        "bootstrap.AGENTS.md",
+        "bootstrap.SOUL.md",
+        "bootstrap.USER.md",
+        "tool_contract",
+        "memory",
+        "active_skills",
+        "skills_summary",
+    ]
+    assert entry["prompt_rebuilt"] is False
+
+    # Independent recomputation (not the builder's own hash): the memory
+    # section hashes the exact block the prompt embeds.
+    memory_entry = next(s for s in entry["prompt"] if s["section"] == "memory")
+    expected_memory = f"# Memory\n\n## Long-term Memory\n{MEMORY_TEXT}"
+    assert memory_entry["sha"] == _sha16(expected_memory)
+    assert memory_entry["bytes"] == len(expected_memory.encode("utf-8"))
+
+    assert isinstance(entry["skills_listed_sha"], str)
+    assert len(entry["skills_listed_sha"]) == 16
+
+    loaded = {item["name"]: item["sha"] for item in entry["skills_loaded"]}
+    # always-on skill and the $name/read_file skill, de-duplicated to two.
+    assert loaded["foo"] == skill_file_sha(workspace / "skills" / "foo" / "SKILL.md")
+    assert loaded["bar"] == skill_file_sha(workspace / "skills" / "bar" / "SKILL.md")
+    assert len(entry["skills_loaded"]) == 2
+
+    # Provenance never retains the user's message or the answer text.
+    assert "SENTINEL-ANSWER-9182" not in json.dumps(entry)
+    assert "load $bar and tell me about it" not in json.dumps(entry)
+
+
+@pytest.mark.asyncio
+async def test_prompt_recording_failure_never_fails_the_turn(tmp_path, monkeypatch):
+    """A raise while hashing skills is logged content-free; the turn answers."""
+    from loguru import logger
+
+    workspace = _make_workspace(tmp_path)
+    bus = MessageBus()
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    provider.chat_stream_with_retry = AsyncMock(
+        return_value=LLMResponse(content="Answer SENTINEL-OK-55", tool_calls=[])
+    )
+    loop = AgentLoop(bus=bus, provider=provider, workspace=workspace, model="test-model")
+    skill_dir = str(workspace / "skills")
+
+    def boom(path):
+        raise OSError(f"cannot read {path}")
+
+    monkeypatch.setattr("nanobot.agent.loop.skill_file_sha", boom)
+    lines: list[str] = []
+    sink = logger.add(lambda m: lines.append(str(m)), level="WARNING")
+    try:
+        await loop._dispatch_one(
+            InboundMessage(
+                channel="websocket", sender_id="u1", chat_id="chat2",
+                content="hello", metadata={"webui_turn_id": "wire-turn-8"},
+            ),
+            asyncio.Queue(),
+        )
+    finally:
+        logger.remove(sink)
+    outbound = []
+    while bus.outbound_size > 0:
+        outbound.append(await bus.consume_outbound())
+    assert any("SENTINEL-OK-55" in (getattr(m, "content", "") or "") for m in outbound)
+
+    persisted = loop.sessions.read_session_file("websocket:chat2")
+    entry = persisted["metadata"]["provenance_v1"][0]
+    assert entry["answered"] is True
+    assert entry["prompt"]  # recorded before the failing step
+    assert entry["skills_loaded"] == []
+    assert any(
+        "recording the prompt fingerprint" in line and "OSError" in line for line in lines
+    )
+    assert not any(skill_dir in line for line in lines)
+
+
+def test_continuation_with_a_different_prompt_flags_rebuilt():
+    first = TurnProvenance(turn_id="t")
+    first.note_prompt([{"section": "identity", "sha": "a" * 16, "bytes": 1}])
+    second = TurnProvenance(turn_id="t")
+    second.note_prompt([{"section": "identity", "sha": "b" * 16, "bytes": 1}])
+    second.absorb_earlier_slice(first.to_dict())
+    assert second.prompt_rebuilt is True
+    assert second.prompt[0]["sha"] == "b" * 16  # latest kept
+
+    same = TurnProvenance(turn_id="t")
+    same.note_prompt(list(first.prompt))
+    same.absorb_earlier_slice(first.to_dict())
+    assert same.prompt_rebuilt is False
+
+
+def _content_free(lines: list[str], *needles: str) -> bool:
+    return not any(needle in line for line in lines for needle in needles)
+
+
+def test_fingerprint_failure_keeps_the_prompt_and_logs_no_content(tmp_path, monkeypatch):
+    from loguru import logger
+
+    import nanobot.agent.context as context_mod
+
+    builder = ContextBuilder(workspace=_make_workspace(tmp_path))
+    expected = _reference_build_system_prompt(builder, channel="websocket")
+
+    def boom(_section, _text):
+        raise RuntimeError("secret-fingerprint-text")
+
+    monkeypatch.setattr(context_mod, "_fingerprint_entry", boom)
+    lines: list[str] = []
+    sink = logger.add(lambda m: lines.append(str(m)), level="WARNING")
+    try:
+        prompt, sections = builder.build_system_prompt_with_fingerprint(channel="websocket")
+    finally:
+        logger.remove(sink)
+    assert prompt == expected
+    assert sections == []
+    assert any("fingerprinting the system prompt" in line for line in lines)
+    assert _content_free(lines, "secret-fingerprint-text", MEMORY_TEXT)
+
+
+def test_skill_hash_failure_never_touches_prompt_rendering(tmp_path, monkeypatch):
+    builder = ContextBuilder(workspace=_make_workspace(tmp_path))
+    expected = _reference_build_system_prompt(builder)
+
+    def boom(_path):
+        raise RuntimeError("secret")
+
+    monkeypatch.setattr("nanobot.agent.skills.skill_file_sha", boom)
+    assert builder.build_system_prompt() == expected
+
+
+# ---------------------------------------------------------------------------
+# Golden: the prompt bytes must match the pre-TP-06 assembly. This is a frozen
+# copy of origin/ziggy-main's ``build_system_prompt`` / ``_load_bootstrap_files``
+# (before TP-06), using only helpers TP-06 does not touch.
+# ---------------------------------------------------------------------------
+
+
+def _reference_bootstrap(builder: ContextBuilder, workspace: Path | None = None) -> str:
+    from nanobot.utils.helpers import load_bundled_template
+
+    parts: list[str] = []
+    project_root = workspace or builder.workspace
+    sources = [
+        ("AGENTS.md", project_root),
+        ("SOUL.md", builder.workspace),
+        ("USER.md", builder.workspace),
+    ]
+    for filename, root in sources:
+        file_path = root / filename
+        if file_path.exists():
+            content = file_path.read_text(encoding="utf-8")
+            if filename == "SOUL.md" and builder._is_template_content(content, "legacy/SOUL.md"):
+                content = load_bundled_template("SOUL.md") or content
+            if not content.strip():
+                continue
+            if filename in builder._SKIPPABLE_DEFAULTS and builder._is_template_content(
+                content, filename
+            ):
+                continue
+            parts.append(f"## {filename}\n\n{content}")
+    return "\n\n".join(parts) if parts else ""
+
+
+def _reference_build_system_prompt(
+    builder: ContextBuilder,
+    *,
+    channel=None,
+    session_summary=None,
+    workspace: Path | None = None,
+    include_memory: bool = True,
+    shared_room: bool = False,
+) -> str:
+    from nanobot.utils.prompt_templates import render_template
+
+    if shared_room:
+        return builder.SHARED_ROOM_SYSTEM_PROMPT
+    root = workspace or builder.workspace
+    parts = [builder._get_identity(channel=channel, workspace=root)]
+    bootstrap = _reference_bootstrap(builder, root)
+    if bootstrap:
+        parts.append(bootstrap)
+    if builder.workflow_scheduling:
+        parts.append(
+            render_template("agent/workflow_intake.md", cron_scheduling=builder.cron_scheduling)
+        )
+    parts.append(render_template("agent/tool_contract.md", cron_scheduling=builder.cron_scheduling))
+    project_path = root.expanduser().resolve()
+    if project_path != builder.workspace.expanduser().resolve():
+        parts.append(
+            "# Current Project\n\n"
+            f"Working directory: {project_path}\n"
+            "Use it as the default root for project files and relative tool paths."
+        )
+    if include_memory:
+        memory = builder.memory.read_memory()
+        if memory and not builder._is_template_content(memory, "memory/MEMORY.md"):
+            parts.append(f"# Memory\n\n## Long-term Memory\n{memory}")
+    active_skills = builder.skills.get_always_skills()
+    if active_skills:
+        active_content = builder.skills.load_skills_for_context(active_skills)
+        if active_content:
+            parts.append(f"# Active Skills\n\n{active_content}")
+    skills_summary = builder.skills.build_skills_summary(exclude=set(active_skills), workspace=root)
+    if skills_summary:
+        parts.append(render_template("agent/skills_section.md", skills_summary=skills_summary))
+    if session_summary and session_summary["text"] != "(nothing)":
+        parts.append(
+            "[Archived Context Summary]\n\n"
+            f"Previous conversation summary (last active {session_summary['last_active']}):\n"
+            f"{session_summary['text']}"
+        )
+    return "\n\n---\n\n".join(parts)
+
+
+@pytest.mark.parametrize("with_user", [True, False])
+@pytest.mark.parametrize("workflow", [True, False])
+def test_prompt_bytes_match_the_pre_tp06_assembly(tmp_path, with_user, workflow):
+    builder = ContextBuilder(
+        workspace=_make_workspace(tmp_path, with_user=with_user),
+        workflow_scheduling=workflow,
+        cron_scheduling=workflow,
+    )
+    other = tmp_path / "proj"
+    other.mkdir()
+    (other / "AGENTS.md").write_text("Project-local rules.\n", encoding="utf-8")
+    summary = {"text": "We talked about deploys.", "last_active": "2026-11-01"}
+    for kw in (
+        {},
+        {"channel": "websocket"},
+        {"include_memory": False},
+        {"shared_room": True},
+        {"workspace": other},
+        {"session_summary": summary},
+        {"session_summary": {"text": "(nothing)", "last_active": "x"}},
+    ):
+        expected = _reference_build_system_prompt(builder, **kw)
+        assert builder.build_system_prompt(**kw) == expected, kw
+        assert builder.build_system_prompt_with_fingerprint(**kw)[0] == expected, kw

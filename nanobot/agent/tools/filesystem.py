@@ -339,6 +339,17 @@ class ReadFileTool(_FsTool):
     def read_only(self) -> bool:
         return True
 
+    def resolved_read_path(self, path: str) -> Path:
+        """The file a read of ``path`` opens, bundled-skill fallback included.
+
+        Provenance (TP-06) asks the same question after a read succeeds, so
+        it records the file that was actually read.
+        """
+        fp = self._resolve_read(path)
+        if not fp.exists():
+            fp = _builtin_skill_read_path(path) or fp
+        return fp
+
     async def execute(
         self,
         path: str | None = None,
@@ -368,9 +379,7 @@ class ReadFileTool(_FsTool):
             if is_sensitive_path(path):
                 return ToolResult.error(f"Error: Reading {path} is blocked (sensitive path — credentials or key material).")
 
-            fp = self._resolve_read(path)
-            if not fp.exists():
-                fp = _builtin_skill_read_path(path) or fp
+            fp = self.resolved_read_path(path)
             # Post-resolve pass: defence in depth against symlink / traversal
             # escapes. Runs *after* the builtin-skill fallback, which can
             # reassign fp -- checking before it would leave the final value
