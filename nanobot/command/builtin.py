@@ -541,7 +541,14 @@ async def cmd_dream(ctx: CommandContext) -> OutboundMessage:
             content = f"Dream failed after {elapsed:.1f}s: {e}"
         finally:
             if store.git.is_initialized():
-                commit_msg = build_dream_commit_message("dream: manual run", diff_body)
+                core_tokens, core_budget = store.core_memory_stats()
+                logger.info("Dream run core: {}/{} tokens", core_tokens, core_budget)
+                commit_msg = build_dream_commit_message(
+                    "dream: manual run",
+                    diff_body,
+                    core_tokens=core_tokens,
+                    core_budget=core_budget,
+                )
                 sha = store.git.auto_commit(commit_msg)
                 if sha:
                     content += f" (commit {sha})"
@@ -844,21 +851,21 @@ async def cmd_dream_restore(ctx: CommandContext) -> OutboundMessage:
                 "Use `/dream-restore` to list recent versions."
             )
         else:
-            undo = git.undo(sha)
-            if undo.restored or undo.skipped:
+            undo = git.undo(sha, message_prefix=_DREAM_COMMIT_PREFIX)
+            if undo.conflicts:
+                content = _format_undo_conflicts(sha, undo.conflicts)
+            elif undo.restored or undo.skipped or undo.kept:
                 lines = [
-                    f"Restored Dream memory to the state before `{sha}`.",
+                    f"Restored Dream memory to the state before `{sha}`."
+                    if undo.restored
+                    else f"Nothing restored from Dream change `{sha}`.",
                     "",
                 ]
                 if undo.new_sha:
                     lines.append(f"- New safety commit: `{undo.new_sha}`")
                 if undo.restored:
                     lines.append(f"- Restored files: {_format_file_paths(undo.restored)}")
-                for path in undo.skipped:
-                    lines.append(
-                        f"- Skipped `{path}` — changed again later; "
-                        f"use `/restore {sha}`"
-                    )
+                lines.extend(_format_undo_leftovers(sha, undo))
                 if undo.new_sha:
                     lines.extend([
                         "",
@@ -884,6 +891,25 @@ def _format_file_paths(paths: list[str]) -> str:
     if not paths:
         return "No tracked memory files changed."
     return ", ".join(f"`{path}`" for path in paths)
+
+
+def _format_undo_leftovers(sha: str, undo: Any) -> list[str]:
+    lines = [
+        f"- Skipped `{path}` — changed again later; use `/restore {sha}`"
+        for path in undo.skipped
+    ]
+    lines.extend(
+        f"- Kept `{path}` — no earlier version in history"
+        for path in undo.kept
+    )
+    return lines
+
+
+def _format_undo_conflicts(sha: str, conflicts: list[str]) -> str:
+    return (
+        f"Nothing changed: couldn't undo `{sha}` because these paths are now "
+        f"a directory, a symlink or under one: {_format_file_paths(conflicts)}."
+    )
 
 
 def _history_git(ctx: CommandContext) -> Any:
@@ -970,7 +996,9 @@ async def cmd_undo(ctx: CommandContext) -> OutboundMessage:
 
     sha = args[0]
     undo = git.undo(sha)
-    if not undo.restored and not undo.skipped:
+    if undo.conflicts:
+        content = _format_undo_conflicts(sha, undo.conflicts)
+    elif not (undo.restored or undo.skipped or undo.kept):
         if git.has_commit(sha):
             content = (
                 f"Nothing to undo from `{sha}`.\n\n"
@@ -985,10 +1013,7 @@ async def cmd_undo(ctx: CommandContext) -> OutboundMessage:
         lines = [f"## Undo `{sha}`", ""]
         if undo.restored:
             lines.append(f"- Restored: {_format_file_paths(undo.restored)}")
-        for path in undo.skipped:
-            lines.append(
-                f"- Skipped `{path}` — changed again later; use `/restore {sha}`"
-            )
+        lines.extend(_format_undo_leftovers(sha, undo))
         content = "\n".join(lines)
 
     return OutboundMessage(
@@ -1035,36 +1060,45 @@ async def cmd_restore(ctx: CommandContext) -> OutboundMessage:
         )
 
     confirmed = len(args) > 1 and args[1].lower() == "confirm"
-    if not confirmed:
-        preview = git.restore_preview(sha)
-        if not preview:
-            content = f"Nothing to restore: memory already matches `{sha}`."
+    plan = git.restore(sha) if confirmed else git.restore_preview(sha)
+    if plan.conflicts:
+        content = (
+            f"Nothing changed: couldn't restore `{sha}` because these paths are "
+            "now a directory, a symlink, too large for history, or under a "
+            f"symlink: {_format_file_paths(plan.conflicts)}."
+        )
+    elif not plan.restored:
+        content = f"Nothing to restore: memory already matches `{sha}`."
+        if plan.kept:
+            content += (
+                "\n\nFiles added since then are kept: "
+                f"{_format_file_paths(plan.kept)}."
+            )
+    else:
+        if confirmed:
+            lines = [
+                f"Restored memory to `{sha}`.",
+                "",
+                f"- Changed files: {_format_file_paths(plan.restored)}",
+            ]
         else:
             lines = [
                 f"## Restore `{sha}`",
                 "",
-                "This would overwrite or delete every later change to:",
+                "This would overwrite every later change to:",
                 "",
             ]
-            lines.extend(f"- `{path}`" for path in preview)
-            lines.extend([
-                "",
-                f"Confirm with `/restore {sha} confirm`.",
-            ])
-            content = "\n".join(lines)
-    else:
-        changed = git.restore(sha)
-        if not changed:
-            content = f"Nothing to restore: memory already matches `{sha}`."
+            lines.extend(f"- `{path}`" for path in plan.restored)
+        if plan.kept:
+            lines.append(
+                f"- Kept (added since, never deleted): {_format_file_paths(plan.kept)}"
+            )
+        lines.append("")
+        if confirmed:
+            lines.append(f"Use `/changes {sha}` to inspect the version you restored.")
         else:
-            lines = [
-                f"Restored memory to `{sha}`.",
-                "",
-                f"- Changed files: {_format_file_paths(changed)}",
-                "",
-                f"Use `/changes {sha}` to inspect the version you restored.",
-            ]
-            content = "\n".join(lines)
+            lines.append(f"Confirm with `/restore {sha} confirm`.")
+        content = "\n".join(lines)
 
     return OutboundMessage(
         channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,

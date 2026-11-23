@@ -11,18 +11,29 @@ from nanobot.command.builtin import (
     build_help_text,
     builtin_command_palette,
     cmd_changes,
+    cmd_dream_restore,
     cmd_restore,
     cmd_undo,
     register_builtin_commands,
 )
 from nanobot.command.router import CommandContext, CommandRouter
-from nanobot.utils.gitstore import GitStore
+from nanobot.utils.gitstore import GitStore, history_dir_for
 
 TRACKED = ["SOUL.md", "USER.md", "memory/MEMORY.md"]
 
 
+def _bare_store(tmp_path) -> GitStore:
+    workspace = tmp_path / "workspace"
+    (workspace / "memory").mkdir(parents=True, exist_ok=True)
+    return GitStore(
+        workspace, tracked_files=TRACKED, git_dir=history_dir_for(workspace) / "workspace.git",
+    )
+
+
 def _make_store(tmp_path) -> GitStore:
-    store = GitStore(tmp_path, tracked_files=TRACKED)
+    store = _bare_store(tmp_path)
+    for rel in TRACKED:
+        (store._workspace / rel).write_text("", encoding="utf-8")
     store.init()
     return store
 
@@ -218,8 +229,52 @@ async def test_restore_when_already_matching_is_noop(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_dream_restore_keeps_later_non_dream_edits(tmp_path) -> None:
+    """MIT-1847: /dream-restore undoes only the Dream commit's own changes and
+    never discards a later owner edit, to another file or to the same one."""
+    ctx, git = _make_ctx(tmp_path, "/dream-restore")
+    ws = git._workspace
+    (ws / "memory" / "MEMORY.md").write_text("pre-dream memory", encoding="utf-8")
+    (ws / "SOUL.md").write_text("pre-dream soul", encoding="utf-8")
+    git.auto_commit("owner baseline")
+    (ws / "memory" / "MEMORY.md").write_text("dream memory", encoding="utf-8")
+    (ws / "SOUL.md").write_text("dream soul", encoding="utf-8")
+    dream_sha = git.auto_commit("dream: consolidate")
+    (ws / "SOUL.md").write_text("owner soul after dream", encoding="utf-8")
+    (ws / "USER.md").write_text("owner user after dream", encoding="utf-8")
+    git.auto_commit("owner edits")
+    ctx.args = dream_sha
+
+    out = await cmd_dream_restore(ctx)
+
+    assert (ws / "memory" / "MEMORY.md").read_text(encoding="utf-8") == "pre-dream memory"
+    assert (ws / "SOUL.md").read_text(encoding="utf-8") == "owner soul after dream"
+    assert (ws / "USER.md").read_text(encoding="utf-8") == "owner user after dream"
+    assert "Restored files: `memory/MEMORY.md`" in out.content
+    assert f"Skipped `SOUL.md` — changed again later; use `/restore {dream_sha}`" in out.content
+
+
+@pytest.mark.asyncio
+async def test_undo_conflict_reports_nothing_changed(tmp_path) -> None:
+    ctx, git = _make_ctx(tmp_path, "/undo")
+    ws = git._workspace
+    (ws / "SOUL.md").write_text("dream", encoding="utf-8")
+    (ws / "USER.md").write_text("dream user", encoding="utf-8")
+    sha = git.auto_commit("dream: edit")
+    (ws / "SOUL.md").unlink()
+    (ws / "SOUL.md").mkdir()
+    ctx.args = sha
+
+    out = await cmd_undo(ctx)
+
+    assert out.content.startswith("Nothing changed")
+    assert "`SOUL.md`" in out.content
+    assert (ws / "USER.md").read_text(encoding="utf-8") == "dream user"
+
+
+@pytest.mark.asyncio
 async def test_commands_reject_uninitialized_store(tmp_path) -> None:
-    git = GitStore(tmp_path, tracked_files=TRACKED)
+    git = _bare_store(tmp_path)
     msg = InboundMessage(channel="cli", sender_id="u1", chat_id="direct", content="/changes")
     loop = SimpleNamespace(consolidator=SimpleNamespace(store=SimpleNamespace(git=git)))
     ctx = CommandContext(

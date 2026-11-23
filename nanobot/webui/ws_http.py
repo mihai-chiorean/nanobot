@@ -1096,6 +1096,35 @@ class GatewayHTTPHandler:
             extra_headers=_NO_STORE_HEADERS,
         )
 
+    async def _handle_memory_items(self, request: WsRequest) -> Response:
+        """``GET /api/memory/items`` -- owner-only "what Ziggy knows about you" (MIT-1880).
+
+        The workspace's own ``USER.md`` and ``memory/MEMORY.md``, rendered as
+        section-grouped items with the stable ``provenance_key`` id
+        ``memory_explain`` already uses, each fact optionally annotated with
+        its ``provenance.jsonl`` source (design section 6). The route takes no
+        parameters: each tester's runtime is its own container and the store
+        is always this runtime's own workspace, so there is nothing to select
+        and no path for a caller-supplied one.
+
+        Auth is the owner API token itself (``tokens.check_api_token``), never
+        the trusted-proxy shortcut in ``check_api_token``: a proxied request
+        with no owner token gets 401 (repo rule for owner routes). Room
+        credentials (``nbrt_``, a distinct audience) are refused the same way
+        -- what Ziggy remembers about the owner is not a room guest's reading
+        matter. Same posture as ``/api/activity/audit`` (MIT-1450).
+        """
+        if not self.tokens.check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        from nanobot.agent.memory import MemoryStore
+        from nanobot.webui.memory_api import list_items, make_session_title_reader
+
+        store = MemoryStore(self.skills_workspace_path)
+        payload = await asyncio.to_thread(
+            list_items, store, title_for=make_session_title_reader(self.session_manager)
+        )
+        return _http_json_response(payload, extra_headers=_NO_STORE_HEADERS)
+
     async def _handle_webui_thread_get_async(self, request: WsRequest, key: str) -> Response:
         diagnostics = _WebUIThreadDiagnostics()
         loop = asyncio.get_running_loop()
@@ -1522,9 +1551,13 @@ class GatewayHTTPHandler:
                         self.local_trigger_store.delete(job.id)
                 elif self.cron_service is not None:
                     self.cron_service.remove_job(job.id)
-        draft_deleted = self.workspaces.discard_draft_scope(decoded_key)
-        session_deleted = self.session_manager.delete_session(decoded_key)
-        transcript_deleted = delete_webui_thread(decoded_key)
+        try:
+            draft_deleted = self.workspaces.discard_draft_scope(decoded_key)
+            session_deleted = self.session_manager.delete_session(decoded_key)
+            transcript_deleted = delete_webui_thread(decoded_key)
+        except OSError:
+            self._log.exception("Could not completely delete conversation {}", decoded_key)
+            return _http_error(500, "Could not completely delete conversation; retry")
         return _http_json_response(
             {"deleted": bool(draft_deleted or session_deleted or transcript_deleted)}
         )
@@ -1831,6 +1864,10 @@ class GatewayHTTPHandler:
             if getattr(request, "method", "GET") != "GET":
                 return _http_error(405, "Method Not Allowed")
             return await self._handle_activity_audit(request)
+        if got == "/api/memory/items":
+            if getattr(request, "method", "GET") != "GET":
+                return _http_error(405, "Method Not Allowed")
+            return await self._handle_memory_items(request)
         if got == "/api/commands":
             return self._handle_commands(request)
         if got == "/api/workspaces/pick-folder":
@@ -1939,6 +1976,7 @@ class GatewayHTTPHandler:
             webui_skills_payload(
                 self.skills_workspace_path,
                 disabled_skills=self.disabled_skills,
+                install_supported=self._skills_install_enabled(),
             )
         )
 
@@ -1948,11 +1986,15 @@ class GatewayHTTPHandler:
         params = _parse_query(request.path)
         query = _query_first(params, "q") or ""
         provider = _query_first(params, "provider") or "all"
+        install_kwargs = (
+            {} if self._skills_install_enabled() else {"install_supported": False}
+        )
         try:
             payload = await search_marketplace_skills(
                 query,
                 self.skills_workspace_path,
                 provider=provider,
+                **install_kwargs,
             )
         except SkillsMarketplaceError as exc:
             return _http_error(exc.status, exc.message)
@@ -1965,10 +2007,14 @@ class GatewayHTTPHandler:
         if not self.check_api_token(request):
             return _http_error(401, "Unauthorized")
         provider = _query_first(_parse_query(request.path), "provider") or "all"
+        install_kwargs = (
+            {} if self._skills_install_enabled() else {"install_supported": False}
+        )
         try:
             payload = await trending_marketplace_skills(
                 self.skills_workspace_path,
                 provider=provider,
+                **install_kwargs,
             )
         except SkillsMarketplaceError as exc:
             return _http_error(exc.status, exc.message)
@@ -1995,8 +2041,15 @@ class GatewayHTTPHandler:
     ) -> Response:
         if not self.check_api_token(request):
             return _http_error(401, "Unauthorized")
+        # Workspace-level install kill switch, checked before the local-request
+        # bypass below: inside a tester container the proxied source address is
+        # not a trustworthy signal and SkillHub installs over plain HTTP (no
+        # ``npx``), so "local" must not imply "may install public skills".
+        if not self._skills_install_enabled():
+            return _http_error(403, "skill installation is disabled for this workspace")
         if not self._allow_webui_package_install(connection, request):
             return _http_error(403, "remote skill installation is disabled")
+
         if self._skill_install_lock.locked():
             return _http_error(409, "another skill installation is already in progress")
 
@@ -2023,6 +2076,7 @@ class GatewayHTTPHandler:
             **webui_skills_payload(
                 self.skills_workspace_path,
                 disabled_skills=self.disabled_skills,
+                install_supported=True,
             ),
             "last_action": action,
         })
@@ -2036,6 +2090,20 @@ class GatewayHTTPHandler:
             )
         except Exception:
             self._log.exception("failed to load remote package install policy")
+            return False
+
+    def _skills_install_enabled(self) -> bool:
+        """Workspace kill switch for public agent-skill installs (MIT-1852).
+
+        Reads ``tools.skills.allow_install``. An unreadable config denies, so a
+        broken config can never reopen installs the workspace switched off; the
+        remote/local policy in :meth:`_allow_webui_package_install` still applies
+        after this gate.
+        """
+        try:
+            return bool(self.settings.config.load().tools.skills.allow_install)
+        except Exception:
+            self._log.exception("failed to load skill install policy")
             return False
 
     def _handle_webui_skill_update(self, request: WsRequest) -> Response:
@@ -2063,6 +2131,7 @@ class GatewayHTTPHandler:
             **webui_skills_payload(
                 self.skills_workspace_path,
                 disabled_skills=self.disabled_skills,
+                install_supported=self._skills_install_enabled(),
             ),
             "last_action": action,
         })
@@ -2093,6 +2162,7 @@ class GatewayHTTPHandler:
             **webui_skills_payload(
                 self.skills_workspace_path,
                 disabled_skills=self.disabled_skills,
+                install_supported=self._skills_install_enabled(),
             ),
             "last_action": action,
         })

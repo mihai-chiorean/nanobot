@@ -88,6 +88,32 @@ class _MCPReadinessHook(AgentHook):
 _MCP_HOT_RELOAD_TIMEOUT_SECONDS = 15.0 + RELOAD_DRAIN_TIMEOUT_SECONDS
 
 
+# Startup connects MCP before the recovery scan so pending MCP calls classify
+# against registered tools.  A hung server must not hold the gateway (WebUI,
+# health, SIGTERM handling) hostage: after this budget startup proceeds, and
+# any call whose tool is still unregistered simply parks for the user.
+_MCP_STARTUP_CONNECT_TIMEOUT_SECONDS = 20.0
+
+
+async def _connect_mcp_before_recovery(
+    provider: MCPProvider,
+    *,
+    timeout_s: float = _MCP_STARTUP_CONNECT_TIMEOUT_SECONDS,
+) -> None:
+    try:
+        await asyncio.wait_for(provider.connect(), timeout=timeout_s)
+    except TimeoutError:
+        logger.warning(
+            "MCP servers did not connect within {:.0f}s; continuing startup, "
+            "the readiness hook will retry them before the next turn",
+            timeout_s,
+        )
+    except asyncio.CancelledError:
+        if task_is_cancelling():
+            raise
+        logger.warning("MCP startup connect was cancelled by an MCP server/SDK")
+
+
 class _RuntimeConfigInvalidator(Protocol):
     def invalidate_runtime_config(self) -> None: ...
 
@@ -270,9 +296,13 @@ def _commit_dream_changes(memory: Any) -> str | None:
     diff_body = memory.dream_content_diff()
     if not diff_body:
         return None
+    core_tokens, core_budget = memory.core_memory_stats()
+    logger.info("Dream run core: {}/{} tokens", core_tokens, core_budget)
     message = memory.build_dream_commit_message(
         "dream: periodic memory consolidation",
         diff_body,
+        core_tokens=core_tokens,
+        core_budget=core_budget,
     )
     return memory.git.auto_commit(message)
 
@@ -487,6 +517,59 @@ def _gateway_readiness_payload(
     return ready, payload
 
 
+async def _drain_agent_turns(
+    agent: AgentLoop,
+    runtime_tasks: asyncio.Future[list[Any]],
+    grace_seconds: int,
+) -> bool:
+    """Give in-flight turns a grace period before the gateway cancels them.
+
+    First-SIGTERM path (MIT-1811): stop admitting new turns, then wait up to
+    ``grace_seconds`` for the turns already running. A forced (repeated
+    signal) shutdown cancels the runtime tasks, which ends this wait early;
+    ``grace_seconds <= 0`` disables the drain and keeps today's
+    cancel-immediately behaviour.
+    """
+    if grace_seconds <= 0:
+        return False
+    agent.begin_drain()
+    active = agent.active_turn_count()
+    logger.info(
+        "Gateway draining: waiting up to {}s for {} active turn(s)",
+        grace_seconds,
+        active,
+    )
+    if active == 0:
+        return True
+    drain_task = asyncio.create_task(
+        agent.wait_idle(grace_seconds),
+        name="nanobot-gateway-drain",
+    )
+    drained = False
+    try:
+        done, _pending = await asyncio.wait(
+            {drain_task, runtime_tasks},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if drain_task in done:
+            with suppress(Exception):
+                drained = bool(drain_task.result())
+        else:
+            logger.info("Gateway drain stopped early: forced shutdown")
+    finally:
+        if not drain_task.done():
+            drain_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await drain_task
+    if not drained:
+        logger.warning(
+            "Gateway drain ended after {}s with {} active turn(s)",
+            grace_seconds,
+            agent.active_turn_count(),
+        )
+    return drained
+
+
 async def _close_gateway_runtime(
     agent: AgentLoop,
     mcp_provider: MCPProvider,
@@ -576,6 +659,7 @@ def _run_gateway(
     )
     from nanobot.providers.fallback_provider import FallbackProvider
     from nanobot.providers.image_generation import image_gen_provider_configs
+    from nanobot.runtime_release import apply_release_env
     from nanobot.session.manager import SessionManager
     from nanobot.session.recovery import RecoveryCoordinator
     from nanobot.session.webui_turns import (
@@ -604,7 +688,11 @@ def _run_gateway(
         )
         raise typer.Exit(1)
 
-    console.print(f"{__logo__} Starting nanobot gateway version {__version__} on port {port}...")
+    release = apply_release_env()
+    console.print(
+        f"{__logo__} Starting nanobot gateway version {__version__} "
+        f"release={release} on port {port}..."
+    )
     _prepare_webui_bundle_for_gateway(
         config,
         mode=webui_bundle_mode,
@@ -679,6 +767,7 @@ def _run_gateway(
         sessions=session_manager,
         bus=bus,
         unified_session=config.agents.defaults.unified_session,
+        tool_is_read_only=tools.is_read_only,
     )
 
     # Create agent with cron service
@@ -887,6 +976,7 @@ def _run_gateway(
         webui_runtime_model_name=_webui_runtime_model_name,
         webui_refresh_runtime_config=_webui_refresh_runtime_config,
         webui_cron_pending_job_ids=agent.pending_cron_job_ids_for_session,
+        webui_session_context_window=agent.session_context_window_tokens,
         webui_local_trigger_pending_ids=agent.pending_local_trigger_ids_for_session,
         webui_static_dist=webui_static_dist,
         webui_runtime_surface=webui_runtime_surface,
@@ -1100,6 +1190,13 @@ def _run_gateway(
             # Recovery must finish before WebSocket and other channels begin
             # accepting new input.  That makes a new user message reliably
             # supersede an old recoverable turn instead of racing its queue.
+            # MCP tools must be registered first: recovery classifies pending
+            # calls by registry lookup, and an MCP tool that is not registered
+            # yet would look unknown and park a resumable read (SR-09).
+            await _connect_mcp_before_recovery(
+                mcp_provider,
+                timeout_s=_MCP_STARTUP_CONNECT_TIMEOUT_SECONDS,
+            )
             await recovery.scan()
             # Ziggy-local (MIT-1010): same ordering requirement as recovery --
             # the Work restart sweep cannot distinguish a task left running by
@@ -1128,7 +1225,9 @@ def _run_gateway(
                 if orphaned:
                     logger.info("Last local client disappeared; stopping on-demand gateway")
 
-            tasks = [
+            # Fill the list in place: the signal handlers hold this same
+            # list, and a second signal must cancel these tasks (MIT-1811).
+            tasks.extend([
                 asyncio.create_task(
                     watch_config_file(
                         Path(config_path),
@@ -1150,7 +1249,7 @@ def _run_gateway(
                     _monitor_local_clients(),
                     name="nanobot-gateway-client-monitor",
                 ),
-            ]
+            ])
             if health_server_enabled:
                 tasks.append(asyncio.create_task(
                     _health_server(config.gateway.host, port),
@@ -1179,6 +1278,19 @@ def _run_gateway(
             if runtime_tasks in done:
                 await runtime_tasks
             else:
+                # First SIGTERM: let running turns finish for up to the
+                # configured grace before cancelling (MIT-1811). A second
+                # signal cancels the runtime tasks, which ends the drain
+                # early; the timeout path below is unchanged from before.
+                # Mark the exit as a gateway shutdown before anything can
+                # cancel a turn: a forced second signal must keep durable
+                # checkpoints exactly like the grace-timeout path does.
+                agent.preserve_inflight_turns_on_shutdown()
+                await _drain_agent_turns(
+                    agent,
+                    runtime_tasks,
+                    config.gateway.shutdown_grace_seconds,
+                )
                 runtime_tasks.cancel()
         except KeyboardInterrupt:
             console.print("\nShutting down...")
