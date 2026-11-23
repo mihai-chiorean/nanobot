@@ -129,6 +129,7 @@ class WorkStore:
                     model TEXT NOT NULL DEFAULT '',
                     reasoning_profile TEXT NOT NULL DEFAULT 'auto',
                     read_only INTEGER NOT NULL DEFAULT 0,
+                    notify_on_finish INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     started_at TEXT,
@@ -212,6 +213,13 @@ class WorkStore:
                 connection.execute(
                     "ALTER TABLE work_tasks ADD COLUMN read_only INTEGER NOT NULL DEFAULT 0"
                 )
+            if "notify_on_finish" not in task_columns:
+                # MIT-1855 (OA-12): hand-off tasks push once when they finish.
+                # Same lazy-migration style as ``read_only`` / ``scope``.
+                connection.execute(
+                    "ALTER TABLE work_tasks "
+                    "ADD COLUMN notify_on_finish INTEGER NOT NULL DEFAULT 0"
+                )
             connection.execute(
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_work_tasks_request_id
@@ -252,6 +260,7 @@ class WorkStore:
         read_only: Any = False,
         status: str = "queued",
         request_id: str | None = None,
+        notify_on_finish: bool = False,
     ) -> dict[str, Any]:
         now = utc_now()
         task_id = f"work_{uuid.uuid4().hex}"
@@ -260,6 +269,7 @@ class WorkStore:
         clean_title = self._preview(title or prompt_preview, 96) or "Untitled task"
         clean_status = status if status in {"scheduled", *ACTIVE_STATUSES} else "queued"
         clean_read_only = 1 if read_only_value(read_only) else 0
+        clean_notify = 1 if notify_on_finish else 0
         columns = [
             "task_id",
             "session_key",
@@ -271,6 +281,7 @@ class WorkStore:
             "model",
             "reasoning_profile",
             "read_only",
+            "notify_on_finish",
             "created_at",
             "updated_at",
             "last_seq",
@@ -286,6 +297,7 @@ class WorkStore:
             model,
             reasoning_profile,
             clean_read_only,
+            clean_notify,
             now,
             now,
             0,
@@ -337,6 +349,73 @@ class WorkStore:
                 """,
                 (utc_now(), task_id, request_id),
             )
+
+    def get_task_by_request_id(self, request_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM work_tasks WHERE request_id = ?", (request_id,)
+            ).fetchone()
+        return self._task_row(row)
+
+    def requeue_unstarted(self, task_id: str) -> bool:
+        """Re-queue a task whose turn never started, so it can be enqueued once.
+
+        MIT-1855: a chat hand-off task that was never enqueued
+        (``dispatched_at`` unset), or was enqueued by a process that died
+        before the turn started (swept ``interrupted`` with no
+        ``started_at``). A task that started, or one still queued after a
+        recorded dispatch, is left alone: re-running it could repeat work.
+        """
+        now = utc_now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            updated = connection.execute(
+                """
+                UPDATE work_tasks
+                SET status = 'queued', updated_at = ?, completed_at = NULL, error = NULL
+                WHERE task_id = ? AND started_at IS NULL
+                  AND ((status = 'queued' AND dispatched_at IS NULL)
+                       OR status = 'interrupted')
+                """,
+                (now, task_id),
+            ).rowcount
+            if not updated:
+                return False
+            self._append_event_in_transaction(
+                connection,
+                task_id,
+                "status.changed",
+                {"status": "queued"},
+                actor="system",
+                step_id=None,
+                created_at=now,
+            )
+        return True
+
+    def abandon_task(self, task_id: str, error: str) -> None:
+        """Fail a task that was never enqueued, without a finish notice."""
+        now = utc_now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            updated = connection.execute(
+                """
+                UPDATE work_tasks
+                SET status = 'failed', notify_on_finish = 0, updated_at = ?,
+                    completed_at = ?, error = ?
+                WHERE task_id = ? AND status IN ('queued', 'running', 'waiting')
+                """,
+                (now, now, error, task_id),
+            ).rowcount
+            if updated:
+                self._append_event_in_transaction(
+                    connection,
+                    task_id,
+                    "status.changed",
+                    {"status": "failed", "error": error},
+                    actor="system",
+                    step_id=None,
+                    created_at=now,
+                )
 
     def reserve_command(self, command_id: str, task_id: str, kind: str) -> tuple[bool, bool]:
         with self._connect() as connection:
