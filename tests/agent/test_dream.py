@@ -1039,7 +1039,7 @@ class TestDreamArchiveHistory:
         sha = _commit_dream_changes(store)
         assert sha is not None
 
-        new_sha = store.git.revert(sha, message_prefix=_DREAM_COMMIT_PREFIX)
+        new_sha = store.git.undo(sha, message_prefix=_DREAM_COMMIT_PREFIX).new_sha
         assert new_sha is not None
         assert store.read_archive() == "# Archive\n- old demoted fact\n"
 
@@ -1057,7 +1057,7 @@ class TestDreamArchiveHistory:
         sha = _commit_dream_changes(store)
         assert sha is not None
 
-        assert store.git.revert(sha, message_prefix=_DREAM_COMMIT_PREFIX) is not None
+        assert store.git.undo(sha, message_prefix=_DREAM_COMMIT_PREFIX).new_sha is not None
         assert store.read_archive() == "# Archive\n- fact A\n"
 
     def test_no_baseline_commit_when_everything_is_in_history(self, store):

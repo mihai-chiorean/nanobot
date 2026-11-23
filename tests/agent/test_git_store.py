@@ -12,6 +12,7 @@ from nanobot.utils.gitstore import (
     CommitInfo,
     GitStore,
     GitStoreError,
+    UndoResult,
     history_dir_for,
 )
 
@@ -221,45 +222,246 @@ class TestCommitInfoFormat:
         assert c.subject() == "(no message)"
 
 
-class TestRevert:
-    def test_returns_none_when_not_initialized(self, git):
-        assert git.revert("abc") is None
+def _seed(ws, **files):
+    for rel, text in files.items():
+        path = ws / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
 
-    def test_undoes_commit_changes(self, git_ready):
-        """revert(sha) should undo the given commit by restoring to its parent."""
-        ws = git_ready._workspace
+
+@pytest.fixture
+def seeded(git):
+    """Initialized store whose init commit already holds the tracked files."""
+    _seed(git._workspace, **{"SOUL.md": "", "USER.md": "", "memory/MEMORY.md": ""})
+    git.init()
+    return git
+
+
+class TestUndo:
+    def test_returns_empty_when_not_initialized(self, git):
+        assert git.undo("abc") == UndoResult()
+
+    def test_undoes_commit_changes(self, seeded):
+        ws = seeded._workspace
         (ws / "SOUL.md").write_text("v1 content", encoding="utf-8")
-        git_ready.auto_commit("v1")
+        seeded.auto_commit("v1")
         (ws / "SOUL.md").write_text("v2 content", encoding="utf-8")
-        git_ready.auto_commit("v2")
+        sha = seeded.auto_commit("v2")
 
-        commits = git_ready.log()
-        # Revert v2 → SOUL.md back to v1.
-        new_sha = git_ready.revert(commits[0].sha)
-        assert new_sha is not None
+        result = seeded.undo(sha)
+
+        assert result.restored == ["SOUL.md"]
+        assert result.new_sha is not None
+        assert seeded.log()[0].message == f"undo {sha}"
         assert (ws / "SOUL.md").read_text(encoding="utf-8") == "v1 content"
 
-    def test_root_commit_returns_none(self, git_ready):
-        """Cannot revert the root commit (no parent to restore to)."""
-        commits = git_ready.log()
+    def test_undo_keeps_later_edits_to_other_files(self, seeded):
+        """MIT-1847: undoing commit A must not discard commit B's later edit."""
+        ws = seeded._workspace
+        (ws / "USER.md").write_text("user edit", encoding="utf-8")
+        sha_a = seeded.auto_commit("dream: edit user")
+        (ws / "SOUL.md").write_text("soul edit", encoding="utf-8")
+        seeded.auto_commit("edit soul")
+
+        result = seeded.undo(sha_a)
+
+        assert result.restored == ["USER.md"]
+        assert (ws / "USER.md").read_text(encoding="utf-8") == ""
+        assert (ws / "SOUL.md").read_text(encoding="utf-8") == "soul edit"
+
+    def test_undo_skips_file_changed_later(self, seeded):
+        """MIT-1847: a later edit to the same file (committed or not) survives."""
+        ws = seeded._workspace
+        (ws / "USER.md").write_text("dream value", encoding="utf-8")
+        (ws / "SOUL.md").write_text("dream soul", encoding="utf-8")
+        sha = seeded.auto_commit("dream: edit")
+        (ws / "USER.md").write_text("edited again later", encoding="utf-8")
+        seeded.auto_commit("owner edit")
+
+        result = seeded.undo(sha)
+
+        assert result.restored == ["SOUL.md"]
+        assert result.skipped == ["USER.md"]
+        assert (ws / "USER.md").read_text(encoding="utf-8") == "edited again later"
+        assert (ws / "SOUL.md").read_text(encoding="utf-8") == ""
+
+    def test_undo_restores_deleted_file(self, seeded):
+        ws = seeded._workspace
+        (ws / "SOUL.md").write_text("soul", encoding="utf-8")
+        seeded.auto_commit("write soul")
+        (ws / "SOUL.md").unlink()
+        delete_sha = seeded.auto_commit("delete soul")
+
+        result = seeded.undo(delete_sha)
+
+        assert result.restored == ["SOUL.md"]
+        assert (ws / "SOUL.md").read_text(encoding="utf-8") == "soul"
+
+    def test_undo_keeps_file_added_by_commit(self, seeded):
+        """SM-01 invariant: a path missing from the parent tree is never
+        deleted — its prior state is unknown."""
+        ws = seeded._workspace
+        (ws / "memory" / "MEMORY.md").unlink()
+        seeded.auto_commit("delete memory file")
+        (ws / "memory" / "MEMORY.md").write_text("new file", encoding="utf-8")
+        add_sha = seeded.auto_commit("add memory file back")
+
+        result = seeded.undo(add_sha)
+
+        assert result.kept == ["memory/MEMORY.md"]
+        assert result.restored == [] and result.new_sha is None
+        assert (ws / "memory" / "MEMORY.md").read_text(encoding="utf-8") == "new file"
+
+    def test_root_commit_is_refused(self, seeded):
+        commits = seeded.log()
         assert len(commits) == 1
-        assert git_ready.revert(commits[0].sha) is None
+        assert seeded.undo(commits[0].sha) == UndoResult()
 
-    def test_invalid_sha_returns_none(self, git_ready):
-        assert git_ready.revert("deadbeef") is None
+    def test_invalid_sha_returns_empty(self, seeded):
+        assert seeded.undo("deadbeef") == UndoResult()
 
-    def test_message_prefix_rejects_unrelated_commit_without_changing_files(self, git_ready):
-        ws = git_ready._workspace
+    def test_message_prefix_rejects_unrelated_commit_without_changing_files(self, seeded):
+        ws = seeded._workspace
         (ws / "SOUL.md").write_text("dream v1", encoding="utf-8")
-        git_ready.auto_commit("dream: v1")
+        seeded.auto_commit("dream: v1")
         (ws / "SOUL.md").write_text("backup state", encoding="utf-8")
-        backup_sha = git_ready.auto_commit("backup: workspace")
+        backup_sha = seeded.auto_commit("backup: workspace")
         (ws / "SOUL.md").write_text("dream v2", encoding="utf-8")
-        latest_sha = git_ready.auto_commit("dream: v2")
+        latest_sha = seeded.auto_commit("dream: v2")
 
-        assert git_ready.revert(backup_sha, message_prefix="dream:") is None
+        assert seeded.undo(backup_sha, message_prefix="dream:") == UndoResult()
         assert (ws / "SOUL.md").read_text(encoding="utf-8") == "dream v2"
-        assert git_ready.log()[0].sha == latest_sha
+        assert seeded.log()[0].sha == latest_sha
+
+    def test_undo_never_overwrites_a_symlink(self, seeded, tmp_path):
+        """A tracked path replaced by a symlink is skipped; the link and its
+        target are untouched."""
+        ws = seeded._workspace
+        (ws / "SOUL.md").write_text("dream soul", encoding="utf-8")
+        sha = seeded.auto_commit("dream: soul")
+        outside = tmp_path / "outside.md"
+        outside.write_text("dream soul", encoding="utf-8")
+        (ws / "SOUL.md").unlink()
+        os.symlink(outside, ws / "SOUL.md")
+
+        result = seeded.undo(sha)
+
+        assert result.skipped == ["SOUL.md"]
+        assert (ws / "SOUL.md").is_symlink()
+        assert outside.read_text(encoding="utf-8") == "dream soul"
+
+
+class TestRestore:
+    def test_returns_empty_when_not_initialized(self, git):
+        assert git.restore("abc") == UndoResult()
+        assert git.restore_preview("abc") == UndoResult()
+
+    def test_restore_sets_every_recorded_path(self, seeded):
+        ws = seeded._workspace
+        _seed(ws, **{"SOUL.md": "soul old", "USER.md": "user old"})
+        snapshot_sha = seeded.auto_commit("snapshot")
+        _seed(ws, **{"SOUL.md": "soul new", "USER.md": "user new", "memory/MEMORY.md": "mem new"})
+        seeded.auto_commit("later edits")
+
+        result = seeded.restore(snapshot_sha)
+
+        assert result.restored == ["SOUL.md", "USER.md", "memory/MEMORY.md"]
+        assert (ws / "SOUL.md").read_text(encoding="utf-8") == "soul old"
+        assert (ws / "USER.md").read_text(encoding="utf-8") == "user old"
+        assert (ws / "memory" / "MEMORY.md").read_text(encoding="utf-8") == ""
+        assert seeded.log()[0].message == f"restore {snapshot_sha}"
+
+    def test_restore_snapshots_uncommitted_edits_first(self, seeded):
+        """Overwritten content must stay recoverable from history."""
+        ws = seeded._workspace
+        snapshot_sha = seeded.log()[0].sha
+        (ws / "SOUL.md").write_text("uncommitted edit", encoding="utf-8")
+
+        result = seeded.restore(snapshot_sha)
+
+        assert result.restored == ["SOUL.md"]
+        assert (ws / "SOUL.md").read_text(encoding="utf-8") == ""
+        messages = [c.message for c in seeded.log()]
+        assert messages[:2] == [f"restore {snapshot_sha}", f"snapshot: before restore {snapshot_sha}"]
+        undo = seeded.undo(seeded.log()[0].sha)
+        assert (ws / "SOUL.md").read_text(encoding="utf-8") == "uncommitted edit", undo
+
+    def test_restore_keeps_tracked_files_added_later(self, seeded):
+        ws = seeded._workspace
+        (ws / "memory" / "MEMORY.md").unlink()
+        deleted_sha = seeded.auto_commit("delete memory file")
+        (ws / "memory" / "MEMORY.md").write_text("added later", encoding="utf-8")
+        seeded.auto_commit("add memory file back")
+
+        assert seeded.restore_preview(deleted_sha).kept == ["memory/MEMORY.md"]
+        result = seeded.restore(deleted_sha)
+
+        assert result.kept == ["memory/MEMORY.md"]
+        assert result.restored == []
+        assert (ws / "memory" / "MEMORY.md").read_text(encoding="utf-8") == "added later"
+
+    def test_restore_preview_lists_only_changed_paths(self, seeded):
+        ws = seeded._workspace
+        (ws / "SOUL.md").write_text("soul old", encoding="utf-8")
+        snapshot_sha = seeded.auto_commit("snapshot")
+        (ws / "SOUL.md").write_text("soul new", encoding="utf-8")
+
+        assert seeded.restore_preview(snapshot_sha).restored == ["SOUL.md"]
+        assert (ws / "SOUL.md").read_text(encoding="utf-8") == "soul new"
+        assert seeded.restore(snapshot_sha).restored == ["SOUL.md"]
+        assert seeded.restore_preview(snapshot_sha).restored == []
+
+    def test_restore_unknown_sha(self, seeded):
+        assert seeded.restore_preview("deadbeef") == UndoResult()
+        assert seeded.restore("deadbeef") == UndoResult()
+
+    def test_restore_refuses_to_overwrite_symlink(self, seeded, tmp_path):
+        ws = seeded._workspace
+        snapshot_sha = seeded.log()[0].sha
+        outside = tmp_path / "outside.md"
+        outside.write_text("not in history", encoding="utf-8")
+        (ws / "SOUL.md").unlink()
+        os.symlink(outside, ws / "SOUL.md")
+        (ws / "USER.md").write_text("user later", encoding="utf-8")
+        head = seeded.log()[0].sha
+
+        result = seeded.restore(snapshot_sha)
+
+        assert result.conflicts == ["SOUL.md"] and result.restored == []
+        assert (ws / "SOUL.md").is_symlink()
+        assert outside.read_text(encoding="utf-8") == "not in history"
+        assert (ws / "USER.md").read_text(encoding="utf-8") == "user later"
+        assert seeded.log()[0].sha == head
+
+
+class TestHasCommit:
+    def test_false_when_not_initialized(self, git):
+        assert git.has_commit("abc") is False
+
+    def test_true_for_known_false_for_unknown(self, git_ready):
+        ws = git_ready._workspace
+        (ws / "SOUL.md").write_text("v", encoding="utf-8")
+        sha = git_ready.auto_commit("v")
+        assert git_ready.has_commit(sha) is True
+        assert git_ready.has_commit("deadbeef") is False
+
+
+class TestLogIncludeFiles:
+    def test_files_listed_per_commit(self, git_ready):
+        ws = git_ready._workspace
+        (ws / "SOUL.md").write_text("soul", encoding="utf-8")
+        (ws / "USER.md").write_text("user", encoding="utf-8")
+        git_ready.auto_commit("both")
+
+        commits = git_ready.log(max_entries=1, include_files=True)
+
+        assert commits[0].files == ["SOUL.md", "USER.md"]
+
+    def test_files_empty_by_default(self, git_ready):
+        ws = git_ready._workspace
+        (ws / "SOUL.md").write_text("soul", encoding="utf-8")
+        git_ready.auto_commit("soul")
+        assert git_ready.log(max_entries=1)[0].files == []
 
 
 class TestMemoryStoreGitProperty:
@@ -528,7 +730,7 @@ class TestBareWorkspaceHistory:
         with pytest.raises(GitStoreError, match="auto-commit failed"):
             bare.auto_commit("boom")
 
-    def test_revert_restores_wildcard_tracked_files(self, bare, ws):
+    def test_undo_restores_wildcard_tracked_files(self, bare, ws):
         """Codex P2: revert must restore skills/**, prompts/*.md and pipeline
         state (not only literal paths)."""
         (ws / "skills" / "s").mkdir(parents=True)
@@ -550,15 +752,15 @@ class TestBareWorkspaceHistory:
         (ws / "skills" / "added" / "SKILL.md").write_text("new", encoding="utf-8")
         sha = bare.auto_commit("dream: rewrite")
 
-        assert bare.revert(sha, message_prefix="dream:") is not None
+        assert bare.undo(sha, message_prefix="dream:").new_sha is not None
         for rel, text in files.items():
             assert (ws / rel).read_text(encoding="utf-8") == text, rel
         # Added by the commit: prior state unknown, so kept (never deleted).
         assert (ws / "skills" / "added" / "SKILL.md").read_text(encoding="utf-8") == "new"
         # The restored state is itself committed: nothing left to commit.
-        assert bare.auto_commit("after revert") is None
+        assert bare.auto_commit("after undo") is None
 
-    def test_revert_leaves_files_the_commit_did_not_touch(self, bare, ws):
+    def test_undo_leaves_files_the_commit_did_not_touch(self, bare, ws):
         (ws / "SOUL.md").write_text("soul v1", encoding="utf-8")
         bare.init()
         (ws / "SOUL.md").write_text("soul v2", encoding="utf-8")
@@ -567,7 +769,7 @@ class TestBareWorkspaceHistory:
         (ws / "skills" / "later" / "SKILL.md").write_text("later", encoding="utf-8")
         bare.auto_commit("skill install")
 
-        assert bare.revert(sha, message_prefix="dream:") is not None
+        assert bare.undo(sha, message_prefix="dream:").new_sha is not None
         assert (ws / "SOUL.md").read_text(encoding="utf-8") == "soul v1"
         assert (ws / "skills" / "later" / "SKILL.md").read_text(encoding="utf-8") == "later"
 
@@ -585,7 +787,7 @@ class TestBareWorkspaceHistory:
         finally:
             repo.close()
 
-    def test_binary_asset_round_trips_through_revert(self, bare, ws):
+    def test_binary_asset_round_trips_through_undo(self, bare, ws):
         """Restore a binary file from history and compare bytes on disk."""
         binary = b"\x89PNG\r\n\x1a\n\xff\xfe\x00\x01\x80\x00" + bytes(range(256))
         asset = ws / "skills" / "x" / "assets" / "a.bin"
@@ -594,7 +796,7 @@ class TestBareWorkspaceHistory:
         bare.init()
         asset.write_bytes(b"\x00corrupted\xff")
         sha = bare.auto_commit("dream: clobber asset")
-        assert bare.revert(sha) is not None
+        assert bare.undo(sha).new_sha is not None
         assert asset.read_bytes() == binary
 
     def test_migration_falls_back_to_copy_across_filesystems(self, ws, monkeypatch):
@@ -621,7 +823,7 @@ class TestBareWorkspaceHistory:
         parked = ws.parent / "history" / "legacy-dot-git" / "HEAD"
         assert parked.read_text(encoding="utf-8") == "ref: refs/heads/master\n"
 
-    def test_revert_never_deletes_a_file_excluded_by_the_size_cap(self, bare, ws):
+    def test_undo_never_deletes_a_file_excluded_by_the_size_cap(self, bare, ws):
         """Codex P2 r2: a path absent from the parent tree may have existed
         but been excluded (oversize); revert must not delete it."""
         asset = ws / "skills" / "x" / "big.bin"
@@ -632,11 +834,11 @@ class TestBareWorkspaceHistory:
         asset.write_bytes(b"shrunk")
         (ws / "SOUL.md").write_text("soul v2", encoding="utf-8")
         sha = bare.auto_commit("dream: shrink")
-        assert bare.revert(sha) is not None
+        assert bare.undo(sha).new_sha is not None
         assert asset.read_bytes() == b"shrunk"
         assert (ws / "SOUL.md").read_text(encoding="utf-8") == "soul v1"
 
-    def test_revert_refuses_file_dir_conflict_without_touching_anything(self, bare, ws):
+    def test_undo_refuses_file_dir_conflict_without_touching_anything(self, bare, ws):
         """Codex P2 r2: all-or-nothing when a file became a directory."""
         (ws / "skills").mkdir()
         (ws / "skills" / "helper").write_text("helper file", encoding="utf-8")
@@ -648,12 +850,12 @@ class TestBareWorkspaceHistory:
         (ws / "SOUL.md").write_text("soul v2", encoding="utf-8")
         sha = bare.auto_commit("dream: restructure")
         head_before = bare.log()[0].sha
-        assert bare.revert(sha) is None
+        assert bare.undo(sha).conflicts
         assert (ws / "SOUL.md").read_text(encoding="utf-8") == "soul v2"
         assert (ws / "skills" / "helper" / "SKILL.md").read_text(encoding="utf-8") == "dir now"
         assert bare.log()[0].sha == head_before
 
-    def test_revert_refuses_dir_to_file_conflict(self, bare, ws):
+    def test_undo_refuses_dir_to_file_conflict(self, bare, ws):
         (ws / "skills" / "helper").mkdir(parents=True)
         (ws / "skills" / "helper" / "SKILL.md").write_text("in dir", encoding="utf-8")
         (ws / "SOUL.md").write_text("soul v1", encoding="utf-8")
@@ -663,6 +865,207 @@ class TestBareWorkspaceHistory:
         (ws / "skills" / "helper").write_text("file now", encoding="utf-8")
         (ws / "SOUL.md").write_text("soul v2", encoding="utf-8")
         sha = bare.auto_commit("dream: flatten")
-        assert bare.revert(sha) is None
+        assert bare.undo(sha).conflicts
         assert (ws / "SOUL.md").read_text(encoding="utf-8") == "soul v2"
         assert (ws / "skills" / "helper").read_text(encoding="utf-8") == "file now"
+
+    def test_undo_refuses_symlinked_parent_into_history(self, bare, ws):
+        """A tracked directory swapped for a symlink (e.g. into history/) is
+        never written through; the whole undo is refused."""
+        (ws / "skills" / "s").mkdir(parents=True)
+        (ws / "skills" / "s" / "SKILL.md").write_text("v1", encoding="utf-8")
+        (ws / "SOUL.md").write_text("soul v1", encoding="utf-8")
+        bare.init()
+        (ws / "skills" / "s" / "SKILL.md").write_text("v2", encoding="utf-8")
+        (ws / "SOUL.md").write_text("soul v2", encoding="utf-8")
+        sha = bare.auto_commit("dream: edit")
+        decoy = ws.parent / "history" / "s"
+        decoy.mkdir()
+        (decoy / "SKILL.md").write_text("v2", encoding="utf-8")
+        (ws / "skills" / "s" / "SKILL.md").unlink()
+        (ws / "skills" / "s").rmdir()
+        os.symlink(decoy, ws / "skills" / "s")
+
+        result = bare.undo(sha)
+
+        assert result.conflicts == ["skills/s/SKILL.md"]
+        assert result.restored == []
+        assert (decoy / "SKILL.md").read_text(encoding="utf-8") == "v2"
+        assert (ws / "SOUL.md").read_text(encoding="utf-8") == "soul v2"
+
+    def test_restore_refuses_symlinked_parent_into_history(self, bare, ws):
+        (ws / "skills" / "s").mkdir(parents=True)
+        (ws / "skills" / "s" / "SKILL.md").write_text("v1", encoding="utf-8")
+        bare.init()
+        target = bare.log()[0].sha
+        decoy = ws.parent / "history" / "s"
+        decoy.mkdir()
+        (decoy / "SKILL.md").write_text("decoy", encoding="utf-8")
+        (ws / "skills" / "s" / "SKILL.md").unlink()
+        (ws / "skills" / "s").rmdir()
+        os.symlink(decoy, ws / "skills" / "s")
+
+        result = bare.restore(target)
+
+        assert result.conflicts == ["skills/s/SKILL.md"]
+        assert (decoy / "SKILL.md").read_text(encoding="utf-8") == "decoy"
+
+    def test_restore_never_overwrites_an_oversize_file(self, bare, ws):
+        """An oversize file is not in history, so overwriting it would lose
+        data for good: restore refuses with nothing changed."""
+        (ws / "skills" / "x").mkdir(parents=True)
+        (ws / "skills" / "x" / "notes.md").write_text("small", encoding="utf-8")
+        (ws / "SOUL.md").write_text("soul v1", encoding="utf-8")
+        bare.init()
+        target = bare.log()[0].sha
+        big = b"y" * (1024 * 1024 + 1)
+        (ws / "skills" / "x" / "notes.md").write_bytes(big)
+        (ws / "SOUL.md").write_text("soul v2", encoding="utf-8")
+        head = bare.auto_commit("grow")
+
+        assert bare.restore_preview(target).conflicts == ["skills/x/notes.md"]
+        result = bare.restore(target)
+
+        assert result.conflicts == ["skills/x/notes.md"]
+        assert (ws / "skills" / "x" / "notes.md").read_bytes() == big
+        assert (ws / "SOUL.md").read_text(encoding="utf-8") == "soul v2"
+        assert bare.log()[0].sha == head
+
+    def test_restore_refuses_file_dir_conflict(self, bare, ws):
+        (ws / "skills").mkdir()
+        (ws / "skills" / "helper").write_text("helper file", encoding="utf-8")
+        (ws / "SOUL.md").write_text("soul v1", encoding="utf-8")
+        bare.init()
+        target = bare.log()[0].sha
+        (ws / "skills" / "helper").unlink()
+        (ws / "skills" / "helper").mkdir()
+        (ws / "skills" / "helper" / "SKILL.md").write_text("dir now", encoding="utf-8")
+        (ws / "SOUL.md").write_text("soul v2", encoding="utf-8")
+
+        result = bare.restore(target)
+
+        assert result.conflicts == ["skills/helper"]
+        assert (ws / "SOUL.md").read_text(encoding="utf-8") == "soul v2"
+        assert (ws / "skills" / "helper" / "SKILL.md").read_text(encoding="utf-8") == "dir now"
+
+    def test_restore_restores_wildcard_tracked_files(self, bare, ws):
+        files = {"skills/s/SKILL.md": "skill v1", "prompts/p.md": "prompt v1"}
+        for rel, text in files.items():
+            (ws / rel).parent.mkdir(parents=True, exist_ok=True)
+            (ws / rel).write_text(text, encoding="utf-8")
+        bare.init()
+        target = bare.log()[0].sha
+        for rel in files:
+            (ws / rel).write_text("v2", encoding="utf-8")
+
+        result = bare.restore(target)
+
+        assert result.restored == sorted(files)
+        for rel, text in files.items():
+            assert (ws / rel).read_text(encoding="utf-8") == text
+
+    def test_write_failure_mid_apply_changes_nothing(self, bare, ws, monkeypatch):
+        """Writes are staged first: a failure while staging the second file
+        leaves the first untouched (no partial application)."""
+        import tempfile
+
+        (ws / "SOUL.md").write_text("soul v1", encoding="utf-8")
+        (ws / "USER.md").write_text("user v1", encoding="utf-8")
+        bare.init()
+        (ws / "SOUL.md").write_text("soul v2", encoding="utf-8")
+        (ws / "USER.md").write_text("user v2", encoding="utf-8")
+        sha = bare.auto_commit("dream: both")
+        real_mkstemp = tempfile.mkstemp
+        calls = []
+
+        def flaky_mkstemp(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 2:
+                raise OSError("disk full")
+            return real_mkstemp(*args, **kwargs)
+
+        monkeypatch.setattr(tempfile, "mkstemp", flaky_mkstemp)
+        with pytest.raises(GitStoreError):
+            bare.undo(sha)
+
+        assert (ws / "SOUL.md").read_text(encoding="utf-8") == "soul v2"
+        assert (ws / "USER.md").read_text(encoding="utf-8") == "user v2"
+        assert sorted(p.name for p in ws.iterdir()) == ["SOUL.md", "USER.md"]
+
+    def test_rename_failure_mid_apply_rolls_back(self, bare, ws, monkeypatch):
+        """Codex P2: a failure in the rename phase (second os.replace) rolls
+        back the first rename and leaves no temp or backup files."""
+        (ws / "SOUL.md").write_text("soul v1", encoding="utf-8")
+        (ws / "USER.md").write_text("user v1", encoding="utf-8")
+        bare.init()
+        (ws / "SOUL.md").write_text("soul v2", encoding="utf-8")
+        (ws / "USER.md").write_text("user v2", encoding="utf-8")
+        sha = bare.auto_commit("dream: both")
+        head = bare.log()[0].sha
+        real_replace = os.replace
+        calls = []
+
+        def flaky_replace(src, dst, *args, **kwargs):
+            calls.append(dst)
+            if len(calls) == 2:
+                raise OSError("rename failed")
+            return real_replace(src, dst, *args, **kwargs)
+
+        monkeypatch.setattr(os, "replace", flaky_replace)
+        with pytest.raises(GitStoreError):
+            bare.undo(sha)
+
+        assert len(calls) >= 2
+        assert (ws / "SOUL.md").read_text(encoding="utf-8") == "soul v2"
+        assert (ws / "USER.md").read_text(encoding="utf-8") == "user v2"
+        assert sorted(p.name for p in ws.iterdir()) == ["SOUL.md", "USER.md"]
+        assert bare.log()[0].sha == head
+
+    def test_restore_keeps_execute_bit(self, bare, ws):
+        """Codex P2: a 0755 skill script stays executable after restore/undo."""
+        script = ws / "skills" / "s" / "run.sh"
+        script.parent.mkdir(parents=True)
+        script.write_text("#!/bin/sh\necho v1\n", encoding="utf-8")
+        os.chmod(script, 0o755)
+        bare.init()
+        target = bare.log()[0].sha
+        script.write_text("#!/bin/sh\necho v2\n", encoding="utf-8")
+        sha = bare.auto_commit("dream: script")
+
+        assert bare.undo(sha).restored == ["skills/s/run.sh"]
+        assert script.read_text(encoding="utf-8") == "#!/bin/sh\necho v1\n"
+        assert os.stat(script).st_mode & 0o777 == 0o755
+        script.write_text("#!/bin/sh\necho v3\n", encoding="utf-8")
+        assert bare.restore(target).restored == ["skills/s/run.sh"]
+        assert os.stat(script).st_mode & 0o777 == 0o755
+
+    def test_failed_rollback_keeps_backup_and_reports_it(self, bare, ws, monkeypatch):
+        """Codex P2: ENOSPC on the second rename and on the rollback rename.
+        The backup is then the only copy of the original: it must survive and
+        its path must be in the error."""
+        import errno
+
+        (ws / "SOUL.md").write_text("soul v1", encoding="utf-8")
+        (ws / "USER.md").write_text("user v1", encoding="utf-8")
+        bare.init()
+        (ws / "SOUL.md").write_text("soul v2", encoding="utf-8")
+        (ws / "USER.md").write_text("user v2", encoding="utf-8")
+        sha = bare.auto_commit("dream: both")
+        real_replace = os.replace
+        calls = []
+
+        def enospc_replace(src, dst, *args, **kwargs):
+            calls.append(dst)
+            if len(calls) in (2, 3):
+                raise OSError(errno.ENOSPC, "No space left on device")
+            return real_replace(src, dst, *args, **kwargs)
+
+        monkeypatch.setattr(os, "replace", enospc_replace)
+        with pytest.raises(GitStoreError, match="Rollback failed") as info:
+            bare.undo(sha)
+
+        backups = [p for p in ws.iterdir() if p.name.endswith(".bak")]
+        assert len(backups) == 1
+        assert backups[0].read_text(encoding="utf-8") == "soul v2"
+        assert str(backups[0]) in str(info.value)
+        assert (ws / "USER.md").read_text(encoding="utf-8") == "user v2"

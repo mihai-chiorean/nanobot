@@ -42,6 +42,7 @@ from nanobot.agent.reasoning_policy import (
     resolve_reasoning_profile,
 )
 from nanobot.agent.runner import AgentRunner, AgentRunResult, AgentRunSpec
+from nanobot.agent.skills import skill_file_sha
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.ask import (
     ask_user_call_is_expired,
@@ -68,7 +69,6 @@ from nanobot.agent.tools.publish_file import (
     bind_publish_file_turn,
     reset_publish_file_turn,
 )
-from nanobot.agent.skills import skill_file_sha
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.runtime_control import AgentRuntimeControl
 
@@ -98,7 +98,7 @@ from nanobot.bus.outbound_events import (
 )
 from nanobot.bus.queue import MessageBus
 from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
-from nanobot.command.router import normalize_command_text
+from nanobot.command.router import DIRECT_TURN, normalize_command_text
 from nanobot.config.schema import AgentDefaults, ModelPresetConfig
 from nanobot.events import NO_EVENTS, AgentEvent, EventSink
 from nanobot.llm_usage.context import source_from_request
@@ -3325,6 +3325,8 @@ class AgentLoop:
             and not automation_metadata
             and ctx.msg.channel != "system"
             and ctx.msg.sender_id != "subagent"
+            # Scheduled Work runs replay stored instructions as a user message.
+            and "work_task_id" not in (ctx.msg.metadata or {})
         )
         cmd_ctx = CommandContext(
             msg=ctx.msg,
@@ -4075,10 +4077,14 @@ class AgentLoop:
                     kwargs["on_runtime_admitted"] = on_runtime_admitted
                 if attributes is not None:
                     kwargs["attributes"] = dict(attributes)
-                return await self._process_message(
-                    msg,
-                    **kwargs,
-                )
+                direct_token = DIRECT_TURN.set(True)
+                try:
+                    return await self._process_message(
+                        msg,
+                        **kwargs,
+                    )
+                finally:
+                    DIRECT_TURN.reset(direct_token)
         finally:
             self._direct_turn_count -= 1
             await self.runtime_event_publisher.run_status_changed(msg, session_key, "idle")
