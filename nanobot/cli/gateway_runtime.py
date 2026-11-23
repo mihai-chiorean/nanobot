@@ -1181,7 +1181,9 @@ def _run_gateway(
                 if orphaned:
                     logger.info("Last local client disappeared; stopping on-demand gateway")
 
-            tasks = [
+            # Fill the list in place: the signal handlers hold this same
+            # list, and a second signal must cancel these tasks (MIT-1811).
+            tasks.extend([
                 asyncio.create_task(
                     watch_config_file(
                         Path(config_path),
@@ -1203,7 +1205,7 @@ def _run_gateway(
                     _monitor_local_clients(),
                     name="nanobot-gateway-client-monitor",
                 ),
-            ]
+            ])
             if health_server_enabled:
                 tasks.append(asyncio.create_task(
                     _health_server(config.gateway.host, port),

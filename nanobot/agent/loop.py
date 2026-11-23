@@ -854,11 +854,10 @@ class AgentLoop:
         self._unified_session = unified_session
         self._running = False
         # MIT-1811: first-SIGTERM drain. While _draining, the dispatch loop
-        # parks messages it already pulled off the bus instead of starting
-        # turns with them; the receipts stay unprocessed so the next gateway
-        # replays them from ChatInboxStore.
+        # drops messages it pulls off the bus instead of starting turns with
+        # them; their receipts stay unprocessed so the next gateway replays
+        # them from ChatInboxStore.
         self._draining = False
-        self._held_messages: list[InboundMessage] = []
         self._runtime_context_providers: list[RuntimeContextProvider] = []
         self._active_tasks: dict[str, set[asyncio.Task[Any]]] = {}
         self._direct_turn_count: int = 0
@@ -2268,11 +2267,12 @@ class AgentLoop:
                     continue
 
                 # MIT-1811: during the shutdown drain no new turn may start.
-                # A message already pulled off the bus is parked instead of
-                # processed; its durable receipt stays unprocessed, so the
-                # next gateway start replays it from ChatInboxStore.
-                if self._draining:
-                    self._held_messages.append(msg)
+                # A message pulled off the bus is dropped unprocessed; its
+                # durable receipt stays unprocessed, so the next gateway start
+                # replays it from ChatInboxStore. A subagent result for a
+                # session that is still running goes through: the in-flight
+                # turn needs it to finish, and it has no receipt to replay.
+                if self._draining and not self._completes_inflight_turn(msg):
                     continue
 
                 raw = msg.content.strip()
@@ -2712,13 +2712,21 @@ class AgentLoop:
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
 
+    def _completes_inflight_turn(self, msg: InboundMessage) -> bool:
+        return (
+            msg.channel == "system"
+            and msg.metadata.get("injected_event") == "subagent_result"
+            and self._effective_session_key(msg) in self._pending_queues
+        )
+
     def begin_drain(self) -> None:
         """Stop starting new turns while letting in-flight ones finish.
 
-        MIT-1811: called on the first SIGTERM. The dispatch loop parks every
+        MIT-1811: called on the first SIGTERM. The dispatch loop drops every
         message it pulls off the bus from now on (never processing it, so
-        durable receipts stay unprocessed for the next gateway to replay);
-        turns already running keep their task groups until they complete.
+        durable receipts stay unprocessed for the next gateway to replay),
+        except subagent results for sessions still running; turns already
+        running keep their task groups until they complete.
         """
         self._draining = True
         logger.info("Agent loop draining; {} active turn(s)", self.active_turn_count())

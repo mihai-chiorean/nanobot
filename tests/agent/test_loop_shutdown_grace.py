@@ -3,8 +3,9 @@
 Covers ``AgentLoop.begin_drain``/``wait_idle`` and the dispatch-loop gate:
 on the first SIGTERM the gateway stops admitting new turns, in-flight turns
 run to completion inside the grace, a turn outliving the grace is cancelled
-like today, and a message arriving while draining is held unprocessed so the
-next gateway replays it from ``ChatInboxStore``.
+like today, and a message arriving while draining is dropped unprocessed so
+the next gateway replays it from ``ChatInboxStore`` -- except a subagent
+result that a still-running turn needs to finish.
 """
 
 from __future__ import annotations
@@ -173,7 +174,7 @@ async def test_turn_outliving_grace_is_cancelled_and_preserved(tmp_path) -> None
 
 
 async def test_message_arriving_after_begin_drain_stays_unprocessed(tmp_path) -> None:
-    """Post-drain input is held, never dispatched, and its receipt stays recoverable."""
+    """Post-drain input is dropped, never dispatched, and its receipt stays recoverable."""
     loop, bus = _make_loop(tmp_path)
     inbox = ChatInboxStore(tmp_path)
     loop._chat_inbox = inbox
@@ -202,20 +203,62 @@ async def test_message_arriving_after_begin_drain_stays_unprocessed(tmp_path) ->
         await inbox.claim_for_enqueue("c1", "cm-late")
         await bus.publish_inbound(late)
         deadline = time.monotonic() + 3.0
-        while not loop._held_messages:
+        while bus.inbound_size:
             if time.monotonic() > deadline:
-                raise AssertionError("late message was never held")
+                raise AssertionError("late message was never consumed")
             await asyncio.sleep(0.01)
         await asyncio.sleep(0.05)  # let any (wrong) dispatch attempt run
 
-        assert [msg.content for msg in loop._held_messages] == ["late"]
         assert "late" not in turns.started  # no turn was started for it
-        assert bus.inbound_size == 0  # held, not left dangling on the bus
+        assert loop.active_turn_count() == 0
 
         recoverable = {record.client_message_id for record in await inbox.recoverable()}
         assert "cm-late" in recoverable  # unprocessed: the next process replays it
         assert "cm-pre" not in recoverable  # control: processed receipts leave
         assert "late" not in turns.completed
+    finally:
+        await _stop_dispatch(loop, run_task)
+
+
+def _subagent_result(session_key: str, task_id: str) -> InboundMessage:
+    return InboundMessage(
+        channel="system",
+        sender_id="subagent",
+        chat_id=session_key,
+        content=f"result of {task_id}",
+        session_key_override=session_key,
+        metadata={"injected_event": "subagent_result", "subagent_task_id": task_id},
+    )
+
+
+async def test_subagent_result_reaches_inflight_turn_while_draining(tmp_path) -> None:
+    """A running turn waiting on its subagent gets the result during the drain."""
+    loop, bus = _make_loop(tmp_path)
+    started: list[str] = []
+    received: list[str] = []
+
+    async def _dispatch_one(msg, pending_queue=None, **kwargs):
+        started.append(msg.content)
+        if msg.content == "parent":
+            # Like a parent turn blocked on its subagent's announced result.
+            result = await pending_queue.get()
+            received.append(result.content)
+
+    loop._dispatch_one = _dispatch_one
+    run_task = asyncio.create_task(loop.run())
+    try:
+        await bus.publish_inbound(_ws_message("parent", "cm-parent"))
+        await _await_active_turns(loop, 1)
+
+        loop.begin_drain()
+        # A result for a session with no running turn must not start one.
+        await bus.publish_inbound(_subagent_result("websocket:other", "sub-idle"))
+        await bus.publish_inbound(_subagent_result("websocket:c1", "sub-1"))
+
+        assert await loop.wait_idle(3.0) is True  # finished inside the grace
+        assert received == ["result of sub-1"]
+        assert "result of sub-idle" not in started
+        assert loop.active_turn_count() == 0
     finally:
         await _stop_dispatch(loop, run_task)
 
