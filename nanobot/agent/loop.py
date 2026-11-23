@@ -3671,9 +3671,15 @@ class AgentLoop:
             checkpoint = ctx.require_session().metadata.get(self._RUNTIME_CHECKPOINT_KEY)
             return not isinstance(checkpoint, dict) or checkpoint.get("turn_had_write") is not False
 
+        def is_read_only(name: str) -> bool:
+            # The registry ``_run_agent_loop`` runs with, as SR-09 does.
+            tools = ctx.tools if ctx.tools is not None else self.tools
+            return tools.is_read_only(name)
+
         return HandoffHook(
             threshold=float(threshold),
             turn_had_write=turn_had_write,
+            is_read_only=is_read_only,
             may_hand_off=lambda: not self._draining and not ctx.injected_messages,
         )
 
