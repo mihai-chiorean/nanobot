@@ -2058,16 +2058,16 @@ class GatewayHTTPHandler:
     def _skills_install_enabled(self) -> bool:
         """Workspace kill switch for public agent-skill installs (MIT-1852).
 
-        Reads ``tools.skills.allow_install``. An unreadable config falls back to
-        the default (enabled) so a transient load failure never silently blocks
-        the single-user install path; the remote/local policy in
-        :meth:`_allow_webui_package_install` still applies after this gate.
+        Reads ``tools.skills.allow_install``. An unreadable config denies, so a
+        broken config can never reopen installs the workspace switched off; the
+        remote/local policy in :meth:`_allow_webui_package_install` still applies
+        after this gate.
         """
         try:
             return bool(self.settings.config.load().tools.skills.allow_install)
         except Exception:
             self._log.exception("failed to load skill install policy")
-            return True
+            return False
 
     def _handle_webui_skill_update(self, request: WsRequest) -> Response:
         if not self.check_api_token(request):

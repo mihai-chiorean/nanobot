@@ -264,3 +264,21 @@ async def test_search_reports_install_unsupported_when_disabled(
     control = _body(await _search(enabled))
     assert control["install_supported"] is True
     assert all(skill["install_supported"] is True for skill in control["skills"])
+
+
+@pytest.mark.asyncio
+async def test_install_refused_when_policy_config_cannot_be_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unreadable config must not reopen installs the workspace switched off."""
+    install = AsyncMock(side_effect=AssertionError("install must not run"))
+    monkeypatch.setattr("nanobot.webui.ws_http.install_marketplace_skill", install)
+    channel = _build(tmp_path, allow_install=False)
+    (tmp_path / "config.json").write_text("{not json", encoding="utf-8")
+
+    response = await _install(channel)
+
+    assert response is not None
+    assert response.status_code == 403
+    install.assert_not_called()
