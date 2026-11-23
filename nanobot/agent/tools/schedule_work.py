@@ -29,6 +29,10 @@ if TYPE_CHECKING:
 #: registry by original MCP name.
 WORK_SCHEDULE_CONNECTOR_TOOL = "work_schedule_create"
 
+#: Failure texts after which a create may still have reached ziggy-work: the
+#: MCP wrapper's transport-level errors and the registry's wrapped exception.
+_UNKNOWN_OUTCOME_PREFIXES = ("(MCP tool call", "(MCP tool returned", "Error executing ")
+
 _PARAMETERS = tool_parameters_schema(
     title=StringSchema("Short title for the scheduled Work plan."),
     goal=StringSchema("One-sentence outcome the work should accomplish."),
@@ -339,9 +343,11 @@ class ScheduleWorkTool(Tool):
             result = await self._tool_registry.execute(connector.name, args)
         except Exception:
             logger.exception("ziggy-work schedule creation failed via {}", connector.name)
-            return ToolResult.error(
-                "Error: failed to create the schedule in ziggy-work. Nothing was scheduled."
-            )
+            return self._unknown_outcome("the connector call raised an exception")
+        if self._is_connector_failure(result) and self._is_unknown_outcome(result):
+            # Drop the registry's "[Analyze ... try a different approach.]"
+            # hint: retrying a create of unknown outcome is exactly the risk.
+            return self._unknown_outcome(str(result).split("\n\n[", 1)[0][:300])
         if self._is_connector_failure(result):
             return ToolResult.error(
                 "Error: ziggy-work rejected the schedule: "
@@ -392,7 +398,8 @@ class ScheduleWorkTool(Tool):
         ``at``, ``timezone``, ``skill``): ``at`` is the RFC3339 one-shot fire
         time, and ``every`` becomes robfig's ``@every <n>s``. When ``at`` is
         set, ``cron`` must be omitted — the connector requires exactly one of
-        the two.
+        the two. Optional fields (``skill``) are omitted rather than sent as
+        null.
         """
         cron: str | None
         at_time: str | None = None
@@ -405,13 +412,15 @@ class ScheduleWorkTool(Tool):
             at_time = datetime.fromtimestamp(
                 (schedule.at_ms or 0) / 1000, tz=timezone.utc
             ).isoformat()
-        skill = request_metadata.get("skill")
         args: dict[str, Any] = {
             "title": title,
             "content": plan["instructions"],
             "timezone": schedule.tz or plan["schedule"]["timezone"] or self._default_timezone,
-            "skill": str(skill) if skill else None,
         }
+        # Optional connector fields are omitted when absent: the schema
+        # declares them as plain strings, so a null is a validation refusal.
+        if skill := request_metadata.get("skill"):
+            args["skill"] = str(skill)
         if at_time is not None:
             args["at"] = at_time
         else:
@@ -431,6 +440,30 @@ class ScheduleWorkTool(Tool):
             ):
                 return tool
         return None
+
+    @staticmethod
+    def _is_unknown_outcome(result: Any) -> bool:
+        """True when a failed create may still have committed in ziggy-work.
+
+        The MCP wrapper's own failures (timeout, connection reset or
+        terminated session, cancellation, malformed reply), an exception the
+        registry wrapped, and the connector's "temporarily unavailable"
+        (anything other than Work's 400/404/409) all leave the outcome open.
+        Only schema/validation errors and Work's definite refusals do not.
+        """
+        text = str(result).lstrip()
+        return (
+            text.startswith(_UNKNOWN_OUTCOME_PREFIXES)
+            or "temporarily unavailable" in text
+        )
+
+    @staticmethod
+    def _unknown_outcome(detail: str) -> ToolResult:
+        return ToolResult.error(
+            "Error: the outcome of creating the schedule in ziggy-work is unknown "
+            f"({detail.strip()}). It may or may not have been created. Call "
+            "work_schedule_list to check whether it exists before creating it again."
+        )
 
     @staticmethod
     def _is_connector_failure(result: Any) -> bool:

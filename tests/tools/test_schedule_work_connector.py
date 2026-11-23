@@ -39,6 +39,48 @@ CONNECTOR_REGISTERED_NAME = "mcp_ziggy-work_work_schedule_create"
 _IDEMPOTENCY_KEY_META = "ziggy.dev/idempotency_key"
 
 
+#: The connector's real ``work_schedule_create`` input schema, copied verbatim
+#: from mihai-chiorean/ziggy services/ziggy-connectors/internal/httpapi/
+#: testdata/connector-tools.golden.json. Both fixtures below advertise it, so
+#: the registry validates every call exactly as it would against the live
+#: connector and an argument-shape mismatch fails these tests.
+WORK_SCHEDULE_CREATE_INPUT_SCHEMA: dict[str, Any] = {
+    "additionalProperties": False,
+    "properties": {
+        "at": {
+            "description": "RFC 3339 timestamp for a one-shot schedule, such as 2026-10-09T07:00:00Z. Provide exactly one of cron or at.",
+            "type": "string",
+        },
+        "content": {
+            "description": "Prompt content delivered on each fire, from 1 to 8192 bytes.",
+            "type": "string",
+        },
+        "cron": {
+            "description": "Standard cron expression for a recurring schedule, such as '0 7 * * *'. Provide exactly one of cron or at.",
+            "type": "string",
+        },
+        "paused": {
+            "description": "Create the schedule paused so it never fires until work_schedule_resume.",
+            "type": "boolean",
+        },
+        "skill": {
+            "description": "Optional managed skill name to run on each fire, lowercase letters, digits, and hyphens, at most 64 characters.",
+            "type": "string",
+        },
+        "timezone": {
+            "description": "IANA time zone for the cron schedule, such as America/Los_Angeles. Defaults to UTC.",
+            "type": "string",
+        },
+        "title": {
+            "description": "Schedule title, from 1 to 200 characters.",
+            "type": "string",
+        },
+    },
+    "required": ["title", "content"],
+    "type": "object",
+}
+
+
 class _FakeConnector(Tool):
     """Stand-in for the SR-23 connector MCP tool ``work_schedule_create``."""
 
@@ -59,7 +101,7 @@ class _FakeConnector(Tool):
 
     @property
     def parameters(self) -> dict[str, Any]:
-        return {"type": "object", "properties": {}}
+        return WORK_SCHEDULE_CREATE_INPUT_SCHEMA
 
     async def execute(self, **kwargs: Any) -> Any:
         self.calls.append(kwargs)
@@ -120,6 +162,14 @@ def _complete_workflow(**overrides: object) -> dict[str, object]:
     }
     workflow.update(overrides)
     return workflow
+
+
+def _assert_unknown_outcome(result: Any) -> None:
+    text = str(result)
+    assert "outcome" in text and "unknown" in text, text
+    assert "work_schedule_list" in text, text
+    assert "Nothing was scheduled" not in text, text
+    assert "rejected" not in text, text
 
 
 # ---------------------------------------------------------------------------
@@ -268,7 +318,12 @@ async def test_schedule_work_connector_tool_result_error_writes_nothing(
 async def test_schedule_work_connector_error_string_writes_nothing(tmp_path: Path) -> None:
     """A connector that returns a bare error *ToolResult* is a failure even when
     the registry is not in the loop (direct tool.execute path)."""
-    connector = _FakeConnector(result=ToolResult.error("Error: schedule service unavailable"))
+    connector = _FakeConnector(
+        result=ToolResult.error(
+            "Work rejected the schedule: check the title, content, timezone, "
+            "and exactly one of cron or at"
+        )
+    )
     tool = _make_tool(tmp_path, connector=connector)
 
     with _bind():
@@ -276,14 +331,18 @@ async def test_schedule_work_connector_error_string_writes_nothing(tmp_path: Pat
 
     assert str(result).startswith("Error:")
     assert "ziggy-work rejected the schedule" in str(result)
-    assert "schedule service unavailable" in str(result)
+    assert "check the title, content, timezone" in str(result)
+    assert "Nothing was scheduled" in str(result)
     assert tool._cron.list_jobs() == []
     assert tool._work_store.list_tasks() == []
 
 
 @pytest.mark.asyncio
-async def test_schedule_work_connector_exception_writes_nothing(tmp_path: Path) -> None:
-    """The registry wraps raised exceptions into an error ``ToolResult``."""
+async def test_schedule_work_connector_exception_is_an_unknown_outcome(
+    tmp_path: Path,
+) -> None:
+    """The registry wraps raised exceptions into an error ``ToolResult``; the
+    call may have reached ziggy-work, so the outcome is unknown, not refused."""
     connector = _FakeConnector(result=RuntimeError("mcp server unreachable"))
     tool = _make_tool(tmp_path, connector=connector)
 
@@ -291,7 +350,7 @@ async def test_schedule_work_connector_exception_writes_nothing(tmp_path: Path) 
         result = await tool.execute(**_complete_workflow())
 
     assert str(result).startswith("Error:")
-    assert "ziggy-work rejected the schedule" in str(result)
+    _assert_unknown_outcome(result)
     assert tool._cron.list_jobs() == []
     assert tool._work_store.list_tasks() == []
 
@@ -320,15 +379,25 @@ async def test_schedule_work_success_text_starting_with_error_is_not_a_failure(
 class _RecordingSession:
     """Fake MCP ClientSession recording how call_tool was invoked."""
 
-    def __init__(self, *, fail: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        fail: bool = False,
+        error_text: str = "Error: rejected",
+        raises: BaseException | None = None,
+    ) -> None:
         self.calls: list[dict] = []
         self._fail = fail
+        self._error_text = error_text
+        self._raises = raises
 
     async def call_tool(self, name, arguments=None, **kwargs):
         self.calls.append({"name": name, "arguments": arguments, **kwargs})
+        if self._raises is not None:
+            raise self._raises
         if self._fail:
             return SimpleNamespace(
-                content=[mcp_types.TextContent(type="text", text="Error: rejected")],
+                content=[mcp_types.TextContent(type="text", text=self._error_text)],
                 isError=True,
             )
         return SimpleNamespace(
@@ -344,7 +413,7 @@ def _real_connector_wrapper(
     tool_def = SimpleNamespace(
         name=WORK_SCHEDULE_CONNECTOR_TOOL,
         description="Create a schedule in ziggy-work.",
-        inputSchema={"type": "object", "properties": {}},
+        inputSchema=WORK_SCHEDULE_CREATE_INPUT_SCHEMA,
     )
     wrapper = MCPToolWrapper(session, "ziggy-work", tool_def, tool_timeout=5)
     wrapper._original_name = WORK_SCHEDULE_CONNECTOR_TOOL
@@ -409,6 +478,84 @@ async def test_connector_call_without_a_turn_scope_still_schedules(tmp_path: Pat
     assert "Scheduled Work plan 'Daily digest' in ziggy-work" in str(result)
     (call,) = session.calls
     assert _IDEMPOTENCY_KEY_META not in (call["meta"] or {})
+
+
+@pytest.mark.asyncio
+async def test_connector_call_without_a_skill_omits_skill(tmp_path: Path) -> None:
+    """No request-metadata skill: the optional ``skill`` field is omitted. The
+    connector declares it a string, so sending null is refused by the
+    registry's schema validation before any MCP call."""
+    session = _RecordingSession()
+    registry, _wrapper = _real_connector_wrapper(tmp_path, session)
+    tool = _make_tool(tmp_path, registry=registry)
+
+    with _bind(metadata={"client_message_id": "cm-7"}):
+        result = await tool.execute(**_complete_workflow())
+
+    assert "Scheduled Work plan 'Daily digest' in ziggy-work" in str(result)
+    (call,) = session.calls
+    assert call["arguments"] == {
+        "title": "Daily digest",
+        "content": "Check services and publish backend-health-digest.md.",
+        "cron": "0 8 * * *",
+        "timezone": "America/Los_Angeles",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "session_kwargs",
+    [
+        pytest.param({"raises": ConnectionResetError("reset")}, id="connection-reset"),
+        pytest.param({"raises": TimeoutError()}, id="timeout"),
+        pytest.param(
+            {
+                "fail": True,
+                "error_text": "schedule service is temporarily unavailable; retry shortly",
+            },
+            id="connector-unavailable",
+        ),
+    ],
+)
+async def test_connector_unknown_outcome_never_claims_nothing_was_scheduled(
+    tmp_path: Path, session_kwargs: dict[str, Any]
+) -> None:
+    """The create may have committed in ziggy-work: report an unknown outcome
+    and point at work_schedule_list instead of claiming nothing was scheduled."""
+    session = _RecordingSession(**session_kwargs)
+    registry, _wrapper = _real_connector_wrapper(tmp_path, session)
+    tool = _make_tool(tmp_path, registry=registry)
+
+    with _bind(metadata={"client_message_id": "cm-42"}):
+        result = await tool.execute(**_complete_workflow())
+
+    assert str(result).startswith("Error:")
+    _assert_unknown_outcome(result)
+    # A non-idempotent create is never retried automatically.
+    assert len(session.calls) == 1
+    assert tool._cron.list_jobs() == []
+    assert tool._work_store.list_tasks() == []
+
+
+@pytest.mark.asyncio
+async def test_connector_definite_refusal_says_nothing_was_scheduled(
+    tmp_path: Path,
+) -> None:
+    """Negative control: a 400-style refusal is definite."""
+    session = _RecordingSession(
+        fail=True,
+        error_text="Work rejected the schedule: check the title, content, timezone, "
+        "and exactly one of cron or at",
+    )
+    registry, _wrapper = _real_connector_wrapper(tmp_path, session)
+    tool = _make_tool(tmp_path, registry=registry)
+
+    with _bind(metadata={"client_message_id": "cm-42"}):
+        result = await tool.execute(**_complete_workflow())
+
+    assert "ziggy-work rejected the schedule" in str(result)
+    assert "Nothing was scheduled" in str(result)
+    assert "unknown" not in str(result)
 
 
 # ---------------------------------------------------------------------------
