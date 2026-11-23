@@ -121,7 +121,7 @@ class _GatewayAgentContractStub:
         # running by the previous process, before any channel accepts input.
         return 0
 
-    async def send_interrupted_finish_notices(self) -> int:
+    async def send_pending_finish_notices(self) -> int:
         # Ziggy-local (MIT-1857): after the MCP connect, gateway startup pushes
         # the work.finished notices the sweep parked for the connectors bearer.
         return 0

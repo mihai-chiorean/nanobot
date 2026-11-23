@@ -5,7 +5,9 @@ Covers the design rules (docs/design/onboarding-and-approval-tuning.md §4,
 exactly one authenticated POST to the connectors runtime route; unflagged and
 cancelled tasks send nothing; one retry after 30 s on network errors or 5xx;
 a second failure returns False without raising; the restart sweep's notices
-go out with status ``interrupted`` once the connectors credential is ready.
+go out with status ``interrupted`` once the connectors credential is ready;
+and every flagged task is reported exactly once across restarts: a push
+without a 2xx is owed until the next start, an accepted one never repeats.
 """
 
 from __future__ import annotations
@@ -352,6 +354,94 @@ async def test_cancelled_sends_nothing(
 
 
 # ---------------------------------------------------------------------------
+# Exactly once per task, across restarts (durable finish_notified_at)
+# ---------------------------------------------------------------------------
+
+
+async def test_push_without_2xx_is_owed_until_the_next_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(finish_notify, "_sleep", lambda delay: asyncio.sleep(0))
+    down = PostRecorder(responses=[503, 503])
+    _install_mock_push(monkeypatch, down)
+    cfg = _cfg(tmp_path)
+    loop = _make_loop(tmp_path, cfg)
+    loop.work_store = WorkStore(tmp_path, reconcile_on_open=False)
+    task = loop.work_store.create_task(
+        chat_id="chat-1", content="x", title="Sort receipts", notify_on_finish=True
+    )
+    await loop.record_work_status(_work_message(task["task_id"]), "succeeded")
+    await _drain(loop)
+    assert len(down.posts) == 2  # first try + the one retry, both 503
+
+    # Next process: the push is still owed and goes out once.
+    up = PostRecorder()
+    _install_mock_push(monkeypatch, up)
+    restarted = _make_loop(tmp_path, cfg)
+    restarted.work_store = WorkStore(tmp_path, reconcile_on_open=False)
+    assert await restarted.send_pending_finish_notices() == 1
+    await _drain(restarted)
+    assert [post.body for post in up.posts] == [
+        {"task_id": task["task_id"], "title": "Sort receipts", "status": "succeeded"}
+    ]
+
+    # And never again.
+    again = _make_loop(tmp_path, cfg)
+    again.work_store = WorkStore(tmp_path, reconcile_on_open=False)
+    assert await again.send_pending_finish_notices() == 0
+    await _drain(again)
+    assert len(up.posts) == 1
+
+
+async def test_push_lost_with_the_process_is_sent_on_the_next_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The task ended but the fire-and-forget push died with the process."""
+    recorder = PostRecorder()
+    _install_mock_push(monkeypatch, recorder)
+    store = WorkStore(tmp_path, reconcile_on_open=False)
+    task = store.create_task(chat_id="chat-1", content="x", title="T", notify_on_finish=True)
+    store.update_status(task["task_id"], "failed", error="boom")
+
+    loop = _make_loop(tmp_path, _cfg(tmp_path))
+    loop.work_store = WorkStore(tmp_path, reconcile_on_open=False)
+    assert loop.work_store.reconcile_interrupted() == 0
+    assert await loop.send_pending_finish_notices() == 1
+    await _drain(loop)
+    assert [post.body["status"] for post in recorder.posts] == ["failed"]
+
+
+async def test_status_push_and_startup_sweep_send_one_post(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recorder = PostRecorder()
+    _install_mock_push(monkeypatch, recorder)
+    loop = _make_loop(tmp_path, _cfg(tmp_path))
+    loop.work_store = WorkStore(tmp_path, reconcile_on_open=False)
+    task = loop.work_store.create_task(
+        chat_id="chat-1", content="x", title="T", notify_on_finish=True
+    )
+    await loop.record_work_status(_work_message(task["task_id"]), "succeeded")
+    # Same task, while its push is still in flight.
+    await loop.send_pending_finish_notices()
+    await _drain(loop)
+    await loop.send_pending_finish_notices()
+    await _drain(loop)
+    assert len(recorder.posts) == 1
+
+
+def test_owed_notices_are_this_store_only(tmp_path: Path) -> None:
+    """Each tenant runtime has its own store: another's tasks never appear."""
+    mine = WorkStore(tmp_path / "a", reconcile_on_open=False)
+    theirs = WorkStore(tmp_path / "b", reconcile_on_open=False)
+    other = theirs.create_task(chat_id="chat-1", content="x", notify_on_finish=True)
+    theirs.update_status(other["task_id"], "succeeded")
+    assert mine.pending_finish_notices() == []
+    assert theirs.get_task(other["task_id"]) is not None
+    assert "finish_notified_at" not in theirs.get_task(other["task_id"])
+
+
+# ---------------------------------------------------------------------------
 # Restart sweep -> startup notices
 # ---------------------------------------------------------------------------
 
@@ -380,7 +470,7 @@ async def test_restart_sweep_notices_post_interrupted(
     cfg = _cfg(tmp_path)
     loop = _make_loop(tmp_path, cfg)
     loop.work_store = store
-    sent = await loop.send_interrupted_finish_notices()
+    sent = await loop.send_pending_finish_notices()
     await _drain(loop)
 
     # Exactly the flagged task, with status interrupted.
@@ -391,8 +481,9 @@ async def test_restart_sweep_notices_post_interrupted(
         "title": "Tidy the drive",
         "status": "interrupted",
     }
-    # Consumed in one go: a later reconnect must not re-push.
+    # Accepted and recorded: a later start must not re-push.
     assert store.pending_finish_notices() == []
+    assert await loop.send_pending_finish_notices() == 0
 
 
 def test_sweep_parks_only_flagged_tasks(tmp_path: Path) -> None:
@@ -406,7 +497,9 @@ def test_sweep_parks_only_flagged_tasks(tmp_path: Path) -> None:
 
     assert store.pending_finish_notices() == []  # nothing before the sweep
     assert store.reconcile_interrupted() == 2
-    assert store.pending_finish_notices() == [(flagged["task_id"], "One more push")]
+    assert store.pending_finish_notices() == [
+        (flagged["task_id"], "One more push", "interrupted")
+    ]
 
 
 async def test_token_endpoint_failure_is_logged_not_raised(tmp_path: Path) -> None:

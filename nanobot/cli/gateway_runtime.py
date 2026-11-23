@@ -1213,14 +1213,15 @@ def _run_gateway(
             async def _run_agent() -> None:
                 try:
                     await mcp_provider.connect()
-                    # Ziggy-local (MIT-1857, OA-15): the restart sweep above
-                    # parked the interrupted hand-off tasks; now that the MCP
-                    # servers -- and with them the connectors client-
+                    # Ziggy-local (MIT-1857, OA-15): hand-off tasks still owing
+                    # a work.finished push (the restart sweep's interrupted
+                    # ones, and any push lost with the last process); now that
+                    # the MCP servers -- and with them the connectors client-
                     # credentials token -- are connected, send those pushes.
-                    pending = await agent.send_interrupted_finish_notices()
+                    pending = await agent.send_pending_finish_notices()
                     if pending:
                         logger.info(
-                            "Work: sent {} interrupted finish push(es) from a previous run",
+                            "Work: sending {} owed finish push(es) from a previous run",
                             pending,
                         )
                     await agent.run()

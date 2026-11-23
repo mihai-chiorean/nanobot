@@ -942,6 +942,7 @@ class AgentLoop:
         # Ziggy-local (MIT-1857, OA-15): strong refs to fire-and-forget
         # work.finished pushes so the event loop keeps them alive.
         self._finish_notify_tasks: set[asyncio.Task[bool]] = set()
+        self._finish_notify_inflight: set[str] = set()
         # MIT-1401: one audit log per workspace. The default (~/.nanobot/
         # workspace/audit.jsonl) is the owner's workspace whenever tenants share
         # a HOME, which put every tenant's audit rows in front of the owner.
@@ -1351,36 +1352,57 @@ class AgentLoop:
                 await self._schedule_work_finish_notify(task_id, status)
 
     async def _schedule_work_finish_notify(self, task_id: str, status: str) -> None:
-        """Fire one work.finished push for *task_id* if it is flagged for it."""
+        """Fire one work.finished push for *task_id* if it still owes one."""
+        if not await self.work_store.run_io(self.work_store.finish_notice_owed, task_id):
+            return
         task = await self.work_store.run_io(self.work_store.get_task, task_id)
-        if task is None or not task.get("notify_on_finish"):
+        if task is None:
             return
         self._spawn_finish_notify(str(task_id), str(task.get("title") or ""), status)
 
     def _spawn_finish_notify(self, task_id: str, title: str, status: str) -> None:
+        """Push once per task: one in flight at a time, marked durable on a 2xx.
+
+        Connectors coalesces on ``work_finished:{task_id}`` for 24 h, so the
+        one remaining repeat -- a 2xx whose mark was lost to a crash, re-sent
+        on the next start -- still reaches the tester once.
+        """
+        if task_id in self._finish_notify_inflight:
+            return
         from types import SimpleNamespace
 
         from nanobot.work.finish_notify import notify_finished
 
         cfg = SimpleNamespace(tools=self.tools_config, channels=self.channels_config)
-        task = asyncio.create_task(
-            notify_finished(cfg, task_id, title, status),
-            name=f"work-finish-notify:{task_id}:{status}",
-        )
+
+        async def push() -> bool:
+            try:
+                ok = await notify_finished(cfg, task_id, title, status)
+                if ok:
+                    await self.work_store.run_io(self.work_store.mark_finish_notified, task_id)
+                return ok
+            except Exception:
+                logger.exception("work.finished bookkeeping failed for task {}", task_id)
+                return False
+            finally:
+                self._finish_notify_inflight.discard(task_id)
+
+        self._finish_notify_inflight.add(task_id)
+        task = asyncio.create_task(push(), name=f"work-finish-notify:{task_id}:{status}")
         self._finish_notify_tasks.add(task)
         task.add_done_callback(self._finish_notify_tasks.discard)
 
-    async def send_interrupted_finish_notices(self) -> int:
-        """Push ``interrupted`` notices left behind by the restart sweep.
+    async def send_pending_finish_notices(self) -> int:
+        """Push every work.finished notice still owed from earlier runs.
 
-        MIT-1857 (OA-15): the sweep in ``WorkStore.reconcile_interrupted`` runs
-        at store open, before any connectors credential exists; the gateway
-        calls this once the MCP servers (and with them the client-credentials
-        token for the connectors server) are connected.
+        MIT-1857 (OA-15): the restart sweep's ``interrupted`` tasks and any
+        push that did not get a 2xx before the last process ended. The
+        gateway calls this once the MCP servers (and with them the
+        connectors client-credentials token) are connected.
         """
         notices = await self.work_store.run_io(self.work_store.pending_finish_notices)
-        for task_id, title in notices:
-            self._spawn_finish_notify(task_id, title, "interrupted")
+        for task_id, title, status in notices:
+            self._spawn_finish_notify(task_id, title, status)
         return len(notices)
 
     def work_artifact_refs(self, msg: InboundMessage) -> list[dict[str, Any]]:

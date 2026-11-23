@@ -78,11 +78,6 @@ class WorkStore:
         # brought up on first use instead.
         self._ready = False
         self._has_compat_scope = False
-        # Ziggy-local (MIT-1857, OA-15): (task_id, title) pairs the restart
-        # sweep marked ``interrupted`` that owe a work.finished push. The sweep
-        # runs before any MCP credential exists, so the pushes go out later,
-        # once the gateway has connected the connectors server.
-        self._pending_finish_notices: list[tuple[str, str]] = []
 
     def _ensure_ready(self) -> None:
         if self._ready:
@@ -135,6 +130,7 @@ class WorkStore:
                     reasoning_profile TEXT NOT NULL DEFAULT 'auto',
                     read_only INTEGER NOT NULL DEFAULT 0,
                     notify_on_finish INTEGER NOT NULL DEFAULT 0,
+                    finish_notified_at TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     started_at TEXT,
@@ -225,6 +221,9 @@ class WorkStore:
                     "ALTER TABLE work_tasks "
                     "ADD COLUMN notify_on_finish INTEGER NOT NULL DEFAULT 0"
                 )
+            if "finish_notified_at" not in task_columns:
+                # MIT-1857 (OA-15): set once connectors accepted the push.
+                connection.execute("ALTER TABLE work_tasks ADD COLUMN finish_notified_at TEXT")
             connection.execute(
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_work_tasks_request_id
@@ -245,6 +244,7 @@ class WorkStore:
         item.pop("scope", None)
         item.pop("request_id", None)
         item.pop("dispatched_at", None)
+        item.pop("finish_notified_at", None)
         item["read_only"] = read_only_value(item.get("read_only", False))
         return item
 
@@ -813,20 +813,11 @@ class WorkStore:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT task_id, title, notify_on_finish FROM work_tasks
+                SELECT task_id FROM work_tasks
                 WHERE status IN ('queued', 'running')
                 """
             ).fetchall()
             task_ids = [str(row["task_id"]) for row in rows]
-            # MIT-1857 (OA-15): hand-off tasks owe a work.finished push, but
-            # the sweep runs before any connectors credential exists. Park the
-            # flagged ones; ``pending_finish_notices`` hands them to the
-            # startup hook once the credential is ready.
-            self._pending_finish_notices = [
-                (str(row["task_id"]), str(row["title"]))
-                for row in rows
-                if row["notify_on_finish"]
-            ]
             connection.execute(
                 """
                 UPDATE work_tasks
@@ -847,11 +838,40 @@ class WorkStore:
             )
         return len(task_ids)
 
-    def pending_finish_notices(self) -> list[tuple[str, str]]:
-        """Consume the ``interrupted`` work.finished notices left by the restart sweep.
+    def finish_notice_owed(self, task_id: str) -> bool:
+        """Whether *task_id* is a flagged hand-off task not yet reported."""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM work_tasks WHERE task_id = ? AND notify_on_finish = 1 "
+                "AND finish_notified_at IS NULL",
+                (task_id,),
+            ).fetchone()
+        return row is not None
 
-        MIT-1857 (OA-15): drained in one go so a later MCP reconnect does not
-        re-push a task that has already been reported.
+    def pending_finish_notices(self) -> list[tuple[str, str, str]]:
+        """``(task_id, title, status)`` of hand-off tasks that still owe a push.
+
+        MIT-1857 (OA-15): a task flagged ``notify_on_finish`` that ended in a
+        push status and has no ``finish_notified_at`` yet. Durable, so a push
+        lost to a crash, a SIGTERM or a connectors outage goes out on the
+        next start; the restart sweep's ``interrupted`` tasks are included.
         """
-        notices, self._pending_finish_notices = self._pending_finish_notices, []
-        return notices
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT task_id, title, status FROM work_tasks
+                WHERE notify_on_finish = 1 AND finish_notified_at IS NULL
+                  AND status IN ('succeeded', 'failed', 'interrupted')
+                ORDER BY completed_at, task_id
+                """
+            ).fetchall()
+        return [(str(row["task_id"]), str(row["title"]), str(row["status"])) for row in rows]
+
+    def mark_finish_notified(self, task_id: str) -> None:
+        """Record that connectors accepted *task_id*'s work.finished push."""
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE work_tasks SET finish_notified_at = COALESCE(finish_notified_at, ?) "
+                "WHERE task_id = ?",
+                (utc_now(), task_id),
+            )
