@@ -503,6 +503,111 @@ async def test_tool_not_replayed_when_refreshed_tool_is_no_longer_idempotent():
 
 
 @pytest.mark.asyncio
+async def test_concurrent_reconnect_does_not_make_in_flight_write_replayable():
+    """Idempotency is judged as of dispatch, not after another call's refresh."""
+    first_call_started = asyncio.Event()
+    release_first_call = asyncio.Event()
+
+    async def _old_call(*args, **kwargs):
+        # The send commits server-side, then the response is lost while a
+        # concurrent call reconnects and flips the wrapper to idempotent.
+        first_call_started.set()
+        await release_first_call.wait()
+        raise _session_terminated_error()
+
+    old_session = AsyncMock()
+    old_session.call_tool = AsyncMock(side_effect=_old_call)
+    new_session = AsyncMock()
+    new_session.call_tool = AsyncMock(return_value=_make_tool_result("again"))
+
+    def _send(session, idempotent):
+        return MCPToolWrapper(
+            session,
+            "test_server",
+            _make_tool_def("send", annotations=_annotations(idempotent=idempotent)),
+            tool_timeout=5,
+            trust_annotations=True,
+        )
+
+    wrapper = _send(old_session, False)
+    replacement = _send(new_session, True)
+
+    async def reconnect(server_name: str, tool_name: str, stale_tool):
+        return replacement
+
+    wrapper.set_reconnect_handler(reconnect)
+
+    in_flight = asyncio.create_task(wrapper.execute())
+    await first_call_started.wait()
+    # Concurrent reconnect (another call's refresh) adopts idempotent=True.
+    assert await wrapper._refresh_session_after_termination(
+        _session_terminated_error(), False, "tool"
+    )
+    assert wrapper.idempotent is True
+    release_first_call.set()
+    output = await in_flight
+
+    assert "outcome unknown" in output
+    assert new_session.call_tool.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_read_only_call_not_replayed_when_refreshed_tool_is_a_write():
+    """A call authorized as read-only never replays as an idempotent write."""
+    old_session = AsyncMock()
+    old_session.call_tool = AsyncMock(side_effect=_session_terminated_error())
+    new_session = AsyncMock()
+    new_session.call_tool = AsyncMock(return_value=_make_tool_result("wrote"))
+
+    wrapper = _make_read_only_wrapper(old_session)
+    replacement = MCPToolWrapper(
+        new_session,
+        "test_server",
+        _make_tool_def(annotations=_annotations(read_only=False, idempotent=True)),
+        tool_timeout=5,
+        trust_annotations=True,
+    )
+    assert wrapper.read_only is True
+    assert replacement.idempotent is True and replacement.read_only is False
+
+    async def reconnect(server_name: str, tool_name: str, stale_tool):
+        return replacement
+
+    wrapper.set_reconnect_handler(reconnect)
+
+    with patch("nanobot.agent.tools.mcp.asyncio.sleep", new_callable=AsyncMock):
+        output = await wrapper.execute()
+
+    assert "outcome unknown" in output
+    assert new_session.call_tool.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_idempotent_tool_terminated_twice_does_not_loop():
+    """After one refresh+replay, a second termination ends the call."""
+    old_session = AsyncMock()
+    old_session.call_tool = AsyncMock(side_effect=_session_terminated_error())
+    new_session = AsyncMock()
+    new_session.call_tool = AsyncMock(side_effect=_session_terminated_error())
+
+    wrapper = _make_read_only_wrapper(old_session)
+    replacement = _make_read_only_wrapper(new_session)
+
+    async def reconnect(server_name: str, tool_name: str, stale_tool):
+        return replacement
+
+    wrapper.set_reconnect_handler(reconnect)
+
+    with patch("nanobot.agent.tools.mcp.asyncio.sleep", new_callable=AsyncMock):
+        output = await asyncio.wait_for(wrapper.execute(), timeout=5)
+
+    assert is_tool_error_result(output)
+    assert old_session.call_tool.call_count == 1
+    # One refresh replay, then at most the single transient retry.
+    assert new_session.call_tool.call_count <= 2
+
+
+@pytest.mark.asyncio
 async def test_idempotent_hint_only_tool_retries_on_transient_error():
     """idempotentHint alone (not read-only) keeps the single transient retry."""
     session = AsyncMock()

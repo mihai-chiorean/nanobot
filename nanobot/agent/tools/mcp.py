@@ -798,6 +798,10 @@ class MCPToolWrapper(_MCPWrapperBase):
         return False
 
     async def execute(self, **kwargs: Any) -> str:
+        # Snapshot the safety flags at dispatch: a concurrent reconnect can
+        # change this shared wrapper's annotations while the call is in flight.
+        dispatch_read_only = self.read_only
+        dispatch_idempotent = self.idempotent
         retried_transient = False
         refreshed_session = False
         while True:
@@ -827,21 +831,27 @@ class MCPToolWrapper(_MCPWrapperBase):
             except Exception as exc:
                 if _is_session_terminated(exc):
                     # Always replace a dead session so later calls recover, but
-                    # replay this call only if the tool was idempotent before
-                    # and is still idempotent after the refresh: the call may
-                    # have reached the server before the connection died, and
-                    # repeating a non-idempotent call (e.g. browser_fill_form)
-                    # could run the action twice (MIT-1817).
-                    was_idempotent = self.idempotent
-                    if await self._refresh_session_after_termination(
+                    # replay this call only if the tool was idempotent at
+                    # dispatch and is still at least as safe after the refresh:
+                    # the call may have reached the server before the
+                    # connection died, so repeating a non-idempotent call (e.g.
+                    # browser_fill_form) could run the action twice, and a call
+                    # authorized as read-only must not replay as a write
+                    # (MIT-1817).
+                    refreshed_now = await self._refresh_session_after_termination(
                         exc,
                         refreshed_session,
                         "tool",
-                    ):
-                        refreshed_session = True
-                        if was_idempotent and self.idempotent:
-                            continue
-                    if not (was_idempotent and self.idempotent):
+                    )
+                    refreshed_session = refreshed_session or refreshed_now
+                    replay_safe = (
+                        dispatch_idempotent
+                        and self.idempotent
+                        and (self.read_only or not dispatch_read_only)
+                    )
+                    if refreshed_now and replay_safe:
+                        continue
+                    if not replay_safe:
                         logger.warning(
                             "mcp_retry_skipped tool={} reason=not_idempotent",
                             self._name,
