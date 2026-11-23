@@ -30,6 +30,11 @@ def test_missing_file_is_unknown(tmp_path: Path) -> None:
     assert resolve_release_id(env={}, root=tmp_path) == "unknown"
 
 
+def test_undecodable_file_is_unknown_not_a_startup_crash(tmp_path: Path) -> None:
+    (tmp_path / "RELEASE_ID").write_bytes(b"\xff\xfe")
+    assert resolve_release_id(env={}, root=tmp_path) == "unknown"
+
+
 @pytest.mark.parametrize("bad", ["bad id", "x" * 70, "-leading-dash", "", "sp ace", ".dot-first"])
 def test_malformed_value_is_unknown(tmp_path: Path, bad: str) -> None:
     _write_release_file(tmp_path, bad)
