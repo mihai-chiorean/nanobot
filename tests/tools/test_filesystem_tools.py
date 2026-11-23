@@ -812,3 +812,37 @@ class TestHistoryDirRefusal:
         tool = ReadFileTool(workspace=workspace, allowed_dir=workspace)
         result = await tool.execute(path="notes.md")
         assert "hello" in result
+
+    @pytest.mark.asyncio
+    async def test_recursive_grep_from_tenant_root_skips_history(self, ws_root):
+        """Codex P2: grep(path=<tenant root>) must not read history/ descendants."""
+        from nanobot.agent.tools.search import GrepTool
+
+        tenant, workspace = ws_root
+        (workspace / "visible.md").write_text("ref: visible\n", encoding="utf-8")
+        tool = GrepTool(workspace=workspace, allowed_dir=tenant)
+        result = await tool.execute(pattern="ref:", path=str(tenant))
+        assert "visible" in result
+        assert "refs/heads/master" not in result
+        assert "workspace.git" not in result
+
+    @pytest.mark.asyncio
+    async def test_find_files_from_tenant_root_skips_history(self, ws_root):
+        from nanobot.agent.tools.search import FindFilesTool
+
+        tenant, workspace = ws_root
+        tool = FindFilesTool(workspace=workspace, allowed_dir=tenant)
+        result = await tool.execute(path=str(tenant), include_dirs=True)
+        assert "notes.md" in result
+        assert "history" not in result
+        assert "HEAD" not in result
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("recursive", [True, False])
+    async def test_list_dir_from_tenant_root_skips_history(self, ws_root, recursive):
+        tenant, workspace = ws_root
+        tool = ListDirTool(workspace=workspace, allowed_dir=tenant)
+        result = await tool.execute(path=str(tenant), recursive=recursive)
+        assert "workspace" in result
+        assert "history" not in result
+        assert "HEAD" not in result

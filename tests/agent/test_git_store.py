@@ -20,8 +20,10 @@ TRACKED = ["SOUL.md", "USER.md", "memory/MEMORY.md"]
 
 @pytest.fixture
 def git(tmp_path):
-    """Uninitialized GitStore."""
-    return GitStore(tmp_path, tracked_files=TRACKED)
+    """Uninitialized GitStore (bare history next to the workspace)."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    return GitStore(workspace, tracked_files=TRACKED, git_dir=history_dir_for(workspace) / "workspace.git")
 
 
 @pytest.fixture
@@ -32,27 +34,17 @@ def git_ready(git):
 
 
 class TestInit:
-    def test_not_initialized_by_default(self, git, tmp_path):
+    def test_not_initialized_by_default(self, git):
         assert not git.is_initialized()
-        assert not (tmp_path / ".git").is_dir()
+        assert not git._git_dir.exists()
 
-    def test_init_creates_git_dir(self, git, tmp_path):
+    def test_init_creates_bare_repo(self, git):
         assert git.init()
-        assert (tmp_path / ".git").is_dir()
+        assert (git._git_dir / "HEAD").is_file()
+        assert not (git._workspace / ".git").exists()
 
     def test_init_idempotent(self, git_ready):
         assert not git_ready.init()
-
-    def test_init_creates_gitignore(self, git_ready):
-        gi = git_ready._workspace / ".gitignore"
-        assert gi.exists()
-        content = gi.read_text(encoding="utf-8")
-        for f in TRACKED:
-            assert f"!{f}" in content
-
-    def test_init_touches_tracked_files(self, git_ready):
-        for f in TRACKED:
-            assert (git_ready._workspace / f).exists()
 
     def test_init_makes_initial_commit(self, git_ready):
         commits = git_ready.log()
@@ -60,30 +52,9 @@ class TestInit:
         assert "init" in commits[0].message
 
     def test_init_failure_is_explicit(self, git):
-        with patch("dulwich.porcelain.init", side_effect=OSError("cannot initialize")):
+        with patch("dulwich.repo.Repo.init_bare", side_effect=OSError("cannot initialize")):
             with pytest.raises(GitStoreError, match="init failed"):
                 git.init()
-
-
-class TestBuildGitignore:
-    def test_subdirectory_dirs(self, git):
-        content = git._build_gitignore()
-        assert "!memory/\n" in content
-        for f in TRACKED:
-            assert f"!{f}\n" in content
-        assert content.startswith("/*\n")
-
-    def test_root_level_files_no_dir_entries(self, tmp_path):
-        gs = GitStore(tmp_path, tracked_files=["a.md", "b.md"])
-        content = gs._build_gitignore()
-        assert "!a.md\n" in content
-        assert "!b.md\n" in content
-        dir_lines = [
-            line
-            for line in content.split("\n")
-            if line.startswith("!") and line.endswith("/")
-        ]
-        assert dir_lines == []
 
 
 class TestAutoCommit:
@@ -123,11 +94,6 @@ class TestAutoCommit:
         git_ready.auto_commit("nothing 1")
         git_ready.auto_commit("nothing 2")
         assert len(git_ready.log()) == 1  # only init commit
-
-    def test_status_failure_is_explicit(self, git_ready):
-        with patch("dulwich.porcelain.status", side_effect=OSError("broken index")):
-            with pytest.raises(GitStoreError, match="auto-commit failed"):
-                git_ready.auto_commit("update")
 
 
 class TestLog:
@@ -266,11 +232,11 @@ class TestRevert:
         git_ready.auto_commit("v2")
 
         commits = git_ready.log()
-        # commits[0] = v2 (HEAD), commits[1] = init
-        # Revert v2 → restore to init's state (empty SOUL.md)
+        # commits[0] = v2 (HEAD), commits[1] = init (no SOUL.md yet)
+        # Revert v2 → SOUL.md did not exist before, so it is removed.
         new_sha = git_ready.revert(commits[0].sha)
         assert new_sha is not None
-        assert (ws / "SOUL.md").read_text(encoding="utf-8") == ""
+        assert not (ws / "SOUL.md").exists()
 
     def test_root_commit_returns_none(self, git_ready):
         """Cannot revert the root commit (no parent to restore to)."""
@@ -488,10 +454,15 @@ class TestBareWorkspaceHistory:
         assert "ziggy|ziggy@runtime|init: workspace history" in out
 
     def test_migrates_legacy_dot_git(self, ws):
-        # A real legacy store (the pre-SM-01 layout) inside the workspace.
-        legacy_store = GitStore(ws, tracked_files=["SOUL.md"])
+        # A legacy store (the pre-SM-01 layout) inside the workspace.
         (ws / "SOUL.md").write_text("# old soul", encoding="utf-8")
-        assert legacy_store.init() is True
+        subprocess.run(["git", "init", "-q", str(ws)], check=True)
+        subprocess.run(["git", "-C", str(ws), "add", "SOUL.md"], check=True)
+        subprocess.run(
+            ["git", "-C", str(ws), "-c", "user.name=nanobot", "-c", "user.email=n@d",
+             "commit", "-q", "-m", "init: nanobot memory store"],
+            check=True,
+        )
         legacy_head = (ws / ".git" / "HEAD").read_text(encoding="utf-8")
         (ws / ".gitignore").write_text("/*\n", encoding="utf-8")
         (ws / "SOUL.md").write_text("# soul", encoding="utf-8")
@@ -521,6 +492,7 @@ class TestBareWorkspaceHistory:
             assert GitStore._read_blob_from_tree(repo, tree, "SOUL.md") == b"# soul"
         finally:
             repo.close()
+
     def test_init_is_noop_when_bare_repo_exists(self, ws):
         store = GitStore(
             ws,
@@ -554,3 +526,95 @@ class TestBareWorkspaceHistory:
         )
         with pytest.raises(GitStoreError, match="auto-commit failed"):
             bare.auto_commit("boom")
+
+    def test_revert_restores_wildcard_tracked_files(self, bare, ws):
+        """Codex P2: revert must restore skills/**, prompts/*.md and pipeline
+        state (not only literal paths), and drop files the commit added."""
+        (ws / "skills" / "s").mkdir(parents=True)
+        (ws / "prompts").mkdir()
+        (ws / "memory" / "pipelines").mkdir(parents=True)
+        files = {
+            "SOUL.md": "soul v1",
+            "skills/s/SKILL.md": "skill v1",
+            "prompts/p.md": "prompt v1",
+            "memory/pipelines/run.md": "pipeline v1",
+        }
+        for rel, text in files.items():
+            (ws / rel).write_text(text, encoding="utf-8")
+        bare.init()
+
+        for rel in files:
+            (ws / rel).write_text("v2", encoding="utf-8")
+        (ws / "skills" / "added").mkdir()
+        (ws / "skills" / "added" / "SKILL.md").write_text("new", encoding="utf-8")
+        sha = bare.auto_commit("dream: rewrite")
+
+        assert bare.revert(sha, message_prefix="dream:") is not None
+        for rel, text in files.items():
+            assert (ws / rel).read_text(encoding="utf-8") == text, rel
+        assert not (ws / "skills" / "added" / "SKILL.md").exists()
+        # The restored state is itself committed: nothing left to commit.
+        assert bare.auto_commit("after revert") is None
+
+    def test_revert_leaves_files_the_commit_did_not_touch(self, bare, ws):
+        (ws / "SOUL.md").write_text("soul v1", encoding="utf-8")
+        bare.init()
+        (ws / "SOUL.md").write_text("soul v2", encoding="utf-8")
+        sha = bare.auto_commit("dream: soul")
+        (ws / "skills" / "later").mkdir(parents=True)
+        (ws / "skills" / "later" / "SKILL.md").write_text("later", encoding="utf-8")
+        bare.auto_commit("skill install")
+
+        assert bare.revert(sha, message_prefix="dream:") is not None
+        assert (ws / "SOUL.md").read_text(encoding="utf-8") == "soul v1"
+        assert (ws / "skills" / "later" / "SKILL.md").read_text(encoding="utf-8") == "later"
+
+    def test_oversize_file_is_tracked_again_after_it_shrinks(self, bare, ws):
+        """Codex P2: the oversize log-once set must not gate eligibility."""
+        (ws / "skills").mkdir()
+        big = ws / "skills" / "notes.md"
+        big.write_bytes(b"x" * (1024 * 1024 + 1))
+        bare.init()
+        big.write_text("small now", encoding="utf-8")
+        assert bare.auto_commit("shrunk") is not None
+        repo, tree = self._tree_at_head(bare)
+        try:
+            assert GitStore._read_blob_from_tree(repo, tree, "skills/notes.md") == b"small now"
+        finally:
+            repo.close()
+
+    def test_binary_asset_round_trips_through_revert(self, bare, ws):
+        """Restore a binary file from history and compare bytes on disk."""
+        binary = b"\x89PNG\r\n\x1a\n\xff\xfe\x00\x01\x80\x00" + bytes(range(256))
+        asset = ws / "skills" / "x" / "assets" / "a.bin"
+        asset.parent.mkdir(parents=True)
+        asset.write_bytes(binary)
+        bare.init()
+        asset.write_bytes(b"\x00corrupted\xff")
+        sha = bare.auto_commit("dream: clobber asset")
+        assert bare.revert(sha) is not None
+        assert asset.read_bytes() == binary
+
+    def test_migration_falls_back_to_copy_across_filesystems(self, ws, monkeypatch):
+        """history/ on another filesystem: rename raises EXDEV, move copies."""
+        import errno
+
+        (ws / ".git").mkdir()
+        (ws / ".git" / "HEAD").write_text("ref: refs/heads/master\n", encoding="utf-8")
+        real_rename = os.rename
+
+        def exdev_rename(src, dst, *args, **kwargs):
+            if str(src) == str(ws / ".git"):
+                raise OSError(errno.EXDEV, "Invalid cross-device link")
+            return real_rename(src, dst, *args, **kwargs)
+
+        monkeypatch.setattr(os, "rename", exdev_rename)
+        store = GitStore(
+            ws,
+            tracked_files=DEFAULT_TRACKED_PATTERNS,
+            git_dir=history_dir_for(ws) / "workspace.git",
+        )
+        assert store.init() is True
+        assert not (ws / ".git").exists()
+        parked = ws.parent / "history" / "legacy-dot-git" / "HEAD"
+        assert parked.read_text(encoding="utf-8") == "ref: refs/heads/master\n"

@@ -209,21 +209,26 @@ class _FsTool(Tool):
         (PermissionError), which every file tool already funnels to a clean
         ToolResult.error.
         """
-        if self._workspace is None:
-            return
-        try:
-            history = history_dir_for(Path(self._workspace))
-        except (OSError, RuntimeError, ValueError):
-            return
-        try:
-            under_history = resolved == history or history in resolved.parents
-        except (OSError, RuntimeError, ValueError):
-            return
-        if under_history:
+        if self._is_history_path(resolved):
             raise SensitivePathError(
                 f"Access to {path} is blocked (workspace history — the agent "
                 "cannot read or rewrite its own undo history)."
             )
+
+    def _is_history_path(self, path: Path) -> bool:
+        """True if *path* is the workspace history dir or anything under it.
+
+        Traversing tools (list_dir, grep, find_files) call this per entry to
+        prune history/ when a widened root (e.g. the tenant root) contains it.
+        """
+        if self._workspace is None:
+            return False
+        try:
+            history = history_dir_for(Path(self._workspace))
+            resolved = Path(path).resolve(strict=False)
+        except (OSError, RuntimeError, ValueError):
+            return False
+        return resolved == history or history in resolved.parents
 
     def _resolve_read(self, path: str) -> Path:
         plugin_skill_dirs: list[Path] = []
@@ -1284,13 +1289,15 @@ class ListDirTool(_FsTool):
                 for item in sorted(dp.rglob("*")):
                     if any(p in self._IGNORE_DIRS for p in item.parts):
                         continue
+                    if self._is_history_path(item):
+                        continue
                     total += 1
                     if len(items) < cap:
                         rel = item.relative_to(dp)
                         items.append(f"{rel}/" if item.is_dir() else str(rel))
             else:
                 for item in sorted(dp.iterdir()):
-                    if item.name in self._IGNORE_DIRS:
+                    if item.name in self._IGNORE_DIRS or self._is_history_path(item):
                         continue
                     total += 1
                     if len(items) < cap:
