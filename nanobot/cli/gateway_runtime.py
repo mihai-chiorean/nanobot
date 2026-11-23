@@ -576,6 +576,7 @@ def _run_gateway(
     )
     from nanobot.providers.fallback_provider import FallbackProvider
     from nanobot.providers.image_generation import image_gen_provider_configs
+    from nanobot.runtime_release import apply_release_env
     from nanobot.session.manager import SessionManager
     from nanobot.session.recovery import RecoveryCoordinator
     from nanobot.session.webui_turns import (
@@ -604,7 +605,11 @@ def _run_gateway(
         )
         raise typer.Exit(1)
 
-    console.print(f"{__logo__} Starting nanobot gateway version {__version__} on port {port}...")
+    release = apply_release_env()
+    console.print(
+        f"{__logo__} Starting nanobot gateway version {__version__} "
+        f"release={release} on port {port}..."
+    )
     _prepare_webui_bundle_for_gateway(
         config,
         mode=webui_bundle_mode,
