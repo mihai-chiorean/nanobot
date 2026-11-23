@@ -846,3 +846,19 @@ class TestHistoryDirRefusal:
         assert "workspace" in result
         assert "history" not in result
         assert "HEAD" not in result
+
+    @pytest.mark.asyncio
+    async def test_grep_skips_file_symlink_into_history(self, ws_root):
+        """Codex P2 r2: a workspace file symlink into history/ is not read."""
+        from nanobot.agent.tools.search import FindFilesTool, GrepTool
+
+        tenant, workspace = ws_root
+        (workspace / "head.txt").symlink_to(tenant / "history" / "workspace.git" / "HEAD")
+        grep = GrepTool(workspace=workspace, allowed_dir=tenant)
+        result = await grep.execute(pattern="ref:", path=str(workspace))
+        assert "refs/heads/master" not in result
+        find = FindFilesTool(workspace=workspace, allowed_dir=tenant)
+        assert "head.txt" not in await find.execute(path=str(workspace))
+        read = ReadFileTool(workspace=workspace, allowed_dir=tenant)
+        out = await read.execute(path=str(workspace / "head.txt"))
+        assert "refs/heads/master" not in out

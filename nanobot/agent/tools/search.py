@@ -206,7 +206,11 @@ class _SearchTool(_FsTool):
                 if d not in self._IGNORE_DIRS and not self._is_history_path(current / d)
             )
             for filename in sorted(filenames):
-                yield current / filename
+                file_path = current / filename
+                # A file symlink can point into history/; check the target.
+                if self._is_history_path(file_path):
+                    continue
+                yield file_path
 
 
 class FindFilesTool(_SearchTool):

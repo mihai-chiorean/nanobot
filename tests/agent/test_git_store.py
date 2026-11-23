@@ -228,15 +228,16 @@ class TestRevert:
     def test_undoes_commit_changes(self, git_ready):
         """revert(sha) should undo the given commit by restoring to its parent."""
         ws = git_ready._workspace
+        (ws / "SOUL.md").write_text("v1 content", encoding="utf-8")
+        git_ready.auto_commit("v1")
         (ws / "SOUL.md").write_text("v2 content", encoding="utf-8")
         git_ready.auto_commit("v2")
 
         commits = git_ready.log()
-        # commits[0] = v2 (HEAD), commits[1] = init (no SOUL.md yet)
-        # Revert v2 → SOUL.md did not exist before, so it is removed.
+        # Revert v2 → SOUL.md back to v1.
         new_sha = git_ready.revert(commits[0].sha)
         assert new_sha is not None
-        assert not (ws / "SOUL.md").exists()
+        assert (ws / "SOUL.md").read_text(encoding="utf-8") == "v1 content"
 
     def test_root_commit_returns_none(self, git_ready):
         """Cannot revert the root commit (no parent to restore to)."""
@@ -529,7 +530,7 @@ class TestBareWorkspaceHistory:
 
     def test_revert_restores_wildcard_tracked_files(self, bare, ws):
         """Codex P2: revert must restore skills/**, prompts/*.md and pipeline
-        state (not only literal paths), and drop files the commit added."""
+        state (not only literal paths)."""
         (ws / "skills" / "s").mkdir(parents=True)
         (ws / "prompts").mkdir()
         (ws / "memory" / "pipelines").mkdir(parents=True)
@@ -552,7 +553,8 @@ class TestBareWorkspaceHistory:
         assert bare.revert(sha, message_prefix="dream:") is not None
         for rel, text in files.items():
             assert (ws / rel).read_text(encoding="utf-8") == text, rel
-        assert not (ws / "skills" / "added" / "SKILL.md").exists()
+        # Added by the commit: prior state unknown, so kept (never deleted).
+        assert (ws / "skills" / "added" / "SKILL.md").read_text(encoding="utf-8") == "new"
         # The restored state is itself committed: nothing left to commit.
         assert bare.auto_commit("after revert") is None
 
@@ -618,3 +620,49 @@ class TestBareWorkspaceHistory:
         assert not (ws / ".git").exists()
         parked = ws.parent / "history" / "legacy-dot-git" / "HEAD"
         assert parked.read_text(encoding="utf-8") == "ref: refs/heads/master\n"
+
+    def test_revert_never_deletes_a_file_excluded_by_the_size_cap(self, bare, ws):
+        """Codex P2 r2: a path absent from the parent tree may have existed
+        but been excluded (oversize); revert must not delete it."""
+        asset = ws / "skills" / "x" / "big.bin"
+        asset.parent.mkdir(parents=True)
+        asset.write_bytes(b"x" * (1024 * 1024 + 1))
+        (ws / "SOUL.md").write_text("soul v1", encoding="utf-8")
+        bare.init()
+        asset.write_bytes(b"shrunk")
+        (ws / "SOUL.md").write_text("soul v2", encoding="utf-8")
+        sha = bare.auto_commit("dream: shrink")
+        assert bare.revert(sha) is not None
+        assert asset.read_bytes() == b"shrunk"
+        assert (ws / "SOUL.md").read_text(encoding="utf-8") == "soul v1"
+
+    def test_revert_refuses_file_dir_conflict_without_touching_anything(self, bare, ws):
+        """Codex P2 r2: all-or-nothing when a file became a directory."""
+        (ws / "skills").mkdir()
+        (ws / "skills" / "helper").write_text("helper file", encoding="utf-8")
+        (ws / "SOUL.md").write_text("soul v1", encoding="utf-8")
+        bare.init()
+        (ws / "skills" / "helper").unlink()
+        (ws / "skills" / "helper").mkdir()
+        (ws / "skills" / "helper" / "SKILL.md").write_text("dir now", encoding="utf-8")
+        (ws / "SOUL.md").write_text("soul v2", encoding="utf-8")
+        sha = bare.auto_commit("dream: restructure")
+        head_before = bare.log()[0].sha
+        assert bare.revert(sha) is None
+        assert (ws / "SOUL.md").read_text(encoding="utf-8") == "soul v2"
+        assert (ws / "skills" / "helper" / "SKILL.md").read_text(encoding="utf-8") == "dir now"
+        assert bare.log()[0].sha == head_before
+
+    def test_revert_refuses_dir_to_file_conflict(self, bare, ws):
+        (ws / "skills" / "helper").mkdir(parents=True)
+        (ws / "skills" / "helper" / "SKILL.md").write_text("in dir", encoding="utf-8")
+        (ws / "SOUL.md").write_text("soul v1", encoding="utf-8")
+        bare.init()
+        (ws / "skills" / "helper" / "SKILL.md").unlink()
+        (ws / "skills" / "helper").rmdir()
+        (ws / "skills" / "helper").write_text("file now", encoding="utf-8")
+        (ws / "SOUL.md").write_text("soul v2", encoding="utf-8")
+        sha = bare.auto_commit("dream: flatten")
+        assert bare.revert(sha) is None
+        assert (ws / "SOUL.md").read_text(encoding="utf-8") == "soul v2"
+        assert (ws / "skills" / "helper").read_text(encoding="utf-8") == "file now"

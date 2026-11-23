@@ -521,8 +521,9 @@ class GitStore:
         """Revert (undo) the changes introduced by the given commit.
 
         Every file the commit changed is restored to its state at the commit's
-        parent (files it added are deleted), then a new commit records the
-        revert. When *message_prefix*
+        parent, then a new commit records the revert. Files absent from the
+        parent tree are kept, never deleted; a file/directory conflict refuses
+        the whole revert with nothing changed. When *message_prefix*
         is provided, commits outside that history are rejected before any files
         are changed.
 
@@ -562,12 +563,15 @@ class GitStore:
                     logger.warning("Git revert: cannot revert root commit {}", commit)
                     return None
 
-                # Undo exactly what this commit changed: every path whose blob
-                # differs between the parent tree and the commit tree goes
-                # back to the parent's bytes, or is deleted if the commit
-                # added it. Paths are the concrete ones stored in the trees,
-                # so wildcard-tracked files (skills/**, prompts/*.md) are
-                # covered and files the commit did not touch are left alone.
+                # Undo what this commit changed: every path whose blob differs
+                # between the parent and the commit tree goes back to the
+                # parent's bytes. Paths come from the trees, so wildcard-
+                # tracked files (skills/**, prompts/*.md) are covered and
+                # files the commit did not touch are left alone.
+                #
+                # A path missing from the parent tree is never deleted: it may
+                # have existed then but been excluded (size cap, symlink), so
+                # its prior state is unknown. Such paths are kept and logged.
                 parent_obj = cast("Commit", repo[typed_commit.parents[0]])
                 before = self._tree_blobs(repo, parent_obj.tree)
                 after = self._tree_blobs(repo, typed_commit.tree)
@@ -575,18 +579,47 @@ class GitStore:
                     p for p in before.keys() | after.keys() if before.get(p) != after.get(p)
                 )
                 workspace = self._workspace.resolve()
-                restored: list[str] = []
+                writes: list[tuple[str, Path, bytes]] = []
+                kept: list[str] = []
                 for filepath in changed:
+                    blob_id = before.get(filepath)
+                    if blob_id is None:
+                        kept.append(filepath)
+                        continue
                     dest = self._workspace / filepath
                     if workspace not in dest.resolve().parents:
                         continue
-                    blob_id = before.get(filepath)
-                    if blob_id is None:
-                        dest.unlink(missing_ok=True)
-                    else:
-                        dest.parent.mkdir(parents=True, exist_ok=True)
-                        dest.write_bytes(cast("Blob", repo[blob_id]).data)
-                    restored.append(filepath)
+                    writes.append((filepath, dest, cast("Blob", repo[blob_id]).data))
+
+                # Preflight (all-or-nothing): refuse before touching anything
+                # if a target is now a directory or one of its parents is now
+                # a file (file <-> directory replacement by the commit).
+                conflicts = [
+                    filepath
+                    for filepath, dest, _ in writes
+                    if dest.is_dir()
+                    or any(
+                        (self._workspace / anc).exists() and not (self._workspace / anc).is_dir()
+                        for anc in Path(filepath).parents
+                    )
+                ]
+                if conflicts:
+                    logger.warning(
+                        "Git revert: refusing {}; file/directory conflict at {}",
+                        commit,
+                        ", ".join(conflicts),
+                    )
+                    return None
+                if kept:
+                    logger.warning(
+                        "Git revert: {} added {}; kept (prior state unknown)",
+                        commit,
+                        ", ".join(kept),
+                    )
+                for _, dest, data in writes:
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    dest.write_bytes(data)
+                restored = [filepath for filepath, _, _ in writes]
 
             if not restored:
                 return None
