@@ -24,6 +24,7 @@ import re
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 from loguru import logger
@@ -203,10 +204,16 @@ class TurnProvenance:
             self.prompt = list(entry["prompt"])
         if self.skills_listed_sha is None and isinstance(entry.get("skills_listed_sha"), str):
             self.skills_listed_sha = entry["skills_listed_sha"]
-        for name in ("skills_loaded", "calls"):
-            earlier = entry.get(name)
-            if isinstance(earlier, list):
-                setattr(self, name, [*earlier, *getattr(self, name)])
+        earlier_calls = entry.get("calls")
+        if isinstance(earlier_calls, list):
+            self.calls = [*earlier_calls, *self.calls]
+        earlier_skills = entry.get("skills_loaded")
+        if isinstance(earlier_skills, list):
+            merged_skills = [dict(item) for item in earlier_skills if isinstance(item, dict)]
+            for item in self.skills_loaded:
+                if item not in merged_skills:
+                    merged_skills.append(item)
+            self.skills_loaded = merged_skills
         earlier_repairs = entry.get("args_repaired")
         if isinstance(earlier_repairs, dict):
             merged = {k: v for k, v in earlier_repairs.items() if isinstance(v, int)}
@@ -228,6 +235,51 @@ class TurnProvenance:
                 else:
                     merged_used.append(dict(item))
             self.used = merged_used
+
+    def note_prompt(self, sections: list[dict[str, Any]]) -> None:
+        """Record one system-prompt build's section fingerprint (TP-06).
+
+        The first non-empty list is the turn's fingerprint; a later build
+        with a different list (compaction or a summary change mid-turn)
+        flags ``prompt_rebuilt`` and the last one is kept.
+        """
+        if self.prompt and sections and sections != self.prompt:
+            self.prompt_rebuilt = True
+        if sections:
+            self.prompt = list(sections)
+
+    def note_skill(self, name: str, sha: str) -> None:
+        """Append ``{name, sha}`` to ``skills_loaded``, de-duplicated (TP-06)."""
+        entry = {"name": name, "sha": sha}
+        if entry not in self.skills_loaded:
+            self.skills_loaded.append(entry)
+
+    def note_read_file_skill(self, arguments: Any) -> None:
+        """Record a skill the model pulled in itself with ``read_file`` (TP-06).
+
+        A ``read_file`` of ``.../<name>/SKILL.md`` is how the model loads an
+        on-demand skill; the parent directory name plus the file hash join
+        ``skills_loaded``. Relative paths resolve against the turn's
+        workspace scope. Anything that is not an existing SKILL.md records
+        nothing, and the arguments are never retained.
+        """
+        args = arguments if isinstance(arguments, dict) else {}
+        path = args.get("path")
+        if not isinstance(path, str) or not path.endswith("/SKILL.md"):
+            return
+        candidate = Path(path).expanduser()
+        if not candidate.is_absolute():
+            from nanobot.security.workspace_access import current_workspace_scope
+
+            scope = current_workspace_scope()
+            if scope is None:
+                return
+            candidate = scope.project_path / candidate
+        if not candidate.is_file():
+            return
+        from nanobot.agent.skills import skill_file_sha
+
+        self.note_skill(candidate.parent.name, skill_file_sha(candidate))
 
     def note_tool_result(self, tool: Any, status: str) -> None:
         """Record one executed tool call.

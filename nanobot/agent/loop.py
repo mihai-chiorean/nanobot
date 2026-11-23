@@ -68,6 +68,7 @@ from nanobot.agent.tools.publish_file import (
     bind_publish_file_turn,
     reset_publish_file_turn,
 )
+from nanobot.agent.skills import skill_file_sha
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.runtime_control import AgentRuntimeControl
 
@@ -83,6 +84,7 @@ from nanobot.agent.turn_provenance import (
     TurnProvenance,
     account_intent,
     bind_turn_provenance,
+    current_turn_provenance,
     log_recording_failure,
     reset_turn_provenance,
     save_to_session,
@@ -483,7 +485,8 @@ class _ZiggyTurnHook(AgentHook):
 
 
 class _TurnProvenanceHook(AgentHook):
-    """TP-09 (MIT-1870): count the turn's "Used:" source families.
+    """TP-09 (MIT-1870): count the turn's "Used:" source families; TP-06
+    (MIT-1867): note SKILL.md files the model read.
 
     Feeds the turn's :class:`TurnProvenance` record from the executed tool
     call's tool object. Counting only in ``after_execute_tool`` /
@@ -517,6 +520,11 @@ class _TurnProvenanceHook(AgentHook):
     ) -> None:
         with _provenance_boundary("counting a tool result"):
             self._record.note_tool_result(self._tool_object(tool_call, tool), "ok")
+        if tool_call.name == "read_file":
+            # TP-06: a successful read of a SKILL.md is the model loading
+            # that skill itself; only its name and file hash are kept.
+            with _provenance_boundary("noting a skill read"):
+                self._record.note_read_file_skill(tool_call.arguments)
 
     async def on_execute_tool_error(
         self,
@@ -1499,6 +1507,72 @@ class AgentLoop:
             ),
         )
 
+    def _build_transcript_for_turn(
+        self,
+        transcript: TranscriptInput,
+        *,
+        channel: str | None = None,
+        workspace: Path | None = None,
+        include_memory: bool = True,
+    ) -> list[dict[str, Any]]:
+        """``ContextBuilder.build_transcript`` that also notes the prompt fingerprint.
+
+        Used as the turn's ``transcript_builder`` so every build (the first
+        and any rebuild after compaction) lands on the turn's provenance
+        record (TP-06). The messages are exactly what the builder returns.
+        """
+        fingerprint: list[dict[str, Any]] = []
+        messages = self.context.build_transcript(
+            transcript,
+            channel=channel,
+            workspace=workspace,
+            include_memory=include_memory,
+            fingerprint_out=fingerprint,
+        )
+        self._note_turn_prompt(
+            fingerprint,
+            shared_room=transcript.shared_room,
+            skill_reference_text=transcript.current_message,
+        )
+        return messages
+
+    def _note_turn_prompt(
+        self,
+        sections: list[dict[str, Any]],
+        *,
+        shared_room: bool,
+        skill_reference_text: str | None,
+    ) -> None:
+        """Attach one system-prompt build to the turn's provenance record (TP-06).
+
+        Listed = the skills summary the prompt showed; loaded = always-on
+        skills plus ``$name`` invocations. A shared-room prompt carries
+        neither. Hashes only, and a failure never touches the turn.
+        """
+        provenance = current_turn_provenance()
+        if provenance is None:
+            return
+        with _provenance_boundary("recording the prompt fingerprint"):
+            provenance.note_prompt(sections)
+            if shared_room:
+                return
+            skills = self.context.skills
+            always_skills = skills.get_always_skills()
+            _summary, listed_sha = skills.build_skills_summary_with_sha(
+                exclude=set(always_skills),
+            )
+            provenance.skills_listed_sha = listed_sha
+            paths = {
+                entry["name"]: entry["path"]
+                for entry in skills.list_skills(filter_unavailable=False)
+            }
+            for name in always_skills + skills.get_explicitly_invoked_skills(
+                skill_reference_text or ""
+            ):
+                path = paths.get(name)
+                if path is not None:
+                    provenance.note_skill(name, skill_file_sha(path))
+
     def _request_context_for_turn(self, ctx: TurnContext) -> RequestContext:
         assert ctx.session is not None
         scope = self.workspace_scopes.for_turn(
@@ -2127,7 +2201,7 @@ class AgentLoop:
             session_metadata=session.metadata if session is not None else None,
         )
         transcript_builder = partial(
-            self.context.build_transcript,
+            self._build_transcript_for_turn,
             channel=request_ctx.channel,
             workspace=effective_scope.project_path,
             include_memory=session.policy.persist if session is not None else True,
@@ -3412,13 +3486,23 @@ class AgentLoop:
             )
         if ctx.ask_user_resume_id is not None:
             assert ctx.request_context is not None
+            prompt_sections: list[dict[str, Any]] = []
+            system_prompt = self.context.build_system_prompt(
+                channel=ctx.request_context.channel,
+                session_summary=ctx.pending_summary,
+                workspace=ctx.request_context.workspace,
+                include_memory=session.policy.persist,
+                fingerprint_out=prompt_sections,
+            )
+            # TP-06: the resume path's only prompt build (the runner gets
+            # initial_messages, not the builder), so it is noted here.
+            self._note_turn_prompt(
+                prompt_sections,
+                shared_room=False,
+                skill_reference_text=ctx.msg.content,
+            )
             ctx.initial_messages = ask_user_tool_result_messages(
-                self.context.build_system_prompt(
-                    channel=ctx.request_context.channel,
-                    session_summary=ctx.pending_summary,
-                    workspace=ctx.request_context.workspace,
-                    include_memory=session.policy.persist,
-                ),
+                system_prompt,
                 ctx.history,
                 ctx.ask_user_resume_id,
                 ctx.msg.content,

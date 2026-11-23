@@ -1,6 +1,7 @@
 """Context builder for assembling agent prompts."""
 
 import base64
+import hashlib
 import mimetypes
 import platform
 from dataclasses import dataclass
@@ -46,6 +47,16 @@ async def handle_runtime_control(state: Any, msg: InboundMessage, tools: ToolReg
         await state.discard_session(msg.session_key)
         return True
     return await image_generation_tools.handle_runtime_control(state, msg, tools)
+
+
+def _fingerprint_entry(section: str, text: str) -> dict[str, Any]:
+    """One ``{section, sha, bytes}`` entry for a system-prompt section (TP-06)."""
+    raw = text.encode("utf-8")
+    return {
+        "section": section,
+        "sha": hashlib.sha256(raw).hexdigest()[:16],
+        "bytes": len(raw),
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,59 +160,117 @@ class ContextBuilder:
         workspace: Path | None = None,
         include_memory: bool = True,
         shared_room: bool = False,
+        fingerprint_out: list[dict[str, Any]] | None = None,
     ) -> str:
-        """Build the system prompt from identity, bootstrap files, memory, and skills."""
+        """Build the system prompt from identity, bootstrap files, memory, and skills.
+
+        ``fingerprint_out`` (TP-06): when a list is supplied, it receives the
+        same per-section fingerprint list ``build_system_prompt_with_fingerprint``
+        returns, on the one existing assembly call so a turn never builds the
+        prompt twice.
+        """
+        prompt, sections = self.build_system_prompt_with_fingerprint(
+            channel=channel,
+            session_summary=session_summary,
+            workspace=workspace,
+            include_memory=include_memory,
+            shared_room=shared_room,
+        )
+        if fingerprint_out is not None:
+            fingerprint_out.extend(sections)
+        return prompt
+
+    def build_system_prompt_with_fingerprint(
+        self,
+        *,
+        channel: str | None = None,
+        session_summary: SessionSummary | None = None,
+        workspace: Path | None = None,
+        include_memory: bool = True,
+        shared_room: bool = False,
+    ) -> tuple[str, list[dict[str, Any]]]:
+        """As ``build_system_prompt``, plus a per-section fingerprint (TP-06).
+
+        The list is *returned*, never stored on the builder: one ContextBuilder
+        serves concurrent turns (chat, cron, Work). Each entry is
+        ``{"section", "sha", "bytes"}`` for a section that is actually in the
+        prompt; missing sections are left out, and the shared-room prompt is
+        the single ``shared_room`` entry replacing all of them.
+        """
         if shared_room:
             # A room prompt is a replacement, not an addition: identity,
             # bootstrap files, memory and skills all describe private context
             # that must not reach a guest-visible conversation.
-            return self.SHARED_ROOM_SYSTEM_PROMPT
+            prompt = self.SHARED_ROOM_SYSTEM_PROMPT
+            return prompt, [_fingerprint_entry("shared_room", prompt)]
         root = workspace or self.workspace
-        parts = [self._get_identity(channel=channel, workspace=root)]
+        parts: list[str] = []
+        sections: list[dict[str, Any]] = []
 
-        bootstrap = self._load_bootstrap_files(root)
-        if bootstrap:
-            parts.append(bootstrap)
+        def _add(section: str, key: str) -> None:
+            parts.append(section)
+            sections.append(_fingerprint_entry(key, section))
+
+        _add(self._get_identity(channel=channel, workspace=root), "identity")
+
+        bootstrap_parts = self._load_bootstrap_parts(root)
+        if bootstrap_parts:
+            parts.append("\n\n".join(chunk for _filename, chunk in bootstrap_parts))
+            sections.extend(
+                _fingerprint_entry(f"bootstrap.{filename}", chunk)
+                for filename, chunk in bootstrap_parts
+            )
 
         if self.workflow_scheduling:
-            parts.append(render_template("agent/workflow_intake.md", cron_scheduling=self.cron_scheduling))
+            _add(
+                render_template("agent/workflow_intake.md", cron_scheduling=self.cron_scheduling),
+                "workflow_intake",
+            )
 
-        parts.append(render_template("agent/tool_contract.md", cron_scheduling=self.cron_scheduling))
+        _add(
+            render_template("agent/tool_contract.md", cron_scheduling=self.cron_scheduling),
+            "tool_contract",
+        )
 
         project_path = root.expanduser().resolve()
         if project_path != self.workspace.expanduser().resolve():
-            parts.append(
+            _add(
                 "# Current Project\n\n"
                 f"Working directory: {project_path}\n"
-                "Use it as the default root for project files and relative tool paths."
+                "Use it as the default root for project files and relative tool paths.",
+                "project",
             )
 
         if include_memory:
             memory = self.memory.read_memory()
             if memory and not self._is_template_content(memory, "memory/MEMORY.md"):
-                parts.append(f"# Memory\n\n## Long-term Memory\n{memory}")
+                _add(f"# Memory\n\n## Long-term Memory\n{memory}", "memory")
 
         active_skills = self.skills.get_always_skills()
         if active_skills:
             active_content = self.skills.load_skills_for_context(active_skills)
             if active_content:
-                parts.append(f"# Active Skills\n\n{active_content}")
+                _add(f"# Active Skills\n\n{active_content}", "active_skills")
 
-        skills_summary = self.skills.build_skills_summary(
+        skills_summary, _skills_listed_sha = self.skills.build_skills_summary_with_sha(
             exclude=set(active_skills),
             workspace=root,
         )
         if skills_summary:
-            parts.append(render_template("agent/skills_section.md", skills_summary=skills_summary))
-
-        if session_summary and session_summary["text"] != "(nothing)":
-            parts.append(
-                "[Archived Context Summary]\n\n"
-                f"Previous conversation summary (last active {session_summary['last_active']}):\n"
-                f"{session_summary['text']}"
+            _add(
+                render_template("agent/skills_section.md", skills_summary=skills_summary),
+                "skills_summary",
             )
 
-        return "\n\n---\n\n".join(parts)
+        if session_summary and session_summary["text"] != "(nothing)":
+            _add(
+                "[Archived Context Summary]\n\n"
+                f"Previous conversation summary (last active {session_summary['last_active']}):\n"
+                f"{session_summary['text']}",
+                "archived_summary",
+            )
+
+        return "\n\n---\n\n".join(parts), sections
 
     def _get_identity(self, channel: str | None = None, workspace: Path | None = None) -> str:
         """Get the core identity section."""
@@ -245,7 +314,17 @@ class ContextBuilder:
 
     def _load_bootstrap_files(self, workspace: Path | None = None) -> str:
         """Load project instructions plus the agent's global profile files."""
-        parts: list[str] = []
+        chunks = [chunk for _filename, chunk in self._load_bootstrap_parts(workspace)]
+        return "\n\n".join(chunks) if chunks else ""
+
+    def _load_bootstrap_parts(self, workspace: Path | None = None) -> list[tuple[str, str]]:
+        """Return ``(filename, section)`` pairs for the bootstrap files (TP-06).
+
+        Each section is the exact block the system prompt embeds; the joined
+        string ``_load_bootstrap_files`` returns is built from these pairs, so
+        the fingerprint can name each file's section separately.
+        """
+        parts: list[tuple[str, str]] = []
         project_root = workspace or self.workspace
         sources = [
             ("AGENTS.md", project_root),
@@ -268,9 +347,9 @@ class ContextBuilder:
                     content, filename
                 ):
                     continue
-                parts.append(f"## {filename}\n\n{content}")
+                parts.append((filename, f"## {filename}\n\n{content}"))
 
-        return "\n\n".join(parts) if parts else ""
+        return parts
 
     @staticmethod
     def _is_template_content(content: str, template_path: str) -> bool:
@@ -332,19 +411,27 @@ class ContextBuilder:
         channel: str | None = None,
         workspace: Path | None = None,
         include_memory: bool = True,
+        fingerprint_out: list[dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
-        """Build a model transcript while preserving the fresh-turn boundary."""
+        """Build a model transcript while preserving the fresh-turn boundary.
+
+        ``fingerprint_out`` (TP-06): when a list is supplied it receives the
+        system prompt's per-section fingerprint, on this one assembly call
+        and without storing anything on the builder.
+        """
         root = workspace or self.workspace
+        system_prompt = self.build_system_prompt(
+            channel=channel,
+            session_summary=transcript.session_summary,
+            workspace=root,
+            include_memory=include_memory,
+            shared_room=transcript.shared_room,
+            fingerprint_out=fingerprint_out,
+        )
         messages: list[dict[str, Any]] = [
             {
                 "role": "system",
-                "content": self.build_system_prompt(
-                    channel=channel,
-                    session_summary=transcript.session_summary,
-                    workspace=root,
-                    include_memory=include_memory,
-                    shared_room=transcript.shared_room,
-                ),
+                "content": system_prompt,
             },
             *transcript.history,
         ]
