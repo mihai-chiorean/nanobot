@@ -286,10 +286,6 @@ def _provenance_boundary(what: str) -> Iterator[None]:
         log_recording_failure(what, exc)
 
 
-class _HandoffAlreadyStarted(Exception):  # noqa: N818
-    """A replayed chat turn whose Work hand-off task already exists."""
-
-
 @dataclass
 class TurnContext:
     msg: InboundMessage
@@ -3584,6 +3580,8 @@ class AgentLoop:
         # off to Work at a tool boundary. The hook raises HandoffRequested
         # from ``before_execute_tools``, so the pending batch never runs and
         # nothing re-executes in Work.
+        if await self._link_replayed_handoff(ctx):
+            return
         handoff_hook = self._handoff_hook_for_turn(ctx)
         if handoff_hook is not None:
             ctx.hooks.append(handoff_hook)
@@ -3632,29 +3630,39 @@ class AgentLoop:
         if ctx.kind is TurnKind.USER:
             await turn_continuation.maybe_continue_turn(ctx)
 
+    def _handoff_eligible(self, ctx: TurnContext) -> bool:
+        """Only private websocket chat turns hand off (MIT-1855).
+
+        Not Work turns (they already carry ``work_task_id``), not shared-room
+        turns, not cron, not ephemeral or internal goal-continuation runs.
+        """
+        if ctx.kind is not TurnKind.USER or ctx.ephemeral:
+            return False
+        msg = ctx.msg
+        return (
+            msg.channel == "websocket"
+            and work_task_id(msg.metadata) is None
+            and not self._shared_room_turn(msg)
+            and cron_trigger(msg.metadata) is None
+            and not turn_continuation.internal_continuation_inbound(msg.metadata)
+        )
+
+    @staticmethod
+    def _handoff_request_id(ctx: TurnContext) -> str:
+        # SR-11: the turn's idempotency scope is stable across a replay of
+        # the same chat message (client_message_id, recovery origin scope).
+        return f"handoff:{ctx.msg.chat_id}:{ctx.idempotency_scope}"
+
     def _handoff_hook_for_turn(self, ctx: TurnContext) -> HandoffHook | None:
         """MIT-1855 (OA-12): build the hand-off hook for a qualifying turn only.
 
-        Only private websocket chat turns hand off: not Work turns (they
-        already carry ``work_task_id``), not shared-room turns, not cron, not
-        ephemeral or internal goal-continuation runs, never when the
-        threshold is 0 and never while the runtime drains (MIT-1811).
+        Never when the threshold is 0, never while the runtime drains
+        (MIT-1811), and never once the user has sent a message into the
+        running turn: that correction is part of the request, and the Work
+        task would start from the original one.
         """
         threshold = self.background_handoff_seconds
-        if threshold <= 0 or ctx.kind is not TurnKind.USER or ctx.ephemeral:
-            return None
-        msg = ctx.msg
-        if msg.channel != "websocket":
-            return None
-        if work_task_id(msg.metadata) is not None:
-            return None
-        if self._shared_room_turn(msg):
-            return None
-        if cron_trigger(msg.metadata) is not None:
-            return None
-        if turn_continuation.internal_continuation_inbound(msg.metadata):
-            return None
-        if self._draining:
+        if threshold <= 0 or self._draining or not self._handoff_eligible(ctx):
             return None
 
         def turn_had_write() -> bool:
@@ -3672,7 +3680,66 @@ class AgentLoop:
             threshold=float(threshold),
             turn_had_write=turn_had_write,
             is_read_only=is_read_only,
-            may_hand_off=lambda: not self._draining,
+            may_hand_off=lambda: not self._draining and not ctx.injected_messages,
+        )
+
+    async def _link_replayed_handoff(self, ctx: TurnContext) -> bool:
+        """A replay of a chat turn that already handed off links its task.
+
+        Runs before the turn executes anything: the first attempt's Work task
+        may already have run (and written) under its own idempotency key, so
+        re-executing the turn in chat could repeat a write. A task whose turn
+        never started is enqueued now, once (``requeue_unstarted``).
+        """
+        if not self._handoff_eligible(ctx):
+            return False
+        task = await self.work_store.run_io(
+            self.work_store.get_task_by_request_id, self._handoff_request_id(ctx)
+        )
+        if task is None:
+            return False
+        task_id: str | None = str(task["task_id"])
+        logger.info("Chat turn {} replays a hand-off: linking task {}", ctx.turn_id, task_id)
+        try:
+            await self._resume_unstarted_handoff(ctx, task)
+        except Exception:
+            logger.exception("Work hand-off re-enqueue failed for task {}", task_id)
+            task_id = None
+        assert ctx.transcript_input is not None
+        # Boundary-shaped stand-in for the transcript the turn never built:
+        # the save skips the first ``message_count`` rows, minus the user row
+        # when it was not persisted early.
+        stand_in = [
+            {"role": "system", "content": ""},
+            *ctx.history,
+            {"role": "user", "content": ctx.msg.content},
+        ]
+        self._finish_handoff_turn(ctx, task_id, stand_in)
+        return True
+
+    async def _resume_unstarted_handoff(self, ctx: TurnContext, task: dict[str, Any]) -> None:
+        task_id = str(task["task_id"])
+        if not await self.work_store.run_io(self.work_store.requeue_unstarted, task_id):
+            return
+        # The first attempt seeded the task's session unless it died first;
+        # an empty session simply starts from the original request.
+        try:
+            await self._enqueue_handoff(ctx, task)
+        except Exception:
+            await self.work_store.run_io(
+                self.work_store.abandon_task, task_id, "Hand-off could not be enqueued."
+            )
+            raise
+
+    async def _enqueue_handoff(self, ctx: TurnContext, task: dict[str, Any]) -> None:
+        # MIT-1811: checked again right before the enqueue -- the drain can
+        # begin during the store/session I/O above, and run() would drop the
+        # message while the chat claimed the hand-off.
+        if self._draining:
+            raise RuntimeError("runtime is draining; Work hand-off not enqueued")
+        await self._publish_work_handoff_inbound(ctx, task)
+        await self.work_store.run_io(
+            self.work_store.mark_dispatched, str(task["task_id"]), self._handoff_request_id(ctx)
         )
 
     async def _handle_turn_handoff(self, ctx: TurnContext, hook: HandoffHook) -> None:
@@ -3684,10 +3751,10 @@ class AgentLoop:
         session is seeded with that completed history and receives the
         original user message through ``publish_work_inbound``-shaped inbound
         metadata. If task creation or the enqueue fails the chat gets the
-        apology reply and nothing re-executes either way.
+        apology reply, the task is abandoned without a finish notice, and
+        nothing re-executes either way.
         """
         msg = ctx.msg
-        session = ctx.require_session()
         assert ctx.transcript_input is not None
         transcript = hook.transcript if hook.transcript is not None else ctx.all_messages
         initial_count = ctx.transcript_input.message_count
@@ -3702,14 +3769,13 @@ class AgentLoop:
         completed = [dict(entry) for entry in turn_entries[:cut]]
         user_text = ctx.original_user_text if isinstance(ctx.original_user_text, str) else msg.content
         task_id: str | None = None
+        created = False
         try:
             if not is_valid_webui_chat_id(msg.chat_id):
                 raise ValueError("chat hand-off requires a valid webui chat id")
             title = user_text.strip().splitlines()[0][:80] if user_text.strip() else None
-            # Idempotent on the chat turn's SR-11 scope: a replay of this turn
-            # (chat inbox redelivery, client resend) links the task the first
-            # attempt created instead of running the rest a second time under
-            # a second task id, which would key its writes differently.
+            # Idempotent on the chat turn's SR-11 scope (see
+            # ``_link_replayed_handoff``): never a second task per turn.
             task = await self.work_store.run_io(
                 self.work_store.create_task,
                 chat_id=str(msg.chat_id),
@@ -3718,37 +3784,46 @@ class AgentLoop:
                 title=title,
                 model=self.model,
                 notify_on_finish=True,
-                request_id=f"handoff:{msg.chat_id}:{ctx.idempotency_scope}",
+                request_id=self._handoff_request_id(ctx),
             )
             task_id = str(task["task_id"])
             if not task.get("_was_created", True):
-                logger.info(
-                    "Work hand-off replayed for turn {}: linking existing task {}",
-                    ctx.turn_id,
-                    task_id,
-                )
-                raise _HandoffAlreadyStarted
-            work_session_key = str(task.get("session_key") or f"work:{task_id}")
-            seeded = [
-                {
-                    "role": "user",
-                    "content": msg.content,
-                    "timestamp": datetime.now().isoformat(),
-                },
-                *completed,
-            ]
-            work_session = self.sessions.get_or_create(work_session_key)
-            work_session.messages.extend(seeded)
-            work_session.updated_at = datetime.now()
-            await asyncio.to_thread(self.sessions.save, work_session)
-            await self._publish_work_handoff_inbound(ctx, task)
-        except _HandoffAlreadyStarted:
-            pass
+                # Lost a race with another attempt of this turn.
+                await self._resume_unstarted_handoff(ctx, task)
+            else:
+                created = True
+                work_session_key = str(task.get("session_key") or f"work:{task_id}")
+                seeded = [
+                    {
+                        "role": "user",
+                        "content": msg.content,
+                        "timestamp": datetime.now().isoformat(),
+                    },
+                    *completed,
+                ]
+                work_session = self.sessions.get_or_create(work_session_key)
+                work_session.messages.extend(seeded)
+                work_session.updated_at = datetime.now()
+                await asyncio.to_thread(self.sessions.save, work_session)
+                await self._enqueue_handoff(ctx, task)
         except Exception:
             logger.exception(
                 "Work hand-off failed for turn {} (session {})", ctx.turn_id, ctx.session_key
             )
+            if created and task_id is not None:
+                try:
+                    await self.work_store.run_io(
+                        self.work_store.abandon_task, task_id, "Hand-off could not be enqueued."
+                    )
+                except Exception:
+                    logger.exception("Could not abandon hand-off task {}", task_id)
             task_id = None
+        self._finish_handoff_turn(ctx, task_id, list(transcript[: initial_count + cut]))
+
+    def _finish_handoff_turn(
+        self, ctx: TurnContext, task_id: str | None, kept: list[dict[str, Any]]
+    ) -> None:
+        """Close the chat turn with the fixed hand-off (or apology) reply."""
         reply = HANDOFF_REPLY if task_id is not None else HANDOFF_UNAVAILABLE_REPLY
         ctx.handoff_task_id = task_id
         ctx.final_content = reply
@@ -3760,11 +3835,8 @@ class AgentLoop:
         ctx.provider_compaction_applied = False
         # The partial provider continuation predates the dropped batch; the
         # next turn (chat or Work) must rebuild from text instead.
-        session.provider_state = None
-        ctx.all_messages = [
-            *transcript[: initial_count + cut],
-            {"role": "assistant", "content": reply},
-        ]
+        ctx.require_session().provider_state = None
+        ctx.all_messages = [*kept, {"role": "assistant", "content": reply}]
 
     async def _publish_work_handoff_inbound(self, ctx: TurnContext, task: dict[str, Any]) -> None:
         """Enqueue the original user message into *task*'s own session.
