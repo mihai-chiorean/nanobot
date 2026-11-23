@@ -385,8 +385,10 @@ class _RecordingSession:
         fail: bool = False,
         error_text: str = "Error: rejected",
         raises: BaseException | None = None,
+        success_text: str = "schedule created",
     ) -> None:
         self.calls: list[dict] = []
+        self._success_text = success_text
         self._fail = fail
         self._error_text = error_text
         self._raises = raises
@@ -401,7 +403,7 @@ class _RecordingSession:
                 isError=True,
             )
         return SimpleNamespace(
-            content=[mcp_types.TextContent(type="text", text="schedule created")],
+            content=[mcp_types.TextContent(type="text", text=self._success_text)],
             isError=False,
         )
 
@@ -556,6 +558,43 @@ async def test_connector_definite_refusal_says_nothing_was_scheduled(
     assert "ziggy-work rejected the schedule" in str(result)
     assert "Nothing was scheduled" in str(result)
     assert "unknown" not in str(result)
+
+
+@pytest.mark.asyncio
+async def test_local_record_failure_after_connector_success_reports_scheduled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The connector created the schedule, then the local Work-store write
+    failed (ENOSPC). The result must say it WAS scheduled, name the schedule
+    id, and forbid creating it again: a retry in a new turn carries a new
+    idempotency key and would create a second schedule."""
+    import errno
+    import json as _json
+
+    session = _RecordingSession(
+        success_text=_json.dumps(
+            {"schedule": {"schedule_id": "sch_01JABCDEF", "kind": "cron", "status": "active"}}
+        )
+    )
+    registry, _wrapper = _real_connector_wrapper(tmp_path, session)
+    tool = _make_tool(tmp_path, registry=registry)
+
+    def _enospc(*_args: Any, **_kwargs: Any) -> Any:
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(tool._work_store, "create_task", _enospc)
+
+    with _bind(metadata={"client_message_id": "cm-42"}):
+        result = await tool.execute(**_complete_workflow())
+
+    text = str(result)
+    assert len(session.calls) == 1
+    assert "Scheduled Work plan 'Daily digest' in ziggy-work" in text
+    assert "sch_01JABCDEF" in text
+    assert "do not create it again" in text.lower()
+    assert "No space left on device" in text
+    assert "retry" not in text.lower()
+    assert "Nothing was scheduled" not in text
 
 
 # ---------------------------------------------------------------------------

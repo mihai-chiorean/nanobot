@@ -353,36 +353,61 @@ class ScheduleWorkTool(Tool):
                 "Error: ziggy-work rejected the schedule: "
                 f"{str(result)[:500]} Nothing was scheduled."
             )
-        plan_task_id = await self._record_plan_task(
-            plan=plan,
-            title=title,
-            instructions=plan["instructions"],
-            label=label,
-            deliverable=deliverable,
-            session_key=session_key,
-            chat_id=chat_id,
-        )
-        await self._work_store.run_io(
-            self._work_store.append_event,
-            plan_task_id,
-            "schedule.created",
-            {
-                "connector_tool": connector.name,
-                "schedule": plan["schedule"],
-                "connector_response": str(result)[:500],
-            },
-            actor="planner",
-        )
-        await self._work_store.run_io(
-            self._work_store.update_status,
-            plan_task_id,
-            "scheduled",
-            result_summary=f"Scheduled in ziggy-work: {label}. Deliverable: {deliverable}.",
-        )
-        return (
-            f"Scheduled Work plan '{title}' in ziggy-work via {connector.name}. "
-            f"Plan task: {plan_task_id}. Schedule: {label}."
-        )
+        # From here on the schedule exists in ziggy-work. A local bookkeeping
+        # failure must never read as "not scheduled": a retry in a new turn
+        # carries a new idempotency key and would create a second schedule.
+        schedule_id = self._connector_schedule_id(result)
+        scheduled = f"Scheduled Work plan '{title}' in ziggy-work via {connector.name}"
+        if schedule_id:
+            scheduled += f" (schedule id: {schedule_id})"
+        try:
+            plan_task_id = await self._record_plan_task(
+                plan=plan,
+                title=title,
+                instructions=plan["instructions"],
+                label=label,
+                deliverable=deliverable,
+                session_key=session_key,
+                chat_id=chat_id,
+            )
+            await self._work_store.run_io(
+                self._work_store.append_event,
+                plan_task_id,
+                "schedule.created",
+                {
+                    "connector_tool": connector.name,
+                    "schedule": plan["schedule"],
+                    "schedule_id": schedule_id,
+                    "connector_response": str(result)[:500],
+                },
+                actor="planner",
+            )
+            await self._work_store.run_io(
+                self._work_store.update_status,
+                plan_task_id,
+                "scheduled",
+                result_summary=f"Scheduled in ziggy-work: {label}. Deliverable: {deliverable}.",
+            )
+        except Exception as exc:
+            logger.exception("schedule created in ziggy-work but the local plan record failed")
+            return (
+                f"{scheduled}. Schedule: {label}. The schedule exists in ziggy-work; "
+                "do not create it again. Recording the local Work plan failed "
+                f"({type(exc).__name__}: {str(exc)[:200]}), so it may be missing "
+                "from the Work tab; work_schedule_list shows the schedule."
+            )
+        return f"{scheduled}. Plan task: {plan_task_id}. Schedule: {label}."
+
+    @staticmethod
+    def _connector_schedule_id(result: Any) -> str | None:
+        """The ``schedule.schedule_id`` from the connector's structured reply."""
+        try:
+            data = json.loads(str(result))
+        except (TypeError, ValueError):
+            return None
+        schedule = data.get("schedule") if isinstance(data, dict) else None
+        schedule_id = schedule.get("schedule_id") if isinstance(schedule, dict) else None
+        return str(schedule_id) if schedule_id else None
 
     def _connector_schedule_args(
         self,
