@@ -27,6 +27,8 @@ from typing import Any
 import httpx
 from loguru import logger
 
+from nanobot.agent.tools.mcp_client_credentials import OAuthClientCredentialsError
+
 # The three endings that push (design §4 "The push"); a tester-made
 # ``cancelled`` is deliberately absent.
 PUSH_STATUSES = frozenset({"succeeded", "failed", "interrupted"})
@@ -61,6 +63,19 @@ def _connector_server(cfg: Any) -> Any | None:
     plus optional ``channels.websocket`` naming the connector server). The
     agent loop passes a view built from its ``tools_config``/``channels_config``.
     """
+    server = _configured_connector_server(cfg)
+    if server is None:
+        return None
+    # The MCP provider only trusts operator-config loopback endpoints on
+    # copies marked by ``_mark_operator_configured``; ``tools.mcpServers`` here
+    # is that same operator config, so it gets the same mark (else the
+    # tenant connector at https://127.0.0.1:8790 fails the SSRF guard).
+    from nanobot.agent.tools.mcp import _mark_operator_configured
+
+    return _mark_operator_configured({"connector": server})["connector"]
+
+
+def _configured_connector_server(cfg: Any) -> Any | None:
     tools = getattr(cfg, "tools", None)
     servers = getattr(tools, "mcp_servers", None) if tools is not None else None
     if not servers:
@@ -198,7 +213,18 @@ async def notify_finished(
                 async with _push_client(server, auth, transport) as client:
                     response = await client.post(url, json=body)
             except httpx.HTTPError as exc:
+                # Includes a network error on the token request.
                 retry_reason = f"network error ({type(exc).__name__})"
+            except OAuthClientCredentialsError as exc:
+                if (exc.status_code or 0) < 500:
+                    logger.warning(
+                        "work.finished push failed for task {} "
+                        "(error_class=token_rejected, status={})",
+                        task_id,
+                        exc.status_code,
+                    )
+                    return False
+                retry_reason = f"token endpoint HTTP {exc.status_code}"
             else:
                 if 200 <= response.status_code < 300:
                     return True

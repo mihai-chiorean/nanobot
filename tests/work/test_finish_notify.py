@@ -502,8 +502,11 @@ def test_sweep_parks_only_flagged_tasks(tmp_path: Path) -> None:
     ]
 
 
-async def test_token_endpoint_failure_is_logged_not_raised(tmp_path: Path) -> None:
+async def test_token_endpoint_failure_is_logged_not_raised(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A connectors outage on the token endpoint returns False, never raises."""
+    monkeypatch.setattr(finish_notify, "_sleep", lambda delay: asyncio.sleep(0))
     recorder = PostRecorder()
 
     def failing_token(request: httpx.Request) -> httpx.Response:
@@ -532,3 +535,110 @@ async def test_token_endpoint_failure_is_logged_not_raised(tmp_path: Path) -> No
     )
     assert ok is False
     assert recorder.posts == []
+
+
+# ---------------------------------------------------------------------------
+# Review round: loopback connector, stale notices, token-endpoint retry
+# ---------------------------------------------------------------------------
+
+
+async def test_loopback_connector_through_the_real_auth_and_transport_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Production shape: the tenant connector at https://127.0.0.1:8790.
+
+    Nothing in finish_notify is replaced: the real ``_auth_for`` /
+    ``_push_client`` build the SSRF-guarded stack; only the socket layer
+    under the pinned transport is stubbed.
+    """
+    seen: list[str] = []
+
+    async def fake_socket(self: Any, request: httpx.Request) -> httpx.Response:
+        seen.append(f"{request.method} {request.url}")
+        if request.url.path == "/oauth/token":
+            return httpx.Response(200, json={"access_token": "minted", "expires_in": 300})
+        return httpx.Response(202, json={"result": "queued"})
+
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", fake_socket)
+    monkeypatch.setattr(finish_notify, "_auth_cache", {})
+    secret_file = tmp_path / "client_secret"
+    secret_file.write_text("s3cret\n", encoding="utf-8")
+    cfg = _cfg(
+        tmp_path,
+        servers={
+            "ziggy-connectors": MCPServerConfig(
+                url="https://127.0.0.1:8790/mcp",
+                oauth_client_credentials=OAuthClientCredentialsConfig(
+                    token_url="https://127.0.0.1:8790/oauth/token",
+                    client_id="runtime-client",
+                    client_secret_file=str(secret_file),
+                ),
+            )
+        },
+    )
+
+    ok = await notify_finished(cfg, "work_" + "a" * 32, "Loopback", "succeeded")
+
+    assert ok is True
+    assert seen == [
+        "POST https://127.0.0.1:8790/oauth/token",
+        "POST https://127.0.0.1:8790/runtime/work/finished",
+    ]
+
+
+async def test_owed_notice_older_than_20h_is_expired_not_replayed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sqlite3
+    from datetime import datetime, timedelta, timezone
+
+    recorder = PostRecorder()
+    _install_mock_push(monkeypatch, recorder)
+    store = WorkStore(tmp_path, reconcile_on_open=False)
+    old = store.create_task(chat_id="chat-1", content="x", title="Old", notify_on_finish=True)
+    store.update_status(old["task_id"], "succeeded")
+    fresh = store.create_task(chat_id="chat-1", content="y", title="New", notify_on_finish=True)
+    store.update_status(fresh["task_id"], "succeeded")
+    stamp = (datetime.now(timezone.utc) - timedelta(hours=21)).isoformat().replace(
+        "+00:00", "Z"
+    )
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            "UPDATE work_tasks SET completed_at = ? WHERE task_id = ?", (stamp, old["task_id"])
+        )
+
+    loop = _make_loop(tmp_path, _cfg(tmp_path))
+    loop.work_store = store
+    assert await loop.send_pending_finish_notices() == 1
+    await _drain(loop)
+    assert [post.body["task_id"] for post in recorder.posts] == [fresh["task_id"]]
+    assert store.pending_finish_notices() == []
+
+
+async def test_token_endpoint_5xx_is_retried_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(finish_notify, "_sleep", lambda delay: asyncio.sleep(0))
+    token_answers = [503, 200]
+    posts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "/oauth/token" in str(request.url):
+            status = token_answers.pop(0)
+            if status != 200:
+                return httpx.Response(status, text="busy")
+            return httpx.Response(200, json={"access_token": "minted", "expires_in": 300})
+        posts.append(str(request.url))
+        return httpx.Response(202, json={"result": "queued"})
+
+    transport = httpx.MockTransport(handler)
+    ok = await notify_finished(
+        _cfg(tmp_path),
+        "work_" + "b" * 32,
+        "Token blip",
+        "failed",
+        transport=transport,
+        token_transport=transport,
+    )
+    assert ok is True
+    assert posts == [_FINISHED_URL]

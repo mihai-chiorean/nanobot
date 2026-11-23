@@ -10,7 +10,7 @@ import shutil
 import sqlite3
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +28,11 @@ MAX_TASK_ARTIFACT_BYTES = 256 * 1024 * 1024
 MAX_TENANT_ARTIFACT_BYTES = 1024 * 1024 * 1024
 MAX_EVENTS_PER_TASK = 10_000
 MAX_EVENT_PAGE = 500
+
+
+# MIT-1857: owed work.finished notices older than this are dropped, inside
+# connectors' 24 h coalescing window on work_finished:{task_id}.
+FINISH_NOTICE_MAX_AGE = timedelta(hours=20)
 
 
 def utc_now() -> str:
@@ -377,7 +382,8 @@ class WorkStore:
             updated = connection.execute(
                 """
                 UPDATE work_tasks
-                SET status = 'queued', updated_at = ?, completed_at = NULL, error = NULL
+                SET status = 'queued', updated_at = ?, completed_at = NULL, error = NULL,
+                    finish_notified_at = NULL
                 WHERE task_id = ? AND started_at IS NULL
                   AND ((status = 'queued' AND dispatched_at IS NULL)
                        OR status = 'interrupted')
@@ -915,15 +921,42 @@ class WorkStore:
             ).fetchone()
         return row is not None
 
-    def pending_finish_notices(self) -> list[tuple[str, str, str]]:
+    def pending_finish_notices(
+        self, *, max_age: timedelta = FINISH_NOTICE_MAX_AGE
+    ) -> list[tuple[str, str, str]]:
         """``(task_id, title, status)`` of hand-off tasks that still owe a push.
 
         MIT-1857 (OA-15): a task flagged ``notify_on_finish`` that ended in a
         push status and has no ``finish_notified_at`` yet. Durable, so a push
         lost to a crash, a SIGTERM or a connectors outage goes out on the
         next start; the restart sweep's ``interrupted`` tasks are included.
+        Notices older than *max_age* are marked notified and dropped:
+        connectors coalesces on ``work_finished:{task_id}`` for 24 h only, so
+        a stale replay could repeat a push that was in fact delivered.
         """
+        cutoff = (datetime.now(timezone.utc) - max_age).isoformat().replace("+00:00", "Z")
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            stale = connection.execute(
+                """
+                SELECT task_id FROM work_tasks
+                WHERE notify_on_finish = 1 AND finish_notified_at IS NULL
+                  AND status IN ('succeeded', 'failed', 'interrupted')
+                  AND completed_at IS NOT NULL AND completed_at < ?
+                """,
+                (cutoff,),
+            ).fetchall()
+            if stale:
+                connection.executemany(
+                    "UPDATE work_tasks SET finish_notified_at = ? WHERE task_id = ?",
+                    [(utc_now(), str(row["task_id"])) for row in stale],
+                )
+                logger.warning(
+                    "work.finished: dropping {} notice(s) older than {} h (expired): {}",
+                    len(stale),
+                    int(max_age.total_seconds() // 3600),
+                    ", ".join(str(row["task_id"]) for row in stale),
+                )
             rows = connection.execute(
                 """
                 SELECT task_id, title, status FROM work_tasks
