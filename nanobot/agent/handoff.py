@@ -160,6 +160,19 @@ def signin_needs_tester(tool_results: Iterable[Any]) -> bool:
     )
 
 
+# The dedicated sign-in tools (connectors' ``site_login``). MCP tools reach the
+# agent as ``mcp_<server>_<tool>`` with a tenant-settable server key, so names
+# match on the trailing tool segment.
+SIGNIN_TOOL_NAMES: frozenset[str] = frozenset({"site_login"})
+
+
+def is_signin_tool_name(name: str | None) -> bool:
+    """Whether a tool name (as seen by the agent) is a dedicated sign-in tool."""
+    if not name:
+        return False
+    return any(name == tool or name.endswith(f"_{tool}") for tool in SIGNIN_TOOL_NAMES)
+
+
 class HandoffRequested(Exception):  # noqa: N818
     """Recognised stop: the runner passes it up without error bookkeeping.
 
@@ -188,8 +201,8 @@ class HandoffHook(AgentHook):
     sampled after each executed batch in ``after_iteration``: the batch being
     dropped by a time hand-off never ran and must not count, every batch that
     did run must. A sign-in hand-off keeps the batch that produced the
-    sign-in, so that batch's own calls count too: only the sign-in calls
-    whose result needs the tester may be non-read-only (*is_read_only* is the
+    sign-in, so that batch's own calls count too: only dedicated sign-in
+    calls (``site_login``) whose result needs the tester may be non-read-only (*is_read_only* is the
     same registry lookup SR-09 uses). *may_hand_off* is consulted before
     either raise (``False`` while the runtime drains).
     """
@@ -227,7 +240,13 @@ class HandoffHook(AgentHook):
         if wrote_before or not signin_needs_tester(context.tool_results):
             return
         for call, result in zip(context.tool_calls, context.tool_results):
-            if not self._is_read_only(call.name) and not signin_needs_tester([result]):
+            if self._is_read_only(call.name):
+                continue
+            # Only a dedicated sign-in call may be the batch's write, and only
+            # when it is the result that needs the tester. Any other mutation
+            # (a browser_act submit that ran into a login wall, say) may have
+            # been dispatched, so Work must not redo it.
+            if not (is_signin_tool_name(call.name) and signin_needs_tester([result])):
                 return
         if not self._may_hand_off():
             return

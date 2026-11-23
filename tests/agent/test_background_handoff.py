@@ -1330,3 +1330,49 @@ async def test_existing_task_that_never_started_is_enqueued_once(
     assert loop.bus.inbound.empty(), "enqueued exactly once"
     assert inbound.metadata["work_task_id"] == task_id
     assert loop.work_store.get_task(task_id)["status"] == "queued"
+
+
+@pytest.mark.asyncio
+async def test_auth_failure_after_a_submit_dispatch_does_not_hand_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """browser_act submitted, hit a login wall: the submit may have gone out."""
+    calls: list[str] = []
+    tools = [
+        _fake_tool(
+            "mcp_ziggy_browser_act", result=_SESSION_EXPIRED, calls=calls, read_only=False
+        )
+    ]
+    loop, outbound = await _handoff_turn(
+        tmp_path,
+        monkeypatch,
+        responses=[
+            _tool_response("call-act", "mcp_ziggy_browser_act"),
+            _final_response("the site signed you out mid-submit"),
+        ],
+        tools=tools,
+        threshold=float("inf"),
+    )
+
+    assert calls == ["mcp_ziggy_browser_act"]
+    assert outbound is not None
+    assert outbound.content == "the site signed you out mid-submit"
+    assert loop.work_store.list_tasks() == []
+
+
+@pytest.mark.asyncio
+async def test_read_only_page_open_with_expired_session_hands_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[str] = []
+    tools = [_fake_tool("mcp_ziggy_browser_open", result=_SESSION_EXPIRED, calls=calls)]
+    loop, outbound = await _handoff_turn(
+        tmp_path,
+        monkeypatch,
+        responses=[_tool_response("call-open", "mcp_ziggy_browser_open")],
+        tools=tools,
+        threshold=float("inf"),
+    )
+
+    assert outbound is not None and outbound.content == HANDOFF_REPLY
+    assert len(loop.work_store.list_tasks()) == 1
