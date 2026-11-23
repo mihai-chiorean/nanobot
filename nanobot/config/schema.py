@@ -67,6 +67,7 @@ class DreamConfig(Base):
         default=None,
         validation_alias=AliasChoices("modelOverride", "model", "model_override"),
     )  # Model preset name for Dream sessions
+    core_memory_tokens: int = Field(default=2000, ge=1)  # Token budget for the injected memory/MEMORY.md core
 
     def build_schedule(self, timezone: str) -> CronSchedule:
         """Build the runtime schedule, preferring the legacy cron override if present."""
@@ -359,6 +360,10 @@ class GatewayConfig(Base):
     port: int = 18790
     restart_mode: Literal["auto", "exec", "spawn", "exit"] = "auto"
     heartbeat: HeartbeatConfig = Field(default_factory=HeartbeatConfig)
+    # MIT-1811: on the first SIGTERM, stop admitting new turns and let the
+    # ones already running finish for up to this many seconds before the
+    # usual cancellation path. 0 disables the grace (cancel immediately).
+    shutdown_grace_seconds: int = Field(default=90, ge=0, le=600)
 
 
 class OAuthClientCredentialsConfig(Base):
@@ -390,6 +395,12 @@ class MCPServerConfig(Base):
     headers: dict[str, str] = Field(default_factory=dict)  # HTTP/SSE: custom headers
     tool_timeout: int = 30  # seconds before a tool call is cancelled
     enabled_tools: list[str] = Field(default_factory=lambda: ["*"])  # Only register these tools; accepts raw MCP names or wrapped mcp_<server>_<tool> names; ["*"] = all capabilities (tools, resources, prompts); any restriction = only listed tools, no resources/prompts
+    # Ziggy-local (MIT-1817): operator opt-in to trust this server's MCP
+    # tool annotations (readOnlyHint/idempotentHint). The spec says these are
+    # hints that must not be trusted from unknown servers, so they only take
+    # effect for servers the operator marked trusted in their own config file
+    # (tenant configs are mounted read-only in the container).
+    trust_annotations: bool = False
     # Ziggy-local (MIT-1405): non-interactive auth for tenant connectors.
     oauth_client_credentials: OAuthClientCredentialsConfig | None = None
     # Ziggy-local (MIT-1405): set only by the MCP provider for entries that
@@ -419,18 +430,24 @@ def _lazy_default(module_path: str, class_name: str) -> Any:
     return getattr(module, class_name)()
 
 
-class SkillsToolConfig(Base):
-    """Ziggy-local (fork, MIT-1850): agent skill tool policy.
+class SkillsConfig(Base):
+    """Agent-skill policy (Ziggy-local, MIT-1852 / MIT-1850).
 
-    ``drafts`` makes every agent/Dream write under ``skills/<name>/`` land as a
-    draft overlay in ``skills/_proposed/<name>/`` instead of going live (see
-    ``_FsTool._resolve_write``). ``allow_install`` gates the public skill
-    install routes (MIT-1852); the field is declared here so both SM-series
-    issues share one config section.
+    ``allow_install`` gates the WebUI marketplace install route independently of
+    ``tools.webuiAllowRemotePackageInstall`` and the "is this request local?"
+    bypass it sits behind: inside a tester container the proxied request's source
+    address is not a trustworthy signal, and the SkillHub provider installs over
+    plain HTTP with no ``npx``. Owner provisioning (MIT-1865) turns this off per
+    tenant.
+
+    ``drafts`` (MIT-1850) makes every agent/Dream file-tool write under
+    ``skills/<name>/`` fail with a pointer to the draft overlay in
+    ``skills/_proposed/<name>/`` (see ``_FsTool._resolve_write``); only the user
+    activates a draft, via ``/skill accept``.
     """
 
-    drafts: bool = True  # skill writes become drafts under skills/_proposed/
-    allow_install: bool = True  # allow installing skills from public sources
+    allow_install: bool = True  # allow public agent-skill installs from the WebUI
+    drafts: bool = True  # agent skill writes must go to skills/_proposed/
 
 
 class ToolsConfig(Base):
@@ -441,12 +458,11 @@ class ToolsConfig(Base):
     tool implementations.
     """
 
+    skills: SkillsConfig = Field(default_factory=SkillsConfig)
+
     web: WebToolsConfig = Field(default_factory=lambda: _lazy_default("nanobot.agent.tools.web", "WebToolsConfig"))
     exec: ExecToolConfig = Field(default_factory=lambda: _lazy_default("nanobot.agent.tools.shell", "ExecToolConfig"))
     file: FileToolsConfig = Field(default_factory=lambda: _lazy_default("nanobot.agent.tools.filesystem", "FileToolsConfig"))
-    # Ziggy-local (fork, MIT-1850): skill draft + install policy; defined here
-    # (not next to a tool) because no tool module owns it.
-    skills: SkillsToolConfig = Field(default_factory=SkillsToolConfig)
     cli_apps: CliAppsToolConfig = Field(default_factory=lambda: _lazy_default("nanobot.agent.tools.cli_apps", "CliAppsToolConfig"))
     my: MyToolConfig = Field(default_factory=lambda: _lazy_default("nanobot.agent.tools.self", "MyToolConfig"))
     # Ziggy-local (fork, MIT-1013): a real off-switch for conversation recall.

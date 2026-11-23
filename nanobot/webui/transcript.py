@@ -198,6 +198,7 @@ def webui_transcript_revision(
     snapshots: list[tuple[str, int, int]] = []
     artifacts = (
         ("active", active_path),
+        ("attachment_states", active_path.with_suffix(".attachments.json")),
         ("legacy", _legacy_webui_thread_path(session_key)),
         ("manifest", segment_dir / "manifest.json"),
         ("segments", segment_dir),
@@ -290,7 +291,7 @@ def _read_transcript_file(path: Path) -> list[dict[str, Any]]:
                     logger.warning("bad jsonl at {} line {}", path, line_no)
                     continue
                 if isinstance(obj, dict):
-                    lines_out.append(cast(dict[str, Any], obj))
+                    lines_out.append(_apply_attachment_display_state(cast(dict[str, Any], obj)))
     except OSError as e:
         logger.warning("read transcript failed {}: {}", path, e)
         return []
@@ -1284,8 +1285,13 @@ class WebUITranscriptRecorder:
             mcp_presets=mcp_presets,
             session_mentions=session_mentions,
         )
+        attachments = metadata.get("attachments")
+        if payload is None and attachments:
+            payload = {"event": "user", "chat_id": chat_id, "text": text}
         if payload is None:
             return False
+        if attachments:
+            payload["attachments"] = attachments
         client_message_id = _normalized_client_message_id(
             (metadata or {}).get("client_message_id")
         )
@@ -1439,18 +1445,12 @@ def delete_webui_transcript(session_key: str) -> bool:
     for path in (webui_transcript_path(session_key), _legacy_webui_thread_path(session_key)):
         if not path.is_file():
             continue
-        try:
-            path.unlink()
-            removed = True
-        except OSError as e:
-            logger.warning("Failed to delete webui transcript {}: {}", path, e)
+        path.unlink()
+        removed = True
     segments_dir = webui_transcript_segments_dir(session_key)
     if segments_dir.is_dir():
-        try:
-            shutil.rmtree(segments_dir)
-            removed = True
-        except OSError as e:
-            logger.warning("Failed to delete webui transcript segments {}: {}", segments_dir, e)
+        shutil.rmtree(segments_dir)
+        removed = True
     return removed
 
 
@@ -2814,7 +2814,9 @@ def replay_transcript_to_ui_messages(
             client_message_id = _normalized_client_message_id(rec.get("client_message_id"))
             if client_message_id is not None:
                 row["client_message_id"] = client_message_id
-            if media_att:
+            if isinstance(rec.get("attachments"), list):
+                row["media"] = _attachment_display_media(rec["attachments"], media_att or [])
+            elif media_att:
                 row["media"] = media_att
                 if all(m.get("kind") == "image" for m in media_att):
                     row["images"] = [{"url": m.get("url"), "name": m.get("name")} for m in media_att]
@@ -3358,6 +3360,59 @@ def _client_projection_source(record: dict[str, Any]) -> dict[str, Any] | None:
     return projected
 
 
+def update_attachment_display_state(session_key: str, attachment_id: str,
+                                    partial: str | None = None) -> None:
+    """Persist a display overlay so paginated/archived history shows unlocked chips."""
+    path = webui_transcript_path(session_key).with_suffix(".attachments.json")
+    states: dict[str, Any] = json.loads(path.read_text()) if path.exists() else {}
+    state: dict[str, Any] = {"error": None, "locked_reason": None}
+    if partial:
+        state["partial"] = partial[:256]
+    states[attachment_id] = state
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    with tmp.open("w") as f:
+        json.dump(states, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def _apply_attachment_display_state(row: dict[str, Any]) -> dict[str, Any]:
+    cards = row.get("attachments")
+    chat = row.get("chat_id")
+    if not isinstance(cards, list) or not isinstance(chat, str):
+        return row
+    from nanobot.webui.session_identity import webui_session_key
+    path = webui_transcript_path(webui_session_key(chat)).with_suffix(".attachments.json")
+    if not path.exists():
+        return row
+    states = json.loads(path.read_text())
+    updated: list[object] = []
+    for raw_card in cast(list[object], cards):
+        if isinstance(raw_card, dict):
+            card = cast(dict[str, Any], raw_card)
+            updated.append({**card, **states.get(card.get("attachment_id"), {})})
+        else:
+            updated.append(raw_card)
+    row["attachments"] = updated
+    return row
+
+
+def _attachment_display_media(raw: object, signed: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    from nanobot.webui.pdf_attachments import parse_attachment_cards
+
+    result: list[dict[str, Any]] = []
+    for index, status in enumerate(parse_attachment_cards(raw)):
+        # A worker may send derived page PNGs alongside a PDF card. Only
+        # retain a signed URL when it belongs to that card's original file.
+        media = signed[index] if index < len(signed) else {}
+        if not str(media.get("name", "")).endswith(status["name"]):
+            media = {}
+        result.append({**media, **status})
+    return result
+
+
 def _client_projection_event(
     record: dict[str, Any],
     *,
@@ -3380,10 +3435,13 @@ def _client_projection_event(
             for path in cast(list[Any], raw_paths)
             if path
         ] if isinstance(raw_paths, list) else []
+        media: list[dict[str, Any]] = []
         if paths and augment_user_media is not None:
             media = augment_user_media(paths)
             if media:
                 projected["media_urls"] = media
+        if isinstance(record.get("attachments"), list):
+            projected["media_urls"] = _attachment_display_media(record["attachments"], media)
         for source_key, target_key in (
             ("cli_apps", "cli_apps"),
             ("mcp_presets", "mcp_presets"),

@@ -190,6 +190,9 @@ class Session:
     last_consolidated: int = 0
     provider_state: ProviderConversationState | None = field(default=None, repr=False)
     policy: SessionPolicy = field(default_factory=SessionPolicy, repr=False, compare=False)
+    # A background caller may retain this object beyond cache eviction/delete.
+    # Never let that old object recreate a deleted conversation on its next save.
+    deleted: bool = field(default=False, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if not isinstance(cast(object, self.metadata), dict):
@@ -455,6 +458,7 @@ class SessionStore(Protocol):
         *,
         fsync: bool = False,
         touch_updated_at: bool = False,
+        updated_at: datetime | None = None,
     ) -> bool: ...
 
     def list_sessions(self) -> list[SessionInfo]: ...
@@ -1234,6 +1238,24 @@ class JsonlSessionStore:
             finally:
                 tmp.unlink(missing_ok=True)
 
+    @staticmethod
+    def _distrust_embedded_checkpoint(session: Session) -> None:
+        """Mark the main record's checkpoint as possibly superseded.
+
+        A sidecar that is discarded as stale or mismatched may have held newer
+        turn state than the checkpoint embedded in the main record (e.g. a
+        crash between a metadata-only rewrite and the sidecar re-base).  We
+        cannot tell which is newest, so the embedded checkpoint must not carry
+        "no write happened" evidence into recovery: SR-09 auto-continue then
+        fails closed and the turn parks for the user.
+        """
+        checkpoint = session.metadata.get(_RUNTIME_CHECKPOINT_KEY)
+        if isinstance(checkpoint, dict):
+            session.metadata[_RUNTIME_CHECKPOINT_KEY] = {
+                **cast(dict[str, Any], checkpoint),
+                "turn_had_write": True,
+            }
+
     def _overlay_runtime_checkpoint_unlocked(self, session: Session, main_path: Path) -> None:
         checkpoint_path = self.get_runtime_checkpoint_path(session.key)
         try:
@@ -1243,12 +1265,14 @@ class JsonlSessionStore:
                     "Ignoring non-regular runtime checkpoint for session {}",
                     session.key,
                 )
+                self._distrust_embedded_checkpoint(session)
                 return
             # A complete session save supersedes an older sidecar. This comparison
             # closes the small crash window between replacing the JSONL and unlinking
             # its previous checkpoint.
             if main_path.stat().st_mtime_ns > checkpoint_stat.st_mtime_ns:
                 checkpoint_path.unlink(missing_ok=True)
+                self._distrust_embedded_checkpoint(session)
                 return
             raw = _json_object(json.loads(checkpoint_path.read_text(encoding="utf-8")))
             if (
@@ -1259,6 +1283,7 @@ class JsonlSessionStore:
                 or not isinstance(raw.get("checkpoint"), dict)
             ):
                 checkpoint_path.unlink(missing_ok=True)
+                self._distrust_embedded_checkpoint(session)
                 return
             provider_record = raw.get("provider_state")
             provider_state = (
@@ -1280,6 +1305,7 @@ class JsonlSessionStore:
                 session.key,
                 exc,
             )
+            self._distrust_embedded_checkpoint(session)
             # Atomic writes mean a malformed target cannot become valid later.
             # Remove it once so future loads do not repeatedly parse and log it.
             with suppress(OSError):
@@ -1342,6 +1368,7 @@ class JsonlSessionStore:
         *,
         fsync: bool = False,
         touch_updated_at: bool = False,
+        updated_at: datetime | None = None,
     ) -> bool:
         """Atomically replace only a session file's metadata record.
 
@@ -1371,7 +1398,7 @@ class JsonlSessionStore:
                     metadata.update(deepcopy(updates))
                     data["metadata"] = metadata
                     if touch_updated_at:
-                        data["updated_at"] = datetime.now().isoformat()
+                        data["updated_at"] = (updated_at or datetime.now()).isoformat()
                     with open(tmp_path, "x", encoding="utf-8") as target:
                         target.write(json.dumps(data, ensure_ascii=False) + "\n")
                         shutil.copyfileobj(source, target)
@@ -1407,11 +1434,8 @@ class JsonlSessionStore:
         for path in paths:
             if not path.exists():
                 continue
-            try:
-                path.unlink()
-                deleted = True
-            except OSError as e:
-                logger.warning("Failed to delete session file {}: {}", path, e)
+            path.unlink()
+            deleted = True
         return deleted
 
     def read(self, key: str) -> SessionPayload | None:
@@ -1801,30 +1825,31 @@ class SessionManager:
         return self._jsonl_store.repair(key, path=path)
 
     def save(self, session: Session, *, fsync: bool = False) -> None:
-        """Persist a session and retain it in the cache."""
-        if not session.policy.persist:
-            return
-
-        self._store.save(session, fsync=fsync)
-        self._remember(session)
-        if self._indexer is not None:
-            # Indexing is derived bookkeeping: it must never fail a turn.
-            try:
-                self._indexer.on_session_saved(session)
-            except Exception:
-                logger.exception("Recall index update failed for {}", session.key)
+        """Persist a live session and retain it in the cache."""
+        with self.locked_session_files():
+            if not session.policy.persist or session.deleted:
+                return
+            self._store.save(session, fsync=fsync)
+            self._remember(session)
+            if self._indexer is not None:
+                # Indexing is derived bookkeeping: it must never fail a turn.
+                try:
+                    self._indexer.on_session_saved(session)
+                except Exception:
+                    logger.exception("Recall index update failed for {}", session.key)
 
     def save_runtime_checkpoint(self, session: Session) -> None:
         """Persist volatile recovery state without rewriting long history."""
-        if not session.policy.persist:
-            return
-        if self._store is self._jsonl_store:
-            self._jsonl_store.save_runtime_checkpoint(session)
-            self._remember(session)
-            return
-        # Third-party stores keep their existing all-or-nothing semantics until
-        # they opt into a dedicated checkpoint primitive.
-        self.save(session)
+        with self.locked_session_files():
+            if not session.policy.persist or session.deleted:
+                return
+            if self._store is self._jsonl_store:
+                self._jsonl_store.save_runtime_checkpoint(session)
+                self._remember(session)
+                return
+            # Third-party stores keep their existing all-or-nothing semantics until
+            # they opt into a dedicated checkpoint primitive.
+            self.save(session)
 
     def rename_model_preset(self, old_name: str, new_name: str) -> int:
         """Rename a session-scoped model preset across durable and live sessions."""
@@ -1891,17 +1916,23 @@ class SessionManager:
         self._overflow_cache.pop(key, None)
 
     def delete_session(self, key: str) -> bool:
-        """Delete a persisted session and invalidate its cache entry."""
-        self.invalidate(key)
-        deleted = self._store.delete(key)
-        if self._delete_observer is not None:
-            self._delete_observer(key)
-        if self._indexer is not None:
-            try:
-                self._indexer.on_session_deleted(key)
-            except Exception:
-                logger.exception("Recall index delete failed for {}", key)
-        return deleted
+        """Delete persisted state and retire any object held by a background caller."""
+        with self.locked_session_files():
+            # Serialize the retirement with save/checkpoint, including a save
+            # already queued on the file lock. Cache invalidation alone leaves
+            # the caller's Session reference able to recreate the file.
+            if session := self.get_cached(key):
+                session.deleted = True
+            self.invalidate(key)
+            deleted = self._store.delete(key)
+            if self._delete_observer is not None:
+                self._delete_observer(key)
+            if self._indexer is not None:
+                try:
+                    self._indexer.on_session_deleted(key)
+                except Exception:
+                    logger.exception("Recall index delete failed for {}", key)
+            return deleted
 
     def restore_sessions_to_workspace(self) -> SessionRestoreResult:
         """Restore session files to the pre-relocation path for an explicit rollback."""
@@ -2442,14 +2473,26 @@ class SessionManager:
         touch_updated_at: bool = False,
     ) -> bool:
         """Atomically update metadata without replacing session history."""
+        stamp = datetime.now() if touch_updated_at else None
         updated = self._store.update_metadata(
             key,
             updates,
             fsync=fsync,
             touch_updated_at=touch_updated_at,
+            updated_at=stamp,
         )
         if updated and (session := self.get_cached(key)) is not None:
             session.metadata.update(deepcopy(updates))
+            if stamp is not None:
+                session.updated_at = stamp
+                if self._store is self._jsonl_store and isinstance(
+                    session.metadata.get(_RUNTIME_CHECKPOINT_KEY), dict
+                ):
+                    # The in-flight sidecar is only trusted while its
+                    # base_updated_at matches the main record, so re-base it
+                    # or the bump would silently drop the awaiting_tools
+                    # checkpoint a crash mid-tool needs (SR-09).
+                    self._jsonl_store.save_runtime_checkpoint(session)
         return updated
 
     def list_sessions(self) -> list[dict[str, Any]]:

@@ -374,9 +374,12 @@ async def _execute_tool_call(
         # "llm-iteration -> tool:<name>". observe_tool redacts and truncates
         # the arguments before export (MIT-211) and is a no-op when Langfuse
         # is not configured.
+        trace_params = params
+        if tool_call.name == "unlock_attachment" and isinstance(params, dict):
+            trace_params = {**params, "password": "[REDACTED]"}
         with (
             observe_tool(
-                tool_name=tool_call.name, arguments=params, metadata=tool_span_metadata,
+                tool_name=tool_call.name, arguments=trace_params, metadata=tool_span_metadata,
             ),
             file_read_context(tool_call.id, read_results)
             if tool_call.name == "read_file" else nullcontext(),
