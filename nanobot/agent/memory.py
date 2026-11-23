@@ -105,7 +105,9 @@ class MemoryStore:
     # FROM this diff (record_dream_provenance), never by the model turn, so
     # diffing it here would be circular. It rides in the same auto-commit via
     # GitStore's tracked-file list instead.
-    _DREAM_CONTENT_PATHS = ("SOUL.md", "USER.md", "memory/MEMORY.md")
+    # memory/archive.md is included (MIT-1871): Dream demotes facts there, and
+    # an archive-only edit must still produce a commit /dream-restore can undo.
+    _DREAM_CONTENT_PATHS = ("SOUL.md", "USER.md", "memory/MEMORY.md", "memory/archive.md")
     _LEGACY_ENTRY_START_RE = re.compile(r"^\[(\d{4}-\d{2}-\d{2}[^\]]*)\]\s*")
     _LEGACY_TIMESTAMP_RE = re.compile(r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2})\]\s*")
     _LEGACY_RAW_MESSAGE_RE = re.compile(
@@ -148,8 +150,8 @@ class MemoryStore:
         # the Agent once the per-workspace index exists; None in plain CLI use.
         self._recall: Any = None
         self._git = GitStore(workspace, tracked_files=[
-            "SOUL.md", "USER.md", "memory/MEMORY.md", "memory/.dream_cursor",
-            "memory/provenance.jsonl",
+            "SOUL.md", "USER.md", "memory/MEMORY.md", "memory/archive.md",
+            "memory/.dream_cursor", "memory/provenance.jsonl",
         ])
         self._maybe_migrate_legacy_history()
 

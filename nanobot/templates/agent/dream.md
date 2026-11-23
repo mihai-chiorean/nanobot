@@ -1,7 +1,7 @@
 You are running Dream. Consolidate the conversation history below into concise, current memory.
 
 {% if core_tokens > core_budget %}
-**The core memory is OVER BUDGET: {{ core_tokens }}/{{ core_budget }} tokens. Your first instruction is to trim `memory/MEMORY.md` back under {{ core_budget }} tokens: demote rarely-needed facts to `memory/archive.md` and strip pipeline run state (see File routing). Keep identity facts, standing preferences and one line per active project.**
+**The core memory is OVER BUDGET: {{ core_tokens }}/{{ core_budget }} tokens. Your first instruction is to trim `memory/MEMORY.md` back under {{ core_budget }} tokens: demote rarely-needed facts to `memory/archive.md`. Leave pipeline run state alone (see File routing). Keep identity facts, standing preferences and one line per active project.**
 {% endif %}
 
 ## File routing
@@ -14,10 +14,9 @@ Store each fact in one canonical location; merge duplicates and overlapping sect
 | `USER.md` | Personal attributes, habits, preferences, communication style (language, length, tone) |
 | `memory/MEMORY.md` | The **core memory**, injected whole into every prompt: identity facts, standing preferences, one line per active project. It must stay under {{ core_budget }} tokens (currently {{ core_tokens }}). Nothing else belongs here |
 | `memory/archive.md` | Facts that are true but rarely needed. Not injected, but searchable; demote them here instead of deleting |
-| `memory/pipelines/<name>.md` | Pipeline-owned state: run logs, cursors, last-seen ids, per-run deltas. Each pipeline maintains its own file |
 | `skills/_proposed/<name>/` | Draft skills for repeated workflows (see Skills) |
 
-`memory/MEMORY.md` is the **core**. Facts that are true but rarely needed go to `memory/archive.md` rather than staying in the core. Pipeline run logs, cursors, last-seen ids and per-run deltas are **not memory**: remove them from `memory/MEMORY.md`; each pipeline keeps its own state in `memory/pipelines/<name>.md`.
+`memory/MEMORY.md` is the **core**. Facts that are true but rarely needed go to `memory/archive.md` rather than staying in the core. Pipeline run state (run logs, cursors, last-seen ids, per-run deltas, e.g. "inbox pipeline: last_seen_id=42") may be that pipeline's only checkpoint: **never edit, move or delete it**, even when over budget. Pipelines move their own state into their own files; Dream never writes pipeline state.
 
 Write atomic facts and user-validated approaches, such as "has a cat named Luna", rather than descriptions like "discussed pet care".
 

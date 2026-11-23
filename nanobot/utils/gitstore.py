@@ -489,9 +489,16 @@ class GitStore:
                 parent_obj = cast("Commit", repo[typed_commit.parents[0]])
                 tree = cast("Tree", repo[parent_obj.tree])
 
+                commit_tree = cast("Tree", repo[typed_commit.tree])
                 restored: list[str] = []
                 for filepath in self._tracked_files:
                     content = self._read_blob_from_tree(repo, tree, filepath)
+                    if content is None and (
+                        self._read_blob_from_tree(repo, commit_tree, filepath) is not None
+                    ):
+                        # The reverted commit first added this file (e.g. a
+                        # newly tracked memory/archive.md): undo means empty.
+                        content = ""
                     if content is not None:
                         dest = self._workspace / filepath
                         dest.write_text(content, encoding="utf-8")
