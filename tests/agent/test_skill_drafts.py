@@ -390,7 +390,7 @@ def test_accept_commits_and_overwrite_is_revertible(tmp_path: Path) -> None:
     newest = git.log(max_entries=1)[0]
     assert newest.subject() == "skill: accept demo"
     assert "New description" in _read(tmp_path, "skills/demo/SKILL.md")
-    assert git.revert(newest.sha) is not None
+    assert git.undo(newest.sha) is not None
     assert "Old description" in _read(tmp_path, "skills/demo/SKILL.md")
 
 
@@ -407,7 +407,7 @@ def test_accept_records_uncommitted_live_state_first(tmp_path: Path) -> None:
 
     subjects = [c.subject() for c in git.log(max_entries=3)]
     assert subjects[:2] == ["skill: accept demo", "skill: before accept demo"]
-    git.revert(git.log(max_entries=1)[0].sha)
+    git.undo(git.log(max_entries=1)[0].sha)
     assert "Hand edited" in _read(tmp_path, "skills/demo/SKILL.md")
 
 
@@ -438,11 +438,7 @@ def test_accept_refuses_overwrite_of_file_too_big_for_history(tmp_path: Path) ->
     assert (tmp_path / "skills/demo/assets/big.bin").read_bytes() == big
 
 
-def test_accept_rolls_back_completed_renames_on_rename_failure(
-    tmp_path: Path, monkeypatch
-) -> None:
-    """The 3rd os.replace fails: the 2 completed renames (a new file and an
-    overwrite) are undone, no temp files remain, the draft is kept."""
+def _rollback_fixture(tmp_path: Path) -> None:
     _write_live(tmp_path, "demo", {"SKILL.md": _skill_md("demo", "Old"), "scripts/a.py": "old\n"})
     _write_draft(
         tmp_path, "demo",
@@ -452,18 +448,48 @@ def test_accept_rolls_back_completed_renames_on_rename_failure(
             "scripts/a.py": "new\n",
         },
     )
-    git = _git(tmp_path)
-    real_replace = skill_drafts.os.replace
+
+
+def _fail_third_accept_rename(monkeypatch, *, fail_backup_restore: bool = False) -> dict:
+    """Fail accept's 3rd temp->live rename (and optionally every backup restore)."""
+    real_replace = os.replace
     calls = {"n": 0}
 
     def flaky_replace(src, dst, *args, **kwargs):
-        if os.fsdecode(os.path.basename(src)).startswith(".skill-draft-"):  # accept renames only
+        src_s, dst_s = os.fsdecode(src), os.fsdecode(dst)
+        staged = src_s.endswith(".tmp") or os.path.basename(src_s).startswith(".skill-draft-")
+        if "skills/demo" in dst_s and staged:
             calls["n"] += 1
             if calls["n"] == 3:
                 raise OSError("rename failed")
+        if fail_backup_restore and src_s.endswith(".bak"):
+            raise OSError("restore failed")
         return real_replace(src, dst, *args, **kwargs)
 
-    monkeypatch.setattr(skill_drafts.os, "replace", flaky_replace)
+    monkeypatch.setattr(os, "replace", flaky_replace)
+    return calls
+
+
+def test_accept_rolls_back_completed_renames_without_rewriting_in_place(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The 3rd rename fails and the disk is full: rollback must restore the
+    originals by rename, never by rewriting them (which would truncate)."""
+    _rollback_fixture(tmp_path)
+    git = _git(tmp_path)
+    git.init()
+    calls = _fail_third_accept_rename(monkeypatch)
+
+    real_write_bytes = Path.write_bytes
+
+    def enospc_write_bytes(self, data):
+        if "skills/demo/" not in self.as_posix():
+            return real_write_bytes(self, data)
+        with open(self, "wb"):
+            pass  # truncated, then the disk is full
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(Path, "write_bytes", enospc_write_bytes)
     with pytest.raises(OSError, match="rename failed"):
         skill_drafts.accept(tmp_path, "demo", git)
 
@@ -471,9 +497,28 @@ def test_accept_rolls_back_completed_renames_on_rename_failure(
     live = tmp_path / "skills/demo"
     assert "Old" in _read(tmp_path, "skills/demo/SKILL.md")
     assert _read(tmp_path, "skills/demo/scripts/a.py") == "old\n"
-    assert not (live / "assets").exists()
-    assert not list(live.rglob(".skill-draft-*"))
+    assert not (live / "assets/new.txt").exists()
+    assert not [p for p in live.rglob("*") if p.name.endswith((".tmp", ".bak"))]
     assert (tmp_path / "skills/_proposed/demo/SKILL.md").exists()
+
+
+def test_accept_failed_rollback_keeps_backup_and_reports_it(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from nanobot.utils.gitstore import GitStoreError
+
+    _rollback_fixture(tmp_path)
+    git = _git(tmp_path)
+    git.init()
+    _fail_third_accept_rename(monkeypatch, fail_backup_restore=True)
+
+    with pytest.raises(GitStoreError, match="original kept at") as excinfo:
+        skill_drafts.accept(tmp_path, "demo", git)
+
+    backups = [p for p in (tmp_path / "skills/demo").rglob("*.bak")]
+    assert backups
+    assert any(b"Old" in p.read_bytes() for p in backups)
+    assert all(str(p) in str(excinfo.value) for p in backups)
 
 
 def test_reject_refuses_when_a_draft_file_is_too_big_for_history(tmp_path: Path) -> None:
@@ -496,7 +541,7 @@ def test_reject_removes_draft_with_invalid_name_restorably(tmp_path: Path) -> No
     assert "Demo" in skill_drafts.list_drafts(tmp_path)
     assert skill_drafts.reject(tmp_path, "Demo", git) is True
     assert not (tmp_path / "skills/_proposed/Demo").exists()
-    git.revert(git.log(max_entries=1)[0].sha)
+    git.undo(git.log(max_entries=1)[0].sha)
     assert (tmp_path / "skills/_proposed/Demo/SKILL.md").exists()
     # Traversal never matches a _proposed entry.
     assert skill_drafts.reject(tmp_path, "../_proposed", git) is False
@@ -541,5 +586,5 @@ def test_reject_commits_draft_first_so_it_is_restorable(tmp_path: Path) -> None:
     newest = git.log(max_entries=1)[0]
     assert newest.subject() == "skill: reject demo"
     assert not (tmp_path / "skills/_proposed/demo").exists()
-    git.revert(newest.sha)
+    git.undo(newest.sha)
     assert (tmp_path / "skills/_proposed/demo/SKILL.md").exists()

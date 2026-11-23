@@ -351,52 +351,6 @@ def _ensure_history(history: GitStore) -> None:
         history.init()
 
 
-def _apply_all_or_nothing(
-    live: Path, draft_files: dict[str, bytes], live_files: dict[str, bytes]
-) -> None:
-    """Write *draft_files* under *live*; on any failure restore the live skill.
-
-    Every file is staged as a temp file first, then renamed into place.  If a
-    stage or a rename fails, completed renames are undone (overwritten files
-    get their old bytes back, new files and directories this created are
-    removed), every temp file is deleted, and the error propagates.
-    """
-    created_dirs: list[Path] = []
-    staged: list[tuple[str, Path, str]] = []
-    replaced: list[str] = []
-    try:
-        for rel, data in draft_files.items():
-            target = live / rel
-            missing = [p for p in [target.parent, *target.parent.parents] if not p.exists()]
-            for directory in reversed(missing):
-                directory.mkdir()
-                created_dirs.append(directory)
-            fd, tmp_name = tempfile.mkstemp(dir=target.parent, prefix=".skill-draft-")
-            staged.append((tmp_name, target, rel))
-            with os.fdopen(fd, "wb") as handle:
-                handle.write(data)
-        for tmp_name, target, rel in staged:
-            os.replace(tmp_name, target)
-            replaced.append(rel)
-    except BaseException:
-        for rel in reversed(replaced):
-            target = live / rel
-            try:
-                if rel in live_files:
-                    target.write_bytes(live_files[rel])
-                else:
-                    target.unlink()
-            except OSError:
-                logger.exception("skill_drafts: could not roll back {}", target)
-        for tmp_name, _target, _rel in staged:
-            with suppress(OSError):
-                os.unlink(tmp_name)
-        for directory in reversed(created_dirs):
-            with suppress(OSError):
-                directory.rmdir()
-        raise
-
-
 def accept(ws: Path | str, name: str, history: GitStore) -> list[str]:
     """Apply draft *name* over the live skill. Returns problems; [] means accepted.
 
@@ -410,6 +364,8 @@ def accept(ws: Path | str, name: str, history: GitStore) -> list[str]:
     problems = check(ws, name)
     if problems:
         return problems
+    if Path(history._workspace).resolve() != Path(ws).resolve():
+        return ["Workspace history belongs to a different workspace; nothing changed"]
     live = live_skill_dir(ws, name)
     draft = draft_dir(ws, name)
     draft_files = _draft_files(ws, name)
@@ -438,7 +394,11 @@ def accept(ws: Path | str, name: str, history: GitStore) -> list[str]:
         logger.exception("skill_drafts: pre-accept history commit failed for '{}'", name)
         return [f"Could not record the current state in workspace history ({exc}); nothing changed"]
 
-    _apply_all_or_nothing(live, draft_files, live_files)
+    # All or nothing, by GitStore's own write path (the one /undo uses):
+    # staged temps, hard-link backups of replaced files, rollback by rename.
+    # A failed rollback keeps the backup and names it in the GitStoreError.
+    rel_live = live.relative_to(Path(ws)).as_posix()
+    history._apply_writes([(f"{rel_live}/{rel}", data) for rel, data in draft_files.items()])
     shutil.rmtree(draft)
     _prune_empty_proposed(draft)
     try:

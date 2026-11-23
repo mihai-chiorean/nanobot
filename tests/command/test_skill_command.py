@@ -301,7 +301,7 @@ async def test_skill_accept_and_reject_refused_outside_a_user_turn(ws: Path) -> 
         out = await cmd_skill(
             _ctx_args(loop, f"/skill {sub} demo", f"{sub} demo", is_user_turn=False)
         )
-        assert "only runs as your own chat message" in out.content
+        assert "send it again when it finishes" in out.content
 
     assert (ws / "skills/_proposed/demo/SKILL.md").exists()
     assert not (ws / "skills/demo").exists()
@@ -366,6 +366,21 @@ async def test_scheduled_work_cannot_accept_a_skill_draft(ws: Path) -> None:
 
     result = await run_work_task_cron_job(job, agent=loop)
 
-    assert result is not None and "only runs as your own chat message" in result
+    assert result is not None and "not by scheduled or automated work" in result
+    assert (ws / "skills/_proposed/demo/SKILL.md").exists()
+    assert not (ws / "skills/demo").exists()
+
+
+@pytest.mark.asyncio
+async def test_custom_process_direct_caller_cannot_accept_or_reject(ws: Path) -> None:
+    """An in-process caller (e.g. sender_id="cron", no automation metadata)
+    goes through process_direct, which the history-write gate refuses."""
+    _write_draft(ws, "demo")
+    loop = _make_loop(ws)
+
+    for sub in ("accept", "reject"):
+        out = await loop.process_direct(f"/skill {sub} demo", sender_id="cron")
+        assert out is not None and "not by scheduled or automated work" in out.content
+
     assert (ws / "skills/_proposed/demo/SKILL.md").exists()
     assert not (ws / "skills/demo").exists()

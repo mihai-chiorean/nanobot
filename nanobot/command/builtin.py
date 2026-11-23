@@ -1280,19 +1280,6 @@ def _skill_reply(ctx: CommandContext, content: str, *, as_text: bool = False) ->
     )
 
 
-def _interactive_user_turn(ctx: CommandContext) -> bool:
-    """A genuine interactive user turn, not an automated run.
-
-    ``is_user_turn`` already excludes system/subagent messages, cron and
-    local-trigger turns and mid-turn injected commands. Scheduled Work runs
-    enter through ``process_direct`` as an ordinary user message, so their
-    Work-task metadata is checked here too.
-    """
-    from nanobot.cron.work_runner import WORK_TASK_META_TASK_ID
-
-    return ctx.is_user_turn and WORK_TASK_META_TASK_ID not in (ctx.msg.metadata or {})
-
-
 async def cmd_skill(ctx: CommandContext) -> OutboundMessage:
     """List skills, or manage the draft overlays (drafts/diff/accept/reject)."""
     from nanobot.agent import skill_drafts
@@ -1336,17 +1323,14 @@ async def cmd_skill(ctx: CommandContext) -> OutboundMessage:
         return _skill_reply(ctx, _SKILL_USAGE, as_text=True)
     if not name:
         return _skill_reply(ctx, f"{sub.capitalize()} needs a skill name.\n\n{_SKILL_USAGE}", as_text=True)
-    if sub in {"accept", "reject"} and not _interactive_user_turn(ctx):
-        # Only the user activates or discards a draft. Automation turns (cron,
-        # triggers, subagent/session relays, scheduled Work runs) and commands
-        # injected mid-turn are refused, so the agent cannot accept its own
-        # draft by routing "/skill accept" back into a session.
-        return _skill_reply(
-            ctx,
-            f"/skill {sub} only runs as your own chat message while no task is "
-            "running in this chat. Send it again when the current task finishes.",
-            as_text=True,
-        )
+    if sub in {"accept", "reject"}:
+        # Only the owner, typing in a chat, activates or discards a draft:
+        # the same gate as /undo and /restore (scheduled work, cron, triggers,
+        # subagents and every in-process process_direct caller are refused),
+        # so the agent can never accept its own draft.
+        refusal = _history_write_refusal(ctx)
+        if refusal is not None:
+            return refusal
     history = loop.consolidator.store.git
 
     try:
