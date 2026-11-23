@@ -14,6 +14,9 @@ from nanobot.runtime_context import RuntimeContextBlock
 
 # Default builtin skills directory (relative to this file)
 BUILTIN_SKILLS_DIR = Path(__file__).parent.parent / "skills"
+# MIT-1850: agent/Dream skill drafts live under <workspace>/skills/_proposed/;
+# never a live skill, only the user activates one (/skill accept).
+PROPOSED_SKILLS_DIR = "_proposed"
 
 # Opening ---, YAML body (group 1), closing --- on its own line; supports CRLF.
 _STRIP_SKILL_FRONTMATTER = re.compile(
@@ -82,7 +85,7 @@ class SkillsLoader:
             return []
         entries: list[dict[str, str]] = []
         for skill_dir in base.iterdir():
-            if not skill_dir.is_dir():
+            if not skill_dir.is_dir() or skill_dir.name == PROPOSED_SKILLS_DIR:
                 continue
             skill_file = skill_dir / "SKILL.md"
             if not skill_file.exists():
