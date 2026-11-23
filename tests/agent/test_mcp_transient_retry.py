@@ -445,7 +445,10 @@ async def test_non_idempotent_tool_does_not_refresh_session_on_termination():
     )
     replacement = _make_read_only_wrapper(new_session)
 
+    reconnects = []
+
     async def reconnect(server_name: str, tool_name: str, stale_tool):
+        reconnects.append(tool_name)
         return replacement
 
     wrapper.set_reconnect_handler(reconnect)
@@ -456,6 +459,47 @@ async def test_non_idempotent_tool_does_not_refresh_session_on_termination():
     assert is_tool_error_result(output)
     assert old_session.call_tool.call_count == 1
     assert new_session.call_tool.call_count == 0
+    # The dead session is still replaced so later calls recover.
+    assert len(reconnects) == 1
+
+
+@pytest.mark.asyncio
+async def test_tool_not_replayed_when_refreshed_tool_is_no_longer_idempotent():
+    """Replay needs idempotency from the server as it is after the reconnect."""
+    old_session = AsyncMock()
+    old_session.call_tool = AsyncMock(side_effect=_session_terminated_error())
+    new_session = AsyncMock()
+    new_session.call_tool = AsyncMock(
+        side_effect=[ConnectionResetError("response lost"), _make_tool_result("3rd")]
+    )
+
+    def _send(session, idempotent):
+        return MCPToolWrapper(
+            session,
+            "test_server",
+            _make_tool_def("send", annotations=_annotations(idempotent=idempotent)),
+            tool_timeout=5,
+            trust_annotations=True,
+        )
+
+    wrapper = _send(old_session, True)
+    replacement = _send(new_session, False)
+    assert wrapper.idempotent is True
+    assert replacement.idempotent is False
+
+    async def reconnect(server_name: str, tool_name: str, stale_tool):
+        return replacement
+
+    wrapper.set_reconnect_handler(reconnect)
+
+    with patch("nanobot.agent.tools.mcp.asyncio.sleep", new_callable=AsyncMock):
+        output = await wrapper.execute()
+
+    assert "outcome unknown" in output
+    assert is_tool_error_result(output)
+    assert old_session.call_tool.call_count == 1
+    assert new_session.call_tool.call_count == 0
+    assert wrapper.idempotent is False
 
 
 @pytest.mark.asyncio

@@ -631,6 +631,12 @@ class _MCPWrapperBase(Tool):
             )
             return False
         self._session = refreshed_session
+        # Adopt the refreshed tool's annotations so the retry gate judges the
+        # tool as the server describes it now, not as it did at first connect
+        # (MIT-1817).
+        if hasattr(refreshed_tool, "_annotations"):
+            self._annotations = refreshed_tool._annotations
+            self._trust_annotations = getattr(refreshed_tool, "_trust_annotations", False)
         return True
 
 
@@ -819,25 +825,31 @@ class MCPToolWrapper(_MCPWrapperBase):
                 logger.warning("MCP tool '{}' was cancelled by server/SDK", self._name)
                 return ToolResult.error("(MCP tool call was cancelled)")
             except Exception as exc:
-                if not self.idempotent and _is_session_terminated(exc):
-                    # The call may have reached the server before the
-                    # connection died; repeating a non-idempotent call (e.g.
-                    # browser_fill_form) could run the action twice (MIT-1817).
-                    logger.warning(
-                        "mcp_retry_skipped tool={} reason=not_idempotent",
-                        self._name,
-                    )
-                    return ToolResult.error(
-                        "(MCP tool call outcome unknown after a connection error: "
-                        "do not repeat it without checking whether it took effect)"
-                    )
-                if await self._refresh_session_after_termination(
-                    exc,
-                    refreshed_session,
-                    "tool",
-                ):
-                    refreshed_session = True
-                    continue
+                if _is_session_terminated(exc):
+                    # Always replace a dead session so later calls recover, but
+                    # replay this call only if the tool was idempotent before
+                    # and is still idempotent after the refresh: the call may
+                    # have reached the server before the connection died, and
+                    # repeating a non-idempotent call (e.g. browser_fill_form)
+                    # could run the action twice (MIT-1817).
+                    was_idempotent = self.idempotent
+                    if await self._refresh_session_after_termination(
+                        exc,
+                        refreshed_session,
+                        "tool",
+                    ):
+                        refreshed_session = True
+                        if was_idempotent and self.idempotent:
+                            continue
+                    if not (was_idempotent and self.idempotent):
+                        logger.warning(
+                            "mcp_retry_skipped tool={} reason=not_idempotent",
+                            self._name,
+                        )
+                        return ToolResult.error(
+                            "(MCP tool call outcome unknown after a connection error: "
+                            "do not repeat it without checking whether it took effect)"
+                        )
                 if _is_transient(exc):
                     if not retried_transient:
                         retried_transient = True

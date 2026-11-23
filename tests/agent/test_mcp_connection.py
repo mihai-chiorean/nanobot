@@ -666,6 +666,85 @@ async def test_mcp_tool_reconnects_after_session_terminated(
 
 
 @pytest.mark.asyncio
+async def test_mcp_untrusted_tool_refreshes_dead_session_without_replay(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A non-idempotent call is not replayed, but the dead session is replaced.
+
+    Without the refresh, a default (untrusted) server stays on its dead
+    connection and every later call fails while status reads ``connected``.
+    """
+    provider, registry = _make_provider(
+        mcp_servers={"remote": _stdio_server("remote")}
+    )
+    closed: list[str] = []
+    sessions: list[Any] = []
+    connect_count = 0
+
+    async def _mark_closed(name: str) -> None:
+        closed.append(name)
+
+    class _FakeSession:
+        def __init__(self, index: int) -> None:
+            self.index = index
+            self.call_count = 0
+
+        async def call_tool(
+            self, _name: str, arguments: dict[str, Any], meta: dict | None = None
+        ) -> Any:
+            self.call_count += 1
+            if self.index == 1:
+                raise McpError(ErrorData(code=-32000, message="Session terminated"))
+            return SimpleNamespace(
+                content=[mcp_types.TextContent(type="text", text="recovered")]
+            )
+
+    async def _fake_connect(servers, registry):
+        nonlocal connect_count
+        stacks = {}
+        for name in servers:
+            connect_count += 1
+            session = _FakeSession(connect_count)
+            sessions.append(session)
+            tool_def = SimpleNamespace(
+                name="send",
+                description="send tool",
+                inputSchema={"type": "object", "properties": {}},
+                annotations=None,
+            )
+            registry.register(MCPToolWrapper(session, name, tool_def, tool_timeout=5))
+            stack = AsyncExitStack()
+            await stack.__aenter__()
+            stack.push_async_callback(_mark_closed, name)
+            stacks[name] = stack
+        return stacks
+
+    monkeypatch.setattr("nanobot.agent.tools.mcp.connect_mcp_servers", _fake_connect)
+
+    await provider.connect()
+    old_tool = registry.get("mcp_remote_send")
+    assert isinstance(old_tool, MCPToolWrapper)
+
+    output = await old_tool.execute()
+
+    assert "outcome unknown" in output
+    # Not replayed on the new session...
+    assert sessions[0].call_count == 1
+    assert sessions[1].call_count == 0
+    # ...but the dead connection was replaced.
+    assert connect_count == 2
+    assert closed == ["remote"]
+    assert provider.connected_server_names == {"remote"}
+    new_tool = registry.get("mcp_remote_send")
+    assert new_tool is not old_tool
+
+    # The next request runs on the live connection and succeeds.
+    assert await new_tool.execute() == "recovered"
+    assert connect_count == 2
+
+
+@pytest.mark.asyncio
 async def test_mcp_reconnect_handler_uses_sanitized_server_prefix(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
